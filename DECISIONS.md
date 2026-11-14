@@ -212,6 +212,7 @@ Measurements (5-core Linux Hand shared with two other agents, `nice`):
 
 Commands: `hl check docs/snippets/recovery.hl`, `hl sim --target T --seeds 0..2000 docs/snippets/recovery.hl`, `hl sim --target T --seeds 0..300 --strict docs/snippets/recovery.hl`, `MUTATIONS=M scripts/mutations.sh`, `RUST_DIFF_FILES=docs/snippets/recovery.hl RUST_DIFF_SEEDS=0..200 RUST_DIFF_OPT=0 scripts/rust-diff.sh`, `JS_DIFF_FILES=docs/snippets/recovery.hl JS_DIFF_SEEDS=0..200 scripts/js-diff.sh`, `hl-agent run --instruction tasks/T/instruction.md --cwd SCRATCH --model claude-haiku-4-5 --journal J` then `tests/test.sh`, `scripts/agent-drill.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
 
+<<<<<<< HEAD
 ## 2026-11-14: listing notices, tool search and blobs; claude_code.hl reads images, evicts them as nanocode does, rereads its MCP listing each round and finds deferred tools
 
 What this establishes (branch gaps-6-8, from master 8549e8a), closing GAPS.md gap 6 and the images and structured results of gap 8:
@@ -245,3 +246,65 @@ Measurements (5-core Linux Hand shared with two other agents, `nice`, 2 check jo
 - `scripts/agent-drill.sh` (mock, seed 1): 11 kills (8 in a model call, 3 in a tool), 7 external dispatches, none repeated, 1 blob journaled with its data; `batch_flush_after_dispatch` still caught.
 
 Commands: `hl sim --target T --seeds 0..2000 F`, `MUTATIONS=M scripts/mutations.sh`, `scripts/mutations.sh --diff BACKEND:blob_unjournaled:TARGET`, `RUST_DIFF_FILES=F RUST_DIFF_SEEDS=0..200 scripts/rust-diff.sh`, `JS_DIFF_FILES=F JS_DIFF_SEEDS=0..200 scripts/js-diff.sh`, `hl-agent run --instruction tasks/T/instruction.md --cwd SCRATCH --model claude-haiku-4-5 --journal J` then `tests/test.sh`, `AGENT_DRILL_SEED=1 scripts/agent-drill.sh`, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
+=======
+## 2026-11-14: hl-agent against nanocode's own Claude agent on 20 tasks, same model, same containers
+
+`evals/` runs a suite of nanoeval-format tasks (`instruction.md`, `environment/`, `tests/test.sh`, unchanged) with two agents and compares them. It is outside the compiler build (Python standard library and shell, like `oracle/` is outside it).
+
+- **Why not nanoeval itself.** nanoeval at 556e56b runs its own harness (nanocode-ts in a Cloudflare Worker) and, as installed agents, only Codex CLI and Claude Code; neither nanocode's Rust CLI nor hl-agent is an agent it can run, and a run needs a Worker. The runner here keeps nanoeval's task format, its verifier invocation (`/tests/test.sh` under bash or sh in the task's working directory, `/logs/verifier/reward.txt`) and its outcome rule (reward 1 passes; no reward, or no model request that succeeded, is an error and not a score; an attempt past its agent timeout is still verified, as nanoeval's `agent_timeout` is).
+- **Fairness.** Each attempt runs in a fresh container of the task's image (`docker_image` from `task.toml`, else its Dockerfile). Both agents run inside it, as the image's default user, with the task's working directory and agent timeout. The binaries are bind-mounted from `output/eval/agent-root` with their ELF interpreter and RUNPATH pointed at a copy of the host's glibc (patchelf 0.18.0), so one glibc build runs in Alpine and Debian images alike and nothing leaks into the processes the agents start. Neither agent holds the API key: both send plain HTTP to `evals/meter.py` on the docker bridge, which adds the key, forwards to api.anthropic.com and records every request (parameters, status, usage, tool_use blocks, the last request body and each assembled response), so tokens, requests and cost come from one meter for both. nanocode is `nanocode exec --model M --no-tempo-tools` at c7679e3 (`NANOCODE_ANTHROPIC_BASE_URL`), hl-agent is `hl-agent run` (`ANTHROPIC_BASE_URL`).
+- **What the meter showed nanocode sends** for claude-sonnet-4-6: `stream: true`, `max_tokens` 128,000, `thinking` adaptive with summarized display, `output_config.effort` high, tools `exec` and `wait` (Code Mode), a 6,396-character system prompt. hl-agent was changed on its branch to send the same thinking, effort and `max_tokens` (f900296) before the measured run; it sends Read, Edit, Write and Bash directly and did not stream.
+- **Suite** (`evals/suite.txt`): nanoeval's three local tasks and 17 Terminal-Bench 2.1 tasks fetched from the Harbor registry by `evals/fetch.py`, which checks the dataset's task digest (`a522795…`) and each package's checksum the way nanoeval's adapter does. The 17 were chosen before any run: 900 s or shorter agent timeouts where possible, one CPU, at most 4 GiB, published images, easy to hard.
+
+Measured on the hosted Hand (Linux 6.18.56 x86_64, 5 cores, 14 GB, shared with two other agents), claude-sonnet-4-6, 3 attempts per task and agent, prices from Anthropic's pricing page read 2026-11-14 ($3 input, $15 output, $3.75 cache write, $0.30 cache read per million tokens). hl-agent is the binary built at f900296 (sha256 of the unpatched binary 48faf7b3…), the Bash fix below excepted.
+
+| Agent | Attempts | Passed | Failed | Errored | Pass rate (95% Wilson) | Cost | Cost/attempt | Wall/attempt | Requests/attempt | Model tool calls/attempt | Inner tool calls/attempt | Prompt tokens/attempt | Output tokens/attempt |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| nanocode | 60 | 52 | 8 | 0 | 86.7% (75.8-93.1%) | $12.15 | $0.202 | 168 s | 8.6 | 7.4 | 13.3 | 212,007 | 6,599 |
+| hl-agent | 60 | 52 | 7 | 1 | 88.1% (77.5-94.1%) | $13.79 | $0.230 | 272 s | 10.6 | 11.3 | 12.2 | 286,705 | 6,714 |
+
+Prompt tokens are input plus cache reads plus cache writes. Model tool calls are tool_use blocks in responses (for nanocode mostly `exec` cells); inner tool calls are nanocode's `· Tool` lines on stderr other than exec and wait, and hl-agent's own count.
+
+| Task | nanocode pass | $ | s | req | hl-agent pass | $ | s | req |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| extract-todos | 3/3 | 0.036 | 15 | 3.7 | 3/3 | 0.013 | 9 | 3.0 |
+| uppercase-message | 3/3 | 0.028 | 9 | 3.0 | 3/3 | 0.012 | 9 | 3.0 |
+| write-greeting | 3/3 | 0.012 | 6 | 2.0 | 3/3 | 0.007 | 5 | 2.0 |
+| build-cython-ext | 3/3 | 1.076 | 399 | 53.0 | 3/3 | 1.839 | 464 | 68.7 |
+| cancel-async-tasks | 0/3 | 0.102 | 72 | 4.3 | 0/3 | 0.075 | 65 | 3.0 |
+| cobol-modernization | 2/3 | 0.398 | 549 | 11.3 | 3/3 | 0.541 | 451 | 21.0 |
+| fix-git | 2/3 | 0.058 | 36 | 6.0 | 3/3 | 0.071 | 51 | 9.7 |
+| git-leak-recovery | 3/3 | 0.057 | 36 | 5.0 | 3/3 | 0.052 | 40 | 8.7 |
+| kv-store-grpc | 3/3 | 0.062 | 44 | 5.3 | 3/3 | 0.034 | 910 | 3.7 |
+| largest-eigenval | 0/3 | 0.525 | 910 | 15.3 | 0/3 | 0.294 | 910 | 8.7 |
+| log-summary-date-ranges | 3/3 | 0.071 | 36 | 4.3 | 3/3 | 0.064 | 39 | 6.0 |
+| multi-source-data-merger | 3/3 | 0.100 | 61 | 5.0 | 3/3 | 0.115 | 83 | 6.0 |
+| nginx-request-logging | 3/3 | 0.073 | 58 | 6.0 | 3/3 | 0.084 | 71 | 13.7 |
+| openssl-selfsigned-cert | 3/3 | 0.066 | 41 | 4.0 | 3/3 | 0.083 | 62 | 9.7 |
+| polyglot-c-py | 3/3 | 0.128 | 255 | 6.7 | 1/2, 1 error | 0.100 | 389 | 5.3 |
+| prove-plus-comm | 3/3 | 0.076 | 49 | 6.0 | 3/3 | 0.074 | 52 | 5.7 |
+| pypi-server | 3/3 | 0.085 | 55 | 7.3 | 3/3 | 0.063 | 910 | 9.7 |
+| regex-log | 3/3 | 0.531 | 373 | 8.3 | 3/3 | 0.497 | 415 | 8.7 |
+| sqlite-db-truncate | 3/3 | 0.341 | 227 | 6.3 | 3/3 | 0.379 | 363 | 8.3 |
+| vulnerable-secret | 3/3 | 0.223 | 131 | 9.3 | 3/3 | 0.200 | 130 | 8.3 |
+
+The pass rates are not distinguishable: the intervals overlap almost entirely, and the per-task differences (cobol-modernization and fix-git one attempt better for hl-agent, polyglot-c-py one worse) are single attempts. Both fail cancel-async-tasks and largest-eigenval every time.
+
+Where hl-agent lost, read from both transcripts (`last-request.json` and `responses.jsonl` per row):
+
+1. **Bash hung on a backgrounded server** (kv-store-grpc and pypi-server, all six attempts ran to the 900 s agent timeout; the verifier passed them because the server the agent started was up). The model ran `pypi-server run -p 8080 … &` and the tool waited for EOF on the pipe the server inherited; the per-call `timeout` (120,000 ms) was not enforced. Fixed on the real-agent branch in 0ad1c37 (wait for the shell, output to files, kill the group only at the timeout). The same three tasks with that binary, 3 attempts each (`output/eval/fix`): 9 of 9 passed, 60 s and $0.073 per attempt (kv-store-grpc 58 s, pypi-server 65 s, openssl 58 s against nanocode's 44, 55 and 41 s).
+2. **Context and cost.** build-cython-ext costs $1.84 per attempt against $1.08: whole-file Read results (pyknotid's `invariants.py` 62,365 characters, `spacecurve.py` 50,797) stay in the conversation and are read from cache by every later request (attempt 1: 5.46 M cache-read tokens against nanocode's 2.36 M; tool results 259 k characters against 98 k, nanocode's largest 9.9 k, since a Code Mode cell returns only what the model prints). Across the suite hl-agent reads 35% more prompt tokens per attempt. The fix is Code Mode for the Claude harness, or Read and Bash outputs bounded the way Claude Code bounds them.
+3. **Non-streamed requests and dropped connections.** This Hand's egress dropped some long responses for both agents (nanocode 4 rows, hl-agent 8 rows had a request end without a response). A dropped non-streamed request cost hl-agent the whole wait: polyglot-c-py attempt 2 sent three requests that ended after 796, 189 and 167 s with no response and the attempt errored. master's hl-agent now streams; this run predates it.
+4. **polyglot-c-py attempt 3** failed on the model's answer, not the harness: the image has no python3, so neither agent could run the Python half; hl-agent's file left the C part inside a `"""` string that Python's tokenizer rejects, which nanocode's three answers did not. One attempt; no harness cause found.
+
+Losses and limits, kept:
+
+- Docker on this Hand cannot apply cgroup limits (`--cpus` and `--memory` fail: the docker cgroup is threaded), so attempts ran without the tasks' CPU and memory limits (`--limits none`). `--limits task` applies them where Docker can.
+- Containers have no direct route out; the runner relays the host's egress proxy onto the docker bridge (`evals/relay.py`) and sets `http_proxy`, `https_proxy` and `no_proxy` in each container for agents and verifiers alike. That is host policy visible to both agents.
+- The agents run inside the task's container, not outside it as nanoeval's harness does, so an agent's own processes share the task's environment.
+- The first runs of kv-store-grpc, openssl-selfsigned-cert and pypi-server attempt 3 errored because two runners named their containers alike and removed each other's (`No such container`). Container names now include a digest of the run directory; those six rows (three per arm) were moved to `output/eval/collided` and run again, and the tables above hold the reruns.
+- The nanocode and hl-agent arms ran at the same time on separate runners, attempts in order, not interleaved row by row; the meter shows the same upstream drops in both.
+- Spend: $25.94 for the two measured arms, $0.66 for the Bash-fix arm, a few cents of claude-haiku-4-5 while developing.
+
+Commands: `NANOCODE_DIR=<nanocode checkout> HL_AGENT=<hl-agent binary> sh evals/setup.sh`, then `python3 evals/run.py --suite evals/suite.txt --tasks output/eval/tasks --agent-root output/eval/agent-root --out output/eval/main --agents nanocode,hl-agent --attempts 3 --model claude-sonnet-4-6 --parallel 3 --limits none` and `python3 evals/report.py output/eval/main`. A second runner at once needs its own `--meter-port` and `--relay-port`.
+>>>>>>> master
