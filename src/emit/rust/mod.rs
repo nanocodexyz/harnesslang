@@ -14,6 +14,8 @@ use types::{Types, camel, constant, ident, sum_name};
 const RUNTIME_JOURNAL: &str = include_str!("runtime/journal.rs");
 const RUNTIME_ENGINE: &str = include_str!("runtime/engine.rs");
 const RUNTIME_JSONL: &str = include_str!("runtime/jsonl.rs");
+const SHARED_CELL_JOURNAL: &str = include_str!("../../run/cell_journal.rs");
+const SHARED_STRUCT_RENAMES: [(&str, &str); 1] = [("Fields", "CellFields")];
 const LINTS: &str = "#![allow(dead_code, unused_variables, unused_parens, unreachable_code, unused_comparisons, clippy::all)]\n";
 
 pub const TARGETS: [Target; 3] = [
@@ -34,6 +36,7 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     let mut out = String::from(LINTS);
     out.push_str(RUNTIME_JOURNAL);
     out.push_str(RUNTIME_ENGINE);
+    out.push_str(&shared_source(SHARED_CELL_JOURNAL));
     match target {
         Target::NativeJsonl => out.push_str(RUNTIME_JSONL),
         Target::NativeSqlite | Target::ServerPostgres => out.push_str(&sql::store(target)?),
@@ -43,6 +46,49 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     out.push_str(&generate(program, target));
     out.push_str("}\n");
     Ok(out)
+}
+
+fn shared_source(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.lines() {
+        if line.starts_with("use ") {
+            assert!(
+                line.starts_with("use std::") || line.starts_with("use crate::run::json::"),
+                "a shared runtime source imports only std and the journal's Json, found {line}"
+            );
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for (from, to) in SHARED_STRUCT_RENAMES {
+        out = rename_word(&out, from, to);
+    }
+    assert!(
+        !out.contains("crate::"),
+        "a shared runtime source names nothing of the compiler"
+    );
+    out
+}
+
+fn rename_word(text: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(from) {
+        let before = rest[..index].chars().next_back();
+        let after = rest[index + from.len()..].chars().next();
+        let word =
+            |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        out.push_str(&rest[..index]);
+        out.push_str(if word(before) || word(after) {
+            from
+        } else {
+            to
+        });
+        rest = &rest[index + from.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn check_names(program: &Program) -> Result<(), String> {
