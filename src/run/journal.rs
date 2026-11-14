@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::effect::EffectClass;
+use crate::run::cell_journal::{CellUpdate, NESTED_ID_INFIX};
 use crate::run::crc::crc32;
 use crate::run::json::{self, Json};
 
@@ -57,10 +58,31 @@ pub enum Record {
         seq: u64,
         response: Json,
     },
+    NestedCall {
+        turn: u64,
+        seq: u64,
+        nested: u64,
+        tool: String,
+        effect: EffectClass,
+        input: Json,
+    },
+    NestedResult {
+        turn: u64,
+        seq: u64,
+        nested: u64,
+        output: Output,
+    },
+    Cell {
+        cell: u64,
+        fresh: bool,
+        session: String,
+        update: CellUpdate,
+    },
     Recovery {
         turn: u64,
         attempt: u64,
         unknown: Vec<u64>,
+        nested: Vec<(u64, u64)>,
     },
     Status {
         turn: u64,
@@ -83,14 +105,32 @@ impl Record {
             | Self::Result { turn, .. }
             | Self::Model { turn, .. }
             | Self::Recovery { turn, .. }
-            | Self::Status { turn, .. } => Some(*turn),
-            Self::Checkpoint { .. } => None,
+            | Self::Status { turn, .. }
+            | Self::NestedCall { turn, .. }
+            | Self::NestedResult { turn, .. } => Some(*turn),
+            Self::Checkpoint { .. } | Self::Cell { .. } => None,
         }
     }
 }
 
 pub fn call_id(turn: u64, seq: u64) -> String {
     format!("{turn}/{seq}")
+}
+
+pub fn nested_id(turn: u64, seq: u64, nested: u64) -> String {
+    crate::run::cell_journal::nested_call_id(&call_id(turn, seq), nested)
+}
+
+pub fn parse_any_call_id(text: &str) -> Result<(u64, u64, Option<u64>), String> {
+    let Some((origin, nested)) = text.split_once(NESTED_ID_INFIX) else {
+        let (turn, seq) = parse_call_id(text)?;
+        return Ok((turn, seq, None));
+    };
+    let (turn, seq) = parse_call_id(origin)?;
+    let nested = nested
+        .parse()
+        .map_err(|_| format!("call id {text:?} has no nested call number"))?;
+    Ok((turn, seq, Some(nested)))
 }
 
 fn parse_call_id(text: &str) -> Result<(u64, u64), String> {
@@ -188,20 +228,58 @@ pub fn to_json(record: &Record) -> Json {
             turn,
             attempt,
             unknown,
+            nested,
         } => (
             "recovery",
             Json::object([
                 ("attempt", Json::Number(*attempt)),
                 ("turn", turn_text(*turn)),
-                (
-                    "unknown",
-                    Json::Array(
-                        unknown
-                            .iter()
-                            .map(|seq| Json::String(call_id(*turn, *seq)))
-                            .collect(),
-                    ),
-                ),
+                ("unknown", recovery_ids(*turn, unknown, nested)),
+            ]),
+        ),
+        Record::NestedCall {
+            turn,
+            seq,
+            nested,
+            tool,
+            effect,
+            input,
+        } => (
+            "call",
+            Json::object([
+                ("call_id", Json::String(nested_id(*turn, *seq, *nested))),
+                ("effect", Json::text(effect.name())),
+                ("input", input.clone()),
+                ("seq", Json::Number(*seq)),
+                ("tool", Json::text(tool)),
+                ("turn", turn_text(*turn)),
+            ]),
+        ),
+        Record::NestedResult {
+            turn,
+            seq,
+            nested,
+            output,
+        } => (
+            "result",
+            Json::object([
+                ("call_id", Json::String(nested_id(*turn, *seq, *nested))),
+                ("output", output_json(output)),
+                ("seq", Json::Number(*seq)),
+            ]),
+        ),
+        Record::Cell {
+            cell,
+            fresh,
+            session,
+            update,
+        } => (
+            "cell",
+            Json::object([
+                ("cell", Json::Number(*cell)),
+                ("fresh", Json::Bool(*fresh)),
+                ("session", Json::text(session)),
+                ("update", update.to_json()),
             ]),
         ),
         Record::Status {
@@ -224,6 +302,28 @@ pub fn to_json(record: &Record) -> Json {
         ),
     };
     Json::object([(tag, body)])
+}
+
+fn recovery_ids(turn: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Json {
+    assert!(
+        unknown.windows(2).all(|pair| pair[0] < pair[1]),
+        "a recovery lists its top-level calls in seq order"
+    );
+    assert!(
+        nested.windows(2).all(|pair| pair[0] < pair[1]),
+        "a recovery lists its nested calls in order"
+    );
+    let mut keyed: Vec<((u64, u64), String)> = unknown
+        .iter()
+        .map(|seq| ((*seq, 0), call_id(turn, *seq)))
+        .chain(
+            nested
+                .iter()
+                .map(|(seq, id)| ((*seq, *id), nested_id(turn, *seq, *id))),
+        )
+        .collect();
+    keyed.sort();
+    Json::Array(keyed.into_iter().map(|(_, id)| Json::String(id)).collect())
 }
 
 struct Fields<'a> {
@@ -256,15 +356,22 @@ impl<'a> Fields<'a> {
             .map_err(|_| format!("{} record's turn is not a number", self.tag))
     }
 
-    fn call(&self) -> Result<(u64, u64), String> {
-        let (turn, seq) = parse_call_id(self.text("call_id")?)?;
+    fn call(&self) -> Result<(u64, u64, Option<u64>), String> {
+        let (turn, seq, nested) = parse_any_call_id(self.text("call_id")?)?;
         if self.number("seq")? != seq {
             return Err(format!(
                 "{} record's seq disagrees with its call id",
                 self.tag
             ));
         }
-        Ok((turn, seq))
+        Ok((turn, seq, nested))
+    }
+
+    fn boolean(&self, key: &str) -> Result<bool, String> {
+        match self.get(key)? {
+            Json::Bool(value) => Ok(*value),
+            _ => Err(format!("{} record's '{key}' is not a bool", self.tag)),
+        }
     }
 
     fn exact(&self, keys: &[&str]) -> Result<(), String> {
@@ -302,34 +409,25 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
                 arguments: fields.get("prompt")?.clone(),
             })
         }
-        "call" => {
-            fields.exact(&["call_id", "effect", "input", "seq", "tool", "turn"])?;
-            let (turn, seq) = fields.call()?;
-            if fields.turn()? != turn {
-                return Err("call record's turn disagrees with its call id".to_owned());
-            }
-            let effect = EffectClass::parse(fields.text("effect")?)
-                .ok_or("call record has an unknown effect class")?;
-            Ok(Record::Call {
-                turn,
-                seq,
-                tool: fields.text("tool")?.to_owned(),
-                effect,
-                input: fields.get("input")?.clone(),
-            })
-        }
+        "call" => call_from(&fields),
         "result" => {
             fields.exact(&["call_id", "output", "seq"])?;
-            let (turn, seq) = fields.call()?;
-            Ok(Record::Result {
-                turn,
-                seq,
-                output: output_from(fields.get("output")?)?,
+            let (turn, seq, nested) = fields.call()?;
+            let output = output_from(fields.get("output")?)?;
+            Ok(match nested {
+                None => Record::Result { turn, seq, output },
+                Some(nested) => Record::NestedResult {
+                    turn,
+                    seq,
+                    nested,
+                    output,
+                },
             })
         }
+        "cell" => cell_from(&fields),
         "model" => {
             fields.exact(&["call_id", "response", "seq", "turn"])?;
-            let (turn, seq) = fields.call()?;
+            let (turn, seq) = top_level(fields.call()?)?;
             Ok(Record::Model {
                 turn,
                 seq,
@@ -343,21 +441,41 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
                 return Err("recovery record's unknown is not a list".to_owned());
             };
             let mut unknown = Vec::new();
+            let mut nested = Vec::new();
             for item in items {
-                let (call_turn, seq) = parse_call_id(
+                let (call_turn, seq, inner) = parse_any_call_id(
                     item.as_str()
                         .ok_or("recovery lists a call id that is not text")?,
                 )?;
                 if call_turn != turn {
                     return Err("recovery lists a call of another turn".to_owned());
                 }
-                unknown.push(seq);
+                match inner {
+                    None => unknown.push(seq),
+                    Some(inner) => nested.push((seq, inner)),
+                }
             }
-            Ok(Record::Recovery {
+            unknown.sort_unstable();
+            nested.sort_unstable();
+            if unknown.windows(2).any(|pair| pair[0] == pair[1])
+                || nested.windows(2).any(|pair| pair[0] == pair[1])
+            {
+                return Err("recovery lists a call twice".to_owned());
+            }
+            let record = Record::Recovery {
                 turn,
                 attempt: fields.number("attempt")?,
                 unknown,
-            })
+                nested,
+            };
+            if to_json(&record)
+                .get("recovery")
+                .and_then(|body| body.get("unknown"))
+                != Some(fields.get("unknown")?)
+            {
+                return Err("recovery lists its calls out of order".to_owned());
+            }
+            Ok(record)
         }
         "status" => status_from(&fields),
         "checkpoint" => {
@@ -371,6 +489,62 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
         }
         other => Err(format!("unknown record '{other}'")),
     }
+}
+
+fn top_level(id: (u64, u64, Option<u64>)) -> Result<(u64, u64), String> {
+    match id {
+        (turn, seq, None) => Ok((turn, seq)),
+        (_, _, Some(_)) => Err("a model reply has a nested call id".to_owned()),
+    }
+}
+
+fn call_from(fields: &Fields<'_>) -> Result<Record, String> {
+    fields.exact(&["call_id", "effect", "input", "seq", "tool", "turn"])?;
+    let (turn, seq, nested) = fields.call()?;
+    if fields.turn()? != turn {
+        return Err("call record's turn disagrees with its call id".to_owned());
+    }
+    let effect = EffectClass::parse(fields.text("effect")?)
+        .ok_or("call record has an unknown effect class")?;
+    let tool = fields.text("tool")?.to_owned();
+    let input = fields.get("input")?.clone();
+    Ok(match nested {
+        None => Record::Call {
+            turn,
+            seq,
+            tool,
+            effect,
+            input,
+        },
+        Some(nested) => Record::NestedCall {
+            turn,
+            seq,
+            nested,
+            tool,
+            effect,
+            input,
+        },
+    })
+}
+
+fn cell_from(fields: &Fields<'_>) -> Result<Record, String> {
+    fields.exact(&["cell", "fresh", "session", "update"])?;
+    let cell = fields.number("cell")?;
+    let fresh = fields.boolean("fresh")?;
+    let session = fields.text("session")?.to_owned();
+    let update = CellUpdate::from_json(fields.get("update")?)?;
+    if update.cell_id != cell || update.session_id != session {
+        return Err("cell record's cell or session disagrees with its update".to_owned());
+    }
+    if update.header.is_some() != fresh {
+        return Err("cell record is fresh exactly when its update carries the header".to_owned());
+    }
+    Ok(Record::Cell {
+        cell,
+        fresh,
+        session,
+        update,
+    })
 }
 
 fn status_from(fields: &Fields<'_>) -> Result<Record, String> {

@@ -59,7 +59,7 @@ pub fn check(
         body,
         worst: ir::worst::WorstCase::default(),
     };
-    handler.worst = ir::worst::compute(&handler).map_err(|overflow| {
+    handler.worst = ir::worst::compute(program, &handler).map_err(|overflow| {
         crate::syntax::Diagnostic::new(
             definition.name.at,
             format!(
@@ -147,6 +147,7 @@ impl Checker<'_> {
             );
         }
         if self.globals.tools.contains_key(&name.text)
+            || self.globals.codes.contains_key(&name.text)
             || self.globals.model.as_deref() == Some(name.text.as_str())
         {
             return error(
@@ -557,6 +558,22 @@ impl Checker<'_> {
                 out,
             ));
         }
+        if let Some(&code) = self.globals.codes.get(&callee.text) {
+            let args = self.args(
+                at,
+                &format!("code tool '{}'", callee.text),
+                args,
+                &[Type::Text],
+                out,
+            )?;
+            return Ok(self.site(
+                SiteKind::Cell(code),
+                SiteClass::Cell,
+                Type::Maybe(Box::new(Type::Text)),
+                args,
+                out,
+            ));
+        }
         if self.globals.model.as_deref() == Some(callee.text.as_str()) {
             let [context] = args else {
                 return error(
@@ -773,6 +790,7 @@ impl Checker<'_> {
             return Ok((Expr::Constant(constant), Type::U64));
         }
         if self.globals.tools.contains_key(&name.text)
+            || self.globals.codes.contains_key(&name.text)
             || self.globals.model.as_deref() == Some(name.text.as_str())
         {
             return error(

@@ -15,6 +15,7 @@ pub struct Globals {
     constants: BTreeMap<String, ir::ConstId>,
     types: BTreeMap<String, ir::SumId>,
     tools: BTreeMap<String, ir::ToolId>,
+    codes: BTreeMap<String, ir::CodeId>,
     fields: BTreeMap<String, ir::FieldId>,
     model: Option<String>,
 }
@@ -31,6 +32,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         constants: Vec::new(),
         sums: Vec::new(),
         tools: Vec::new(),
+        codes: Vec::new(),
         model: None,
         state: Vec::new(),
         invariants: Vec::new(),
@@ -40,6 +42,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         constants: BTreeMap::new(),
         types: BTreeMap::new(),
         tools: BTreeMap::new(),
+        codes: BTreeMap::new(),
         fields: BTreeMap::new(),
         model: None,
     };
@@ -48,6 +51,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
     model(source, &mut program, &mut globals, &mut values)?;
     sums(source, &mut program, &mut globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
+    codes(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
     invariants(source, &mut program, &globals)?;
     handlers(source, &mut program, &globals)?;
@@ -387,6 +391,159 @@ fn tools(
             returns,
             effect: tool.effect,
         });
+    }
+    Ok(())
+}
+
+pub const CODE_FIELDS: [&str; 6] = [
+    "calls",
+    "parallel",
+    "timers",
+    "timer_ms",
+    "journal_bytes",
+    "yield_ms",
+];
+
+fn codes(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &mut Globals,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    let variants = variant_names(program);
+    let declared: Vec<&ast::Code> = source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Code(code) => Some(code),
+            _ => None,
+        })
+        .collect();
+    for (id, code) in declared.iter().enumerate() {
+        claim(values, &code.name, "code tool")?;
+        if variants.contains(&code.name.text) {
+            return error(
+                code.name.at,
+                format!("code tool '{}' has the name of a variant", code.name.text),
+            );
+        }
+        globals.codes.insert(code.name.text.clone(), id);
+    }
+    for code in declared {
+        let checked = code_tool(program, globals, code)?;
+        program.codes.push(checked);
+    }
+    Ok(())
+}
+
+fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Checked<ir::Code> {
+    let name = &code.name.text;
+    if program.model.is_none() {
+        return error(
+            code.name.at,
+            format!("code '{name}' needs a model declaration: its cells are written by the model"),
+        );
+    }
+    let tools = nested_tools(globals, code)?;
+    let mut limits: BTreeMap<&str, Bound> = BTreeMap::new();
+    for field in &code.fields {
+        let Some(key) = CODE_FIELDS.iter().find(|key| **key == field.key.text) else {
+            return error(
+                field.key.at,
+                format!(
+                    "code '{name}' has no field '{}'; its fields are tools, {}",
+                    field.key.text,
+                    CODE_FIELDS.join(", ")
+                ),
+            );
+        };
+        let what = format!("field '{key}' of code '{name}'");
+        if limits
+            .insert(key, bound(program, globals, &field.value, &what)?)
+            .is_some()
+        {
+            return error(field.key.at, format!("code '{name}' gives '{key}' twice"));
+        }
+    }
+    let mut take = |key: &str| match limits.remove(key) {
+        Some(limit) => Ok(limit),
+        None => error(code.name.at, format!("code '{name}' lacks '{key}'")),
+    };
+    let checked = ir::Code {
+        name: name.clone(),
+        tools,
+        calls: take(CODE_FIELDS[0])?,
+        parallel: take(CODE_FIELDS[1])?,
+        timers: take(CODE_FIELDS[2])?,
+        timer_ms: take(CODE_FIELDS[3])?,
+        journal_bytes: take(CODE_FIELDS[4])?,
+        yield_ms: take(CODE_FIELDS[5])?,
+    };
+    code_bounds(code, &checked)?;
+    Ok(checked)
+}
+
+fn nested_tools(globals: &Globals, code: &ast::Code) -> Checked<Vec<ir::ToolId>> {
+    let name = &code.name.text;
+    if code.tools.is_empty() {
+        return error(
+            code.name.at,
+            format!("code '{name}' lists no tools: a cell's every effect is a nested call"),
+        );
+    }
+    let mut tools = Vec::new();
+    for tool in &code.tools {
+        if globals.codes.contains_key(&tool.text) {
+            return error(
+                tool.at,
+                format!(
+                    "code '{name}' lists code tool '{}': cells call declared tools, not cells",
+                    tool.text
+                ),
+            );
+        }
+        let Some(&id) = globals.tools.get(&tool.text) else {
+            return error(
+                tool.at,
+                format!(
+                    "code '{name}' lists '{}', which is not a declared tool",
+                    tool.text
+                ),
+            );
+        };
+        if tools.contains(&id) {
+            return error(
+                tool.at,
+                format!("code '{name}' lists tool '{}' twice", tool.text),
+            );
+        }
+        tools.push(id);
+    }
+    Ok(tools)
+}
+
+fn code_bounds(code: &ast::Code, checked: &ir::Code) -> Checked<()> {
+    let name = &code.name.text;
+    if checked.parallel.value > checked.calls.value {
+        return error(
+            code.name.at,
+            format!(
+                "code '{name}': parallel ({} = {}) exceeds calls ({} = {})",
+                checked.parallel.name,
+                checked.parallel.value,
+                checked.calls.name,
+                checked.calls.value
+            ),
+        );
+    }
+    if checked.parallel.value == 0 {
+        return error(
+            code.name.at,
+            format!(
+                "code '{name}': parallel ({} = 0) lets no nested call start",
+                checked.parallel.name
+            ),
+        );
     }
     Ok(())
 }

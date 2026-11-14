@@ -186,6 +186,7 @@ impl<'a, 'p> Body<'a, 'p> {
             Durability::RidesNextFlush => "Durability::RidesNextFlush",
             Durability::FlushBeforeRun => "Durability::FlushBeforeRun",
             Durability::FlushBeforeRunWhenExternal => "Durability::FlushBeforeRunWhenExternal",
+            Durability::Cell => panic!("emit refuses programs with code tools"),
         };
         let maybe = matches!(site.result, Type::Maybe(_));
         let (kind, run, decode) = self.site_call(site.kind, &site.result, args);
@@ -262,6 +263,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 let parse = self.types.from_json(result);
                 ("Model", run, format!("reply(answer, {parse})?"))
             }
+            SiteKind::Cell(_) => panic!("emit refuses programs with code tools"),
             SiteKind::Now | SiteKind::Random => {
                 let (name, variant) = if kind == SiteKind::Now {
                     ("now", "Now")

@@ -362,6 +362,7 @@ impl Lowering<'_> {
         let classes = match self.handler.sites[site].class {
             crate::ir::SiteClass::Fixed(class) => vec![class],
             crate::ir::SiteClass::Dispatched => self.dispatch_classes(),
+            crate::ir::SiteClass::Cell => vec![EffectClass::External],
         };
         if let [class] = classes.as_slice() {
             return self.resolved(site, *class, &what);

@@ -11,6 +11,7 @@ pub type FieldId = usize;
 pub type LocalId = usize;
 pub type SiteId = usize;
 pub type VariantId = usize;
+pub type CodeId = usize;
 
 pub const CALL: SumId = 0;
 pub const REPLY: SumId = 1;
@@ -116,6 +117,7 @@ pub struct Program {
     pub constants: Vec<Constant>,
     pub sums: Vec<Sum>,
     pub tools: Vec<Tool>,
+    pub codes: Vec<Code>,
     pub model: Option<Model>,
     pub state: Vec<Field>,
     pub invariants: Vec<Invariant>,
@@ -143,6 +145,48 @@ impl Program {
     pub fn dispatch_class(&self, tool: &str) -> EffectClass {
         self.tool(tool)
             .map_or(EffectClass::undeclared(), |(_, tool)| tool.effect)
+    }
+
+    pub fn code(&self, name: &str) -> Option<(CodeId, &Code)> {
+        self.codes
+            .iter()
+            .enumerate()
+            .find(|(_, code)| code.name == name)
+    }
+
+    pub fn resolve_dispatch(&self, tool: &str) -> Resolved {
+        match self.code(tool) {
+            Some((code, _)) => Resolved::Cell(code),
+            None => Resolved::Tool(self.dispatch_class(tool)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    Tool(EffectClass),
+    Cell(CodeId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Code {
+    pub name: String,
+    pub tools: Vec<ToolId>,
+    pub calls: Bound,
+    pub parallel: Bound,
+    pub timers: Bound,
+    pub timer_ms: Bound,
+    pub journal_bytes: Bound,
+    pub yield_ms: Bound,
+}
+
+impl Code {
+    pub fn worst_class(&self, program: &Program) -> EffectClass {
+        self.tools
+            .iter()
+            .map(|tool| program.tools[*tool].effect)
+            .max()
+            .expect("the checker gives every code tool a nested tool")
     }
 }
 
@@ -199,6 +243,7 @@ pub enum SiteKind {
     Model,
     Now,
     Random,
+    Cell(CodeId),
 }
 
 impl SiteKind {
@@ -213,6 +258,7 @@ impl SiteKind {
             Self::Model => "model",
             Self::Now => "now",
             Self::Random => "random",
+            Self::Cell(_) => "cell",
         }
     }
 }
@@ -221,6 +267,7 @@ impl SiteKind {
 pub enum SiteClass {
     Fixed(EffectClass),
     Dispatched,
+    Cell,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +275,7 @@ pub enum Durability {
     RidesNextFlush,
     FlushBeforeRun,
     FlushBeforeRunWhenExternal,
+    Cell,
 }
 
 impl Durability {
@@ -236,6 +284,7 @@ impl Durability {
             SiteClass::Fixed(EffectClass::External) => Self::FlushBeforeRun,
             SiteClass::Fixed(EffectClass::None | EffectClass::Idempotent) => Self::RidesNextFlush,
             SiteClass::Dispatched => Self::FlushBeforeRunWhenExternal,
+            SiteClass::Cell => Self::Cell,
         }
     }
 
@@ -243,7 +292,9 @@ impl Durability {
         match self {
             Self::RidesNextFlush => false,
             Self::FlushBeforeRun => true,
-            Self::FlushBeforeRunWhenExternal => matches!(resolved, EffectClass::External),
+            Self::FlushBeforeRunWhenExternal | Self::Cell => {
+                matches!(resolved, EffectClass::External)
+            }
         }
     }
 }

@@ -455,6 +455,11 @@ impl<'a> Engine<'a> {
                 effect: EffectClass::None,
                 input: Json::Null,
             },
+            SiteKind::Cell(code) => Call {
+                tool: self.program.codes[code].name.clone(),
+                effect: EffectClass::None,
+                input: Json::String(args[0].as_text().to_owned()),
+            },
         }
     }
 
@@ -463,6 +468,17 @@ impl<'a> Engine<'a> {
         self.seq += 1;
         let seq = self.seq;
         let call = self.resolve(site, &args);
+        let cell = match site.kind {
+            SiteKind::Cell(_) => true,
+            SiteKind::Dispatch => self.program.code(&call.tool).is_some(),
+            _ => false,
+        };
+        if cell {
+            return Err(Halt::Exit(Exit::Corrupt(format!(
+                "turn {} reaches code tool '{}': the cell runner is not built",
+                self.turn, call.tool
+            ))));
+        }
         if let SiteClass::Fixed(class) = site.class {
             assert_eq!(
                 class, call.effect,
@@ -565,6 +581,7 @@ impl<'a> Engine<'a> {
             turn: self.turn,
             attempt,
             unknown: vec![seq],
+            nested: Vec::new(),
         });
         self.sites.insert(seq, SiteLog::Unknown(call));
         self.flush()?;
@@ -649,6 +666,7 @@ impl<'a> Engine<'a> {
             }
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
             SiteKind::Random => Output::Ok(Json::Number(world.random())),
+            SiteKind::Cell(_) => unreachable!("a cell site runs through the cell runner"),
             SiteKind::Tool(_) | SiteKind::Dispatch => {
                 let returns = match &site.result {
                     Type::Known(inner) | Type::Maybe(inner) => (**inner).clone(),

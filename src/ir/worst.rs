@@ -1,9 +1,15 @@
-use crate::ir::{Bound, Handler, SiteKind, Stmt};
+use crate::effect::EffectClass;
+use crate::ir::{Bound, Code, Handler, Program, SiteKind, Stmt};
 
 pub const ADMISSION_RECORDS: u64 = 1;
 pub const FINISH_RECORDS: u64 = 2;
 pub const EFFECT_RECORDS: u64 = 2;
 pub const MODEL_RECORDS: u64 = 1;
+pub const CELL_HEADER_RECORDS: u64 = 1;
+pub const CELL_FINISH_RECORDS: u64 = 1;
+pub const NESTED_UPDATE_RECORDS: u64 = 2;
+pub const NESTED_EXTERNAL_RECORDS: u64 = 2;
+pub const TIMER_UPDATE_RECORDS: u64 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Factor {
@@ -196,45 +202,91 @@ fn repeat(body: Paths, factor: &Factor, every_iteration: bool) -> Result<Paths, 
     Ok(Paths { through, ended })
 }
 
-fn block(handler: &Handler, statements: &[Stmt]) -> Result<Paths, Overflow> {
+fn overflow(measure: usize) -> Overflow {
+    Overflow {
+        measure: MEASURES[measure],
+        loops: Vec::new(),
+    }
+}
+
+fn cell_cost(program: &Program, code: &Code) -> Result<Costs, Overflow> {
+    let calls = code.calls.value;
+    let timers = code.timers.value;
+    let effects = calls
+        .checked_add(timers)
+        .and_then(|nested| nested.checked_add(1))
+        .ok_or_else(|| overflow(0))?;
+    let per_call = if code.worst_class(program) == EffectClass::External {
+        NESTED_UPDATE_RECORDS + NESTED_EXTERNAL_RECORDS
+    } else {
+        NESTED_UPDATE_RECORDS
+    };
+    let records = calls
+        .checked_mul(per_call)
+        .and_then(|nested| nested.checked_add(timers.checked_mul(TIMER_UPDATE_RECORDS)?))
+        .and_then(|nested| {
+            nested.checked_add(EFFECT_RECORDS + CELL_HEADER_RECORDS + CELL_FINISH_RECORDS)
+        })
+        .ok_or_else(|| overflow(1))?;
+    Ok([Cost::of(effects), Cost::of(records), Cost::of(calls)])
+}
+
+fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
+    let plain = |records| {
+        [
+            Cost::of(1),
+            Cost::of(records),
+            Cost::of(u64::from(kind.outbound())),
+        ]
+    };
+    match kind {
+        SiteKind::Cell(code) => cell_cost(program, &program.codes[code]),
+        SiteKind::Model => Ok(plain(MODEL_RECORDS)),
+        SiteKind::Dispatch => {
+            let mut widest_cost = plain(EFFECT_RECORDS);
+            for code in &program.codes {
+                widest_cost = widest(widest_cost, cell_cost(program, code)?);
+            }
+            Ok(widest_cost)
+        }
+        SiteKind::Tool(_) | SiteKind::Now | SiteKind::Random => Ok(plain(EFFECT_RECORDS)),
+    }
+}
+
+fn block(program: &Program, handler: &Handler, statements: &[Stmt]) -> Result<Paths, Overflow> {
     let mut paths = continuing(zero());
     for statement in statements {
-        let cost = statement_cost(handler, statement)?;
+        let cost = statement_cost(program, handler, statement)?;
         paths = sequence(paths, cost)?;
     }
     Ok(paths)
 }
 
-fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Paths, Overflow> {
+fn statement_cost(
+    program: &Program,
+    handler: &Handler,
+    statement: &Stmt,
+) -> Result<Paths, Overflow> {
     match statement {
         Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } => Ok(continuing(zero())),
-        Stmt::Effect { site, .. } => {
-            let kind = handler.sites[*site].kind;
-            let records = if kind == SiteKind::Model {
-                MODEL_RECORDS
-            } else {
-                EFFECT_RECORDS
-            };
-            Ok(continuing([
-                Cost::of(1),
-                Cost::of(records),
-                Cost::of(u64::from(kind.outbound())),
-            ]))
-        }
+        Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {
             through: None,
             ended: Some([Cost::of(0), Cost::of(FINISH_RECORDS), Cost::of(0)]),
         }),
         Stmt::If {
             then, otherwise, ..
-        } => Ok(branch(block(handler, then)?, block(handler, otherwise)?)),
+        } => Ok(branch(
+            block(program, handler, then)?,
+            block(program, handler, otherwise)?,
+        )),
         Stmt::Match { arms, .. } => {
             let mut widest_arm = Paths {
                 through: None,
                 ended: None,
             };
             for arm in arms {
-                widest_arm = branch(widest_arm, block(handler, &arm.body)?);
+                widest_arm = branch(widest_arm, block(program, handler, &arm.body)?);
             }
             Ok(widest_arm)
         }
@@ -243,7 +295,7 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Paths, Overflow
                 name: handler.locals[*index].name.clone(),
                 bound: bound.clone(),
             };
-            repeat(block(handler, body)?, &factor, true)
+            repeat(block(program, handler, body)?, &factor, true)
         }
         Stmt::For {
             item, bound, body, ..
@@ -252,13 +304,13 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Paths, Overflow
                 name: handler.locals[*item].name.clone(),
                 bound: bound.clone(),
             };
-            repeat(block(handler, body)?, &factor, false)
+            repeat(block(program, handler, body)?, &factor, false)
         }
     }
 }
 
-pub fn compute(handler: &Handler) -> Result<WorstCase, Overflow> {
-    let body = block(handler, &handler.body)?;
+pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overflow> {
+    let body = block(program, handler, &handler.body)?;
     let longest =
         either(body.through, body.ended).expect("a block keeps a path through it or ending in it");
     let admission = [Cost::of(0), Cost::of(ADMISSION_RECORDS), Cost::of(0)];

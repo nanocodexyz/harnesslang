@@ -12,7 +12,7 @@ pub const FIRST_ROW_SEQ: u64 = 1;
 pub const MILLISECONDS_PER_SECOND: u64 = 1_000;
 pub const MILLISECONDS_PER_DAY: u64 = 86_400_000;
 pub const UNIX_EPOCH_JULIAN_DAY: &str = "2440587.5";
-pub const RECORD_KINDS: [&str; 7] = [
+pub const RECORD_KINDS: [&str; 8] = [
     "admitted",
     "call",
     "result",
@@ -20,6 +20,7 @@ pub const RECORD_KINDS: [&str; 7] = [
     "recovery",
     "status",
     "checkpoint",
+    "cell",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,12 +480,13 @@ fn commit(dialect: Dialect, mutation: Mutation) -> Vec<Statement> {
 pub fn record_kind(record: &Record) -> &'static str {
     let index = match record {
         Record::Admitted { .. } => 0,
-        Record::Call { .. } => 1,
-        Record::Result { .. } => 2,
+        Record::Call { .. } | Record::NestedCall { .. } => 1,
+        Record::Result { .. } | Record::NestedResult { .. } => 2,
         Record::Model { .. } => 3,
         Record::Recovery { .. } => 4,
         Record::Status { .. } => 5,
         Record::Checkpoint { .. } => 6,
+        Record::Cell { .. } => 7,
     };
     RECORD_KINDS[index]
 }
@@ -492,6 +494,9 @@ pub fn record_kind(record: &Record) -> &'static str {
 pub fn record_turn(record: &Record) -> u64 {
     match record {
         Record::Checkpoint { revision, .. } => *revision,
+        Record::Cell { .. } => {
+            panic!("emit refuses programs with code tools, so no cell record reaches sql")
+        }
         other => other
             .turn()
             .expect("every record but a checkpoint has a turn"),

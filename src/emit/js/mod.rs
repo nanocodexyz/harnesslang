@@ -102,18 +102,22 @@ fn fields_literal(fields: &[crate::ir::Field]) -> String {
 fn site_literal(site: &Site) -> String {
     let tool = match site.kind {
         SiteKind::Tool(tool) => tool.to_string(),
-        SiteKind::Dispatch | SiteKind::Model | SiteKind::Now | SiteKind::Random => {
-            "null".to_owned()
-        }
+        SiteKind::Dispatch
+        | SiteKind::Model
+        | SiteKind::Now
+        | SiteKind::Random
+        | SiteKind::Cell(_) => "null".to_owned(),
     };
     let class = match site.class {
         SiteClass::Fixed(effect) => effect.name(),
         SiteClass::Dispatched => "dispatched",
+        SiteClass::Cell => "cell",
     };
     let durability = match site.durability {
         Durability::RidesNextFlush => "rides_next_flush",
         Durability::FlushBeforeRun => "flush_before_run",
         Durability::FlushBeforeRunWhenExternal => "flush_before_run_when_external",
+        Durability::Cell => "cell",
     };
     format!(
         "{{ kind: \"{}\", tool: {tool}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",

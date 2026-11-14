@@ -2,12 +2,16 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 pub const JSON_DEPTH_MAX: u32 = 128;
+pub const FRACTION_BITS: u32 = 32;
+pub const FRACTION_DIGITS: usize = 32;
+const FRACTION_SCALE: u128 = 5_u128.pow(FRACTION_BITS);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Json {
     Null,
     Bool(bool),
     Number(u64),
+    Fraction(u32),
     String(String),
     Array(Vec<Json>),
     Object(BTreeMap<String, Json>),
@@ -73,6 +77,7 @@ impl Json {
             Self::Null => out.push_str("null"),
             Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
             Self::Number(value) => write!(out, "{value}").expect("writing to a string succeeds"),
+            Self::Fraction(numerator) => write_fraction(out, *numerator),
             Self::String(value) => write_string(out, value),
             Self::Array(items) => {
                 out.push('[');
@@ -98,6 +103,34 @@ impl Json {
             }
         }
     }
+}
+
+fn write_fraction(out: &mut String, numerator: u32) {
+    let scaled = u128::from(numerator) * FRACTION_SCALE;
+    let digits = format!("{scaled:0FRACTION_DIGITS$}");
+    assert_eq!(
+        digits.len(),
+        FRACTION_DIGITS,
+        "a fraction below one has fraction_digits decimals"
+    );
+    let trimmed = digits.trim_end_matches('0');
+    let shown = if trimmed.is_empty() { "0" } else { trimmed };
+    write!(out, "0.{shown}").expect("writing to a string succeeds");
+}
+
+fn fraction_from(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || digits.len() > FRACTION_DIGITS {
+        return None;
+    }
+    let mut scaled: u128 = 0;
+    for index in 0..FRACTION_DIGITS {
+        let digit = digits.get(index).map_or(0, |byte| byte - b'0');
+        scaled = scaled * 10 + u128::from(digit);
+    }
+    if scaled % FRACTION_SCALE != 0 {
+        return None;
+    }
+    u32::try_from(scaled / FRACTION_SCALE).ok()
 }
 
 fn write_string(out: &mut String, value: &str) {
@@ -195,10 +228,34 @@ impl Parser<'_> {
         if self.offset - start > 1 && self.bytes[start] == b'0' {
             return Err(format!("number has a leading zero at offset {start}"));
         }
+        if value == 0 && self.offset - start == 1 && self.bytes.get(self.offset) == Some(&b'.') {
+            return self.fraction();
+        }
         if matches!(self.bytes.get(self.offset), Some(b'.' | b'e' | b'E' | b'-')) {
             return self.fail("only unsigned integers are numbers here");
         }
         Ok(Json::Number(value))
+    }
+
+    fn fraction(&mut self) -> Result<Json, String> {
+        self.offset += 1;
+        let start = self.offset;
+        while self
+            .bytes
+            .get(self.offset)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            self.offset += 1;
+        }
+        if matches!(self.bytes.get(self.offset), Some(b'e' | b'E')) {
+            return self.fail("a fraction has no exponent here");
+        }
+        match fraction_from(&self.bytes[start..self.offset]) {
+            Some(numerator) => Ok(Json::Fraction(numerator)),
+            None => self.fail(&format!(
+                "a fraction here is a multiple of 2^-{FRACTION_BITS} below one"
+            )),
+        }
     }
 
     fn hex4(&mut self) -> Result<u32, String> {

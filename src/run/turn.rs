@@ -217,13 +217,7 @@ pub fn run_turn(
                 handler: request.handler.clone(),
                 arguments,
             });
-            TurnLog {
-                handler: request.handler.clone(),
-                arguments: Json::Null,
-                sites: Default::default(),
-                attempts: 0,
-                finished: None,
-            }
+            TurnLog::new(request.handler.clone(), Json::Null)
         }
     };
     let setup = Setup {
@@ -248,6 +242,7 @@ pub fn run_turn(
             turn: request.turn,
             attempt,
             unknown,
+            nested: Vec::new(),
         });
     }
     for (seq, error) in assumed {
