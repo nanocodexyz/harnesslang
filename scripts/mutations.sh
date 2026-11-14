@@ -18,7 +18,7 @@ rerun_rewrites_call examples/agent.hl --twice seq_unique
 checkpoint_hash_order examples/agent.hl --twice replay_equal
 recovery_skipped examples/agent.hl --twice panic
 enum_unchecked examples/hooks.hl --twice enum_valid
-model_failure_unrecorded examples/claude_agent.hl --twice replay_equal|liveness|seq_unique
+model_failure_unrecorded examples/claude_agent.hl --twice liveness|seq_unique
 batch_flush_after_dispatch examples/claude_agent.hl --twice external_once|unknown_reported
 results_in_completion_order examples/claude_agent.hl --twice sequential_equal
 batch_pushes_reversed examples/claude_agent.hl --twice replay_equal
