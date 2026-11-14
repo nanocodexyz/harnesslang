@@ -239,14 +239,20 @@ fn program_literal(program: &Program) -> String {
         let attaches = tool.attaches.as_ref().map_or_else(String::new, |bytes| {
             format!(", attaches: {}", type_literal(&Type::Blob(bytes.clone())))
         });
+        let jobs = tool
+            .jobs
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |bound| format!("{}n", bound.value));
         writeln!(
             out,
-            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\"{finds}{attaches}{spawns} }},",
+            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\", interrupts: {}, recoverable: {}, jobs: {jobs}{finds}{attaches}{spawns} }},",
             js_string(&tool.name),
             fields_literal(&tool.params),
             defaults_literal(&tool.defaults),
             type_literal(&tool.returns),
             tool.effect.name(),
+            interrupts_literal(tool.interrupts),
+            tool.recoverable,
         )
         .expect("writing to a string succeeds");
     }
@@ -276,23 +282,28 @@ fn program_literal(program: &Program) -> String {
             )
         });
         format!(
-            "{{ name: {}, calls: {}n, declared: {}, window: {window} }}",
+            "{{ name: {}, calls: {}n, declared: {}, window: {window}, interrupts: {} }}",
             js_string(&model.name),
             model.calls.value,
-            model.declared()
+            model.declared(),
+            interrupts_literal(model.interrupts)
         )
     });
     let events = &program.events;
-    let steers = events.steers.as_ref().map_or("null".to_owned(), |bound| {
-        format!(
-            "{{ name: {}, max: {}n }}",
-            js_string(&bound.name),
-            bound.value
-        )
-    });
+    let taken = |bound: Option<&crate::ir::Bound>| {
+        bound.map_or("null".to_owned(), |bound| {
+            format!(
+                "{{ name: {}, max: {}n }}",
+                js_string(&bound.name),
+                bound.value
+            )
+        })
+    };
+    let steers = taken(events.steers.as_ref());
+    let jobs = taken(events.jobs.as_ref());
     write!(
         out,
-        "  ],\n  model: {model},\n  events: {{ cancel: {}, steers: {steers}, recordsMax: {}n }},\n  state: {},\n  handlers: [\n",
+        "  ],\n  model: {model},\n  events: {{ cancel: {}, steers: {steers}, jobs: {jobs}, recordsMax: {}n }},\n  state: {},\n  handlers: [\n",
         events.cancel,
         events.records_max(),
         fields_literal(&program.state)
@@ -334,6 +345,13 @@ fn program_literal(program: &Program) -> String {
     }
     out.push_str("};\n");
     out
+}
+
+fn interrupts_literal(interrupts: crate::ir::Interrupts) -> String {
+    format!(
+        "{{ cancel: {}, steer: {} }}",
+        interrupts.cancel, interrupts.steer
+    )
 }
 
 fn bound_literal(bound: &crate::ir::Bound) -> String {
