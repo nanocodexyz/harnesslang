@@ -6,7 +6,7 @@ seeds="${MUTATION_SEEDS:-0..200}"
 hl=target/release/hl
 file=examples/agent.hl
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
-mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early"
+mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early recovery_reports_failed rerun_rewrites_call checkpoint_hash_order"
 
 [ -x "$hl" ] || cargo build --release --locked
 
@@ -14,7 +14,7 @@ for mutation in $mutations; do
   applied=0
   for target in $targets; do
     set +e
-    output=$("$hl" sim --target "$target" --seeds "$seeds" --mutation "$mutation" "$file" 2>&1)
+    output=$("$hl" sim --target "$target" --seeds "$seeds" --twice --mutation "$mutation" "$file" 2>&1)
     status=$?
     set -e
     if [ "$status" -eq 2 ]; then

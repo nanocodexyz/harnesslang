@@ -173,7 +173,8 @@ pub fn sweep(program: &Program, options: &Options) -> Summary {
         if result.is_ok() && options.twice {
             let second = run_seed(program, options.target, options.mutation, seed);
             if second.journal != first.journal || second.acks != first.acks {
-                result = Err(Violation { invariant: Invariant::ReplayEqual, detail: format!("seed {seed} gave {} journal bytes then {}", first.journal.len(), second.journal.len()) });
+                let offset = first.journal.iter().zip(&second.journal).position(|(left, right)| left != right).unwrap_or(first.journal.len().min(second.journal.len()));
+                result = Err(Violation { invariant: Invariant::ReplayEqual, detail: format!("two runs of seed {seed} wrote journals of {} and {} bytes that first differ at byte {offset}", first.journal.len(), second.journal.len()) });
             }
         }
         if let Err(violation) = result {

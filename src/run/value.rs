@@ -170,6 +170,15 @@ pub fn state_json(program: &Program, state: &[Value]) -> Json {
     Json::Object(map)
 }
 
+pub fn state_text_hashed(program: &Program, state: &[Value]) -> String {
+    let mut fields: std::collections::HashMap<&str, Json> = std::collections::HashMap::new();
+    for (field, value) in program.state.iter().zip(state) {
+        fields.insert(&field.name, to_json(program, &field.ty, value));
+    }
+    let entries: Vec<String> = fields.iter().map(|(name, value)| format!("{}:{}", Json::text(name).encode(), value.encode())).collect();
+    format!("{{{}}}", entries.join(","))
+}
+
 pub fn state_from_json(program: &Program, json: &Json) -> Result<Vec<Value>, String> {
     let Json::Object(map) = json else {
         return Err("state is not an object".to_owned());

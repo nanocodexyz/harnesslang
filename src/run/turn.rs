@@ -1,6 +1,6 @@
 use crate::ir::{Handler, Program};
 use crate::run::engine::{Engine, Exit, Finish, Mode, World};
-use crate::run::journal::Record;
+use crate::run::journal::{Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::session::{self, Session, SiteLog, TurnLog};
@@ -56,7 +56,10 @@ pub fn replay(program: &Program, target: &target::Model, turn: u64, log: &TurnLo
 
 pub fn state_before(program: &Program, target: &target::Model, session: &Session, turn: u64) -> Result<Vec<Value>, Exit> {
     let (start, mut state) = match session.checkpoints.range(..turn).next_back() {
-        Some((revision, payload)) => (revision + 1, value::state_from_json(program, payload).map_err(corrupt)?),
+        Some((revision, payload)) => {
+            let payload = crate::run::json::decode(payload).map_err(|error| corrupt(format!("checkpoint {revision}: {error}")))?;
+            (revision + 1, value::state_from_json(program, &payload).map_err(corrupt)?)
+        }
         None => (1, value::initial_state(program)),
     };
     for earlier in start..turn {
@@ -92,6 +95,20 @@ fn recover(log: &mut TurnLog, mutation: Mutation) -> Vec<u64> {
     unknown
 }
 
+fn assume_failed(log: &mut TurnLog, seqs: Vec<u64>) -> Vec<(u64, String)> {
+    let mut assumed = Vec::new();
+    for seq in seqs {
+        let site = log.sites.get_mut(&seq).expect("a recovered seq has a site");
+        let SiteLog::Unknown(call) = site else {
+            panic!("recover marks open calls unknown");
+        };
+        let error = format!("{} was lost in a crash", call.tool);
+        *site = SiteLog::Done(call.clone(), Output::Failed(error.clone()));
+        assumed.push((seq, error));
+    }
+    assumed
+}
+
 pub fn run_turn(
     program: &Program,
     target: &target::Model,
@@ -112,6 +129,7 @@ pub fn run_turn(
     let state = state_before(program, target, &session, request.turn)?;
     let mut pending = Vec::new();
     let mut unknown = Vec::new();
+    let mut assumed = Vec::new();
     let log = match session.turns.get(&request.turn) {
         Some(log) => {
             if log.handler != request.handler || log.arguments != arguments {
@@ -120,6 +138,9 @@ pub fn run_turn(
             let mut log = log.clone();
             if matches!(target.recovery, target::Recovery::AtLoad) {
                 unknown = recover(&mut log, mutation);
+            }
+            if mutation == Mutation::RecoveryReportsFailed {
+                assumed = assume_failed(&mut log, std::mem::take(&mut unknown));
             }
             log
         }
@@ -139,6 +160,9 @@ pub fn run_turn(
     if !unknown.is_empty() {
         let attempt = engine.next_attempt();
         engine.append(Record::Recovery { turn: request.turn, attempt, unknown });
+    }
+    for (seq, error) in assumed {
+        engine.append(Record::Result { turn: request.turn, seq, output: Output::Failed(error) });
     }
     engine.run(&request.arguments).map(|ran| Ran::Finished(ran.finish))
 }

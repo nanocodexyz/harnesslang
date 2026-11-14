@@ -164,7 +164,11 @@ impl<'a> Engine<'a> {
     fn finish(&mut self, outcome: Outcome, result: Json) -> Result<Finish, Exit> {
         let finish = Finish { turn: self.turn, outcome, result: result.clone() };
         self.append(Record::Status { turn: self.turn, last: self.seq, outcome, result });
-        let payload = value::state_json(self.program, &self.state);
+        let payload = if self.mutation == Mutation::CheckpointHashOrder {
+            value::state_text_hashed(self.program, &self.state)
+        } else {
+            value::state_json(self.program, &self.state).encode()
+        };
         self.append(Record::Checkpoint { revision: self.turn, state: self.program.name.clone(), payload });
         if self.mutation == Mutation::FinishBeforeFlush {
             self.acknowledge(&finish);
@@ -401,6 +405,9 @@ impl<'a> Engine<'a> {
                 return self.unknown(seq, call);
             }
             return self.dispatch(site_id, seq, &call, args, true);
+        }
+        if self.mutation == Mutation::RerunRewritesCall && !call.effect.may_be_unknown() {
+            self.append(Record::Call { turn: self.turn, seq, tool: call.tool.clone(), effect: call.effect, input: call.input.clone() });
         }
         self.execute(site_id, seq, &call, args)
     }

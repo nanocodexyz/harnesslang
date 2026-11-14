@@ -50,7 +50,7 @@ impl TurnLog {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Session {
     pub turns: BTreeMap<u64, TurnLog>,
-    pub checkpoints: BTreeMap<u64, Json>,
+    pub checkpoints: BTreeMap<u64, String>,
 }
 
 impl Session {

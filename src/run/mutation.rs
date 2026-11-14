@@ -11,10 +11,13 @@ pub enum Mutation {
     FinishBeforeFlush,
     IdempotentReportedUnknown,
     GateReleasesEarly,
+    RecoveryReportsFailed,
+    RerunRewritesCall,
+    CheckpointHashOrder,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -24,6 +27,9 @@ impl Mutation {
         Self::FinishBeforeFlush,
         Self::IdempotentReportedUnknown,
         Self::GateReleasesEarly,
+        Self::RecoveryReportsFailed,
+        Self::RerunRewritesCall,
+        Self::CheckpointHashOrder,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -37,6 +43,9 @@ impl Mutation {
             Self::FinishBeforeFlush => "finish_before_flush",
             Self::IdempotentReportedUnknown => "idempotent_reported_unknown",
             Self::GateReleasesEarly => "gate_releases_early",
+            Self::RecoveryReportsFailed => "recovery_reports_failed",
+            Self::RerunRewritesCall => "rerun_rewrites_call",
+            Self::CheckpointHashOrder => "checkpoint_hash_order",
         }
     }
 
@@ -60,6 +69,9 @@ impl Mutation {
             Self::FinishBeforeFlush => vec![Target::NativeJsonl, Target::NativeSqlite, Target::ServerPostgres, Target::Vercel],
             Self::IdempotentReportedUnknown => vec![Target::NativeJsonl, Target::Cloudflare],
             Self::GateReleasesEarly => vec![Target::Cloudflare],
+            Self::RecoveryReportsFailed => vec![Target::NativeJsonl, Target::NativeSqlite, Target::ServerPostgres, Target::Cloudflare],
+            Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
+            Self::CheckpointHashOrder => all,
         }
     }
 }

@@ -4,6 +4,7 @@ use crate::effect::EffectClass;
 use crate::run::crc::crc32;
 use crate::run::json::{self, Json};
 
+
 pub const FIRST_SEQ: u64 = 1;
 pub const CRC32_CHECK_INPUT: &[u8] = b"123456789";
 pub const CRC32_CHECK: u32 = 0xcbf4_3926;
@@ -71,7 +72,7 @@ pub enum Record {
     Checkpoint {
         revision: u64,
         state: String,
-        payload: Json,
+        payload: String,
     },
 }
 
@@ -180,7 +181,7 @@ pub fn to_json(record: &Record) -> Json {
         Record::Checkpoint { revision, state, payload } => (
             "checkpoint",
             Json::object([
-                ("payload", Json::String(payload.encode())),
+                ("payload", Json::String(payload.clone())),
                 ("revision", Json::Number(*revision)),
                 ("state", Json::text(state)),
             ]),
@@ -284,7 +285,7 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
         "status" => status_from(&fields),
         "checkpoint" => {
             fields.exact(&["payload", "revision", "state"])?;
-            let payload = json::decode(fields.text("payload")?)?;
+            let payload = fields.text("payload")?.to_owned();
             Ok(Record::Checkpoint { revision: fields.number("revision")?, state: fields.text("state")?.to_owned(), payload })
         }
         other => Err(format!("unknown record '{other}'")),
