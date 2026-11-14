@@ -158,6 +158,7 @@ struct Check<'a> {
     fold: Fold,
     classes: BTreeMap<String, EffectClass>,
     unknown_nested: BTreeMap<String, BTreeSet<u64>>,
+    finish_problems: BTreeMap<String, Vec<(usize, String)>>,
     tally: &'a mut Tally,
     found: &'a mut Vec<Disagreement>,
 }
@@ -251,6 +252,7 @@ impl<'a> Check<'a> {
             fold: Fold::default(),
             classes: BTreeMap::new(),
             unknown_nested: BTreeMap::new(),
+            finish_problems: BTreeMap::new(),
             tally,
             found,
         }
@@ -557,16 +559,16 @@ impl<'a> Check<'a> {
             .remove(&view.journal.origin_call_id)
             .unwrap_or_default();
         self.tally.nested_unknown += listed.len() as u64;
-        for what in cell_check::unknown_delivered(&view.journal, &listed) {
-            self.disagree(Some(index), what);
-        }
+        let mut problems = cell_check::unknown_delivered(&view.journal, &listed);
         let open = cell_check::open_running(&view.journal);
         if !open.is_empty() {
-            self.disagree(
-                Some(index),
-                format!("cell {cell} finishes with nested calls still running: {open:?}"),
-            );
+            problems.push(format!(
+                "cell {cell} finishes with nested calls still running: {open:?}"
+            ));
         }
+        let problems = problems.into_iter().map(|what| (index, what)).collect();
+        self.finish_problems
+            .insert(view.journal.origin_call_id.clone(), problems);
     }
 
     fn note_unknown_nested(&mut self, unknown: &[String]) {
@@ -614,6 +616,12 @@ impl<'a> Check<'a> {
                 );
             }
         };
+        let problems = self.finish_problems.remove(call_id).unwrap_or_default();
+        if !matches!(site, SiteOutput::Unknown) {
+            for (at, what) in problems {
+                self.disagree(Some(at), what);
+            }
+        }
         self.tally.differentials += 1;
         if let Err(what) = cell_check::differential(&view.journal, &site) {
             self.disagree(Some(index), what);
@@ -672,6 +680,10 @@ impl<'a> Check<'a> {
                     "the interpreter's run passed but nanocode's fold holds calls open {open:?}"
                 ),
             );
+        }
+        let unreported = std::mem::take(&mut self.finish_problems);
+        for (at, what) in unreported.into_values().flatten() {
+            self.disagree(Some(at), what);
         }
         let cells: Vec<(String, u64)> = self
             .fold

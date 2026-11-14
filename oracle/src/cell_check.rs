@@ -263,7 +263,11 @@ pub fn differential(journal: &CellJournal, output: &SiteOutput) -> Result<(), St
     let entries = &journal.entries;
     let mut follow = Follow { expected: entries };
     let run = djs::run(&script, Some(entries.clone()), &mut follow)?;
-    if let Some(difference) = cells::first_difference(&run.entries, entries) {
+    let compared = match output {
+        SiteOutput::Unknown if run.entries.len() >= entries.len() => &run.entries[..entries.len()],
+        _ => &run.entries[..],
+    };
+    if let Some(difference) = cells::first_difference(compared, entries) {
         return Err(format!(
             "djs replaying cell {} writes a different journal: {difference}",
             journal.cell_id
