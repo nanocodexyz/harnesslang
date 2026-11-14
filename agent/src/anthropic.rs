@@ -8,7 +8,7 @@ use crate::tools;
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const BASE_URL_DEFAULT: &str = "https://api.anthropic.com";
-pub const STREAM_IDLE_SECONDS_MAX: u64 = 600;
+pub const STREAM_IDLE_SECONDS_MAX: u64 = 300;
 pub const STREAM_IDLE_BYTES_PER_SECOND: u64 = 1;
 pub const CURL_TIMED_OUT: i32 = 28;
 pub const MODE_TEXT_ONLY: &str = "text_only";
