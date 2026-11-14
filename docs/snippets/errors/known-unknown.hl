@@ -1,0 +1,11 @@
+harness notes
+
+tool read(path: text) -> text effect none
+
+on show(path: text) -> text {
+  match read(path) {
+    ok(body) => { return body }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}

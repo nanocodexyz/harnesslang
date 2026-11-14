@@ -1,0 +1,5 @@
+harness notes
+
+type tree = leaf(text) | node(tree, tree)
+
+on ping() -> u64 { return 1 }

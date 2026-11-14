@@ -1,0 +1,9 @@
+harness notes
+
+type phase = idle | busy(text)
+
+state {
+  current: phase
+}
+
+on ping() -> u64 { return 1 }

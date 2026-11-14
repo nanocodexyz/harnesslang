@@ -1,0 +1,7 @@
+harness notes
+
+on ping() -> u64 {
+  let count = 1
+  count = 2
+  return count
+}

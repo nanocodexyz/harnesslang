@@ -1,0 +1,6 @@
+harness notes
+
+on ping() -> u64 {
+  let loop = 1
+  return loop
+}

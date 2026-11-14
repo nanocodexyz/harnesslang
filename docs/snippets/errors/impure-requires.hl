@@ -1,0 +1,7 @@
+harness notes
+
+on ping() -> u64
+  requires now() > 0
+{
+  return 1
+}

@@ -1,0 +1,10 @@
+harness notes
+
+state {
+  count: u64
+}
+
+on ping(name: text) -> u64 {
+  count = name
+  return count
+}

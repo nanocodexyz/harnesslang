@@ -1,0 +1,6 @@
+harness notes
+
+on ping() -> u64 {
+  return 1
+  return 2
+}

@@ -1,0 +1,3 @@
+harness notes
+
+on ping() -> text { return "tab\there" }

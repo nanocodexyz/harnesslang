@@ -1,0 +1,7 @@
+harness notes
+
+state {
+  log: list<text, 64>
+}
+
+on ping() -> u64 { return len(log) }

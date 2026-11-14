@@ -1,0 +1,5 @@
+harness notes
+
+# a harness has no comments
+
+on ping() -> u64 { return 1 }

@@ -1,0 +1,9 @@
+harness notes
+
+type outcome = done(text) | stopped
+type signal = done(text) | waiting
+
+on ping(words: text) -> u64 {
+  let value = done(words)
+  return 1
+}

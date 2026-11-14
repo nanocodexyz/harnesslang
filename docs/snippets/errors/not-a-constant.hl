@@ -1,0 +1,9 @@
+harness notes
+
+const steps_max: u64 = 8
+
+on ping(limit: u64) -> u64 {
+  loop step below limit {
+  }
+  return 1
+}

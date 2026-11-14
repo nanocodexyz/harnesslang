@@ -1,0 +1,7 @@
+harness notes
+
+const calls_max: u64 = 4
+
+model think calls calls_max
+
+on ping(call: call) -> text { return call.name }
