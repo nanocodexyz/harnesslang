@@ -4,9 +4,7 @@ import { Failure, Platform, UNCAUGHT_HEADER, assert, sleep, startHost } from "./
 import { statusOf } from "./verify.mjs";
 
 const HTTP_OK = 200;
-const OUTBOUND_KINDS = ["tool", "dispatch", "model"];
-const RUN_POINTS = ["before_run", "after_run"];
-const STATUS_KEY = '{"status":';
+const CLOCK_EVENTS = ["now", "random"];
 const ALARM_POLL_MS = 25;
 const ALARM_WAIT_MS_MAX = 20000;
 const DETAIL_CHARACTERS_MAX = 300;
@@ -28,19 +26,6 @@ function parseTrace(rt, path) {
   return seeds;
 }
 
-function reproducible(seed) {
-  const events = seed.events;
-  for (let index = 0; index < events.length; index++) {
-    const event = events[index];
-    if (event.event !== "hook" || event.answer !== "crash") continue;
-    if (RUN_POINTS.includes(event.point) && OUTBOUND_KINDS.includes(event.kind)) continue;
-    const flushed = events[index - 1];
-    if (event.point === "after_flush" && flushed?.event === "flush" && !flushed.bytes.includes(STATUS_KEY)) continue;
-    return { ok: false, point: `${event.point}${event.kind ? ` ${event.kind}` : ""}` };
-  }
-  return { ok: true };
-}
-
 class TraceWorld {
   constructor(rt, seed) {
     this.rt = rt;
@@ -52,7 +37,8 @@ class TraceWorld {
     this.platform = null;
     this.failure = null;
     this.ackIndex = 0;
-    this.stats = { runs: 0, crashes: 0, alarmRuns: 0, requests: 0, comparisons: 0 };
+    this.lastRun = 0;
+    this.stats = { runs: 0, crashes: 0, alarmRuns: 0, requests: 0, comparisons: 0, starts: 0 };
   }
 
   peek() {
@@ -78,12 +64,30 @@ class TraceWorld {
         this.index += 1;
         continue;
       }
-      if (event?.event === "hook" && event.answer === "ok") {
+      if ((event?.event === "hook" && event.answer === "ok") || CLOCK_EVENTS.includes(event?.event)) {
         this.index += 1;
         continue;
       }
       return;
     }
+  }
+
+  plan() {
+    let hooks = 0;
+    const clock = [];
+    for (let index = this.index; index < this.events.length; index++) {
+      const event = this.events[index];
+      if (CLOCK_EVENTS.includes(event.event)) clock.push(Object.assign(Object.create(null), { kind: event.event, value: event.answer }));
+      if (event.event !== "hook") continue;
+      hooks += 1;
+      if (event.answer === "crash") return { crashHook: hooks, clock: this.rt.encodeJson(clock) };
+    }
+    return { crashHook: null, clock: this.rt.encodeJson(clock) };
+  }
+
+  async start() {
+    await this.platform.start("none", this.plan());
+    this.stats.starts += 1;
   }
 
   committed() {
@@ -92,7 +96,18 @@ class TraceWorld {
 
   same(what, expected, actual) {
     this.stats.comparisons += 1;
-    if (expected !== actual) throw new Failure("backend_equal", short(`${what}: the interpreter has ${expected}, workerd has ${actual}`));
+    if (expected !== actual) throw new Failure("backend_equal", short(`event ${this.index}: ${what}: the interpreter has ${expected}, workerd has ${actual}`));
+  }
+
+  sameRows(what, expected, actual) {
+    this.stats.comparisons += 1;
+    if (expected === actual) return;
+    const left = expected.split("\n");
+    const right = actual.split("\n");
+    let row = 0;
+    while (left[row] === right[row]) row += 1;
+    const shown = (line) => (line === undefined ? "no row" : JSON.stringify(short(line)));
+    throw new Failure("backend_equal", `event ${this.index} (run at event ${this.lastRun}): ${what} differ at row ${row + 1} of ${left.length - 1} and ${right.length - 1}: the interpreter has ${shown(left[row])}, workerd has ${shown(right[row])}`);
   }
 
   sameJson(what, expected, actual) {
@@ -101,7 +116,7 @@ class TraceWorld {
 
   async handle(path, body) {
     try {
-      return await this.answer(path, body === "" ? null : this.rt.decodeJson(body));
+      return await this.answer(path, this.rt.decodeJson(body));
     } catch (error) {
       this.failure ??= error instanceof Failure ? error : new Failure("panic", error?.stack ?? String(error));
       await this.platform.kill();
@@ -109,32 +124,14 @@ class TraceWorld {
     }
   }
 
-  crashAt() {
-    const event = this.peek();
-    if (event?.event !== "hook" || event.answer !== "crash") return false;
-    this.index += 1;
-    this.stats.crashes += 1;
-    return true;
-  }
-
   async answer(path, request) {
     this.stats.requests += 1;
     this.quiet();
-    if (path === "/now" || path === "/random") return String(this.take(path.slice(1), path).answer);
-    if (this.crashAt()) {
-      await this.platform.kill();
-      return null;
-    }
     const kind = path === "/model" ? "model" : "tool";
     const event = this.take(kind, short(this.rt.encodeJson(request)));
     this.compare(kind, event, request);
-    this.same("committed rows at the outbound request", JSON.stringify(short(this.expected)), JSON.stringify(short(this.committed())));
-    const answer = kind === "model" ? event.response : event.output;
-    if (this.crashAt()) {
-      await this.platform.kill();
-      return null;
-    }
-    return this.rt.encodeJson(answer);
+    this.sameRows("committed rows at the outbound request", this.expected, this.committed());
+    return this.rt.encodeJson(kind === "model" ? event.response : event.output);
   }
 
   compare(kind, event, request) {
@@ -149,6 +146,16 @@ class TraceWorld {
     this.sameJson("tool class", event.effect, request.effect);
     this.sameJson("tool input", event.input, request.input);
   }
+
+  crashed() {
+    if (this.platform.crashed === null) throw new Failure("liveness", "workerd stopped without reaching the trace's crash point");
+    this.quiet();
+    const event = this.take("hook", "the crash point");
+    this.same("crash answer", "crash", event.answer);
+    const point = this.rt.decodeJson(this.platform.crashed);
+    this.sameJson("crash point", [event.point, event.kind ?? null, event.effect ?? null], [point.point, point.kind ?? null, point.effect ?? null]);
+    this.stats.crashes += 1;
+  }
 }
 
 function hexText(hex) {
@@ -159,8 +166,12 @@ async function alarmRun(world, turn) {
   const started = Date.now();
   for (;;) {
     if (world.failure !== null || !world.platform.alive()) return null;
-    const status = statusOf(world.rt, world.platform.rows(), turn);
-    if (status !== null && !world.platform.alarm()) return { ran: "finished", finish: { turn, outcome: status.outcome, result: status.result } };
+    const line = world.platform.alarms.shift();
+    const result = line === undefined ? null : world.rt.decodeJson(line);
+    if (result !== null && result.ran !== "idle") {
+      if (result.finish === null) throw new Failure("liveness", `turn ${turn}: the alarm found ${result.ran}`);
+      return { ran: result.ran, finish: { turn: Number(result.finish.turn), outcome: result.finish.outcome, result: result.finish.result } };
+    }
     if (Date.now() - started > ALARM_WAIT_MS_MAX) throw new Failure("liveness", `turn ${turn}: the alarm did not finish it within ALARM_WAIT_MS_MAX (${ALARM_WAIT_MS_MAX} ms)`);
     await sleep(ALARM_POLL_MS);
   }
@@ -174,6 +185,7 @@ async function postRun(world, body, turn) {
     if (!world.platform.alive()) return null;
     throw error;
   }
+  if (!world.platform.alive()) return null;
   if (response.status !== HTTP_OK) {
     const uncaught = response.headers[UNCAUGHT_HEADER] === "1" ? " (uncaught in the object)" : "";
     throw new Failure("liveness", `turn ${turn}: the object answered ${response.status}${uncaught}: ${response.body}`);
@@ -195,24 +207,26 @@ async function traceTurn(world, turnEvent) {
   const turn = Number(turnEvent.turn);
   const body = world.rt.encodeJson(Object.assign(Object.create(null), { arguments: turnEvent.arguments, handler: turnEvent.handler, turn: turnEvent.turn }));
   for (let first = true; ; first = false) {
+    world.lastRun = world.index;
     const run = world.take("run", "open the journal");
     world.opened = world.opened.slice(0, Number(run.keep)) + hexText(run.tail);
     world.expected = world.opened;
-    if (!world.platform.alive()) await world.platform.start("none", true);
-    world.same("journal at open", JSON.stringify(short(world.opened)), JSON.stringify(short(world.committed())));
-    world.stats.runs += 1;
+    world.sameRows("journal at open", world.opened, world.committed());
     const byAlarm = !first && world.platform.alarm();
+    if (!world.platform.alive()) await world.start();
+    world.stats.runs += 1;
     if (byAlarm) world.stats.alarmRuns += 1;
     const driven = byAlarm ? await alarmRun(world, turn) : await postRun(world, body, turn);
     if (world.failure !== null) throw world.failure;
     if (driven === null) {
+      world.crashed();
       world.same("run exit", "crash", world.take("exit", "crash").result);
       continue;
     }
     world.quiet();
     world.same("run exit", world.take("exit", driven.ran).result, driven.ran);
     acknowledged(world, driven.finish);
-    world.same("committed rows after the run", JSON.stringify(short(world.expected)), JSON.stringify(short(world.committed())));
+    world.sameRows("committed rows after the run", world.expected, world.committed());
     return;
   }
 }
@@ -240,4 +254,4 @@ async function traceSeed(rt, options, seed) {
   }
 }
 
-export { parseTrace, reproducible, traceSeed };
+export { parseTrace, traceSeed };

@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { Failure } from "./platform.mjs";
 import { killSession } from "./kill.mjs";
-import { parseTrace, reproducible, traceSeed } from "./trace.mjs";
+import { parseTrace, traceSeed } from "./trace.mjs";
 
 const { values } = parseArgs({
   options: {
@@ -93,22 +93,14 @@ async function killMode() {
 
 async function traceMode() {
   const seeds = parseTrace(rt, values.trace);
-  const chosen = [];
-  const skipped = new Map();
-  for (const seed of seeds) {
-    const verdict = reproducible(seed);
-    if (verdict.ok) chosen.push(seed);
-    else skipped.set(verdict.point, (skipped.get(verdict.point) ?? 0) + 1);
-  }
   const limit = Number(values.seeds_max);
-  const run = limit > 0 ? chosen.slice(0, limit) : chosen;
+  const run = limit > 0 ? seeds.slice(0, limit) : seeds;
   const started = Date.now();
   const { results, failure } = await pool(run, Number(values.jobs), (seed) => traceSeed(rt, options, seed));
   if (failure !== null) fail(`seed=${failure.item.seed} profile=${failure.item.profile}`, failure.error);
-  const totals = { seeds: results.length, rows: 0, runs: 0, crashes: 0, alarmRuns: 0, requests: 0, comparisons: 0 };
+  const totals = { seeds: results.length, rows: 0, runs: 0, crashes: 0, alarmRuns: 0, requests: 0, comparisons: 0, starts: 0 };
   for (const result of results) for (const key of Object.keys(totals)) if (key !== "seeds") totals[key] += result[key];
-  const skips = [...skipped.entries()].map(([point, count]) => `${point}:${count}`).join(",");
-  console.log(`trace ${Object.entries(totals).map(([key, value]) => `${key}=${value}`).join(" ")} of ${seeds.length} traced seeds, skipped (crash workerd cannot be killed at) ${skips || "none"} ms=${Date.now() - started}`);
+  console.log(`trace ${Object.entries(totals).map(([key, value]) => `${key}=${value}`).join(" ")} ms=${Date.now() - started}`);
   console.log(`drill: ${results.length} traced seeds ran on workerd with the interpreter's journal, dispatches and acknowledgements`);
 }
 

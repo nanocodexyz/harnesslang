@@ -265,6 +265,10 @@ class FakeStorage {
     return Promise.resolve(this.pendingAlarm !== undefined ? this.pendingAlarm : this.alarm);
   }
 
+  sync() {
+    return Promise.resolve();
+  }
+
   pendingBytes() {
     return this.pendingRows.map((row) => row.record + "\n").join("");
   }

@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, openSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, openSync, readdirSync, writeFileSync, writeSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { dirname, join } from "node:path";
@@ -19,6 +19,9 @@ const READY_WAIT_MS_MAX = 30000;
 const SQLITE_OUTPUT_BYTES_MAX = 1 << 30;
 const NO_SUCH_TABLE = "no such table";
 const UNCAUGHT_HEADER = "hl-drill-uncaught";
+const CRASH_MARKER = "hl-drill crash ";
+const ALARM_MARKER = "hl-drill alarm ";
+const NO_CRASH = "none";
 
 class Failure extends Error {
   constructor(invariant, detail) {
@@ -58,8 +61,8 @@ function connects(port) {
 }
 
 function capnpText(text) {
-  assert(!/["\\\n]/.test(text), "a config text needs no escaping");
-  return `"${text}"`;
+  assert(!/[\n\r]/.test(text), "a config text is one line");
+  return `"${text.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
 function post(port, path, body) {
@@ -84,6 +87,8 @@ class Platform {
     this.port = null;
     this.child = null;
     this.exited = null;
+    this.crashed = null;
+    this.alarms = [];
     this.starts = 0;
     this.kills = 0;
     mkdirSync(this.storage, { recursive: true });
@@ -91,7 +96,7 @@ class Platform {
     copyFileSync(OBJECT_MODULE, join(dir, "object.mjs"));
   }
 
-  config(fault, worldUrl) {
+  config(fault, trace) {
     const host = `http://${LOOPBACK}:${this.hostPort}`;
     return [
       'using Workerd = import "/workerd/workerd.capnp";',
@@ -112,7 +117,8 @@ class Platform {
       '    (name = "HARNESS", durableObjectNamespace = "HarnessObject"),',
       `    (name = "HL_TOOLS_URL", text = ${capnpText(`${host}/tool`)}),`,
       `    (name = "HL_MODEL_URL", text = ${capnpText(`${host}/model`)}),`,
-      `    (name = "HL_DRILL_WORLD_URL", text = ${capnpText(worldUrl ? host : "")}),`,
+      `    (name = "HL_DRILL_CLOCK", text = ${capnpText(trace === null ? "" : trace.clock)}),`,
+      `    (name = "HL_DRILL_CRASH_HOOK", text = ${capnpText(trace === null || trace.crashHook === null ? NO_CRASH : String(trace.crashHook))}),`,
       `    (name = "HL_DRILL_FAULT", text = ${capnpText(fault)}),`,
       "  ],",
       ");",
@@ -120,22 +126,42 @@ class Platform {
     ].join("\n");
   }
 
+  watch(child, log) {
+    let pending = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      writeSync(log, chunk);
+      pending += chunk;
+      const lines = pending.split("\n");
+      pending = lines.pop();
+      for (const line of lines) {
+        if (line.startsWith(ALARM_MARKER) && this.child === child) this.alarms.push(line.slice(ALARM_MARKER.length));
+        if (!line.startsWith(CRASH_MARKER) || this.child !== child) continue;
+        this.crashed = line.slice(CRASH_MARKER.length);
+        this.kill();
+      }
+    });
+  }
+
   alive() {
     return this.child !== null;
   }
 
-  async start(fault, worldUrl) {
+  async start(fault, trace) {
     assert(this.child === null, "one workerd runs per drill session");
     if (this.exited !== null) await this.exited;
     this.port ??= await freePort();
-    writeFileSync(join(this.dir, "config.capnp"), this.config(fault, worldUrl));
+    writeFileSync(join(this.dir, "config.capnp"), this.config(fault, trace));
     const log = openSync(join(this.dir, "workerd.log"), "a");
-    const child = spawn(WORKERD, ["serve", "config.capnp", "--experimental"], { cwd: this.dir, stdio: ["ignore", log, log] });
+    const child = spawn(WORKERD, ["serve", "config.capnp", "--experimental"], { cwd: this.dir, stdio: ["ignore", "pipe", log] });
+    this.crashed = null;
+    this.alarms = [];
+    this.watch(child, log);
     this.exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
     this.child = child;
     this.starts += 1;
     const started = Date.now();
-    while (!(await connects(this.port))) {
+    while (this.child === child && !(await connects(this.port))) {
       if (Date.now() - started > READY_WAIT_MS_MAX) throw new Failure("liveness", `workerd did not listen within READY_WAIT_MS_MAX (${READY_WAIT_MS_MAX} ms)`);
       await sleep(READY_POLL_MS);
     }

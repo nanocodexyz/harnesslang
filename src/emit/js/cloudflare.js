@@ -140,6 +140,7 @@ class HarnessObject {
 
   async settle() {
     await Promise.all(this.storageWrites.splice(0));
+    await this.storage.sync();
   }
 
   async drive(request) {
