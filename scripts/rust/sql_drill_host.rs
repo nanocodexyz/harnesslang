@@ -403,11 +403,9 @@ fn run(options: &Options) -> i32 {
     0
 }
 
-fn load(sql: &mut dyn Sql, session: &str) -> Vec<harness::Record> {
+fn load(sql: &mut dyn Sql, session: &str) -> Result<Vec<harness::Record>, SqlError> {
     let values = [SqlValue::Text(session.to_owned())];
-    let rows = sql
-        .query(&harness::LOAD, &values)
-        .unwrap_or_else(|error| panic!("load: {error:?}"));
+    let rows = sql.query(&harness::LOAD, &values)?;
     let seq_index = harness::LOAD
         .returns
         .iter()
@@ -434,7 +432,7 @@ fn load(sql: &mut dyn Sql, session: &str) -> Vec<harness::Record> {
             .unwrap_or_else(|error| panic!("row {}: {error}", index + 1));
         records.push(record);
     }
-    records
+    Ok(records)
 }
 
 fn integrity(store: &mut Store) -> &'static str {
@@ -457,10 +455,21 @@ fn integrity(store: &mut Store) -> &'static str {
 }
 
 fn verify(options: &Options) -> i32 {
-    let mut store = open_store(options.text("store"), "verify", None)
-        .unwrap_or_else(|error| panic!("verify: {error}"));
+    let mut store = match open_store(options.text("store"), "verify", None) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("store lost: {error}");
+            return EXIT_STORE_LOST;
+        }
+    };
     let integrity = integrity(&mut store);
-    let records = load(store.sql(), options.text("session"));
+    let records = match load(store.sql(), options.text("session")) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("store lost: load: {error:?}");
+            return EXIT_STORE_LOST;
+        }
+    };
     let turns = options.number("turns");
     let taken_over = options.number("taken_over") as usize;
     let verified = checks::check_all(

@@ -26,6 +26,7 @@ pause_poll_seconds=0.002
 pg_ready_polls=300
 pg_ready_poll_seconds=0.1
 held_retries_max=50
+verify_retries_max=10
 killed_status=137
 held_status=3
 fenced_status=4
@@ -171,6 +172,20 @@ ms_seconds() {
   printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000))
 }
 
+verify_store() {
+  local target=$1
+  shift
+  local status
+  for _ in $(seq 1 "$verify_retries_max"); do
+    status=0
+    (host "$target" verify "$@") 2>&1 || status=$?
+    [ "$status" -eq "$store_lost_status" ] || return "$status"
+    wait_postgres
+  done
+  echo "drill: verification found the store unavailable $verify_retries_max times"
+  return 1
+}
+
 total_kills=0
 total_client_kills=0
 total_backend_kills=0
@@ -234,7 +249,7 @@ crash_session() {
       fail "$target session $session lost its store $lost times without a kill"
   done
   local verified
-  verified=$(host "$target" verify "store=$store" "session=crash-$seed" "ledger=$dir/ledger" "acks=$dir/acks" "turns=$turns" taken_over=0 2>&1) || {
+  verified=$(verify_store "$target" "store=$store" "session=crash-$seed" "ledger=$dir/ledger" "acks=$dir/acks" "turns=$turns" taken_over=0) || {
     echo "drill: $target session $session failed verification after $kills kills:" >&2
     echo "$verified" >&2
     exit 1
@@ -292,8 +307,8 @@ takeover() {
   touch "$dir/resume.b"
   wait "$second_pid" || second_status=$?
   local verified verdict=ok
-  verified=$(host "$target" verify "store=$(store_for "$target" "$dir")" "session=takeover-$seed" "ledger=$dir/ledger" \
-    "acks=$dir/acks" "turns=$takeover_turns" taken_over=1 2>&1) || verdict=failed
+  verified=$(verify_store "$target" "store=$(store_for "$target" "$dir")" "session=takeover-$seed" "ledger=$dir/ledger" \
+    "acks=$dir/acks" "turns=$takeover_turns" taken_over=1) || verdict=failed
   echo "takeover target=$target external=$external seed=$seed a_exit=$first_status b_exit=$second_status verify=$verdict $(echo "$verified" | grep -E '^(verified|assertion|[a-z_]+: )' | head -n 1)"
   [ "$first_status" -eq "$fenced_status" ] || fail "$target takeover external $external: a exited $first_status, not fenced ($fenced_status)"
   [ "$second_status" -eq 0 ] || fail "$target takeover external $external: b exited $second_status"
