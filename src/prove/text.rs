@@ -119,6 +119,10 @@ fn collect<'a>(
                 .iter()
                 .for_each(|arm| collect(&arm.body, effects, takes)),
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => collect(body, effects, takes),
+            Stmt::Parallel(parallel) => {
+                effects.insert(parallel.result, (parallel.site, parallel.args.as_slice()));
+                collect(&parallel.body, effects, takes);
+            }
             Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Finish { .. } => {}
         }
     }

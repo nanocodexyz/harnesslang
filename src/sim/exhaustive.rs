@@ -567,7 +567,7 @@ fn workload(program: &Program, seed: u64) -> Vec<TurnRequest> {
             let arguments = handler
                 .params
                 .iter()
-                .map(|local| generate(program, &handler.locals[*local].ty, &mut workload))
+                .map(|local| generate(program, &handler.locals[*local].ty, &mut workload, None))
                 .collect();
             TurnRequest {
                 turn,

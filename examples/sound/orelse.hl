@@ -1,0 +1,16 @@
+harness orelse
+
+state {
+  low: u64
+  high: u64
+}
+
+on pick(note: text) -> u64 {
+  if low < 5 or high < 5 {
+    return 0
+  }
+  if not (low < 5) {
+    low = low - 5
+  }
+  return high - 5
+}

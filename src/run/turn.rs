@@ -129,7 +129,7 @@ pub fn state_before(
                 value::state_from_json(program, &payload).map_err(corrupt)?,
             )
         }
-        None => (1, value::initial_state(program)),
+        None => (1, entry_state(program, session)?),
     };
     for earlier in start..turn {
         let log = session
@@ -141,12 +141,21 @@ pub fn state_before(
     Ok(state)
 }
 
+pub fn entry_state(program: &Program, session: &Session) -> Result<Vec<Value>, Exit> {
+    let Some(payload) = session.checkpoints.get(&session::ENTRY_REVISION) else {
+        return Ok(value::initial_state(program));
+    };
+    let payload = crate::run::json::decode(payload)
+        .map_err(|error| corrupt(format!("the entry checkpoint: {error}")))?;
+    value::state_from_json(program, &payload).map_err(corrupt)
+}
+
 pub fn replay_all(
     program: &Program,
     target: &target::Model,
     session: &Session,
 ) -> Result<Vec<Value>, Exit> {
-    let mut state = value::initial_state(program);
+    let mut state = entry_state(program, session)?;
     for (turn, log) in &session.turns {
         if log.finished.is_some() {
             state = replay(program, target, *turn, log, state)?;

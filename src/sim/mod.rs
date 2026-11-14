@@ -4,6 +4,7 @@ pub mod exhaustive;
 pub mod faults;
 pub mod invariants;
 pub mod rng;
+pub mod strict;
 pub mod trace;
 pub mod world;
 
@@ -18,6 +19,7 @@ use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value::Value;
 use crate::sim::invariants::{Invariant, Violation};
 use crate::sim::rng::Rng;
+use crate::sim::strict::Edges;
 use crate::sim::world::{RESTARTS_PER_TURN_MAX, SimWorld, Stats};
 use crate::target::Target;
 
@@ -32,6 +34,7 @@ pub struct Options {
     pub seeds: Range<u64>,
     pub twice: bool,
     pub mutation: Mutation,
+    pub strict: strict::Mode,
 }
 
 #[derive(Clone, Debug)]
@@ -43,16 +46,19 @@ pub struct SeedRun {
     pub result: Result<(), Violation>,
 }
 
-pub fn generate(program: &Program, ty: &Type, rng: &mut Rng) -> Value {
+pub fn generate(program: &Program, ty: &Type, rng: &mut Rng, edges: Option<&Edges>) -> Value {
     match ty {
-        Type::U64 => Value::U64(rng.below(ARGUMENT_U64_MAX)),
+        Type::U64 => Value::U64(match edges {
+            Some(edges) => edges.draw(rng),
+            None => rng.below(ARGUMENT_U64_MAX),
+        }),
         Type::Bool => Value::Bool(rng.draw() & 1 == 1),
         Type::Text => Value::Text(SimWorld::generated_text(rng)),
         Type::List { element, capacity } => {
             let length = rng.below(capacity.value.min(ARGUMENT_LIST_LENGTH_MAX) + 1);
             Value::List(
                 (0..length)
-                    .map(|_| generate(program, element, rng))
+                    .map(|_| generate(program, element, rng, edges))
                     .collect(),
             )
         }
@@ -62,7 +68,7 @@ pub fn generate(program: &Program, ty: &Type, rng: &mut Rng) -> Value {
             let fields = variants[variant]
                 .fields
                 .iter()
-                .map(|field| generate(program, field, rng))
+                .map(|field| generate(program, field, rng, edges))
                 .collect();
             Value::Variant(variant, fields)
         }
@@ -123,8 +129,19 @@ pub fn run_seed_traced(
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
+    run_seed_checked(program, target, mutation, strict::Mode::Off, seed, trace)
+}
+
+pub fn run_seed_checked(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    strict: strict::Mode,
+    seed: u64,
+    trace: Option<trace::Trace>,
+) -> (SeedRun, Option<trace::Trace>) {
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_seed_unguarded(program, target, mutation, seed, trace)
+        run_seed_unguarded(program, target, mutation, strict, seed, trace)
     }));
     ran.unwrap_or_else(|payload| {
         let detail = payload
@@ -150,12 +167,30 @@ fn run_seed_unguarded(
     program: &Program,
     target: Target,
     mutation: Mutation,
+    strict: strict::Mode,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
     let mut workload = Rng::derive(seed, "workload");
-    let turns = workload.range(1, TURNS_PER_SESSION_MAX);
+    let turns_max = if strict == strict::Mode::Off {
+        TURNS_PER_SESSION_MAX
+    } else {
+        strict::TURNS_PER_SESSION_MAX
+    };
+    let turns = workload.range(1, turns_max);
     let mut world = SimWorld::new(program, target, mutation, seed, true);
+    if strict != strict::Mode::Off {
+        world.edges = Some(Edges::of(program));
+        world.greedy = Rng::derive(seed, "persona").chance(strict::GREEDY_MODEL_PPM);
+    }
+    if strict == strict::Mode::FromAny {
+        let edges = world.edges.clone().expect("set above");
+        let mut rng = Rng::derive(seed, "entry");
+        if let Some(state) = strict::entry(program, &mut rng, &edges) {
+            world.seed_entry(&strict::entry_record(program, &state));
+            world.stats.entry_states += 1;
+        }
+    }
     world.trace = trace;
     let profile_name = world.profile.name;
     world.record("seed", || {
@@ -174,7 +209,10 @@ fn run_seed_unguarded(
         let arguments = handler
             .params
             .iter()
-            .map(|local| generate(program, &handler.locals[*local].ty, &mut workload))
+            .map(|local| {
+                let ty = &handler.locals[*local].ty;
+                generate(program, ty, &mut workload, world.edges.as_ref())
+            })
             .collect();
         let request = TurnRequest {
             turn,
@@ -196,11 +234,33 @@ fn run_seed_unguarded(
     let records = world.medium.durable();
     if result.is_ok() {
         result = match &records {
-            Ok(records) => invariants::check(program, &world, turns, records),
+            Ok(records) => invariants::check(program, &world, turns, records).and_then(|()| {
+                if strict != strict::Mode::Off {
+                    strict::check(program, &world.target, records, &world.worst_faults)
+                } else {
+                    Ok(())
+                }
+            }),
             Err(error) => Err(liveness(format!(
                 "the final journal cannot be read: {error}"
             ))),
         };
+    }
+    if result.is_ok()
+        && profile == "clean"
+        && program.has_parallel()
+        && world.inbox.scheduled.is_empty()
+        && let Ok(records) = &records
+    {
+        result = sequential_twin(
+            program,
+            target,
+            mutation,
+            strict,
+            seed,
+            records,
+            &world.acks,
+        );
     }
     let mut stats = world.stats.clone();
     stats.unknown = records.map_or(0, |records| unknown_count(&records));
@@ -230,6 +290,34 @@ fn run_seed_unguarded(
         result,
     };
     (run, world.trace.take())
+}
+
+fn sequential_twin(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    strict: strict::Mode,
+    seed: u64,
+    records: &[Record],
+    acks: &[Finish],
+) -> Result<(), Violation> {
+    let twin = program.sequential();
+    assert!(
+        !twin.has_parallel(),
+        "the sequential twin runs one call at a time"
+    );
+    let (run, _) = run_seed_unguarded(&twin, target, mutation, strict, seed, None);
+    if invariants::trapped_in_body(&run.acks) {
+        return Ok(());
+    }
+    let checksum = target == Target::NativeJsonl && mutation != Mutation::JsonlNoChecksum;
+    let sequential =
+        crate::run::journal::decode_lines(&run.journal, checksum).map_err(|error| {
+            liveness(format!(
+                "the sequential twin's journal cannot be read: {error}"
+            ))
+        })?;
+    invariants::sequential_equal(records, acks, &sequential.records, &run.acks)
 }
 
 fn unknown_count(records: &[Record]) -> u64 {
@@ -270,6 +358,7 @@ fn add(total: &mut Stats, more: &Stats) {
         (None, None) => None,
         (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
     };
+    total.entry_states += more.entry_states;
 }
 
 pub fn sweep(program: &Program, options: &Options) -> Summary {
@@ -284,8 +373,14 @@ pub fn sweep_traced(
     let mut summary = Summary::default();
     for seed in options.seeds.clone() {
         let trace = sink.as_ref().map(|_| trace::Trace::default());
-        let (first, trace) =
-            run_seed_traced(program, options.target, options.mutation, seed, trace);
+        let (first, trace) = run_seed_checked(
+            program,
+            options.target,
+            options.mutation,
+            options.strict,
+            seed,
+            trace,
+        );
         if let (Some(sink), Some(trace)) = (sink.as_mut(), trace) {
             for line in &trace.lines {
                 writeln!(sink, "{line}")
@@ -296,7 +391,14 @@ pub fn sweep_traced(
         add(&mut summary.stats, &first.stats);
         let mut result = first.result.clone();
         if result.is_ok() && options.twice {
-            let second = run_seed(program, options.target, options.mutation, seed);
+            let (second, _) = run_seed_checked(
+                program,
+                options.target,
+                options.mutation,
+                options.strict,
+                seed,
+                None,
+            );
             if second.journal != first.journal || second.acks != first.acks {
                 let offset = first
                     .journal
@@ -339,6 +441,11 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             if options.twice {
                 replay.push_str(" --twice");
             }
+            match options.strict {
+                strict::Mode::Off => {}
+                strict::Mode::FromZero => replay.push_str(" --strict"),
+                strict::Mode::FromAny => replay.push_str(" --strict --any-state"),
+            }
             if options.mutation != Mutation::None {
                 replay.push_str(&format!(" --mutation {}", options.mutation.name()));
             }
@@ -353,13 +460,21 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             )
         }
         None => format!(
-            "ok target={} mutation={} seeds={}..{} ({} seeds{}): turns={} runs={} crashes={} power_losses={} torn_writes={} takeovers={} fenced={} dispatches={} unknown={}{}",
+            "ok target={} mutation={} seeds={}..{} ({} seeds{}{}): turns={} runs={} crashes={} power_losses={} torn_writes={} takeovers={} fenced={} dispatches={} unknown={}{}",
             options.target.name(),
             options.mutation.name(),
             options.seeds.start,
             options.seeds.end,
             summary.seeds,
             if options.twice { ", each twice" } else { "" },
+            match options.strict {
+                strict::Mode::Off => String::new(),
+                strict::Mode::FromZero => ", strict".to_owned(),
+                strict::Mode::FromAny => format!(
+                    ", strict, {} from an arbitrary entry state",
+                    stats.entry_states
+                ),
+            },
             stats.turns,
             stats.runs,
             stats.crashes,

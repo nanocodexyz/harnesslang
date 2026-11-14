@@ -14,7 +14,7 @@ use crate::prove::{
 
 const U64_MAX: i128 = u64::MAX as i128;
 const ZERO_STATE: &str = "(zero state)";
-const TEMPORARY: &str = crate::check::WILDCARD;
+pub(super) const TEMPORARY: &str = crate::check::WILDCARD;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Quantity {
@@ -151,6 +151,7 @@ fn modified(statements: &[Stmt], program: &Program, out: &mut BTreeSet<Quantity>
                 .iter()
                 .for_each(|arm| modified(&arm.body, program, out)),
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => modified(body, program, out),
+            Stmt::Parallel(parallel) => modified(&parallel.body, program, out),
             Stmt::Let { .. } | Stmt::Effect { .. } | Stmt::Take { .. } | Stmt::Finish { .. } => {}
         }
     }
@@ -286,6 +287,7 @@ impl<'a> Prover<'a> {
             self.bind(&mut state, *param, None);
         }
         for invariant in &program.invariants {
+            self.assume_in_range(&mut state, &invariant.condition);
             state = self.assume(state, &invariant.condition, true);
         }
         state

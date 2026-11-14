@@ -1,0 +1,16 @@
+harness countdown
+
+const steps_max: u64 = 8
+
+state {
+  remaining: u64
+}
+
+on spend(note: text) -> u64
+  requires remaining >= steps_max
+{
+  loop step below steps_max {
+    remaining = remaining - 1
+  }
+  return remaining
+}

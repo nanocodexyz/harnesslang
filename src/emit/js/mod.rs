@@ -30,6 +30,12 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
         return Err(errors.join("\n"));
     }
     let mut out = String::new();
+    let concurrent = target::model(target)
+        .limits
+        .concurrent_requests
+        .map_or_else(|| "null".to_owned(), |limit| limit.value.to_string());
+    writeln!(out, "const CONCURRENT_REQUESTS_MAX = {concurrent};")
+        .expect("writing to a string succeeds");
     for constant in &program.constants {
         writeln!(
             out,
@@ -166,9 +172,10 @@ fn program_literal(program: &Program) -> String {
     }
     let model = program.model.as_ref().map_or("null".to_owned(), |model| {
         format!(
-            "{{ name: {}, calls: {}n }}",
+            "{{ name: {}, calls: {}n, declared: {} }}",
             js_string(&model.name),
-            model.calls.value
+            model.calls.value,
+            model.declared()
         )
     });
     let events = &program.events;
@@ -349,6 +356,36 @@ impl Writer<'_> {
                 self.depth += 1;
                 self.line(&format!("local_{item} = item_{depth};"));
                 self.block(body);
+                self.depth -= 1;
+                self.line("}");
+            }
+            Stmt::Parallel(parallel) => {
+                self.line("{");
+                self.depth += 1;
+                self.line(&format!(
+                    "const items_{depth} = within({}, {}n);",
+                    expr(program, &parallel.list),
+                    parallel.bound.value
+                ));
+                self.line(&format!(
+                    "const values_{depth} = await rt.parallel({}, items_{depth});",
+                    parallel.site
+                ));
+                self.line(&format!(
+                    "for (let index_{depth} = 0; index_{depth} < items_{depth}.length; index_{depth}++) {{"
+                ));
+                self.depth += 1;
+                self.line(&format!(
+                    "local_{} = items_{depth}[index_{depth}];",
+                    parallel.item
+                ));
+                self.line(&format!(
+                    "local_{} = values_{depth}[index_{depth}];",
+                    parallel.result
+                ));
+                self.block(&parallel.body);
+                self.depth -= 1;
+                self.line("}");
                 self.depth -= 1;
                 self.line("}");
             }

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::ir::{Expr, LocalId, SiteKind, Stmt, Type};
+use crate::ir::{Expr, LocalId, Stmt, Type};
 use crate::prove::arith::{LoopKind, Prover, Quantity, State, U64_MAX, capacity, quantity_name};
 use crate::prove::linear::{self, Linear, Var};
 
@@ -80,13 +80,14 @@ impl Prover<'_> {
                 },
                 body,
             ),
+            Stmt::Parallel(parallel) => self.statement(&parallel.sequential(), state),
             Stmt::Effect { site, args, result } => {
                 for arg in args {
                     self.value(&mut state, arg);
                 }
                 self.bind(&mut state, *result, None);
                 let handler = self.handler.expect("an effect belongs to a handler");
-                if handler.sites[*site].kind == SiteKind::Model {
+                if handler.sites[*site].traps_on_decode() {
                     let what = self.names.site(*site, args);
                     self.invariants_hold(
                         &state,

@@ -193,6 +193,26 @@ fn variant_from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value,
     Ok(Value::Variant(index, values))
 }
 
+pub fn model_failure(response: &Json) -> Option<&str> {
+    match response {
+        Json::Object(map) if map.len() == 1 => map.get(ir::MODEL_FAILED).and_then(Json::as_str),
+        _ => None,
+    }
+}
+
+pub fn model_outcome(program: &Program, response: &Json) -> Value {
+    if let Some(error) = model_failure(response) {
+        return Value::Variant(ir::FAILED, vec![Value::Text(error.to_owned())]);
+    }
+    match from_json(program, &Type::Sum(ir::REPLY), response) {
+        Ok(reply) => Value::Variant(ir::OK, vec![reply]),
+        Err(error) => Value::Variant(
+            ir::FAILED,
+            vec![Value::Text(format!("model reply: {error}"))],
+        ),
+    }
+}
+
 pub fn returned(program: &Program, returns: &Type) -> String {
     match program.text_enum(returns) {
         Some(sum) => format!("a value of {}", sum.name),

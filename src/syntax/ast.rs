@@ -76,6 +76,7 @@ pub struct Tool {
 pub struct Model {
     pub name: Name,
     pub calls: Name,
+    pub reply: Option<Name>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +177,7 @@ pub enum Stmt {
         at: Position,
         name: Name,
         list: Expr,
+        parallel: bool,
         body: Block,
     },
     Return {

@@ -72,6 +72,21 @@ function tagged(json) {
   return [keys[0], json[keys[0]]];
 }
 
+const MODEL_FAILED = "failed";
+
+function modelOutcome(response) {
+  const pair = tagged(response);
+  if (pair !== null && pair[0] === MODEL_FAILED && typeof pair[1] === "string") {
+    return variant(VARIANT_FAILED, [pair[1]]);
+  }
+  try {
+    return variant(VARIANT_OK, [fromJson({ sum: SUM_REPLY }, response)]);
+  } catch (error) {
+    if (!(error instanceof DecodeError)) throw error;
+    return variant(VARIANT_FAILED, [`model reply: ${error.message}`]);
+  }
+}
+
 const textEncoder = new TextEncoder();
 const ASCII_ONLY = /^[\x00-\x7f]*$/;
 
@@ -1025,6 +1040,33 @@ function both(left, right) {
 
 function either(left, right) {
   return left || right;
+}
+
+function batchWidth(count, limit) {
+  if (limit === null) return count;
+  assert(Number.isSafeInteger(limit) && limit > 0, "a concurrency limit admits at least one request");
+  return Math.min(limit, count);
+}
+
+async function dispatchConcurrently(world, requests, limit) {
+  const completed = [];
+  let next = 0;
+  const worker = async () => {
+    for (let taken = 0; taken < requests.length; taken++) {
+      const index = next;
+      if (index >= requests.length) return;
+      next += 1;
+      await world.hook(runPoint("before_run", "dispatch", requests[index].effect));
+      const output = await world.tool(requests[index]);
+      await world.hook(runPoint("after_run", "dispatch", requests[index].effect));
+      completed.push([index, output]);
+    }
+  };
+  const workers = [];
+  for (let slot = 0; slot < batchWidth(requests.length, limit); slot++) workers.push(worker());
+  await Promise.all(workers);
+  assert(completed.length === requests.length, "every request of a batch completes once");
+  return completed;
 }
 
 function within(items, capacity) {

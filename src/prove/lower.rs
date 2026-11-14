@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::effect::EffectClass;
-use crate::ir::{BinaryOp, Expr, Handler, Program, SiteId, SiteKind, Stmt, Type};
+use crate::ir::{BinaryOp, Expr, Handler, Parallel, Program, SiteId, SiteKind, Stmt, Type};
 use crate::prove::Mutation;
 use crate::prove::text::Names;
 use crate::run::mutation::Mutation as RunMutation;
@@ -14,6 +14,8 @@ pub enum Record {
     Call(SiteId),
     Result(SiteId),
     Model(SiteId),
+    BatchCall(SiteId),
+    BatchResult(SiteId),
     Status,
     Checkpoint,
 }
@@ -40,6 +42,8 @@ pub enum Entry {
     Rerun,
     Replayed,
     Reopened(SiteId),
+    ReopenedInBatch(SiteId),
+    Has(SiteId),
     FirstAttempt(SiteId),
     LaterAttempt(SiteId),
 }
@@ -82,7 +86,27 @@ pub enum Op {
 pub struct HandlerPlan {
     pub name: String,
     pub sites: Vec<String>,
+    pub real: Vec<SiteId>,
     pub ops: Vec<Op>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Batched {
+    External,
+    Other,
+    Reopened,
+}
+
+const BATCHED: [Batched; 3] = [Batched::External, Batched::Other, Batched::Reopened];
+
+impl Batched {
+    const fn describe(self) -> &'static str {
+        match self {
+            Self::External => "its fresh external calls",
+            Self::Other => "its none and idempotent calls",
+            Self::Reopened => "its external calls reopened in a retried step",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,16 +124,21 @@ pub fn lower(program: &Program, model: &target::Model, mutation: Mutation) -> Pl
         .handlers
         .iter()
         .map(|handler| {
+            let mut batches = Vec::new();
+            batch_sites(&handler.body, &mut batches);
             let lowering = Lowering {
                 program,
                 handler,
                 model,
                 mutation,
                 names: Names::new(program, Some(handler)),
+                batches,
             };
+            let (sites, real) = lowering.site_names();
             HandlerPlan {
                 name: handler.name.clone(),
-                sites: lowering.site_names(),
+                sites,
+                real,
                 ops: lowering.handler(),
             }
         })
@@ -121,6 +150,28 @@ pub fn lower(program: &Program, model: &target::Model, mutation: Mutation) -> Pl
             && run != RunMutation::JsonlNoChecksum,
         checkpoint_sorted: run != RunMutation::CheckpointHashOrder,
         handlers,
+    }
+}
+
+fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
+    for statement in statements {
+        match statement {
+            Stmt::Parallel(parallel) => out.push(parallel.site),
+            Stmt::If {
+                then, otherwise, ..
+            } => {
+                batch_sites(then, out);
+                batch_sites(otherwise, out);
+            }
+            Stmt::Match { arms, .. } => arms.iter().for_each(|arm| batch_sites(&arm.body, out)),
+            Stmt::Loop { body, .. } | Stmt::For { body, .. } => batch_sites(body, out),
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Push { .. }
+            | Stmt::Effect { .. }
+            | Stmt::Take { .. }
+            | Stmt::Finish { .. } => {}
+        }
     }
 }
 
@@ -156,6 +207,7 @@ struct Lowering<'a> {
     model: &'a target::Model,
     mutation: Mutation,
     names: Names<'a>,
+    batches: Vec<SiteId>,
 }
 
 impl Lowering<'_> {
@@ -167,10 +219,39 @@ impl Lowering<'_> {
         matches!(self.model.recovery, Recovery::InStep { .. })
     }
 
-    fn site_names(&self) -> Vec<String> {
+    fn site_names(&self) -> (Vec<String>, Vec<SiteId>) {
         let mut names = vec![String::new(); self.handler.sites.len()];
         self.collect_names(&self.handler.body, &mut names);
-        names
+        let mut real: Vec<SiteId> = (0..names.len()).collect();
+        for site in &self.batches {
+            for batched in BATCHED {
+                assert_eq!(
+                    names.len(),
+                    self.batched(*site, batched),
+                    "a batch's virtual sites follow the handler's sites in order"
+                );
+                names.push(format!(
+                    "{}, {} in its parallel for",
+                    names[*site],
+                    batched.describe()
+                ));
+                real.push(*site);
+            }
+        }
+        (names, real)
+    }
+
+    fn batched(&self, site: SiteId, batched: Batched) -> SiteId {
+        let rank = self
+            .batches
+            .iter()
+            .position(|candidate| *candidate == site)
+            .expect("a parallel for's site is a batch site");
+        let offset = BATCHED
+            .iter()
+            .position(|candidate| *candidate == batched)
+            .expect("every batched kind is listed");
+        self.handler.sites.len() + rank * BATCHED.len() + offset
     }
 
     fn collect_names(&self, statements: &[Stmt], names: &mut [String]) {
@@ -188,6 +269,10 @@ impl Lowering<'_> {
                     .for_each(|arm| self.collect_names(&arm.body, names)),
                 Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
                     self.collect_names(body, names);
+                }
+                Stmt::Parallel(parallel) => {
+                    names[parallel.site] = self.names.site(parallel.site, &parallel.args);
+                    self.collect_names(&parallel.body, names);
                 }
                 Stmt::Let { .. }
                 | Stmt::Assign { .. }
@@ -337,10 +422,11 @@ impl Lowering<'_> {
                     body: self.block(body),
                 });
             }
+            Stmt::Parallel(parallel) => self.parallel(parallel, ops),
             Stmt::Effect { site, args, .. } => {
                 args.iter().for_each(|arg| self.arithmetic_trap(arg, ops));
                 ops.extend(self.effect(*site, args));
-                if self.handler.sites[*site].kind == SiteKind::Model {
+                if self.handler.sites[*site].traps_on_decode() {
                     ops.push(self.trap(format!(
                         "decoding the reply of {}",
                         self.names.site(*site, args)
@@ -352,6 +438,191 @@ impl Lowering<'_> {
                 ops.extend(self.finish());
             }
         }
+    }
+
+    fn parallel(&self, parallel: &Parallel, ops: &mut Vec<Op>) {
+        self.arithmetic_trap(&parallel.list, ops);
+        let label = format!(
+            "parallel for {} in {} (at most {} = {})",
+            self.handler.locals[parallel.item].name,
+            self.names.expr(&parallel.list),
+            parallel.bound.name,
+            parallel.bound.value
+        );
+        let what = self.names.site(parallel.site, &parallel.args);
+        let calls = self
+            .dispatch_classes()
+            .into_iter()
+            .map(|class| {
+                let label = format!("{what} resolves to a tool with effect {}", class.name());
+                arm(
+                    label,
+                    Entry::Plain,
+                    self.batch_call(parallel.site, class, &what),
+                )
+            })
+            .collect();
+        ops.push(Op::Repeat {
+            label: format!("{label}: the call records"),
+            bound: parallel.bound.value,
+            every_iteration: false,
+            body: vec![Op::Choice(calls)],
+        });
+        ops.push(Op::Repeat {
+            label: format!("{label}: the dispatches"),
+            bound: parallel.bound.value,
+            every_iteration: false,
+            body: vec![Op::Choice(self.batch_runs(parallel.site, &what))],
+        });
+        ops.push(Op::Repeat {
+            label: format!("{label}: the pushes in list order"),
+            bound: parallel.bound.value,
+            every_iteration: false,
+            body: self.block(&parallel.body),
+        });
+    }
+
+    fn batch_call(&self, site: SiteId, class: EffectClass, what: &str) -> Vec<Op> {
+        let kind = if class.may_be_unknown() {
+            Batched::External
+        } else {
+            Batched::Other
+        };
+        let mut arms = vec![arm(
+            format!("{what} appends its call record before any dispatch"),
+            Entry::Live,
+            vec![Op::Append(Record::BatchCall(self.batched(site, kind)))],
+        )];
+        let reopened = format!("{what} reopened after a crash left its call open");
+        if !class.may_be_unknown() {
+            arms.push(arm(
+                reopened,
+                Entry::ReopenedInBatch(self.batched(site, Batched::Other)),
+                Vec::new(),
+            ));
+        } else if self.in_step() {
+            arms.push(arm(
+                reopened,
+                Entry::ReopenedInBatch(self.batched(site, Batched::Reopened)),
+                Vec::new(),
+            ));
+        } else {
+            arms.push(arm(
+                format!("{what} reported unknown by recovery"),
+                Entry::Replayed,
+                vec![Op::Yield {
+                    site,
+                    class,
+                    seen: Seen::Unknown,
+                    what: what.to_owned(),
+                }],
+            ));
+        }
+        arms.push(arm(
+            format!("{what} replayed from its recorded result"),
+            Entry::Replayed,
+            Vec::new(),
+        ));
+        vec![Op::Choice(arms)]
+    }
+
+    fn batch_runs(&self, site: SiteId, what: &str) -> Vec<Arm> {
+        let gate = self.model.gate_before_outbound && self.mutation != Mutation::DropFlush;
+        let other = self.batched(site, Batched::Other);
+        let mut group = Vec::new();
+        if gate {
+            group.push(Op::Flush(Point::OutputGate));
+        }
+        group.push(Op::Run {
+            site: other,
+            class: EffectClass::None,
+            outbound: true,
+            what: format!("{what} in a group of none and idempotent calls"),
+        });
+        group.push(Op::Append(Record::BatchResult(other)));
+        let mut arms = vec![arm(
+            format!("a group of {what} with effect none or idempotent runs at once"),
+            Entry::Has(other),
+            group,
+        )];
+        let external = self.batched(site, Batched::External);
+        let alone = self.batch_external(external, what, false);
+        let alone = if self.in_step() {
+            vec![Op::Choice(vec![arm(
+                format!("external {what} reads attempt 1"),
+                Entry::FirstAttempt(external),
+                alone,
+            )])]
+        } else {
+            alone
+        };
+        let mut external_ops = self.batch_flush(gate);
+        external_ops.extend(alone);
+        arms.push(arm(
+            format!("external {what} runs alone"),
+            Entry::Has(external),
+            external_ops,
+        ));
+        if self.in_step() {
+            let reopened = self.batched(site, Batched::Reopened);
+            let mut ops = self.batch_flush(gate);
+            ops.push(Op::Choice(vec![
+                arm(
+                    format!("reopened {what} reads attempt 1: the crash came before its dispatch"),
+                    Entry::FirstAttempt(reopened),
+                    self.batch_external(reopened, what, true),
+                ),
+                arm(
+                    format!("reopened {what} reads attempt 2 or later"),
+                    Entry::LaterAttempt(reopened),
+                    vec![
+                        Op::Append(Record::Recovery),
+                        Op::Flush(Point::Recovery),
+                        Op::Yield {
+                            site: reopened,
+                            class: EffectClass::External,
+                            seen: Seen::Unknown,
+                            what: what.to_owned(),
+                        },
+                    ],
+                ),
+            ]));
+            arms.push(arm(
+                format!("reopened external {what} runs alone"),
+                Entry::Has(reopened),
+                ops,
+            ));
+        }
+        arms
+    }
+
+    fn batch_flush(&self, gate: bool) -> Vec<Op> {
+        if self.mutation == Mutation::DropFlush {
+            return Vec::new();
+        }
+        let point = if gate {
+            Point::OutputGate
+        } else {
+            Point::BeforeExternal
+        };
+        vec![Op::Flush(point)]
+    }
+
+    fn batch_external(&self, site: SiteId, what: &str, reopened: bool) -> Vec<Op> {
+        let label = if reopened { "reopened " } else { "" };
+        let mut ops = vec![
+            Op::Run {
+                site,
+                class: EffectClass::External,
+                outbound: true,
+                what: format!("{label}{what}"),
+            },
+            Op::Append(Record::BatchResult(site)),
+        ];
+        if self.in_step() {
+            ops.push(Op::Flush(Point::StepCommit));
+        }
+        ops
     }
 
     fn dispatch_classes(&self) -> Vec<EffectClass> {

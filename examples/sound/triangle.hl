@@ -1,0 +1,19 @@
+harness triangle
+
+const steps_max: u64 = 8
+const total_max: u64 = 1000
+
+invariant bounded: total <= total_max
+
+state {
+  total: u64
+}
+
+on add(note: text) -> u64 {
+  if total + 28 <= total_max {
+    loop step below steps_max {
+      total = total + step
+    }
+  }
+  return total
+}

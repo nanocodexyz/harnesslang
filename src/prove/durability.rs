@@ -108,6 +108,8 @@ fn describe(records: &BTreeSet<Record>, handler: &HandlerPlan) -> String {
             Record::Call(site) => format!("call of {}", handler.sites[*site]),
             Record::Result(site) => format!("result of {}", handler.sites[*site]),
             Record::Model(site) => format!("reply of {}", handler.sites[*site]),
+            Record::BatchCall(site) => format!("call of {}", handler.sites[*site]),
+            Record::BatchResult(site) => format!("result of {}", handler.sites[*site]),
             Record::Status => "status".to_owned(),
             Record::Checkpoint => "checkpoint".to_owned(),
         })
@@ -281,6 +283,10 @@ impl Prover<'_> {
                 state.durable_calls.remove(&site);
                 state.reopened.remove(&site);
             }
+            Record::BatchCall(site) => {
+                state.open_calls.insert(site);
+            }
+            Record::BatchResult(_) => {}
             Record::Status => {
                 if state.phase != Phase::Running {
                     self.finding(
@@ -319,7 +325,7 @@ impl Prover<'_> {
     }
 
     fn external(&mut self, site: SiteId, what: &str, state: &State, pending: &str) {
-        self.external_sites.insert(site);
+        self.external_sites.insert(self.handler.real[site]);
         if !state.pending.is_empty() {
             self.finding(
                 "durable_before_external",
@@ -412,6 +418,19 @@ fn enter(mut state: State, entry: Entry) -> Option<State> {
             state.reopened.insert(site);
             state.open_calls.insert(site);
             state.durable_calls.insert(site);
+        }
+        Entry::ReopenedInBatch(site) => {
+            if state.mode != Mode::Replay {
+                return None;
+            }
+            state.reopened.insert(site);
+            state.open_calls.insert(site);
+            state.durable_calls.insert(site);
+        }
+        Entry::Has(site) => {
+            if !state.open_calls.contains(&site) {
+                return None;
+            }
         }
         Entry::FirstAttempt(site) => state.attempt = Some((site, true)),
         Entry::LaterAttempt(site) => state.attempt = Some((site, false)),

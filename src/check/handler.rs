@@ -342,8 +342,18 @@ impl Checker<'_> {
                 ..
             } => self.loop_statement(name, limit, body, out),
             ast::Stmt::For {
-                name, list, body, ..
-            } => self.for_statement(name, list, body, out),
+                at,
+                name,
+                list,
+                parallel,
+                body,
+            } => {
+                if *parallel {
+                    self.parallel_statement(*at, name, list, body, out)
+                } else {
+                    self.for_statement(name, list, body, out)
+                }
+            }
             ast::Stmt::Return { value, .. } => {
                 let wanted = self.returns.clone();
                 let at = value.at();
@@ -469,6 +479,100 @@ impl Checker<'_> {
             body,
         });
         Ok(false)
+    }
+
+    fn parallel_statement(
+        &mut self,
+        at: Position,
+        name: &ast::Name,
+        list: &ast::Expr,
+        body: &ast::Block,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let list_at = list.at();
+        let (list, ty) = self.expr(list, None, out)?;
+        let Type::List { element, capacity } = ty else {
+            return error(
+                list_at,
+                format!("'for' walks a list, not {}", self.type_name(&ty)),
+            );
+        };
+        let (match_at, subject, arms) = parallel_body(at, name, body)?;
+        for arm in arms {
+            for statement in &arm.body.statements {
+                self.parallel_push(statement)?;
+            }
+        }
+        let (item, lowered) = self.scoped(|checker| {
+            let item = checker.declare(name, *element)?;
+            let mut lowered = Vec::new();
+            let returned = checker.match_statement(match_at, subject, arms, &mut lowered)?;
+            assert!(!returned, "the arms of a parallel for only push");
+            Ok((item, lowered))
+        })?;
+        let [Stmt::Effect { site, args, result }, tail @ ..] = lowered.as_slice() else {
+            panic!("a parallel for's match starts with its dispatch, found {lowered:?}");
+        };
+        assert_eq!(
+            self.sites[*site].kind,
+            SiteKind::Dispatch,
+            "a parallel for dispatches"
+        );
+        assert!(
+            matches!(args.as_slice(), [Expr::Local(local)] if *local == item),
+            "a parallel for dispatches its own item"
+        );
+        assert!(
+            pushes_only(tail),
+            "a parallel for's arms push values without effects"
+        );
+        out.push(Stmt::Parallel(ir::Parallel {
+            item,
+            list,
+            bound: capacity,
+            site: *site,
+            args: args.clone(),
+            result: *result,
+            body: tail.to_vec(),
+        }));
+        Ok(false)
+    }
+
+    fn parallel_push(&self, statement: &ast::Stmt) -> Checked<()> {
+        let ast::Stmt::Push { value, .. } = statement else {
+            return parallel_error(statement, "the arms of a parallel for only push");
+        };
+        match self.effect_in(value) {
+            Some(callee) => error(
+                callee.at,
+                format!(
+                    "a push in a parallel for runs no effect: found a call of '{}'",
+                    callee.text
+                ),
+            ),
+            None => Ok(()),
+        }
+    }
+
+    fn effect_in<'e>(&self, value: &'e ast::Expr) -> Option<&'e ast::Name> {
+        match value {
+            ast::Expr::Number(..) | ast::Expr::Text(..) | ast::Expr::Bool(..) => None,
+            ast::Expr::Name(_) | ast::Expr::Take { .. } => None,
+            ast::Expr::Member { base, .. } => self.effect_in(base),
+            ast::Expr::Not { operand, .. } => self.effect_in(operand),
+            ast::Expr::Binary { left, right, .. } => {
+                self.effect_in(left).or_else(|| self.effect_in(right))
+            }
+            ast::Expr::Call { callee, args } => {
+                let effect = self.globals.tools.contains_key(&callee.text)
+                    || self.globals.model.as_deref() == Some(callee.text.as_str())
+                    || EFFECT_BUILTINS.contains(&callee.text.as_str());
+                if effect {
+                    return Some(callee);
+                }
+                args.iter().find_map(|arg| self.effect_in(arg))
+            }
+        }
     }
 
     fn match_statement(
@@ -733,10 +837,16 @@ impl Checker<'_> {
                     ),
                 );
             }
+            let result = self
+                .program
+                .model
+                .as_ref()
+                .expect("a model name is bound only with a model")
+                .result();
             return Ok(self.site(
                 SiteKind::Model,
                 SiteClass::Fixed(EffectClass::Idempotent),
-                Type::Sum(ir::REPLY),
+                result,
                 vec![value],
                 out,
             ));
@@ -1018,6 +1128,79 @@ impl Checker<'_> {
             result,
         ))
     }
+}
+
+const EFFECT_BUILTINS: [&str; 3] = ["dispatch", "now", "random"];
+
+fn parallel_body<'b>(
+    at: Position,
+    name: &ast::Name,
+    body: &'b ast::Block,
+) -> Checked<(Position, &'b ast::Expr, &'b [ast::Arm])> {
+    let shape = "the body of a parallel for is only a match on dispatch";
+    let Some(first) = body.statements.first() else {
+        return error(at, format!("{shape}({}): found nothing", name.text));
+    };
+    let ast::Stmt::Match {
+        at: match_at,
+        subject,
+        arms,
+    } = first
+    else {
+        return parallel_error(first, &format!("{shape}({})", name.text));
+    };
+    let dispatches_item = matches!(
+        subject,
+        ast::Expr::Call { callee, args }
+            if callee.text == "dispatch"
+                && matches!(args.as_slice(), [ast::Expr::Name(item)] if item.text == name.text)
+    );
+    if !dispatches_item {
+        return error(
+            subject.at(),
+            format!(
+                "a parallel for matches on dispatch({}), the item it walks",
+                name.text
+            ),
+        );
+    }
+    if let Some(extra) = body.statements.get(1) {
+        return parallel_error(extra, &format!("{shape}({})", name.text));
+    }
+    Ok((*match_at, subject, arms))
+}
+
+fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
+    let at = statement_at(statement);
+    let found = match statement {
+        ast::Stmt::For { parallel: true, .. } => {
+            return error(
+                at,
+                "a parallel for cannot be nested in another parallel for",
+            );
+        }
+        ast::Stmt::Let { .. } => "a let".to_owned(),
+        ast::Stmt::Assign { .. } => "an assignment".to_owned(),
+        ast::Stmt::Push { .. } => "a push".to_owned(),
+        ast::Stmt::If { .. } => "an if".to_owned(),
+        ast::Stmt::Match { .. } => "a match".to_owned(),
+        ast::Stmt::Loop { .. } => "a loop".to_owned(),
+        ast::Stmt::For { .. } => "a for loop".to_owned(),
+        ast::Stmt::Return { .. } => "a return".to_owned(),
+        ast::Stmt::Call { callee, .. }
+        | ast::Stmt::Inlined {
+            function: callee, ..
+        } => format!("a call of fn '{}'", callee.text),
+    };
+    error(at, format!("{shape}: found {found}"))
+}
+
+fn pushes_only(statements: &[Stmt]) -> bool {
+    statements.iter().all(|statement| match statement {
+        Stmt::Push { .. } => true,
+        Stmt::Match { arms, .. } => arms.iter().all(|arm| pushes_only(&arm.body)),
+        _ => false,
+    })
 }
 
 pub(super) fn statement_at(statement: &ast::Stmt) -> Position {

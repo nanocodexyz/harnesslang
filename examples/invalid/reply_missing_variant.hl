@@ -1,0 +1,29 @@
+harness reply_missing_variant
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = done(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>) | paused | refused(text)
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 2 <= context_max
+{
+  push context user(question)
+  match think(context) {
+    ok(reply) => {
+      match reply {
+        answer(words) => { return done(words) }
+        calls(requested) => { return stopped("no tools") }
+        refused(reason) => { return stopped(reason) }
+      }
+    }
+    failed(error) => { return stopped(error) }
+  }
+}

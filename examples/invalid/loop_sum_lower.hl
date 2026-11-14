@@ -1,0 +1,17 @@
+harness loop_sum_lower
+
+const steps_max: u64 = 8
+const step_sum: u64 = 29
+
+state {
+  total: u64
+}
+
+on add(note: text) -> u64
+  requires total == 0
+{
+  loop step below steps_max {
+    total = total + step
+  }
+  return total - step_sum
+}
