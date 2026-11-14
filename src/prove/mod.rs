@@ -14,7 +14,7 @@ use crate::prove::lower::{Op, Plan, Record, Slot};
 use crate::run;
 use crate::target::{self, Target};
 
-pub const PROOF_STEPS_PER_HANDLER_MAX: u64 = 4_000_000;
+pub const PROOF_STEPS_PER_HANDLER_MAX: u64 = 8_000_000;
 pub const PROOF_CONSTRAINTS_MAX: usize = 4_096;
 pub const PROOF_MEMO_ENTRIES_PER_HANDLER_MAX: usize = 16_384;
 
@@ -245,13 +245,18 @@ struct PlannedTree {
     sessions: u64,
 }
 
-fn spawns_on(program: &Program, handler: &crate::ir::Handler, ops: &[Op]) -> u64 {
+fn spawns_on(
+    program: &Program,
+    handler: &crate::ir::Handler,
+    ops: &[Op],
+    real: &[crate::ir::SiteId],
+) -> u64 {
     let spawns = |op: &Op| match op {
         Op::Run {
             slot: lower::Slot::Site(site),
             ..
         } => Count {
-            total: u64::from(spawning(program, handler.sites[*site].kind)),
+            total: u64::from(spawning(program, handler.sites[real[*site]].kind)),
             nested: 0,
         },
         _ => Count::default(),
@@ -272,6 +277,7 @@ fn planned_tree(
     program: &Program,
     handler: &crate::ir::Handler,
     ops: &[Op],
+    real: &[crate::ir::SiteId],
     chain: &str,
     report: &mut Report,
 ) -> Option<PlannedTree> {
@@ -285,7 +291,7 @@ fn planned_tree(
         requests,
         sessions: 1,
     };
-    let spawns = spawns_on(program, handler, ops);
+    let spawns = spawns_on(program, handler, ops, real);
     if spawns == 0 {
         return Some(tree);
     }
@@ -310,6 +316,7 @@ fn planned_tree(
             child_program,
             child,
             &child_plan.handlers[index].ops,
+            &child_plan.handlers[index].real,
             &child_chain,
             report,
         )?;
@@ -382,7 +389,7 @@ fn children(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Rep
         let Some(family) = &handler.worst.family else {
             continue;
         };
-        let planned = spawns_on(program, handler, &lowered.ops);
+        let planned = spawns_on(program, handler, &lowered.ops, &lowered.real);
         assert!(
             planned <= handler.worst.spawns.total,
             "the IR's child session worst case covers every path of the plan"
@@ -393,8 +400,15 @@ fn children(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Rep
             root: &handler.name,
         };
         let chain = format!("{}.{}", program.name, handler.name);
-        let Some(tree) = planned_tree(&descent, program, handler, &lowered.ops, &chain, report)
-        else {
+        let Some(tree) = planned_tree(
+            &descent,
+            program,
+            handler,
+            &lowered.ops,
+            &lowered.real,
+            &chain,
+            report,
+        ) else {
             continue;
         };
         assert!(

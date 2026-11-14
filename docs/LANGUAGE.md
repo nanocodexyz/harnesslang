@@ -3816,6 +3816,20 @@ of `examples/subagents.hl` on every target replay the same answers.
 `examples/subagent_child.hl`, `wait_agent` joins the child the model names, and
 `on subagent start` and `on subagent stop` keep its roster.
 
+`examples/claude_code.hl` offers the same tools to Claude: `spawn_agent`
+starts `examples/claude_code_child.hl`'s `delegated(role, task)`, the Claude
+harness without its MCP listing, which ends when the model calls
+`submit_result`; `list_agents` asks the host; and a round that holds a
+`wait_agent` call runs its calls one after another, joining at each
+`wait_agent`, since the arms of a `parallel` for run no effects. `hl-agent`
+(`agent/`) is its host: a spawn writes the child's arguments to
+`children/T.S/spawn.json` under the parent's journal directory and runs the
+child on a thread, with its own journal there; a join is answered once the
+child's status is durable. After a kill, the parent's replay reaches its open
+join and the host runs an unfinished child from its journal, whose open
+external calls are reported `unknown`, or answers with a finished child's
+result.
+
 #### Spawn trees
 
 A child may spawn children of its own. `docs/snippets/tree.hl` starts a
@@ -4394,7 +4408,7 @@ The compiler's own bounds:
 | --- | --- | --- |
 | nesting of blocks, types, expressions | `NESTING_DEPTH_MAX` = 64 | policy; also bounds the blocks of a handler once its fns are inlined |
 | statements per handler once its fns are inlined | `STATEMENTS_PER_HANDLER_MAX` = 65,536 | policy: over a thousand times the largest example handler; a program whose fns double at each level reaches it in milliseconds |
-| prover steps per handler | `PROOF_STEPS_PER_HANDLER_MAX` = 4,000,000 | policy; reaching it fails the obligation and says so |
+| prover steps per handler | `PROOF_STEPS_PER_HANDLER_MAX` = 8,000,000 | policy; reaching it fails the obligation and says so |
 | constraints per prover step | `PROOF_CONSTRAINTS_MAX` = 4,096 | policy; same |
 | nesting of a journal's JSON | `JSON_DEPTH_MAX` = 128 | policy |
 | Cloudflare outbound requests per invocation | `CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX` = 10,000 | Workers Paid default, developers.cloudflare.com/workers/platform/limits |

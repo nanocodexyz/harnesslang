@@ -16,19 +16,82 @@ const USAGE_INPUT_PER_MESSAGE: u64 = 100;
 const USAGE_OUTPUT: u64 = 20;
 const USAGE_CACHE_READ: u64 = 3_000;
 const HTTP_TOO_MANY: u16 = 429;
+const CHILD_TOOL: &str = "submit_result";
+const SPAWN_TOOL: &str = "spawn_agent";
+const SPAWNED: &str = "$spawned";
+
+#[derive(Clone)]
+struct Scripts {
+    parent: Vec<Value>,
+    child: Vec<Value>,
+}
+
+fn steps_of(path: &str) -> Vec<Value> {
+    let script = Value::decode(&std::fs::read_to_string(path).expect("read the script"))
+        .expect("the script is JSON");
+    script
+        .as_array()
+        .expect("the script is a list of steps")
+        .to_vec()
+}
+
+fn is_child(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(CHILD_TOOL))
+}
+
+fn spawned(messages: &[Value]) -> Option<String> {
+    let blocks = || {
+        messages.iter().flat_map(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .unwrap_or(&[])
+                .iter()
+        })
+    };
+    let id = blocks()
+        .filter(|block| block.get("name").and_then(Value::as_str) == Some(SPAWN_TOOL))
+        .filter_map(|block| block.get("id").and_then(Value::as_str))
+        .last()?;
+    blocks()
+        .find(|block| block.get("tool_use_id").and_then(Value::as_str) == Some(id))
+        .and_then(|block| block.get("content").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn filled(input: &Value, messages: &[Value]) -> Value {
+    match input {
+        Value::String(text) if text == SPAWNED => {
+            Value::String(spawned(messages).unwrap_or_default())
+        }
+        Value::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), filled(value, messages)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [port_file, script, delay_ms] = args.as_slice() else {
-        eprintln!("usage: mock-messages PORT_FILE SCRIPT_JSON DELAY_MS");
-        std::process::exit(2);
+    let (port_file, script, delay_ms, child) = match args.as_slice() {
+        [port_file, script, delay_ms] => (port_file, script, delay_ms, None),
+        [port_file, script, delay_ms, child] => (port_file, script, delay_ms, Some(child)),
+        _ => {
+            eprintln!("usage: mock-messages PORT_FILE SCRIPT_JSON DELAY_MS [CHILD_SCRIPT_JSON]");
+            std::process::exit(2);
+        }
     };
-    let script = Value::decode(&std::fs::read_to_string(script).expect("read the script"))
-        .expect("the script is JSON");
-    let steps = script
-        .as_array()
-        .expect("the script is a list of steps")
-        .to_vec();
+    let steps = Scripts {
+        parent: steps_of(script),
+        child: child.map(|child| steps_of(child)).unwrap_or_default(),
+    };
     let delay = Duration::from_millis(delay_ms.parse().expect("DELAY_MS is a number"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
     let port = listener.local_addr().expect("a bound address").port();
@@ -45,9 +108,13 @@ fn main() {
     }
 }
 
-fn throttle(steps: &[Value], step: usize, throttled: &Mutex<BTreeSet<usize>>) -> Option<u64> {
+fn throttle(
+    steps: &[Value],
+    step: (bool, usize),
+    throttled: &Mutex<BTreeSet<(bool, usize)>>,
+) -> Option<u64> {
     let seconds = steps
-        .get(step)?
+        .get(step.1)?
         .get("throttle")?
         .as_u64()
         .filter(|seconds| *seconds > 0)?;
@@ -159,15 +226,21 @@ fn serve_stream(mut stream: TcpStream, message: &Value, delay: Duration) {
 
 fn serve(
     mut stream: TcpStream,
-    steps: &[Value],
+    scripts: &Scripts,
     delay: Duration,
-    throttled: &Mutex<BTreeSet<usize>>,
+    throttled: &Mutex<BTreeSet<(bool, usize)>>,
 ) {
     let Some((headers, body)) = read_request(&stream) else {
         return;
     };
+    let child = Value::decode(&body).is_ok_and(|body| is_child(&body));
+    let steps = if child {
+        &scripts.child
+    } else {
+        &scripts.parent
+    };
     let step = Value::decode(&body).ok().and_then(|body| check(&body).ok());
-    if let Some(seconds) = step.and_then(|step| throttle(steps, step, throttled)) {
+    if let Some(seconds) = step.and_then(|step| throttle(steps, (child, step), throttled)) {
         let text = Value::object([
             ("type", Value::text("error")),
             (
@@ -351,9 +424,14 @@ fn answer(headers: &[String], body: &str, steps: &[Value]) -> Result<Value, Stri
             Value::number(USAGE_INPUT_PER_MESSAGE),
         ),
     ]);
+    let child = is_child(&body);
     let script = steps
         .get(step)
         .ok_or_else(|| format!("the script has no step {step}"))?;
+    let all = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
     let mut content = vec![Value::object([
         ("type", Value::text("text")),
         (
@@ -369,7 +447,13 @@ fn answer(headers: &[String], body: &str, steps: &[Value]) -> Result<Value, Stri
     for (index, call) in calls.iter().enumerate() {
         content.push(Value::object([
             ("type", Value::text("tool_use")),
-            ("id", Value::String(format!("toolu_{step}_{index}"))),
+            (
+                "id",
+                Value::String(format!(
+                    "toolu_{}{step}_{index}",
+                    if child { "child_" } else { "" }
+                )),
+            ),
             (
                 "name",
                 call.get("name")
@@ -378,9 +462,10 @@ fn answer(headers: &[String], body: &str, steps: &[Value]) -> Result<Value, Stri
             ),
             (
                 "input",
-                call.get("input")
-                    .cloned()
-                    .ok_or("a scripted call has no input")?,
+                filled(
+                    call.get("input").ok_or("a scripted call has no input")?,
+                    all,
+                ),
             ),
         ]));
     }

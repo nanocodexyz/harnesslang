@@ -675,6 +675,10 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
   - `emit/`: Rust, JavaScript and SQL generation
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
+- `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
+  subagent `examples/claude_code_child.hl` emitted as native-jsonl Rust and
+  hosted against the Anthropic API, each spawned child a session with its own
+  journal under the parent's (`children/T.S/`)
 - `oracle/`: the nanocode oracle, its own workspace
 - `scripts/`: the check, docs check, mutation, prover mutation, oracle,
   differential and crash drill scripts
