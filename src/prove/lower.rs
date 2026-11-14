@@ -145,7 +145,8 @@ fn arithmetic(value: &Expr) -> bool {
         | Expr::Text(_)
         | Expr::Constant(_)
         | Expr::Local(_)
-        | Expr::Field(_) => false,
+        | Expr::Field(_)
+        | Expr::Cancelled => false,
     }
 }
 
@@ -191,6 +192,7 @@ impl Lowering<'_> {
                 Stmt::Let { .. }
                 | Stmt::Assign { .. }
                 | Stmt::Push { .. }
+                | Stmt::Take { .. }
                 | Stmt::Finish { .. } => {}
             }
         }
@@ -271,6 +273,7 @@ impl Lowering<'_> {
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
                 self.arithmetic_trap(value, ops);
             }
+            Stmt::Take { .. } => {}
             Stmt::Push { field, value } => {
                 self.arithmetic_trap(value, ops);
                 let name = &self.program.state[*field].name;

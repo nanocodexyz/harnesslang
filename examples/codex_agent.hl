@@ -2,6 +2,7 @@ harness codex_agent
 
 const rounds_max: u64 = 64
 const calls_per_round_max: u64 = 16
+const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
 const turns_max: u64 = 1000000
 
@@ -12,10 +13,10 @@ tool apply_patch(patch: text) -> text effect external
 tool update_plan(plan: text) -> text effect none
 tool view_image(path: text) -> text effect none
 tool web_search(query: text) -> text effect none
-tool steer_waiting() -> bool effect none
-tool steer_take() -> text effect none
 
 model responses calls calls_per_round_max
+
+on steer(message: text) bound steers_per_turn_max
 
 state {
   context: list<entry, context_entries_max>
@@ -36,15 +37,10 @@ on prompt(input: text) -> outcome
     push context assistant(reply)
     match reply {
       answer(words) => {
-        match steer_waiting() {
-          ok(waiting) => {
-            if not waiting { return completed(words) }
-            match steer_take() {
-              ok(steer) => { push context user(steer) }
-              failed(error) => { return failed("steer take failed: " ++ error) }
-            }
-          }
-          failed(error) => { return failed("steer poll failed: " ++ error) }
+        let steers = take steers
+        if len(steers) == 0 { return completed(words) }
+        for steer in steers {
+          push context user(steer)
         }
       }
       calls(requested) => {

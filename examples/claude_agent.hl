@@ -2,10 +2,11 @@ harness claude_agent
 
 const rounds_max: u64 = 64
 const calls_per_round_max: u64 = 16
+const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
 const turns_max: u64 = 1000000
 
-type outcome = completed(text) | failed(text) | cancelled | exhausted
+type outcome = completed(text) | failed(text) | interrupted | exhausted
 
 tool Read(file_path: text) -> text effect none
 tool Glob(pattern: text) -> text effect none
@@ -14,11 +15,11 @@ tool WebFetch(url: text) -> text effect none
 tool Edit(file_path: text, change: text) -> text effect external
 tool Write(file_path: text, content: text) -> text effect external
 tool Bash(command: text) -> text effect external
-tool cancel_requested() -> bool effect none
-tool steer_waiting() -> bool effect none
-tool steer_take() -> text effect none
 
 model messages calls calls_per_round_max
+
+on cancel
+on steer(message: text) bound steers_per_turn_max
 
 state {
   context: list<entry, context_entries_max>
@@ -30,7 +31,7 @@ invariant context_bounded: len(context) <= context_entries_max
 
 on prompt(input: text) -> outcome
   requires turns < turns_max
-    and len(context) + 1 + rounds_max * (2 + calls_per_round_max) <= context_entries_max
+    and len(context) + 1 + rounds_max * (1 + calls_per_round_max + steers_per_turn_max) <= context_entries_max
 {
   push context user(input)
   turns = turns + 1
@@ -41,28 +42,16 @@ on prompt(input: text) -> outcome
       answer(words) => { return completed(words) }
       calls(requested) => {
         for call in requested {
+          if cancelled { return interrupted }
           match dispatch(call) {
             ok(output) => { push context result(call, output) }
             failed(error) => { push context error(call, error) }
             unknown => { push context unknown(call) }
           }
         }
-        match cancel_requested() {
-          ok(stop) => {
-            if stop { return cancelled }
-          }
-          failed(error) => { return failed("cancel poll failed: " ++ error) }
-        }
-        match steer_waiting() {
-          ok(waiting) => {
-            if waiting {
-              match steer_take() {
-                ok(steer) => { push context user(steer) }
-                failed(error) => { return failed("steer take failed: " ++ error) }
-              }
-            }
-          }
-          failed(error) => { return failed("steer poll failed: " ++ error) }
+        if cancelled { return interrupted }
+        for steer in take steers {
+          push context user(steer)
         }
       }
     }

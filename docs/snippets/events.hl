@@ -1,0 +1,35 @@
+harness worker
+
+const steps_max: u64 = 8
+const steers_max: u64 = 4
+const notes_max: u64 = 64
+
+type outcome = done(text) | stopped
+
+tool work(task: text) -> text effect external
+
+on cancel
+on steer(message: text) bound steers_max
+
+state {
+  notes: list<text, notes_max>
+}
+
+invariant notes_bounded: len(notes) <= notes_max
+
+on run(task: text) -> outcome
+  requires len(notes) + steps_max * (1 + steers_max) <= notes_max
+{
+  loop step below steps_max {
+    for steer in take steers {
+      push notes steer
+    }
+    match work(task) {
+      ok(output) => { push notes output }
+      failed(error) => { push notes error }
+      unknown => { return stopped }
+    }
+    if cancelled { return stopped }
+  }
+  return done(task)
+}

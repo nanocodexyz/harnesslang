@@ -19,10 +19,14 @@ pub enum Invariant {
     ReplayEqual,
     Panic,
     EnumValid,
+    EventOnce,
+    EventKept,
+    EventBeforeRead,
+    EventReplayEqual,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 13] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -32,6 +36,10 @@ impl Invariant {
         Self::ReplayEqual,
         Self::Panic,
         Self::EnumValid,
+        Self::EventOnce,
+        Self::EventKept,
+        Self::EventBeforeRead,
+        Self::EventReplayEqual,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -45,6 +53,10 @@ impl Invariant {
             Self::ReplayEqual => "replay_equal",
             Self::Panic => "panic",
             Self::EnumValid => "enum_valid",
+            Self::EventOnce => "event_once",
+            Self::EventKept => "event_kept",
+            Self::EventBeforeRead => "event_before_read",
+            Self::EventReplayEqual => "event_replay_equal",
         }
     }
 }
@@ -141,7 +153,8 @@ pub fn check(
     let calls = safety(world, records)?;
     finish_once(world, &calls, turns)?;
     idempotent_known(&calls, records)?;
-    liveness_and_replay(program, world, turns, records)
+    liveness_and_replay(program, world, turns, records)?;
+    world.inbox.kept(records)
 }
 
 pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violation> {
@@ -156,6 +169,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             );
         }
     }
+    world.inbox.safety(records)?;
     let calls = seq_unique(records)?;
     enum_valid(world, records)?;
     for (id, dispatched) in world

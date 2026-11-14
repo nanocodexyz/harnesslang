@@ -96,6 +96,10 @@ impl Prover<'_> {
                 }
                 Some(state)
             }
+            Stmt::Take { result } => {
+                self.bind(&mut state, *result, None);
+                Some(state)
+            }
             Stmt::Finish { value } => {
                 self.value(&mut state, value);
                 self.invariants_hold(&state, "when the handler returns", "invariant_preserved");

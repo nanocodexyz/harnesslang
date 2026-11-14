@@ -10,6 +10,10 @@ pub fn program(program: &Program) {
             !reads_local(&invariant.condition),
             "an invariant reads only state and constants"
         );
+        assert!(
+            !reads_events(&invariant.condition),
+            "an invariant reads no events"
+        );
     }
     for handler in &program.handlers {
         self::handler(program, handler);
@@ -24,6 +28,23 @@ fn reads_local(value: &Expr) -> bool {
         Expr::Construct { fields, .. } => fields.iter().any(reads_local),
         Expr::Binary { left, right, .. } => reads_local(left) || reads_local(right),
         Expr::Not(operand) | Expr::Len(operand) => reads_local(operand),
+        Expr::Cancelled => false,
+    }
+}
+
+fn reads_events(value: &Expr) -> bool {
+    match value {
+        Expr::U64(_)
+        | Expr::Bool(_)
+        | Expr::Text(_)
+        | Expr::Constant(_)
+        | Expr::Field(_)
+        | Expr::Local(_) => false,
+        Expr::Cancelled => true,
+        Expr::Member { base, .. } => reads_events(base),
+        Expr::Construct { fields, .. } => fields.iter().any(reads_events),
+        Expr::Binary { left, right, .. } => reads_events(left) || reads_events(right),
+        Expr::Not(operand) | Expr::Len(operand) => reads_events(operand),
     }
 }
 
@@ -59,7 +80,8 @@ fn handler(program: &Program, handler: &Handler) {
         assert!(*param < handler.locals.len(), "a parameter is a local");
     }
     if let Some(requires) = &handler.requires {
-        expr(handler, requires);
+        expr(program, handler, requires);
+        assert!(!reads_events(requires), "a requires reads no events");
     }
     block(program, handler, &handler.body, &mut used);
     for (site, count) in used.iter().enumerate() {
@@ -76,26 +98,26 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
         match statement {
             Stmt::Let { local, value } => {
                 assert!(*local < handler.locals.len(), "a let binds a local");
-                expr(handler, value);
+                expr(program, handler, value);
             }
             Stmt::Assign { field, value } | Stmt::Push { field, value } => {
                 assert!(
                     *field < program.state.len(),
                     "assignments target state fields"
                 );
-                expr(handler, value);
+                expr(program, handler, value);
             }
             Stmt::If {
                 condition,
                 then,
                 otherwise,
             } => {
-                expr(handler, condition);
+                expr(program, handler, condition);
                 block(program, handler, then, used);
                 block(program, handler, otherwise, used);
             }
             Stmt::Match { subject, ty, arms } => {
-                expr(handler, subject);
+                expr(program, handler, subject);
                 let variants = ty.variants(program).expect("a match subject is a sum");
                 assert_eq!(
                     arms.len(),
@@ -123,23 +145,37 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     "an effect's local has its site's result type"
                 );
                 used[*site] += 1;
-                args.iter().for_each(|arg| expr(handler, arg));
+                args.iter().for_each(|arg| expr(program, handler, arg));
             }
-            Stmt::Finish { value } => expr(handler, value),
+            Stmt::Take { result } => {
+                assert!(*result < handler.locals.len(), "a take binds a local");
+                assert_eq!(
+                    Some(&handler.locals[*result].ty),
+                    program.events.steers_type().as_ref(),
+                    "a take binds a list of the declared steers"
+                );
+            }
+            Stmt::Finish { value } => expr(program, handler, value),
         }
     }
 }
 
-fn expr(handler: &Handler, value: &Expr) {
+fn expr(program: &Program, handler: &Handler, value: &Expr) {
     match value {
+        Expr::Cancelled => assert!(
+            program.events.cancel,
+            "only a harness with 'on cancel' reads it"
+        ),
         Expr::U64(_) | Expr::Bool(_) | Expr::Text(_) | Expr::Constant(_) | Expr::Field(_) => {}
         Expr::Local(local) => assert!(*local < handler.locals.len(), "a local exists"),
-        Expr::Member { base, .. } => expr(handler, base),
-        Expr::Construct { fields, .. } => fields.iter().for_each(|field| expr(handler, field)),
+        Expr::Member { base, .. } => expr(program, handler, base),
+        Expr::Construct { fields, .. } => fields
+            .iter()
+            .for_each(|field| expr(program, handler, field)),
         Expr::Binary { left, right, .. } => {
-            expr(handler, left);
-            expr(handler, right);
+            expr(program, handler, left);
+            expr(program, handler, right);
         }
-        Expr::Not(operand) | Expr::Len(operand) => expr(handler, operand),
+        Expr::Not(operand) | Expr::Len(operand) => expr(program, handler, operand),
     }
 }

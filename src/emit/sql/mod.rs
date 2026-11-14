@@ -12,7 +12,7 @@ pub const FIRST_ROW_SEQ: u64 = 1;
 pub const MILLISECONDS_PER_SECOND: u64 = 1_000;
 pub const MILLISECONDS_PER_DAY: u64 = 86_400_000;
 pub const UNIX_EPOCH_JULIAN_DAY: &str = "2440587.5";
-pub const RECORD_KINDS: [&str; 7] = [
+pub const RECORD_KINDS: [&str; 8] = [
     "admitted",
     "call",
     "result",
@@ -20,6 +20,7 @@ pub const RECORD_KINDS: [&str; 7] = [
     "recovery",
     "status",
     "checkpoint",
+    "event",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,6 +486,7 @@ pub fn record_kind(record: &Record) -> &'static str {
         Record::Recovery { .. } => 4,
         Record::Status { .. } => 5,
         Record::Checkpoint { .. } => 6,
+        Record::Event { .. } => 7,
     };
     RECORD_KINDS[index]
 }

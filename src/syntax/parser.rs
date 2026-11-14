@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Const, Expr, Function, Handler, Invariant, Item, Model, Name, Param,
-    Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Const, Event, Expr, Function, Handler, Invariant, Item, Model, Name,
+    Param, Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -174,7 +174,7 @@ impl<'a> Parser<'a> {
             "state" => self.state().map(Item::State),
             "invariant" => self.invariant().map(Item::Invariant),
             "fn" => self.function().map(Item::Function),
-            "on" => self.handler().map(Item::Handler),
+            "on" => self.handler_or_event(),
             _ => Err(self.unexpected(ITEMS)),
         }
     }
@@ -313,10 +313,35 @@ impl<'a> Parser<'a> {
         Ok(Function { name, params, body })
     }
 
-    fn handler(&mut self) -> Parsed<Handler> {
+    fn handler_or_event(&mut self) -> Parsed<Item> {
         self.word("on")?;
-        let name = self.name("a handler name")?;
+        let name = self.name("a handler or event name")?;
+        if !self.is_symbol(Symbol::LeftParen) {
+            return Ok(Item::Event(Event {
+                name,
+                params: Vec::new(),
+                bound: None,
+            }));
+        }
         let params = self.params()?;
+        if self.is_symbol(Symbol::Arrow) {
+            return self.handler(name, params).map(Item::Handler);
+        }
+        if !self.is_word("bound") {
+            return Err(
+                self.unexpected("'->' and a result type for a handler, or 'bound' for an event")
+            );
+        }
+        self.advance();
+        let bound = self.bound("the events one turn records")?;
+        Ok(Item::Event(Event {
+            name,
+            params,
+            bound: Some(bound),
+        }))
+    }
+
+    fn handler(&mut self, name: Name, params: Vec<Param>) -> Parsed<Handler> {
         self.symbol(Symbol::Arrow)?;
         let returns = self.type_expr()?;
         let requires = if self.is_word("requires") {
@@ -674,6 +699,11 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self) -> Parsed<Expr> {
         let at = self.at();
+        if self.is_word("take") && matches!(self.peek_second(), Token::Name(_)) {
+            self.advance();
+            let events = self.name("the events to take")?;
+            return Ok(Expr::Take { at, events });
+        }
         match self.peek().token.clone() {
             Token::Number(value) => {
                 self.advance();

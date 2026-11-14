@@ -1,5 +1,6 @@
 use crate::ir::{Handler, Program};
-use crate::run::engine::{Engine, Exit, Finish, Mode, Setup, World};
+use crate::run::engine::{Engine, Exit, Finish, Mode, Setup, World, close_inbox, steer_count};
+use crate::run::journal::Inbound;
 use crate::run::journal::{Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
@@ -52,6 +53,32 @@ fn corrupt(error: String) -> Exit {
     Exit::Corrupt(error)
 }
 
+fn check_events(program: &Program, turn: u64, log: &TurnLog) -> Result<(), Exit> {
+    let declared = &program.events;
+    for event in &log.events {
+        let taken = match &event.delivery.inbound {
+            Inbound::Cancel => declared.cancel,
+            Inbound::Steer(_) => declared.steers.is_some(),
+        };
+        if !taken {
+            return Err(corrupt(format!(
+                "turn {turn} records a {} event, which the program does not take",
+                event.delivery.inbound.name()
+            )));
+        }
+    }
+    let steers = steer_count(&log.events);
+    if let Some(bound) = &declared.steers
+        && steers > bound.value
+    {
+        return Err(corrupt(format!(
+            "turn {turn} records {steers} steers, more than {} ({})",
+            bound.name, bound.value
+        )));
+    }
+    Ok(())
+}
+
 pub fn replay(
     program: &Program,
     target: &target::Model,
@@ -66,6 +93,7 @@ pub fn replay(
         ))
     })?;
     let arguments = arguments_from_json(program, handler, &log.arguments).map_err(corrupt)?;
+    check_events(program, turn, log)?;
     let finished = log
         .finished
         .as_ref()
@@ -174,6 +202,9 @@ pub fn run_turn(
     if let Some(log) = session.turns.get(&request.turn)
         && let Some(finished) = &log.finished
     {
+        if program.events.any() {
+            close_inbox(world, request.turn, finished.last, &log.events);
+        }
         return Ok(Ran::AlreadyFinished(Finish {
             turn: request.turn,
             outcome: finished.outcome,
@@ -192,6 +223,7 @@ pub fn run_turn(
                     request.turn
                 )));
             }
+            check_events(program, request.turn, log)?;
             let mut log = log.clone();
             if matches!(target.recovery, target::Recovery::AtLoad) {
                 unknown = recover(&mut log, mutation);
@@ -223,6 +255,7 @@ pub fn run_turn(
                 sites: Default::default(),
                 attempts: 0,
                 finished: None,
+                events: Vec::new(),
             }
         }
     };

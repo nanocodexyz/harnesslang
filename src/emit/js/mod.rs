@@ -171,9 +171,19 @@ fn program_literal(program: &Program) -> String {
             model.calls.value
         )
     });
+    let events = &program.events;
+    let steers = events.steers.as_ref().map_or("null".to_owned(), |bound| {
+        format!(
+            "{{ name: {}, max: {}n }}",
+            js_string(&bound.name),
+            bound.value
+        )
+    });
     write!(
         out,
-        "  ],\n  model: {model},\n  state: {},\n  handlers: [\n",
+        "  ],\n  model: {model},\n  events: {{ cancel: {}, steers: {steers}, recordsMax: {}n }},\n  state: {},\n  handlers: [\n",
+        events.cancel,
+        events.records_max(),
         fields_literal(&program.state)
     )
     .expect("writing to a string succeeds");
@@ -349,6 +359,7 @@ impl Writer<'_> {
                     args.join(", ")
                 ));
             }
+            Stmt::Take { result } => self.line(&format!("local_{result} = rt.take();")),
             Stmt::Finish { value } => self.line(&format!("return {};", expr(program, value))),
         }
     }
@@ -391,5 +402,6 @@ fn expr(program: &Program, expression: &Expr) -> String {
         } => binary(*op, expr(program, left), expr(program, right)),
         Expr::Not(operand) => format!("!({})", expr(program, operand)),
         Expr::Len(operand) => format!("BigInt(({}).length)", expr(program, operand)),
+        Expr::Cancelled => "rt.cancelled()".to_owned(),
     }
 }

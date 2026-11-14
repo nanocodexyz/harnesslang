@@ -121,6 +121,10 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.line("}");
             }
             Stmt::Effect { site, args, result } => self.effect(*site, args, *result),
+            Stmt::Take { result } => {
+                let local = self.local(*result);
+                self.line(&format!("let {local} = engine.take_steers();"));
+            }
             Stmt::Finish { value } => {
                 let value = self.expr(value);
                 self.line(&format!("return Ok({value});"));
@@ -284,7 +288,7 @@ impl<'a, 'p> Body<'a, 'p> {
     fn type_of(&self, expr: &Expr) -> Type {
         match expr {
             Expr::U64(_) | Expr::Constant(_) | Expr::Len(_) => Type::U64,
-            Expr::Bool(_) | Expr::Not(_) => Type::Bool,
+            Expr::Bool(_) | Expr::Not(_) | Expr::Cancelled => Type::Bool,
             Expr::Text(_) | Expr::Member { .. } => Type::Text,
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
@@ -340,6 +344,7 @@ impl<'a, 'p> Body<'a, 'p> {
             } => self.binary(*op, left, right),
             Expr::Not(operand) => format!("(!{})", self.expr(operand)),
             Expr::Len(operand) => format!("({}.len() as u64)", self.expr(operand)),
+            Expr::Cancelled => "engine.cancelled()".to_owned(),
         }
     }
 

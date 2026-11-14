@@ -54,6 +54,8 @@ expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': w
 expect_error examples/invalid/fn_recursion.hl any "fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask"
 expect_error examples/invalid/fn_arity.hl any "fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1"
 expect_error examples/invalid/fn_hidden_name.hl any "fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input'"
+expect_error examples/invalid/event_unknown.hl any "event_unknown.hl:3:4: error: unknown event 'pause': a harness takes 'cancel' and 'steer'"
+expect_error examples/invalid/event_take_undeclared.hl any "event_take_undeclared.hl:6:16: error: 'take steers' needs 'on steer(message: text) bound N' on the harness"
 for target in native-jsonl native-sqlite server-postgres vercel; do
   "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
 done

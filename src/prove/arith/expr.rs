@@ -50,7 +50,7 @@ impl Prover<'_> {
             Expr::U64(_) | Expr::Constant(_) | Expr::Local(_) | Expr::Field(_) => {
                 self.linear_of(state, value)
             }
-            Expr::Bool(_) | Expr::Text(_) => None,
+            Expr::Bool(_) | Expr::Text(_) | Expr::Cancelled => None,
         }
     }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{self, Expr, Handler, LocalId, Program, SiteId, SiteKind, Stmt};
 
@@ -6,18 +6,21 @@ pub struct Names<'a> {
     program: &'a Program,
     handler: Option<&'a Handler>,
     effects: BTreeMap<LocalId, (SiteId, &'a [Expr])>,
+    takes: BTreeSet<LocalId>,
 }
 
 impl<'a> Names<'a> {
     pub fn new(program: &'a Program, handler: Option<&'a Handler>) -> Self {
         let mut effects = BTreeMap::new();
+        let mut takes = BTreeSet::new();
         if let Some(handler) = handler {
-            collect(&handler.body, &mut effects);
+            collect(&handler.body, &mut effects, &mut takes);
         }
         Self {
             program,
             handler,
             effects,
+            takes,
         }
     }
 
@@ -39,6 +42,9 @@ impl<'a> Names<'a> {
     pub fn local(&self, local: LocalId) -> String {
         if let Some((site, args)) = self.effects.get(&local) {
             return self.site(*site, args);
+        }
+        if self.takes.contains(&local) {
+            return format!("take {}", crate::check::STEERS_READ);
         }
         let handler = self.handler.expect("a local belongs to a handler");
         handler.locals[local].name.clone()
@@ -78,6 +84,7 @@ impl<'a> Names<'a> {
             ),
             Expr::Not(operand) => format!("not {}", self.operand(operand)),
             Expr::Len(operand) => format!("len({})", self.expr(operand)),
+            Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
         }
     }
 
@@ -89,20 +96,29 @@ impl<'a> Names<'a> {
     }
 }
 
-fn collect<'a>(statements: &'a [Stmt], effects: &mut BTreeMap<LocalId, (SiteId, &'a [Expr])>) {
+fn collect<'a>(
+    statements: &'a [Stmt],
+    effects: &mut BTreeMap<LocalId, (SiteId, &'a [Expr])>,
+    takes: &mut BTreeSet<LocalId>,
+) {
     for statement in statements {
         match statement {
             Stmt::Effect { site, args, result } => {
                 effects.insert(*result, (*site, args.as_slice()));
             }
+            Stmt::Take { result } => {
+                takes.insert(*result);
+            }
             Stmt::If {
                 then, otherwise, ..
             } => {
-                collect(then, effects);
-                collect(otherwise, effects);
+                collect(then, effects, takes);
+                collect(otherwise, effects, takes);
             }
-            Stmt::Match { arms, .. } => arms.iter().for_each(|arm| collect(&arm.body, effects)),
-            Stmt::Loop { body, .. } | Stmt::For { body, .. } => collect(body, effects),
+            Stmt::Match { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect(&arm.body, effects, takes)),
+            Stmt::Loop { body, .. } | Stmt::For { body, .. } => collect(body, effects, takes),
             Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Finish { .. } => {}
         }
     }

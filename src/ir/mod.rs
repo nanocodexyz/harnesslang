@@ -127,6 +127,30 @@ pub struct Program {
     pub state: Vec<Field>,
     pub invariants: Vec<Invariant>,
     pub handlers: Vec<Handler>,
+    pub events: Events,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Events {
+    pub cancel: bool,
+    pub steers: Option<Bound>,
+}
+
+impl Events {
+    pub const fn any(&self) -> bool {
+        self.cancel || self.steers.is_some()
+    }
+
+    pub fn records_max(&self) -> u64 {
+        u64::from(self.cancel) + self.steers.as_ref().map_or(0, |bound| bound.value)
+    }
+
+    pub fn steers_type(&self) -> Option<Type> {
+        self.steers.as_ref().map(|bound| Type::List {
+            element: Box::new(Type::Text),
+            capacity: bound.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +336,9 @@ pub enum Stmt {
         args: Vec<Expr>,
         result: LocalId,
     },
+    Take {
+        result: LocalId,
+    },
     Finish {
         value: Expr,
     },
@@ -349,4 +376,5 @@ pub enum Expr {
     },
     Not(Box<Expr>),
     Len(Box<Expr>),
+    Cancelled,
 }

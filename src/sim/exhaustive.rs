@@ -4,8 +4,10 @@ use std::ops::Range;
 
 use crate::effect::EffectClass;
 use crate::ir::{Program, Type};
-use crate::run::engine::{Exit, Finish, ModelRequest, Point, Stop, ToolRequest, World};
-use crate::run::journal::{self, Output, Record};
+use crate::run::engine::{
+    Answer, Exit, Finish, ModelRequest, Point, Read, Stop, ToolRequest, World,
+};
+use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::turn::{Ran, TurnRequest, run_turn};
@@ -518,6 +520,18 @@ impl World for Run<'_, '_> {
 
     fn acknowledge(&mut self, finish: &Finish) {
         World::acknowledge(&mut self.state.sim, finish);
+    }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        World::inbox(&mut self.state.sim, turn)
+    }
+
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]) {
+        World::answer(&mut self.state.sim, turn, position, answers);
+    }
+
+    fn read(&mut self, read: &Read) {
+        World::read(&mut self.state.sim, read);
     }
 }
 

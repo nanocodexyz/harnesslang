@@ -113,6 +113,26 @@ fn generate(program: &Program, target: Target) -> String {
             format!("pub const {}: u64 = {};", constant(&item.name), item.value),
         );
     }
+    let events = &program.events;
+    line(
+        &mut out,
+        format!("pub const TAKES_CANCEL: bool = {};", events.cancel),
+    );
+    let steers = events.steers.as_ref().map_or_else(
+        || "None".to_owned(),
+        |bound| format!("Some(({:?}, {}))", bound.name, constant(&bound.name)),
+    );
+    line(
+        &mut out,
+        format!("pub const STEERS_MAX: Option<(&str, u64)> = {steers};"),
+    );
+    line(
+        &mut out,
+        format!(
+            "pub const EVENT_RECORDS_MAX: u64 = {};",
+            events.records_max()
+        ),
+    );
     out.push('\n');
     for (id, sum) in program.sums.iter().enumerate() {
         sum_definition(&mut out, &types, id, sum);

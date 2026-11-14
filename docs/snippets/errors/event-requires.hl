@@ -1,0 +1,9 @@
+harness worker
+
+on cancel
+
+on run() -> u64
+  requires not cancelled
+{
+  return 1
+}

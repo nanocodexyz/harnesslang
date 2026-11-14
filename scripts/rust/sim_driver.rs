@@ -6,7 +6,7 @@ mod store;
 use std::io::BufRead;
 
 use harness::program;
-use harness::{Exit, Finish, Json, ModelRequest, Output, Point, Ran, Record, Stop, ToolRequest, TurnRequest, World};
+use harness::{Delivery, EventAnswer, Exit, Finish, Json, ModelRequest, Output, Point, Ran, Record, Stop, ToolRequest, TurnRequest, World};
 
 pub struct Events {
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
@@ -248,6 +248,31 @@ impl World for Driver {
         expect(&event, "outcome", &Json::text(finish.outcome.name()));
         expect(&event, "result", &finish.result);
         self.acks += 1;
+    }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        let event = self.events.next("inbox");
+        expect(&event, "turn", &Json::Number(turn));
+        let Json::Array(items) = field(&event, "answer") else {
+            fail(&format!("trace event {} has no list of deliveries", event.encode()));
+        };
+        items
+            .iter()
+            .map(|item| harness::delivery_from(item).unwrap_or_else(|error| fail(&error)))
+            .collect()
+    }
+
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]) {
+        let event = self.events.next("answer");
+        expect(&event, "turn", &Json::Number(turn));
+        expect(&event, "position", &Json::Number(position));
+        let generated = Json::Array(
+            answers
+                .iter()
+                .map(|(id, answer)| Json::object(vec![("answer", Json::text(answer.name())), ("id", Json::text(id))]))
+                .collect(),
+        );
+        expect(&event, "answers", &generated);
     }
 }
 

@@ -1,4 +1,7 @@
-use crate::check::{Checked, Globals, WILDCARD, bound, error, quoted, resolve};
+use crate::check::{
+    CANCELLED_READ, Checked, EVENT_STEER, Globals, STEER_PARAMETER, STEERS_READ, WILDCARD, bound,
+    error, quoted, resolve,
+};
 use crate::effect::EffectClass;
 use crate::ir::{self, BinaryOp, Durability, Expr, LocalId, Site, SiteClass, SiteKind, Stmt, Type};
 use crate::syntax::Position;
@@ -11,6 +14,7 @@ struct Checker<'a> {
     scopes: Vec<Vec<(String, LocalId)>>,
     sites: Vec<Site>,
     returns: Type,
+    reads_events: bool,
 }
 
 pub fn check(
@@ -26,6 +30,7 @@ pub fn check(
         scopes: vec![Vec::new()],
         sites: Vec::new(),
         returns: returns.clone(),
+        reads_events: false,
     };
     let mut params = Vec::new();
     for param in &definition.params {
@@ -39,6 +44,7 @@ pub fn check(
         )?),
         None => None,
     };
+    checker.reads_events = true;
     let (body, returned) = checker.block(&definition.body)?;
     if !returned {
         return error(
@@ -89,6 +95,7 @@ pub fn invariant(
         scopes: vec![Vec::new()],
         sites: Vec::new(),
         returns: Type::Bool,
+        reads_events: false,
     };
     let condition = checker.condition(
         &definition.condition,
@@ -138,6 +145,12 @@ impl Checker<'_> {
                 format!("'{}' is already bound in this handler", name.text),
             );
         }
+        if self.program.events.cancel && name.text == CANCELLED_READ {
+            return error(
+                name.at,
+                format!("'{CANCELLED_READ}' is the cancel event's read: choose another name"),
+            );
+        }
         if self.globals.fields.contains_key(&name.text)
             || self.globals.constants.contains_key(&name.text)
         {
@@ -168,6 +181,46 @@ impl Checker<'_> {
             .expect("a handler always has a scope")
             .push((name, local));
         local
+    }
+
+    fn take(
+        &mut self,
+        at: Position,
+        events: &ast::Name,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
+        if events.text != STEERS_READ {
+            return error(
+                events.at,
+                format!("'take' reads '{STEERS_READ}', found '{}'", events.text),
+            );
+        }
+        let Some(ty) = self.program.events.steers_type() else {
+            return error(
+                at,
+                format!(
+                    "'take {STEERS_READ}' needs 'on {EVENT_STEER}({STEER_PARAMETER}: text) bound N' on the harness"
+                ),
+            );
+        };
+        self.events_readable(at, &format!("take {STEERS_READ}"))?;
+        let local = self.locals.len();
+        self.locals.push(ir::Field {
+            name: format!("{WILDCARD}take{local}"),
+            ty: ty.clone(),
+        });
+        out.push(Stmt::Take { result: local });
+        Ok((Expr::Local(local), ty))
+    }
+
+    fn events_readable(&self, at: Position, what: &str) -> Checked<()> {
+        if self.reads_events {
+            return Ok(());
+        }
+        error(
+            at,
+            format!("'{what}' reads the turn's events, so it belongs in a handler's body"),
+        )
     }
 
     fn temporary(&mut self, site: usize, ty: Type) -> LocalId {
@@ -857,6 +910,7 @@ impl Checker<'_> {
                 self.expect(operand_at, &Type::Bool, &ty)?;
                 Ok((Expr::Not(Box::new(operand)), Type::Bool))
             }
+            ast::Expr::Take { at, events } => self.take(*at, events, out),
         }
     }
 
@@ -887,6 +941,10 @@ impl Checker<'_> {
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
+        if self.program.events.cancel && name.text == CANCELLED_READ {
+            self.events_readable(name.at, CANCELLED_READ)?;
+            return Ok((Expr::Cancelled, Type::Bool));
+        }
         if let Some(local) = self.lookup(&name.text) {
             return Ok((Expr::Local(local), self.locals[local].ty.clone()));
         }

@@ -16,10 +16,14 @@ pub enum Mutation {
     CheckpointHashOrder,
     RecoverySkipped,
     EnumUnchecked,
+    EventRedelivered,
+    EventAckEarly,
+    EventReadUnstamped,
+    EventDrainOnReplay,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 18] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -34,6 +38,10 @@ impl Mutation {
         Self::CheckpointHashOrder,
         Self::RecoverySkipped,
         Self::EnumUnchecked,
+        Self::EventRedelivered,
+        Self::EventAckEarly,
+        Self::EventReadUnstamped,
+        Self::EventDrainOnReplay,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -52,6 +60,10 @@ impl Mutation {
             Self::CheckpointHashOrder => "checkpoint_hash_order",
             Self::RecoverySkipped => "recovery_skipped",
             Self::EnumUnchecked => "enum_unchecked",
+            Self::EventRedelivered => "event_redelivered",
+            Self::EventAckEarly => "event_ack_early",
+            Self::EventReadUnstamped => "event_read_unstamped",
+            Self::EventDrainOnReplay => "event_drain_on_replay",
         }
     }
 
@@ -98,7 +110,16 @@ impl Mutation {
                 Target::Cloudflare,
             ],
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
-            Self::CheckpointHashOrder | Self::EnumUnchecked => all,
+            Self::CheckpointHashOrder
+            | Self::EnumUnchecked
+            | Self::EventReadUnstamped
+            | Self::EventDrainOnReplay => all,
+            Self::EventRedelivered | Self::EventAckEarly => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Cloudflare,
+            ],
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

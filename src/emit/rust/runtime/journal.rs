@@ -432,6 +432,55 @@ pub enum Output {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inbound {
+    Cancel,
+    Steer(String),
+}
+
+impl Inbound {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Steer(_) => "steer",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub id: String,
+    pub inbound: Inbound,
+}
+
+pub fn delivery_json(delivery: &Delivery) -> Json {
+    let mut fields = vec![("id", Json::text(&delivery.id))];
+    if let Inbound::Steer(message) = &delivery.inbound {
+        fields.push(("message", Json::text(message)));
+    }
+    Json::object(vec![(delivery.inbound.name(), Json::object(fields))])
+}
+
+pub fn delivery_from(json: &Json) -> Result<Delivery, String> {
+    let Some((name, Json::Object(map))) = json.tagged() else {
+        return Err(format!("event {} is not a tagged object", json.encode()));
+    };
+    let fields = Fields { tag: name, map };
+    let id = fields.text("id")?.to_owned();
+    let inbound = match name {
+        "cancel" => {
+            fields.exact(&["id"])?;
+            Inbound::Cancel
+        }
+        "steer" => {
+            fields.exact(&["id", "message"])?;
+            Inbound::Steer(fields.text("message")?.to_owned())
+        }
+        other => return Err(format!("unknown event '{other}'")),
+    };
+    Ok(Delivery { id, inbound })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     Admitted {
         turn: u64,
@@ -471,6 +520,12 @@ pub enum Record {
         state: String,
         payload: String,
     },
+    Event {
+        turn: u64,
+        seq: u64,
+        at: u64,
+        delivery: Delivery,
+    },
 }
 
 impl Record {
@@ -483,6 +538,7 @@ impl Record {
             Self::Recovery { .. } => "recovery",
             Self::Status { .. } => "status",
             Self::Checkpoint { .. } => "checkpoint",
+            Self::Event { .. } => "event",
         }
     }
 
@@ -493,7 +549,8 @@ impl Record {
             | Self::Result { turn, .. }
             | Self::Model { turn, .. }
             | Self::Recovery { turn, .. }
-            | Self::Status { turn, .. } => *turn,
+            | Self::Status { turn, .. }
+            | Self::Event { turn, .. } => *turn,
             Self::Checkpoint { revision, .. } => *revision,
         }
     }
@@ -620,6 +677,17 @@ fn record_body(record: &Record) -> Json {
             ("revision", Json::Number(*revision)),
             ("state", Json::text(state)),
         ]),
+        Record::Event {
+            turn,
+            seq,
+            at,
+            delivery,
+        } => Json::object(vec![
+            ("at", Json::Number(*at)),
+            ("event", delivery_json(delivery)),
+            ("seq", Json::Number(*seq)),
+            ("turn", turn_text(*turn)),
+        ]),
     }
 }
 
@@ -731,6 +799,15 @@ pub fn record_from(json: &Json) -> Result<Record, String> {
         }
         "recovery" => recovery_from(&fields),
         "status" => status_from(&fields),
+        "event" => {
+            fields.exact(&["at", "event", "seq", "turn"])?;
+            Ok(Record::Event {
+                turn: fields.turn()?,
+                seq: fields.number("seq")?,
+                at: fields.number("at")?,
+                delivery: delivery_from(fields.get("event")?)?,
+            })
+        }
         "checkpoint" => {
             fields.exact(&["payload", "revision", "state"])?;
             let payload = fields.text("payload")?.to_owned();
@@ -893,12 +970,25 @@ pub struct Finished {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recorded {
+    pub at: u64,
+    pub delivery: Delivery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnLog {
     pub handler: String,
     pub arguments: Json,
     pub sites: BTreeMap<u64, SiteLog>,
     pub attempts: u64,
     pub finished: Option<Finished>,
+    pub events: Vec<Recorded>,
+}
+
+impl TurnLog {
+    pub fn recorded(&self, id: &str) -> bool {
+        self.events.iter().any(|event| event.delivery.id == id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -922,6 +1012,7 @@ pub struct Session {
     pub start: Start,
     pub turns: BTreeMap<u64, TurnLog>,
     pub checkpoints: BTreeMap<u64, String>,
+    pub last_event: u64,
 }
 
 fn running<'a>(session: &'a mut Session, turn: u64, what: &str) -> Result<&'a mut TurnLog, String> {
@@ -998,8 +1089,46 @@ fn admit(session: &mut Session, turn: u64, handler: &str, arguments: &Json) -> R
             sites: BTreeMap::new(),
             attempts: 0,
             finished: None,
+            events: Vec::new(),
         },
     );
+    Ok(())
+}
+
+fn event(session: &mut Session, turn: u64, seq: u64, at: u64, delivery: &Delivery) -> Result<(), String> {
+    if seq <= session.last_event {
+        return Err(format!(
+            "event {seq} of turn {turn} follows event {}",
+            session.last_event
+        ));
+    }
+    let log = running(session, turn, "an event")?;
+    if let Some(last) = log.events.last()
+        && at < last.at
+    {
+        return Err(format!(
+            "event {seq} of turn {turn} is at seq {at}, before the event at seq {}",
+            last.at
+        ));
+    }
+    if log.recorded(&delivery.id) {
+        return Err(format!(
+            "event '{}' of turn {turn} is recorded twice",
+            delivery.id
+        ));
+    }
+    let cancelled = log
+        .events
+        .iter()
+        .any(|event| event.delivery.inbound == Inbound::Cancel);
+    if cancelled && delivery.inbound == Inbound::Cancel {
+        return Err(format!("turn {turn} records a second cancel"));
+    }
+    log.events.push(Recorded {
+        at,
+        delivery: delivery.clone(),
+    });
+    session.last_event = seq;
     Ok(())
 }
 
@@ -1096,6 +1225,12 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
                 last: *last,
             });
         }
+        Record::Event {
+            turn,
+            seq,
+            at,
+            delivery,
+        } => event(session, *turn, *seq, *at, delivery)?,
         Record::Checkpoint {
             revision, payload, ..
         } => {

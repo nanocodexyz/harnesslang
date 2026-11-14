@@ -23,6 +23,14 @@ pub enum Item {
     Invariant(Invariant),
     Function(Function),
     Handler(Handler),
+    Event(Event),
+}
+
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub name: Name,
+    pub params: Vec<Param>,
+    pub bound: Option<Name>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +273,10 @@ pub enum Expr {
         at: Position,
         operand: Box<Expr>,
     },
+    Take {
+        at: Position,
+        events: Name,
+    },
 }
 
 impl Expr {
@@ -274,7 +286,7 @@ impl Expr {
             Self::Name(name) => name.at,
             Self::Member { base, .. } => base.at(),
             Self::Call { callee, .. } => callee.at,
-            Self::Binary { at, .. } | Self::Not { at, .. } => *at,
+            Self::Binary { at, .. } | Self::Not { at, .. } | Self::Take { at, .. } => *at,
         }
     }
 }
