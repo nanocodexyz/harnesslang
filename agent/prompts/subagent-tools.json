@@ -1,0 +1,77 @@
+{
+  "parent": [
+    {
+      "name": "spawn_agent",
+      "description": "Starts a reusable clean-room subagent without inherited conversation history and immediately returns its ID. When the root agent is durable, the task tree survives runtime restarts with the same IDs and interrupted children resume from their latest committed checkpoint; otherwise children are dropped when the parent runtime restarts. Delegate meaningful, separable work and handle trivial or tightly coupled work directly. Start independent subtasks in parallel, wait for and reduce their results, then dispatch dependent stages. Do not repeat delegated work; double-check results against the relevant evidence before relying on them. Keep concurrent write scopes disjoint, and own final synthesis and verification.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "A short role describing the subagent's specialty."
+          },
+          "task": {
+            "type": "string",
+            "description": "A complete, focused task for the subagent."
+          }
+        },
+        "required": [
+          "role",
+          "task"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "wait_agent",
+      "description": "Waits until the requested subagent reaches a terminal status and returns its result: the JSON of what it ended with, {\"submitted\": output} when it submitted a result, {\"failed\": error} or \"exhausted\" otherwise. Waiting again on an agent that already finished returns the same result at once. Use one call per agent, one after another, to collect several.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "The agent ID returned by spawn_agent."
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_agents",
+      "description": "Lists agents in the same task tree in agent_id order. Pending, running, and recoverable interrupted agents are returned by default. Set include_completed to retrieve terminal statuses and completed results in status.output.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "include_completed": {
+            "type": "boolean",
+            "default": false,
+            "description": "Also includes completed, failed, closed, and nonrecoverable interrupted agents."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  ],
+  "child": [
+    {
+      "name": "submit_result",
+      "description": "Submits the current child subagent turn's final output. Supply only the output the task asks for. After an accepted receipt your turn ends. Invalid values can be corrected and retried.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string",
+            "description": "The final result, as text: JSON text when the task asks for structured output."
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

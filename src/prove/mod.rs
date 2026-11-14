@@ -249,7 +249,7 @@ fn children(program: &Program, plan: &Plan, report: &mut Report) {
                 slot: lower::Slot::Site(site),
                 ..
             } => Count {
-                total: u64::from(spawning(program, handler.sites[*site].kind)),
+                total: u64::from(spawning(program, handler.sites[lowered.real[*site]].kind)),
                 nested: 0,
             },
             _ => Count::default(),
