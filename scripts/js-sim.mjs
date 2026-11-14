@@ -169,6 +169,31 @@ class Seed {
     return event.output;
   }
 
+  async tools(world, requests, limit) {
+    const event = this.cursor.next("batch", "a batch of " + requests.length + " calls");
+    same("batch limit", event.limit ?? null, limit === null ? null : BigInt(limit));
+    const order = event.order.map((index) => Number(index));
+    if (order.length !== requests.length) throw differ("batch size", order.length, requests.length);
+    const width = limit === null ? requests.length : Math.min(limit, requests.length);
+    const outputs = new Array(requests.length);
+    const completed = [];
+    let started = 0;
+    const start = async () => {
+      await world.hook({ point: "before_run", kind: "dispatch", effect: requests[started].effect });
+      outputs[started] = await world.tool(requests[started]);
+      started += 1;
+    };
+    while (started < width) await start();
+    for (const index of order) {
+      if (index >= started || outputs[index] === undefined) throw new Failure("backend_equal", "batch call " + index + " completes before it started");
+      await world.hook({ point: "after_run", kind: "dispatch", effect: requests[index].effect });
+      completed.push([index, outputs[index]]);
+      outputs[index] = undefined;
+      if (started < requests.length) await start();
+    }
+    return completed;
+  }
+
   model(request) {
     const event = this.cursor.next("model", `${request.turn}/${request.seq}`);
     same("model call turn", event.turn, request.turn);
@@ -328,6 +353,7 @@ async function cloudflareSeed(seed) {
   const simulation = {
     mutation: values.mutation,
     hook: (point) => seed.hook(point),
+    tools: (world, requests, limit) => seed.tools(world, requests, limit),
     gate: (records) => {
       const bytes = storage.pendingBytes();
       if (rt.encodeLines(records, false) !== bytes) throw differ("rows inserted before the gate", rt.encodeLines(records, false), bytes);
@@ -415,6 +441,7 @@ class SimWorkflow {
         return attempts;
       },
       hook: (point) => seed.hook(point),
+      tools: (world, requests, limit) => seed.tools(world, requests, limit),
       host: this.state.host,
       mutation: values.mutation,
       acknowledge: async (finish) => seed.acknowledged(finish, (turn) => statusIn(this.state.lines(), turn)),

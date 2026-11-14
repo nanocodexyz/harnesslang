@@ -59,7 +59,7 @@ on prompt(input: text) -> outcome
             }
           }
           calls(requested) => {
-            for call in requested {
+            for call in requested parallel {
               match dispatch(call) {
                 ok(output) => { push context result(call, output) }
                 failed(error) => { push context error(call, error) }

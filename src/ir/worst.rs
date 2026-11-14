@@ -245,6 +245,7 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Paths, Overflow
             };
             repeat(block(handler, body)?, &factor, true)
         }
+        Stmt::Parallel(parallel) => statement_cost(handler, &parallel.sequential()),
         Stmt::For {
             item, bound, body, ..
         } => {

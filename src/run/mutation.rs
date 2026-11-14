@@ -20,10 +20,13 @@ pub enum Mutation {
     ListingUnchecked,
     ListedClassDropped,
     InputUnchecked,
+    BatchFlushAfterDispatch,
+    ResultsInCompletionOrder,
+    BatchPushesReversed,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 21] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -42,6 +45,9 @@ impl Mutation {
         Self::ListingUnchecked,
         Self::ListedClassDropped,
         Self::InputUnchecked,
+        Self::BatchFlushAfterDispatch,
+        Self::ResultsInCompletionOrder,
+        Self::BatchPushesReversed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -64,6 +70,9 @@ impl Mutation {
             Self::ListingUnchecked => "listing_unchecked",
             Self::ListedClassDropped => "listed_class_dropped",
             Self::InputUnchecked => "input_unchecked",
+            Self::BatchFlushAfterDispatch => "batch_flush_after_dispatch",
+            Self::ResultsInCompletionOrder => "results_in_completion_order",
+            Self::BatchPushesReversed => "batch_pushes_reversed",
         }
     }
 
@@ -113,9 +122,17 @@ impl Mutation {
             Self::CheckpointHashOrder
             | Self::EnumUnchecked
             | Self::ModelFailureUnrecorded
+            | Self::ResultsInCompletionOrder
+            | Self::BatchPushesReversed
             | Self::ListingUnchecked
             | Self::ListedClassDropped
             | Self::InputUnchecked => all,
+            Self::BatchFlushAfterDispatch => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Vercel,
+            ],
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

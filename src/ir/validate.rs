@@ -208,6 +208,33 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 assert!(!bound.name.is_empty(), "every loop has a named bound");
                 block(program, handler, body, used);
             }
+            Stmt::Parallel(parallel) => {
+                assert!(
+                    !parallel.bound.name.is_empty(),
+                    "every loop has a named bound"
+                );
+                assert_eq!(
+                    handler.sites[parallel.site].kind,
+                    SiteKind::Dispatch,
+                    "a parallel for dispatches"
+                );
+                assert!(
+                    matches!(parallel.args.as_slice(), [Expr::Local(item)] if *item == parallel.item),
+                    "a parallel for dispatches its own item"
+                );
+                assert!(
+                    parallel_pushes_only(&parallel.body),
+                    "the body of a parallel for only pushes after its dispatch"
+                );
+                expr(handler, &parallel.list);
+                block(
+                    program,
+                    handler,
+                    std::slice::from_ref(&parallel.dispatch()),
+                    used,
+                );
+                block(program, handler, &parallel.body, used);
+            }
             Stmt::Effect { site, args, result } => {
                 assert!(*result < handler.locals.len(), "an effect binds a local");
                 assert_eq!(
@@ -220,6 +247,14 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
             Stmt::Finish { value } => expr(handler, value),
         }
     }
+}
+
+fn parallel_pushes_only(statements: &[Stmt]) -> bool {
+    statements.iter().all(|statement| match statement {
+        Stmt::Push { .. } => true,
+        Stmt::Match { arms, .. } => arms.iter().all(|arm| parallel_pushes_only(&arm.body)),
+        _ => false,
+    })
 }
 
 fn expr(handler: &Handler, value: &Expr) {
