@@ -323,7 +323,7 @@ for file in $examples; do
     queue js-diff js_diff_one "$target" "$file"
   done
 done
-for file in $examples; do
+for file in $examples docs/snippets/compaction.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
   done

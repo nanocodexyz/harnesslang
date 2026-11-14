@@ -1,0 +1,12 @@
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on trim(count: text) -> u64 {
+  keep lines last count
+  return len(lines)
+}
