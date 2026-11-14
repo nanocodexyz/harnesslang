@@ -414,7 +414,7 @@ pub fn not_discovered(tool: &str, listing: &str) -> String {
 }
 
 pub fn not_found(tool: &str, found: &str, listing: &str) -> String {
-    format!("{tool} found {found:?}, which listing {listing} did not list in this turn")
+    format!("{tool} found {found}, which listing {listing} did not list in this turn")
 }
 
 pub fn found_names(text: &str) -> Vec<&str> {

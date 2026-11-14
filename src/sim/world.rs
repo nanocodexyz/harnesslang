@@ -54,7 +54,7 @@ pub const BLOB_INVALID_PPM: u64 = 50_000;
 pub const BLOB_ATTACHED_PPM: u64 = 250_000;
 pub const BLOB_OVER_PPM: u64 = 20_000;
 pub const BLOB_WHOLE_PPM: u64 = 10_000;
-pub const BLOB_REPEATS_MAX: u64 = 64;
+pub const BLOB_SHORT_BYTES_MAX: u64 = 4;
 pub const FOUND_TOOLS_MAX: u64 = 3;
 pub const LONG_TEXT_PIECES: [&str; 6] = [
     "alpha ",
@@ -574,7 +574,7 @@ impl<'a> SimWorld<'a> {
         } else if rng.chance(BLOB_WHOLE_PPM) {
             bytes_max
         } else {
-            rng.below(bytes_max.min(BLOB_REPEATS_MAX) + 1)
+            rng.below(bytes_max.min(BLOB_SHORT_BYTES_MAX) + 1)
         };
         let word = WORDS[rng.pick(WORDS.len())].as_bytes();
         let length = usize::try_from(length).expect("a blob's length fits usize");

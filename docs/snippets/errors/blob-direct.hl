@@ -1,0 +1,15 @@
+harness notes
+
+const calls_max: u64 = 4
+const image_bytes_max: u64 = 1048576
+
+tool read(path: text) -> text or blob<image_bytes_max> effect none
+
+model think calls calls_max
+
+on peek(path: text) -> u64 {
+  match read(path) {
+    ok(_) => { return 1 }
+    failed(_) => { return 0 }
+  }
+}

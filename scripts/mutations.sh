@@ -58,7 +58,12 @@ wait_rerun_skips examples/subagents.hl --twice wait_until
 wait_oversleeps examples/subagents.hl --twice wait_until
 truncate_uncut docs/snippets/recovery.hl --twice checkpoint_compacted
 usage_unchecked docs/snippets/recovery.hl --twice replay_equal
-retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent"
+retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent
+notice_dropped docs/snippets/catalog.hl --twice checkpoint_compacted
+search_unchecked docs/snippets/catalog.hl --twice search_listed
+discovery_unchecked docs/snippets/catalog.hl --twice tool_admitted
+blob_unjournaled docs/snippets/images.hl --twice blob_journaled
+blobs_unevicted docs/snippets/images.hl --twice checkpoint_compacted"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

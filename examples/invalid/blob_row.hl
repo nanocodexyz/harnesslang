@@ -1,0 +1,15 @@
+harness photos
+
+const calls_max: u64 = 4
+const context_max: u64 = 16
+const photo_bytes_max: u64 = 2097152
+
+tool photo(name: text) -> blob<photo_bytes_max> effect idempotent
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ping() -> u64 { return 1 }
