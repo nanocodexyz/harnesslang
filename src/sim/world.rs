@@ -10,6 +10,7 @@ use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value;
 use crate::sim::faults::{PowerLoss, Profile, SECTOR_PERSISTED_PPM};
 use crate::sim::rng::Rng;
+use crate::sim::strict::{self, Edges};
 use crate::sim::trace::{self, Trace};
 use crate::target::medium::Medium;
 use crate::target::{self, Target};
@@ -54,6 +55,7 @@ pub struct Stats {
     pub takeovers: u64,
     pub dispatches: u64,
     pub unknown: u64,
+    pub entry_states: u64,
 }
 
 #[derive(Clone)]
@@ -70,6 +72,11 @@ pub struct SimWorld<'a> {
     pub owner_faults: Vec<String>,
     pub stats: Stats,
     pub trace: Option<Trace>,
+    pub edges: Option<Edges>,
+    pub greedy: bool,
+    pub worst_faults: Vec<String>,
+    run_effects: u64,
+    run_outbound: u64,
     rng: Rng,
     faults_left: u64,
     armed: bool,
@@ -102,6 +109,11 @@ impl<'a> SimWorld<'a> {
             owner_faults: Vec::new(),
             stats: Stats::default(),
             trace: None,
+            edges: None,
+            greedy: false,
+            worst_faults: Vec::new(),
+            run_effects: 0,
+            run_outbound: 0,
             rng: Rng::derive(seed, "faults"),
             faults_left: 0,
             armed: faults,
@@ -151,8 +163,21 @@ impl<'a> SimWorld<'a> {
         self.stats.turns += 1;
     }
 
+    pub fn seed_entry(&mut self, record: &Record) {
+        match &mut self.medium {
+            Medium::Jsonl(file) => {
+                let bytes = journal::encode_lines(std::slice::from_ref(record), file.checksum);
+                file.write(&bytes);
+                file.sync();
+            }
+            Medium::Rows(rows) => rows.commit(std::slice::from_ref(record)),
+        }
+    }
+
     pub fn begin_run(&mut self) -> Result<(Vec<Record>, u64), String> {
         self.stats.runs += 1;
+        self.run_effects = 0;
+        self.run_outbound = 0;
         if self.faults_left == 0 {
             self.armed = false;
         }
@@ -234,9 +259,12 @@ impl<'a> SimWorld<'a> {
                 return;
             }
         };
+        let counted = (self.run_effects, self.run_outbound);
+        (self.run_effects, self.run_outbound) = (0, 0);
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
+        (self.run_effects, self.run_outbound) = counted;
         if let Some(trace) = &mut self.trace {
             trace.exit(&ran);
         }
@@ -257,9 +285,12 @@ impl<'a> SimWorld<'a> {
         )
     }
 
-    fn tool_value(program: &Program, rng: &mut Rng, returns: &Type) -> Json {
+    fn tool_value(program: &Program, rng: &mut Rng, returns: &Type, edges: Option<&Edges>) -> Json {
         match returns {
-            Type::U64 => Json::Number(rng.draw() >> 32),
+            Type::U64 => Json::Number(match edges {
+                Some(edges) => edges.draw(rng),
+                None => rng.draw() >> 32,
+            }),
             Type::Bool => Json::Bool(rng.draw() & 1 == 1),
             Type::Text => Json::String(Self::generated_text(rng)),
             Type::Sum(_) => {
@@ -272,6 +303,49 @@ impl<'a> SimWorld<'a> {
                 Json::String(sum.variants[rng.pick(sum.variants.len())].name.clone())
             }
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
+        }
+    }
+
+    fn count_effect(&mut self, outbound: bool) {
+        if self.edges.is_none() {
+            return;
+        }
+        let request = self.current.as_ref().expect("an effect runs within a turn");
+        let worst = &self
+            .program
+            .handler(&request.handler)
+            .expect("a turn request names a handler of the program")
+            .worst;
+        self.run_effects += 1;
+        let mut faults = Vec::new();
+        if self.run_effects == worst.effects.total + 1 {
+            faults.push(format!(
+                "{} effects, over the worst case of {}",
+                self.run_effects, worst.effects.total
+            ));
+        }
+        if outbound {
+            self.run_outbound += 1;
+            if self.run_outbound == worst.requests.total + 1 {
+                faults.push(format!(
+                    "{} outbound requests, over the worst case of {}",
+                    self.run_outbound, worst.requests.total
+                ));
+            }
+            if let Some(limit) = &self.target.limits.outbound_requests_per_invocation
+                && self.run_outbound == limit.value + 1
+            {
+                faults.push(format!(
+                    "{} outbound requests, over the limit of {} {}",
+                    self.run_outbound, limit.value, limit.unit
+                ));
+            }
+        }
+        for fault in faults {
+            self.worst_faults.push(format!(
+                "turn {} ({}): one run made {fault}",
+                request.turn, request.handler
+            ));
         }
     }
 
@@ -342,6 +416,7 @@ impl World for SimWorld<'_> {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        self.count_effect(true);
         let output = self.tool_output(request);
         self.record("tool", || {
             vec![
@@ -357,6 +432,7 @@ impl World for SimWorld<'_> {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        self.count_effect(true);
         let response = self.reply(request);
         let program = self.program;
         self.record("model", || {
@@ -385,14 +461,24 @@ impl World for SimWorld<'_> {
     }
 
     fn now(&mut self) -> u64 {
-        self.clock += self.rng.range(1, CLOCK_STEP_MAX);
-        let clock = self.clock;
+        self.count_effect(false);
+        let clock = match &self.edges {
+            Some(edges) => edges.draw(&mut self.rng),
+            None => {
+                self.clock += self.rng.range(1, CLOCK_STEP_MAX);
+                self.clock
+            }
+        };
         self.record("now", || vec![("answer", Json::Number(clock))]);
         clock
     }
 
     fn random(&mut self) -> u64 {
-        let random = self.rng.draw();
+        self.count_effect(false);
+        let random = match &self.edges {
+            Some(edges) => edges.draw(&mut self.rng),
+            None => self.rng.draw(),
+        };
         self.record("random", || vec![("answer", Json::Number(random))]);
         random
     }
@@ -467,7 +553,12 @@ impl SimWorld<'_> {
                 Self::generated_text(&mut rng)
             ))
         } else {
-            Output::Ok(Self::tool_value(self.program, &mut rng, request.returns))
+            Output::Ok(Self::tool_value(
+                self.program,
+                &mut rng,
+                request.returns,
+                self.edges.as_ref(),
+            ))
         };
         let expected =
             value::checked_output(self.program, request.tool, request.returns, output.clone());
@@ -497,12 +588,19 @@ impl SimWorld<'_> {
             .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
-        if rng.chance(ANSWER_PPM) {
+        if !self.greedy && rng.chance(ANSWER_PPM) {
             return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
         }
-        let over = rng.chance(OVER_CAPACITY_PPM);
+        let over_ppm = match (self.greedy, self.edges.is_some()) {
+            (true, _) => 0,
+            (false, true) => strict::OVER_CAPACITY_PPM,
+            (false, false) => OVER_CAPACITY_PPM,
+        };
+        let over = rng.chance(over_ppm);
         let count = if over {
             request.calls_max + 1
+        } else if self.greedy {
+            request.calls_max
         } else {
             rng.range(1, request.calls_max.max(1))
         };

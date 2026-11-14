@@ -1,0 +1,17 @@
+harness move
+
+const box_max: u64 = 32
+
+state {
+  inbox: list<text, box_max>
+  outbox: list<text, box_max>
+}
+
+on drain(note: text) -> u64
+  requires len(inbox) + len(outbox) <= box_max
+{
+  for item in inbox {
+    push outbox item
+  }
+  return len(outbox)
+}

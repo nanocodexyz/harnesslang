@@ -47,6 +47,8 @@ impl TurnLog {
     }
 }
 
+pub const ENTRY_REVISION: u64 = 0;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Session {
     pub turns: BTreeMap<u64, TurnLog>,
@@ -210,7 +212,8 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
                 .turns
                 .get(revision)
                 .is_some_and(|log| log.finished.is_some());
-            if !finished {
+            let entry = *revision == ENTRY_REVISION && session.turns.is_empty();
+            if !finished && !entry {
                 return Err(format!(
                     "checkpoint at revision {revision}, which is not a finished turn"
                 ));
