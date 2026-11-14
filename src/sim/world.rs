@@ -45,6 +45,7 @@ pub struct Stats {
     pub takeovers: u64,
     pub dispatches: u64,
     pub unknown: u64,
+    pub entry_states: u64,
 }
 
 pub struct SimWorld<'a> {
@@ -141,6 +142,17 @@ impl<'a> SimWorld<'a> {
         self.armed = faults;
         self.lease_spent = false;
         self.stats.turns += 1;
+    }
+
+    pub fn seed_entry(&mut self, record: &Record) {
+        match &mut self.medium {
+            Medium::Jsonl(file) => {
+                let bytes = journal::encode_lines(std::slice::from_ref(record), file.checksum);
+                file.write(&bytes);
+                file.sync();
+            }
+            Medium::Rows(rows) => rows.commit(std::slice::from_ref(record)),
+        }
     }
 
     pub fn begin_run(&mut self) -> Result<(Vec<Record>, u64), String> {

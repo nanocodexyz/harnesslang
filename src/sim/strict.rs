@@ -7,13 +7,22 @@ use crate::run::turn;
 use crate::run::value::{self, Value};
 use crate::sim::invariants::{Invariant, Violation};
 use crate::sim::rng::Rng;
+use crate::sim::world::SimWorld;
 use crate::target;
 
 pub const TURNS_PER_SESSION_MAX: u64 = 12;
 pub const OVER_CAPACITY_PPM: u64 = 50_000;
 pub const EDGE_PPM: u64 = 500_000;
 pub const ALLOWED_TRAPS: [&str; 2] = ["requires(", "model reply: "];
+pub const ENTRY_DRAWS_MAX: u64 = 64;
 const U64_BITS: u64 = u64::BITS as u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    FromZero,
+    FromAny,
+}
 
 #[derive(Clone, Debug)]
 pub struct Edges {
@@ -41,6 +50,62 @@ impl Edges {
         }
         let shift = rng.below(U64_BITS);
         rng.draw() >> shift
+    }
+
+    pub fn length(&self, rng: &mut Rng, capacity: u64) -> u64 {
+        if rng.chance(EDGE_PPM) {
+            let ends = [0, capacity.saturating_sub(1), capacity];
+            return ends[rng.pick(ends.len())];
+        }
+        rng.below(capacity + 1)
+    }
+}
+
+pub fn draw(program: &Program, ty: &Type, rng: &mut Rng, edges: &Edges) -> Value {
+    match ty {
+        Type::U64 => Value::U64(edges.draw(rng)),
+        Type::Bool => Value::Bool(rng.draw() & 1 == 1),
+        Type::Text => Value::Text(SimWorld::generated_text(rng)),
+        Type::List { element, capacity } => {
+            let length = edges.length(rng, capacity.value);
+            Value::List(
+                (0..length)
+                    .map(|_| draw(program, element, rng, edges))
+                    .collect(),
+            )
+        }
+        Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => {
+            let variants = ty.variants(program).expect("a sum has variants");
+            let variant = rng.pick(variants.len());
+            let fields = variants[variant]
+                .fields
+                .iter()
+                .map(|field| draw(program, field, rng, edges))
+                .collect();
+            Value::Variant(variant, fields)
+        }
+    }
+}
+
+pub fn entry(program: &Program, rng: &mut Rng, edges: &Edges) -> Option<Vec<Value>> {
+    for _ in 0..ENTRY_DRAWS_MAX {
+        let state: Vec<Value> = program
+            .state
+            .iter()
+            .map(|declared| draw(program, &declared.ty, rng, edges))
+            .collect();
+        if kept(program, &state, "in the entry state").is_ok() {
+            return Some(state);
+        }
+    }
+    None
+}
+
+pub fn entry_record(program: &Program, state: &[Value]) -> Record {
+    Record::Checkpoint {
+        revision: session::ENTRY_REVISION,
+        state: program.name.clone(),
+        payload: value::state_json(program, state).encode(),
     }
 }
 
@@ -98,8 +163,11 @@ pub fn check(
         invariant: Invariant::Liveness,
         detail: format!("the final journal does not fold: {error}"),
     })?;
-    let mut state = value::initial_state(program);
-    kept(program, &state, "in the zero state")?;
+    let mut state = turn::entry_state(program, &folded).map_err(|exit| Violation {
+        invariant: Invariant::Liveness,
+        detail: format!("the entry checkpoint does not load: {exit:?}"),
+    })?;
+    kept(program, &state, "in the entry state")?;
     for (turn, log) in &folded.turns {
         let finished = log
             .finished

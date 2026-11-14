@@ -31,7 +31,7 @@ pub struct Options {
     pub seeds: Range<u64>,
     pub twice: bool,
     pub mutation: Mutation,
-    pub strict: bool,
+    pub strict: strict::Mode,
 }
 
 #[derive(Clone, Debug)]
@@ -142,14 +142,14 @@ pub fn run_seed_traced(
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
-    run_seed_checked(program, target, mutation, false, seed, trace)
+    run_seed_checked(program, target, mutation, strict::Mode::Off, seed, trace)
 }
 
 pub fn run_seed_checked(
     program: &Program,
     target: Target,
     mutation: Mutation,
-    strict: bool,
+    strict: strict::Mode,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
@@ -180,20 +180,28 @@ fn run_seed_unguarded(
     program: &Program,
     target: Target,
     mutation: Mutation,
-    strict: bool,
+    strict: strict::Mode,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
     let mut workload = Rng::derive(seed, "workload");
-    let turns_max = if strict {
-        strict::TURNS_PER_SESSION_MAX
-    } else {
+    let turns_max = if strict == strict::Mode::Off {
         TURNS_PER_SESSION_MAX
+    } else {
+        strict::TURNS_PER_SESSION_MAX
     };
     let turns = workload.range(1, turns_max);
     let mut world = SimWorld::new(program, target, mutation, seed, true);
-    if strict {
+    if strict != strict::Mode::Off {
         world.edges = Some(Edges::of(program));
+    }
+    if strict == strict::Mode::FromAny {
+        let edges = world.edges.clone().expect("set above");
+        let mut rng = Rng::derive(seed, "entry");
+        if let Some(state) = strict::entry(program, &mut rng, &edges) {
+            world.seed_entry(&strict::entry_record(program, &state));
+            world.stats.entry_states += 1;
+        }
     }
     world.trace = trace;
     let profile_name = world.profile.name;
@@ -237,7 +245,7 @@ fn run_seed_unguarded(
     if result.is_ok() {
         result = match &records {
             Ok(records) => invariants::check(program, &world, turns, records).and_then(|()| {
-                if strict {
+                if strict != strict::Mode::Off {
                     strict::check(program, &world.target, records)
                 } else {
                     Ok(())
@@ -311,6 +319,7 @@ fn add(total: &mut Stats, more: &Stats) {
     total.takeovers += more.takeovers;
     total.dispatches += more.dispatches;
     total.unknown += more.unknown;
+    total.entry_states += more.entry_states;
 }
 
 pub fn sweep(program: &Program, options: &Options) -> Summary {
@@ -393,8 +402,10 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             if options.twice {
                 replay.push_str(" --twice");
             }
-            if options.strict {
-                replay.push_str(" --strict");
+            match options.strict {
+                strict::Mode::Off => {}
+                strict::Mode::FromZero => replay.push_str(" --strict"),
+                strict::Mode::FromAny => replay.push_str(" --strict --any-state"),
             }
             if options.mutation != Mutation::None {
                 replay.push_str(&format!(" --mutation {}", options.mutation.name()));
@@ -417,7 +428,14 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             options.seeds.end,
             summary.seeds,
             if options.twice { ", each twice" } else { "" },
-            if options.strict { ", strict" } else { "" },
+            match options.strict {
+                strict::Mode::Off => String::new(),
+                strict::Mode::FromZero => ", strict".to_owned(),
+                strict::Mode::FromAny => format!(
+                    ", strict, {} from an arbitrary entry state",
+                    stats.entry_states
+                ),
+            },
             stats.turns,
             stats.runs,
             stats.crashes,
