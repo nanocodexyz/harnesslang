@@ -1,6 +1,7 @@
 pub mod check;
 pub mod effect;
 pub mod emit;
+pub mod generate;
 pub mod ir;
 pub mod prove;
 pub mod run;

@@ -15,7 +15,7 @@ const FAILURE_EXIT: u8 = 1;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl emit --target {targets} FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -54,6 +54,9 @@ fn main() -> ExitCode {
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
+        "gen" => harnesslang::generate::cli::gen_command(rest),
+        "fuzz-parse" => harnesslang::generate::cli::fuzz_parse_command(rest),
+        "fuzz-prove" => harnesslang::generate::cli::fuzz_prove_command(rest),
         _ => usage(),
     }
 }
@@ -69,6 +72,9 @@ struct Flags {
     seed: u64,
     trace: Option<String>,
     dump: Option<String>,
+    exhaustive: bool,
+    depth: u64,
+    cuts: sim::exhaustive::Cuts,
 }
 
 fn flags(args: &[String]) -> Option<Flags> {
@@ -83,6 +89,9 @@ fn flags(args: &[String]) -> Option<Flags> {
         seed: 0,
         trace: None,
         dump: None,
+        exhaustive: false,
+        depth: sim::exhaustive::FAULTS_PER_SESSION_DEFAULT,
+        cuts: sim::exhaustive::Cuts::Lines,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -96,6 +105,9 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
             "--trace" => flags.trace = Some(rest.next()?.clone()),
             "--dump-journal" => flags.dump = Some(rest.next()?.clone()),
+            "--exhaustive" => flags.exhaustive = true,
+            "--depth" => flags.depth = rest.next()?.parse().ok()?,
+            "--cuts" => flags.cuts = sim::exhaustive::Cuts::parse(rest.next()?)?,
             file if !file.starts_with("--") && flags.file.is_none() => {
                 flags.file = Some(file.to_owned())
             }
@@ -147,7 +159,9 @@ fn check_command(args: &[String]) -> ExitCode {
     for handler in &program.handlers {
         println!("{}", worst_lines(handler));
     }
-    let proved_targets = flags.target.map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
+    let proved_targets = flags
+        .target
+        .map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
     let proved = harnesslang::prove::cli::report(
         &file,
         &program,
@@ -283,10 +297,6 @@ fn sim_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
-    if let Err(error) = sim::supported(&program) {
-        eprintln!("{file}: error: {error}");
-        return ExitCode::from(FAILURE_EXIT);
-    }
     if !flags.mutation.targets().contains(&target) {
         eprintln!(
             "{file}: error: mutation {} does not apply to {}",
@@ -294,6 +304,19 @@ fn sim_command(args: &[String]) -> ExitCode {
             target.name()
         );
         return ExitCode::from(USAGE_EXIT);
+    }
+    if flags.exhaustive {
+        if flags.twice || flags.trace.is_some() || flags.dump.is_some() {
+            return usage();
+        }
+        let options = sim::exhaustive::Options {
+            target,
+            seeds,
+            mutation: flags.mutation,
+            faults_per_session: flags.depth,
+            cuts: flags.cuts,
+        };
+        return exhaustive_command(&program, &options, &file);
     }
     if let Some(directory) = flags.dump {
         if flags.twice || flags.trace.is_some() {
@@ -319,6 +342,24 @@ fn sim_command(args: &[String]) -> ExitCode {
     };
     println!("{}", sim::report(&summary, &options, &file));
     if summary.failure.is_some() {
+        ExitCode::from(FAILURE_EXIT)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn exhaustive_command(
+    program: &Program,
+    options: &sim::exhaustive::Options,
+    file: &str,
+) -> ExitCode {
+    if let Err(error) = sim::exhaustive::validate(options) {
+        eprintln!("{file}: error: {error}");
+        return ExitCode::from(USAGE_EXIT);
+    }
+    let summary = sim::exhaustive::explore(program, options);
+    println!("{}", sim::exhaustive::report(&summary, options, file));
+    if summary.stopped.is_some() {
         ExitCode::from(FAILURE_EXIT)
     } else {
         ExitCode::SUCCESS

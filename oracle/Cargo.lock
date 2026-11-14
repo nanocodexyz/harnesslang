@@ -59,6 +59,7 @@ name = "hl-oracle"
 version = "0.1.0"
 dependencies = [
  "crc",
+ "nanocode-durability-core",
  "nanocode-turnlog",
  "serde",
  "serde_json",

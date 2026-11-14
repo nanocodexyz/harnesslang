@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ir::{BinaryOp, Bound, Expr, FieldId, Handler, LocalId, Program, Stmt, Type};
 use crate::prove::linear::{self, Budget, Extent, Linear, Var};
 use crate::prove::text::Names;
-use crate::prove::{Finding, PROOF_CONSTRAINTS_MAX, PROOF_STEPS_PER_HANDLER_MAX, Report};
+use crate::prove::{
+    Finding, PROOF_CONSTRAINTS_MAX, PROOF_MEMO_ENTRIES_PER_HANDLER_MAX,
+    PROOF_STEPS_PER_HANDLER_MAX, Report,
+};
 
 const U64_MAX: i128 = u64::MAX as i128;
 const ZERO_STATE: &str = "(zero state)";
@@ -191,10 +194,11 @@ impl<'a> Prover<'a> {
             handler,
             names: Names::new(program, handler),
             vars: Vec::new(),
-            budget: Budget {
-                steps_left: PROOF_STEPS_PER_HANDLER_MAX,
-                constraints_max: PROOF_CONSTRAINTS_MAX,
-            },
+            budget: Budget::new(
+                PROOF_STEPS_PER_HANDLER_MAX,
+                PROOF_CONSTRAINTS_MAX,
+                PROOF_MEMO_ENTRIES_PER_HANDLER_MAX,
+            ),
             path: Vec::new(),
             quiet: 0,
             findings: Vec::new(),

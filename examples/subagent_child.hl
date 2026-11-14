@@ -1,0 +1,58 @@
+harness subagent_child
+
+const rounds_max: u64 = 64
+const calls_per_round_max: u64 = 16
+const context_entries_max: u64 = 4096
+const turns_max: u64 = 1000000
+
+type outcome = submitted(text) | exhausted
+
+tool Read(file_path: text) -> text effect none
+tool Grep(pattern: text) -> text effect none
+tool Bash(command: text) -> text effect external
+tool submit_result(output: text) -> text effect external
+
+model messages calls calls_per_round_max
+
+state {
+  context: list<entry, context_entries_max>
+  turns: u64
+}
+
+invariant turns_bounded: turns <= turns_max
+invariant context_bounded: len(context) <= context_entries_max
+
+on task(assignment: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
+{
+  push context user(assignment)
+  turns = turns + 1
+  loop round below rounds_max {
+    let reply = messages(context)
+    push context assistant(reply)
+    match reply {
+      answer(_) => {
+        push context user("Before finishing, call submit_result with your result.")
+      }
+      calls(requested) => {
+        for call in requested {
+          if call.tool == "submit_result" {
+            match submit_result(call.input) {
+              ok(_) => { return submitted(call.input) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          } else {
+            match dispatch(call) {
+              ok(output) => { push context result(call, output) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
