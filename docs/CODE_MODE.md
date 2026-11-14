@@ -364,17 +364,17 @@ them with the property each must fail with.
 | `nested_flush_after_dispatch` | jsonl, sqlite, postgres | `nested_external_once` |
 | `cell_recovery_redispatches_external` | jsonl, sqlite, postgres, cloudflare | `nested_external_once` |
 | `cell_recovery_reports_failed` (a plain failure instead of the unknown outcome) | jsonl, sqlite, postgres, cloudflare | `unknown_nested_reported` |
-| `cell_replay_ignores_journal` (rerun the script live) | all | `nested_external_once` |
+| `cell_replay_ignores_journal` (rerun the script live) | all | `nested_external_once` or `seq_unique`, whichever a seed reaches first |
 | `cell_rerun_after_finish` | all | `cell_finishes_once` |
 | `timeout_rides` (C2 removed) | jsonl, sqlite, postgres (Cloudflare's event and Vercel's sleep flush before every wait) | `header_before_wait` |
 | `nested_idempotent_reported_unknown` | all | `nested_known` |
 | `nested_enum_unchecked` (a nested result outside its text enum taken as the enum's last value) | all | `nested_enum_valid` |
 | `divergence_dispatches` (dispatch the divergent call) | all | `cell_replay_equal` |
-| `nested_ids_restart` (ids from 1 on every run) | all | `seq_unique` |
+| `nested_ids_restart` (ids from 1 on every run) | all | `seq_unique` or `unknown_nested_reported`, whichever a seed reaches first |
 | `cell_limit_unchecked` | all | `cell_bounded` |
 | `vercel_nested_retry_redispatches` | vercel | `nested_external_once` |
 | `cell_gate_releases_early` | cloudflare | `nested_external_once` |
-| `postgres_cell_unfenced` | postgres | `nested_external_once` |
+| `postgres_cell_unfenced` | postgres | `nested_external_once` or `seq_unique`, whichever a seed reaches first |
 
 ## Oracle
 

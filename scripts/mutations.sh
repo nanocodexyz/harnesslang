@@ -49,7 +49,7 @@ cell_file_of() {
     *) echo examples/code_agent.hl ;;
   esac
 }
-cell_mutations="cell_header_rides_past_external:nested_external_once nested_flush_after_dispatch:nested_external_once cell_recovery_redispatches_external:nested_external_once cell_recovery_reports_failed:unknown_nested_reported cell_replay_ignores_journal:nested_external_once cell_rerun_after_finish:cell_finishes_once timeout_rides:header_before_wait divergence_dispatches:cell_replay_equal nested_ids_restart:seq_unique cell_limit_unchecked:cell_bounded vercel_nested_retry_redispatches:nested_external_once cell_gate_releases_early:nested_external_once postgres_cell_unfenced:nested_external_once nested_idempotent_reported_unknown:nested_known nested_enum_unchecked:nested_enum_valid"
+cell_mutations="cell_header_rides_past_external:nested_external_once nested_flush_after_dispatch:nested_external_once cell_recovery_redispatches_external:nested_external_once cell_recovery_reports_failed:unknown_nested_reported cell_replay_ignores_journal:nested_external_once|seq_unique cell_rerun_after_finish:cell_finishes_once timeout_rides:header_before_wait divergence_dispatches:cell_replay_equal nested_ids_restart:seq_unique|unknown_nested_reported cell_limit_unchecked:cell_bounded vercel_nested_retry_redispatches:nested_external_once cell_gate_releases_early:nested_external_once postgres_cell_unfenced:nested_external_once|seq_unique nested_idempotent_reported_unknown:nested_known nested_enum_unchecked:nested_enum_valid"
 for entry in $cell_mutations; do
   mutation=${entry%%:*}
   expected=${entry#*:}
@@ -67,7 +67,7 @@ for entry in $cell_mutations; do
       continue
     fi
     applied=$((applied + 1))
-    if [ "$status" -ne 1 ] || ! grep -q "^FAIL invariant=$expected " <<< "$output"; then
+    if [ "$status" -ne 1 ] || ! grep -qE "^FAIL invariant=($expected) " <<< "$output"; then
       echo "mutation $mutation on $target was not caught by $expected in seeds $cell_seeds:" >&2
       echo "$output" >&2
       exit 1
