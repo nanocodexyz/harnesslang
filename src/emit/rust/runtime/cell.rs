@@ -437,6 +437,9 @@ impl<'a, 'h> Runner<'a, 'h> {
                 return Err(self.diverged(reason));
             }
             self.cursor += 1;
+            if self.cursor == self.replay.len() {
+                self.go_live()?;
+            }
             return Ok(recorded);
         }
         self.go_live()?;
@@ -730,6 +733,9 @@ impl<'a, 'h> Runner<'a, 'h> {
                     return Err(self.diverged(reason));
                 }
                 self.cursor += 1;
+                if self.cursor == self.replay.len() {
+                    self.go_live()?;
+                }
                 let call = self.calls.get_mut(&id).expect("running");
                 call.output = Some((encoded.clone(), success));
                 self.complete(id)?;
@@ -741,6 +747,9 @@ impl<'a, 'h> Runner<'a, 'h> {
                     return Err(self.diverged(reason));
                 }
                 self.cursor += 1;
+                if self.cursor == self.replay.len() {
+                    self.go_live()?;
+                }
                 Ok(Input::Timer { id })
             }
             other => {

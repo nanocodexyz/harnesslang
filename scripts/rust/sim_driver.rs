@@ -6,7 +6,7 @@ mod store;
 use std::io::BufRead;
 
 use harness::program;
-use harness::{Exit, Finish, Json, ModelRequest, Output, Point, Ran, Record, Stop, ToolRequest, TurnRequest, World};
+use harness::{CellEvent, CellPoint, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Step, Stop, ToolRequest, TurnRequest, Wait, World};
 
 pub struct Events {
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
@@ -87,6 +87,11 @@ pub struct Stats {
     pub writes: u64,
     pub statements: u64,
     pub owners: u64,
+    pub hooks: u64,
+    pub cells: u64,
+    pub steps: u64,
+    pub nested: u64,
+    pub waits: u64,
 }
 
 pub struct Driver {
@@ -169,25 +174,78 @@ impl Driver {
     }
 }
 
-fn point_fields(point: Point) -> (&'static str, Option<(&'static str, &'static str)>) {
+fn point_fields(point: Point) -> (&'static str, Option<&'static str>, Option<&'static str>) {
     match point {
-        Point::BeforeFlush => ("before_flush", None),
-        Point::AfterFlush => ("after_flush", None),
-        Point::BeforeRun(kind, effect) => ("before_run", Some((kind.name(), effect.name()))),
-        Point::AfterRun(kind, effect) => ("after_run", Some((kind.name(), effect.name()))),
-        Point::BeforeAcknowledge => ("before_acknowledge", None),
+        Point::BeforeFlush => ("before_flush", None, None),
+        Point::AfterFlush => ("after_flush", None, None),
+        Point::BeforeRun(kind, effect) => ("before_run", Some(kind.name()), Some(effect.name())),
+        Point::AfterRun(kind, effect) => ("after_run", Some(kind.name()), Some(effect.name())),
+        Point::BeforeAcknowledge => ("before_acknowledge", None, None),
+        Point::Cell(cell @ (CellPoint::BeforeNested(effect) | CellPoint::AfterNested(effect))) => (cell.name(), None, Some(effect.name())),
+        Point::Cell(cell) => (cell.name(), None, None),
+    }
+}
+
+fn bytes_json(data: &[u8]) -> Json {
+    Json::Array(data.iter().map(|byte| Json::Number(u64::from(*byte))).collect())
+}
+
+fn input_json(input: &Input) -> Json {
+    let (tag, body) = match input {
+        Input::Issued => ("issued", Json::Null),
+        Input::Refused { error } => ("refused", Json::object([("error", Json::text(error))])),
+        Input::Result { id, encoded, success } => (
+            "result",
+            Json::object([("encoded", Json::text(encoded)), ("id", Json::Number(*id)), ("success", Json::Bool(*success))]),
+        ),
+        Input::Timer { id } => ("timer", Json::object([("id", Json::Number(*id))])),
+        Input::Clock { value } => ("clock", Json::object([("value", Json::Number(*value))])),
+        Input::Monotonic { value } => ("monotonic", Json::object([("value", Json::Number(*value))])),
+        Input::Random { value } => ("random", Json::object([("value", Json::Fraction(*value))])),
+        Input::Bytes { data } => ("bytes", Json::object([("data", bytes_json(data))])),
+    };
+    Json::object([(tag, body)])
+}
+
+fn event_json(event: &CellEvent) -> Json {
+    match event {
+        CellEvent::Delivered { cell, id } => Json::object([("delivered", Json::object([("cell", Json::Number(*cell)), ("id", Json::Number(*id))]))]),
+        CellEvent::Diverged { cell, reason } => Json::object([("diverged", Json::object([("cell", Json::Number(*cell)), ("reason", Json::text(reason))]))]),
+        CellEvent::Finished { cell, outcome } => Json::object([(
+            "finished",
+            Json::object([("cell", Json::Number(*cell)), ("output", harness::output_json(&outcome.output()))]),
+        )]),
+    }
+}
+
+fn step_from(json: &Json) -> Step {
+    let (tag, body) = json.tagged().unwrap_or_else(|| fail(&format!("a traced step {} has no tag", json.encode())));
+    match tag {
+        "call" => Step::Call { id: number(body, "id"), name: text(body, "name").to_owned(), input: field(body, "input").clone() },
+        "timeout" => Step::Timeout { id: number(body, "id"), delay_ms: number(body, "delay_ms") },
+        "clock" => Step::Clock,
+        "monotonic" => Step::Monotonic,
+        "random" => Step::Random,
+        "bytes" => Step::Bytes { length: number(body, "length") },
+        "idle" => Step::Idle,
+        "done" => Step::Done { output: text(body, "output").to_owned() },
+        "threw" => Step::Threw { error: text(body, "error").to_owned() },
+        other => fail(&format!("a traced step has an unknown tag {other}")),
     }
 }
 
 impl World for Driver {
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
         let event = self.events.next("hook");
-        let (name, site) = point_fields(point);
+        let (name, kind, effect) = point_fields(point);
         expect(&event, "point", &Json::text(name));
-        if let Some((kind, effect)) = site {
+        if let Some(kind) = kind {
             expect(&event, "kind", &Json::text(kind));
+        }
+        if let Some(effect) = effect {
             expect(&event, "effect", &Json::text(effect));
         }
+        self.stats.hooks += 1;
         match text(&event, "answer") {
             "ok" => Ok(()),
             "crash" => Err(Stop::Crash),
@@ -218,6 +276,10 @@ impl World for Driver {
         let event = self.events.next("tool");
         expect(&event, "turn", &Json::Number(request.turn));
         expect(&event, "seq", &Json::Number(request.seq));
+        expect(&event, "nested", &request.nested.map_or(Json::Null, |nested| Json::Number(nested.id)));
+        if request.nested.is_some() {
+            self.stats.nested += 1;
+        }
         expect(&event, "tool", &Json::text(request.tool));
         expect(&event, "effect", &Json::text(request.effect.name()));
         expect(&event, "input", request.input);
@@ -240,6 +302,36 @@ impl World for Driver {
 
     fn random(&mut self) -> u64 {
         number(&self.events.next("random"), "answer")
+    }
+
+    fn cell_start(&mut self, cell: u64, script: &str) -> Step {
+        let event = self.events.next("cell_start");
+        expect(&event, "cell", &Json::Number(cell));
+        expect(&event, "script", &Json::text(script));
+        self.stats.cells += 1;
+        step_from(field(&event, "step"))
+    }
+
+    fn cell_resume(&mut self, cell: u64, input: Input) -> Step {
+        let event = self.events.next("cell_resume");
+        expect(&event, "cell", &Json::Number(cell));
+        expect(&event, "input", &input_json(&input));
+        self.stats.steps += 1;
+        step_from(field(&event, "step"))
+    }
+
+    fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
+        let event = self.events.next("wait");
+        expect(&event, "cell", &Json::Number(wait.cell));
+        expect(&event, "timer", &Json::Number(wait.timer));
+        expect(&event, "until", &Json::Number(wait.until_ms));
+        self.stats.waits += 1;
+        Ok(())
+    }
+
+    fn observe(&mut self, observed: &CellEvent) {
+        let event = self.events.next("cell");
+        expect(&event, "observed", &event_json(observed));
     }
 
     fn acknowledge(&mut self, finish: &Finish) {
@@ -283,7 +375,7 @@ fn main() {
     }
     let stats = &driver.stats;
     println!(
-        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={}",
+        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={}",
         program::TARGET,
         program::HARNESS_NAME,
         stats.seeds,
@@ -295,6 +387,11 @@ fn main() {
         stats.records,
         stats.writes,
         stats.syncs,
-        stats.statements
+        stats.statements,
+        stats.hooks,
+        stats.cells,
+        stats.steps,
+        stats.nested,
+        stats.waits
     );
 }
