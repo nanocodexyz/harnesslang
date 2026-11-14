@@ -1,9 +1,11 @@
 mod system;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 
 use crate::prove::linear::system::{
-    Hashing, Row, cheapest, contradiction, eliminate, prepare, project_rows, variables,
+    Hashing, MultiplyRotate, Row, cheapest, contradiction, eliminate, prepare, project_rows,
+    variables,
 };
 
 pub type Var = usize;
@@ -157,12 +159,18 @@ pub fn negation(constraint: &Linear) -> Option<Linear> {
     constraint.scale(-1)?.plus(1)
 }
 
-type Memo = HashMap<Projection, Outcome, Hashing>;
+type Memo = HashMap<Key, Outcome, Hashing>;
 
-#[derive(PartialEq, Eq, Hash)]
-struct Projection {
-    rows: Vec<Row>,
-    doomed: Vec<Var>,
+#[derive(PartialEq, Eq)]
+struct Key {
+    hash: u64,
+    words: Vec<i128>,
+}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
 }
 
 struct Outcome {
@@ -170,38 +178,64 @@ struct Outcome {
     steps: u64,
 }
 
+fn index_of(names: &[Var], var: Var) -> i128 {
+    let index = names
+        .binary_search(&var)
+        .expect("a projection's variable is named");
+    i128::try_from(index).expect("a variable index fits i128")
+}
+
+fn length_of(items: usize) -> i128 {
+    i128::try_from(items).expect("a length fits i128")
+}
+
+fn projection_key(rows: &[Row], doomed: &[Var], names: &[Var]) -> Key {
+    let terms: usize = rows.iter().map(|row| row.terms.len()).sum();
+    let mut key = Vec::with_capacity(2 + 2 * rows.len() + 2 * terms + doomed.len());
+    key.push(length_of(rows.len()));
+    for row in rows {
+        key.push(length_of(row.terms.len()));
+        for (var, coefficient) in &row.terms {
+            key.push(index_of(names, *var));
+            key.push(*coefficient);
+        }
+        key.push(row.constant);
+    }
+    key.push(length_of(doomed.len()));
+    key.extend(doomed.iter().map(|var| index_of(names, *var)));
+    let mut hasher = MultiplyRotate::default();
+    for word in &key {
+        hasher.write_i128(*word);
+    }
+    Key {
+        hash: hasher.finish(),
+        words: key,
+    }
+}
+
 impl Budget {
     fn projected(&mut self, rows: Vec<Row>, doomed: Vec<Var>) -> Result<Vec<Row>, Unsure> {
         let names = variables(&rows);
-        let key = Projection {
-            rows: rows.iter().map(|row| row.renamed(&names)).collect(),
-            doomed: doomed
-                .iter()
-                .map(|var| {
-                    names
-                        .binary_search(var)
-                        .expect("a doomed variable is named")
-                })
-                .collect(),
-        };
-        let restore = |rows: Vec<Row>| rows.iter().map(|row| row.restored(&names)).collect();
+        let key = projection_key(&rows, &doomed, &names);
         if let Some(outcome) = self.memo.get(&key)
             && outcome.steps <= self.steps_left
         {
             self.steps_left -= outcome.steps;
+            let restore = |rows: Vec<Row>| rows.iter().map(|row| row.restored(&names)).collect();
             return outcome.projected.clone().map(restore);
         }
         let steps_before = self.steps_left;
-        let projected = project_rows(key.rows.clone(), key.doomed.clone(), self);
+        let projected = project_rows(rows, doomed, self);
         let steps = steps_before - self.steps_left;
         if projected != Err(Unsure::Budget) && self.memo.len() < self.memo_entries_max {
+            let rename = |rows: &Vec<Row>| rows.iter().map(|row| row.renamed(&names)).collect();
             let outcome = Outcome {
-                projected: projected.clone(),
+                projected: projected.as_ref().map(rename).map_err(|unsure| *unsure),
                 steps,
             };
             self.memo.insert(key, outcome);
         }
-        projected.map(restore)
+        projected
     }
 }
 
@@ -345,7 +379,7 @@ fn candidate(
             break;
         };
         remaining.retain(|candidate| *candidate != var);
-        let next = eliminate(&rows, var, budget)?;
+        let next = eliminate(rows.clone(), var, budget)?;
         stages.push((var, std::mem::replace(&mut rows, next)));
     }
     if contradiction(&rows) {

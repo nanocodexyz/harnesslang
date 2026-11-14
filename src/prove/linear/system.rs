@@ -1,9 +1,52 @@
 use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, DefaultHasher};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::prove::linear::{Budget, Interval, Linear, Unsure, Var, ceil_div, floor_div, gcd};
 
-pub type Hashing = BuildHasherDefault<DefaultHasher>;
+const FX_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+const FX_ROTATION_BITS: u32 = 5;
+
+#[derive(Default)]
+pub struct MultiplyRotate {
+    hash: u64,
+}
+
+impl Hasher for MultiplyRotate {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(size_of::<u64>());
+        for chunk in &mut chunks {
+            self.write_u64(u64::from_le_bytes(
+                chunk.try_into().expect("an exact chunk is a word"),
+            ));
+        }
+        for byte in chunks.remainder() {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(FX_ROTATION_BITS) ^ word).wrapping_mul(FX_MULTIPLIER);
+    }
+
+    fn write_u128(&mut self, word: u128) {
+        self.write_u64(word as u64);
+        self.write_u64((word >> u64::BITS) as u64);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
+
+    fn write_i128(&mut self, word: i128) {
+        self.write_u128(word as u128);
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+pub type Hashing = BuildHasherDefault<MultiplyRotate>;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Row {
@@ -209,13 +252,13 @@ pub fn prepare(constraints: &[Linear]) -> Result<Vec<Row>, Unsure> {
     Ok(subsume(rows))
 }
 
-pub fn eliminate(rows: &[Row], var: Var, budget: &mut Budget) -> Result<Vec<Row>, Unsure> {
+pub fn eliminate(rows: Vec<Row>, var: Var, budget: &mut Budget) -> Result<Vec<Row>, Unsure> {
     let mut kept = Vec::with_capacity(rows.len());
     let mut above = Vec::new();
     let mut below = Vec::new();
     for row in rows {
         match row.coefficient(var) {
-            None => kept.push(row.clone()),
+            None => kept.push(row),
             Some(coefficient) if coefficient > 0 => above.push((row, coefficient)),
             Some(coefficient) => below.push((row, -coefficient)),
         }
@@ -282,7 +325,7 @@ pub fn project_rows(
             break;
         };
         doomed.retain(|candidate| *candidate != var);
-        rows = eliminate(&rows, var, budget)?;
+        rows = eliminate(rows, var, budget)?;
     }
     Ok(rows)
 }
