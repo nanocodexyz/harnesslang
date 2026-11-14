@@ -257,10 +257,11 @@ impl Budget {
 
 fn projected_rows(
     constraints: &[Linear],
+    extra: &[Linear],
     keep: &BTreeSet<Var>,
     budget: &mut Budget,
 ) -> Result<Vec<Row>, Unsure> {
-    let system = dense(constraints, &mut budget.scratch)?;
+    let system = dense(constraints, extra, &mut budget.scratch)?;
     budget.projected(system, keep)
 }
 
@@ -269,19 +270,19 @@ pub fn project(
     keep: &BTreeSet<Var>,
     budget: &mut Budget,
 ) -> Result<Vec<Linear>, Unsure> {
-    let rows = projected_rows(constraints, keep, budget)?;
+    let rows = projected_rows(constraints, &[], keep, budget)?;
     Ok(rows.iter().map(Row::linear).collect())
 }
 
 pub fn feasible(constraints: &[Linear], budget: &mut Budget) -> Result<bool, Unsure> {
-    let projected = projected_rows(constraints, &BTreeSet::new(), budget)?;
+    let projected = projected_rows(constraints, &[], &BTreeSet::new(), budget)?;
     Ok(!contradiction(&projected))
 }
 
 pub fn implies(facts: &[Linear], goal: &Linear, budget: &mut Budget) -> Result<bool, Unsure> {
-    let mut system = facts.to_vec();
-    system.push(negation(goal).ok_or(Unsure::Overflow)?);
-    Ok(!feasible(&system, budget)?)
+    let negated = [negation(goal).ok_or(Unsure::Overflow)?];
+    let projected = projected_rows(facts, &negated, &BTreeSet::new(), budget)?;
+    Ok(contradiction(&projected))
 }
 
 pub fn upper(
@@ -298,10 +299,8 @@ pub fn upper(
         !expression.terms.contains_key(&fresh),
         "the measuring variable is fresh in the expression"
     );
-    let mut system = facts.to_vec();
     let pinned = equal(&Linear::var(fresh), expression).ok_or(Unsure::Overflow)?;
-    system.extend(pinned);
-    let projected = projected_rows(&system, &BTreeSet::from([fresh]), budget)?;
+    let projected = projected_rows(facts, &pinned, &BTreeSet::from([fresh]), budget)?;
     let mut best: Option<i128> = None;
     for row in &projected {
         if row.terms.is_empty() {
@@ -378,7 +377,7 @@ fn candidate(
     constraints: &[Linear],
     budget: &mut Budget,
 ) -> Result<Option<BTreeMap<Var, i128>>, Unsure> {
-    let Dense { mut rows, names } = dense(constraints, &mut budget.scratch)?;
+    let Dense { mut rows, names } = dense(constraints, &[], &mut budget.scratch)?;
     let vars = names.len();
     let mut stages = Vec::with_capacity(vars);
     let mut remaining: Vec<Var> = (0..vars).collect();

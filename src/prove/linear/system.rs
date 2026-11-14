@@ -410,8 +410,8 @@ pub struct Dense {
     pub names: Vec<Var>,
 }
 
-pub fn dense(constraints: &[Linear], scratch: &mut Scratch) -> Result<Dense, Unsure> {
-    let rows: Vec<Row> = constraints.iter().map(Row::of).collect();
+pub fn dense(facts: &[Linear], extra: &[Linear], scratch: &mut Scratch) -> Result<Dense, Unsure> {
+    let rows: Vec<Row> = facts.iter().chain(extra).map(Row::of).collect();
     let names = variables(&rows);
     let renamed = rows.iter().map(|row| row.renamed(&names)).collect();
     let prepared = prepare(renamed, names.len(), scratch)?;
