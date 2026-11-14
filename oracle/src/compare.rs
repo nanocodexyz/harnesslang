@@ -4,8 +4,9 @@ use std::fmt;
 use nanocode_turnlog::{EffectClass, Effects, Fold, Phase, Record, Status};
 use serde_json::Value;
 
+use crate::cell_check::{self, SiteOutput};
 use crate::journal::{self, Lines};
-use crate::summary::{self, CheckpointSummary, Header, Line, Recovery, TurnSummary};
+use crate::summary::{self, CellSummary, CheckpointSummary, Header, Line, Recovery, TurnSummary};
 
 const BUILTIN_NONE_TOOLS: [&str; 2] = ["now", "random"];
 
@@ -38,6 +39,10 @@ pub struct Tally {
     pub open_external_prefixes: u64,
     pub rejected: u64,
     pub targets: BTreeMap<String, u64>,
+    pub cell_records: u64,
+    pub cells_finished: u64,
+    pub nested_unknown: u64,
+    pub differentials: u64,
 }
 
 impl fmt::Display for Tally {
@@ -54,7 +59,7 @@ impl fmt::Display for Tally {
             .collect();
         write!(
             formatter,
-            "journals={} records={} turns={} failed_turns={} calls={} replies={} recoveries={} unknown={} prefixes_with_open_external={} rejected_by_both={} targets={}",
+            "journals={} records={} turns={} failed_turns={} calls={} replies={} recoveries={} unknown={} prefixes_with_open_external={} rejected_by_both={} cell_records={} cells_finished={} nested_unknown={} djs_replays={} targets={}",
             self.journals,
             self.records,
             self.turns,
@@ -65,6 +70,10 @@ impl fmt::Display for Tally {
             self.unknown,
             self.open_external_prefixes,
             self.rejected,
+            self.cell_records,
+            self.cells_finished,
+            self.nested_unknown,
+            self.differentials,
             targets.join(",")
         )
     }
@@ -147,6 +156,7 @@ struct Check<'a> {
     effects: Effects,
     fold: Fold,
     classes: BTreeMap<String, EffectClass>,
+    unknown_nested: BTreeMap<String, BTreeSet<u64>>,
     tally: &'a mut Tally,
     found: &'a mut Vec<Disagreement>,
 }
@@ -239,6 +249,7 @@ impl<'a> Check<'a> {
             effects,
             fold: Fold::default(),
             classes: BTreeMap::new(),
+            unknown_nested: BTreeMap::new(),
             tally,
             found,
         }
@@ -268,7 +279,11 @@ impl<'a> Check<'a> {
             return false;
         };
         self.before(index, &record);
-        let applied = self.fold.apply(&record, None);
+        let applied = self
+            .fold
+            .apply(&record, None)
+            .map_err(|error| error.to_string())
+            .and_then(|()| self.cell_accepts(&record));
         let ok = match (line, applied) {
             (Line::Rejected { record: at, .. }, Err(_)) if *at == index => {
                 self.tally.rejected += 1;
@@ -309,6 +324,10 @@ impl<'a> Check<'a> {
                 self.checkpoint(index, checkpoint);
                 true
             }
+            (Line::Cell { cell, record: at }, Ok(())) if *at == index => {
+                self.cell(index, cell, &record);
+                true
+            }
             (other, Ok(())) => {
                 self.disagree(
                     Some(index),
@@ -344,9 +363,9 @@ impl<'a> Check<'a> {
             Record::Call {
                 call_id,
                 effect,
+                input,
                 tool,
                 turn,
-                ..
             } => {
                 let expected = self.effects.of(tool);
                 if *effect != expected {
@@ -358,6 +377,14 @@ impl<'a> Check<'a> {
                 if self.classes.insert(call_id.clone(), *effect).is_some() {
                     self.disagree(Some(index), format!("call {call_id} is recorded twice"));
                 }
+                if let Some(what) = cell_check::durable_before_dispatch(
+                    &self.fold,
+                    call_id,
+                    tool,
+                    &raw(input.get()),
+                ) {
+                    self.disagree(Some(index), what);
+                }
                 *self.tally.calls.entry(class_name(*effect)).or_default() += 1;
             }
             Record::Model { .. } => self.tally.replies += 1,
@@ -366,7 +393,11 @@ impl<'a> Check<'a> {
                 turn,
                 unknown,
                 ..
-            } => self.recovery(index, *attempt, turn, unknown),
+            } => {
+                self.recovery(index, *attempt, turn, unknown);
+                self.note_unknown_nested(unknown);
+            }
+            Record::Result { call_id, output } => self.site_result(index, call_id, output.get()),
             Record::Status { status, turn } => {
                 let open = self.open_calls(turn);
                 if !open.is_empty() {
@@ -490,6 +521,98 @@ impl<'a> Check<'a> {
         wrong
     }
 
+    fn cell_accepts(&self, record: &Record) -> Result<(), String> {
+        match record {
+            Record::Cell { cell, session, .. } => cell_check::accepts(&self.fold, session, *cell),
+            _ => Ok(()),
+        }
+    }
+
+    fn cell(&mut self, index: usize, ours: &CellSummary, record: &Record) {
+        let Record::Cell { cell, session, .. } = record else {
+            self.disagree(
+                Some(index),
+                format!(
+                    "the interpreter summarises cell {} for a record that is not a cell",
+                    ours.cell
+                ),
+            );
+            return;
+        };
+        self.tally.cell_records += 1;
+        let view = match cell_check::view(&self.fold, session, *cell) {
+            Ok(view) => view,
+            Err(error) => return self.disagree(Some(index), error),
+        };
+        for what in cell_check::compare(&view, ours) {
+            self.disagree(Some(index), format!("cell {cell}: {what}"));
+        }
+        if !view.journal.finished {
+            return;
+        }
+        self.tally.cells_finished += 1;
+        let listed = self
+            .unknown_nested
+            .remove(&view.journal.origin_call_id)
+            .unwrap_or_default();
+        self.tally.nested_unknown += listed.len() as u64;
+        for what in cell_check::unknown_delivered(&view.journal, &listed) {
+            self.disagree(Some(index), what);
+        }
+        let open = cell_check::open_running(&view.journal);
+        if !open.is_empty() {
+            self.disagree(
+                Some(index),
+                format!("cell {cell} finishes with nested calls still running: {open:?}"),
+            );
+        }
+    }
+
+    fn note_unknown_nested(&mut self, unknown: &[String]) {
+        for call_id in unknown {
+            if let Some((origin, id)) = cell_check::nested(call_id) {
+                self.unknown_nested
+                    .entry(origin.to_owned())
+                    .or_default()
+                    .insert(id);
+            }
+        }
+    }
+
+    fn site_result(&mut self, index: usize, call_id: &str, output: &str) {
+        let Some(view) = cell_check::by_origin(&self.fold, call_id) else {
+            return;
+        };
+        if !view.journal.finished {
+            return self.disagree(
+                Some(index),
+                format!("code site {call_id} has a result before its cell finished"),
+            );
+        }
+        let site = match raw(output) {
+            Value::Object(map) => match (map.get("ok"), map.get("failed")) {
+                (Some(Value::String(text)), None) => SiteOutput::Ok(text.clone()),
+                (None, Some(_)) => SiteOutput::Failed,
+                _ => {
+                    return self.disagree(
+                        Some(index),
+                        format!("code site {call_id} has a result that is neither ok text nor failed: {output}"),
+                    );
+                }
+            },
+            _ => {
+                return self.disagree(
+                    Some(index),
+                    format!("code site {call_id} has a result that is not an object: {output}"),
+                );
+            }
+        };
+        self.tally.differentials += 1;
+        if let Err(what) = cell_check::differential(&view.journal, &site) {
+            self.disagree(Some(index), what);
+        }
+    }
+
     fn checkpoint(&mut self, index: usize, ours: &CheckpointSummary) {
         let revision = self
             .fold
@@ -542,6 +665,18 @@ impl<'a> Check<'a> {
                     "the interpreter's run passed but nanocode's fold holds calls open {open:?}"
                 ),
             );
+        }
+        let cells: Vec<(String, u64)> = self
+            .fold
+            .cells()
+            .map(|(session, cell, _)| (session.to_owned(), cell))
+            .collect();
+        for (session, cell) in cells {
+            let finished =
+                cell_check::view(&self.fold, &session, cell).map(|view| view.journal.finished);
+            if finished != Ok(true) {
+                self.disagree(None, format!("the interpreter's run passed but cell {cell} of {session} is not finished: {finished:?}"));
+            }
         }
     }
 }

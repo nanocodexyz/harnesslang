@@ -55,6 +55,18 @@ pub struct CheckpointSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellSummary {
+    pub calls: BTreeMap<u64, String>,
+    pub cell: u64,
+    pub entries: Vec<Value>,
+    pub finished: bool,
+    pub origin: String,
+    pub seq: u64,
+    pub unknown: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Line {
     Turn {
@@ -64,6 +76,10 @@ pub enum Line {
     },
     Checkpoint {
         checkpoint: CheckpointSummary,
+        record: usize,
+    },
+    Cell {
+        cell: CellSummary,
         record: usize,
     },
     Rejected {

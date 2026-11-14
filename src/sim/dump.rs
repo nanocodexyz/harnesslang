@@ -75,6 +75,13 @@ fn tools_json(program: &Program) -> Json {
         );
         tools.insert(tool.name.clone(), Json::text(tool.effect.name()));
     }
+    for code in &program.codes {
+        let previous = tools.insert(code.name.clone(), Json::text(EffectClass::None.name()));
+        assert!(
+            previous.is_none(),
+            "the checker refuses a code tool named like a tool"
+        );
+    }
     Json::Object(tools)
 }
 

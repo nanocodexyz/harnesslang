@@ -1,3 +1,4 @@
+mod cell_check;
 mod cells;
 mod compare;
 mod djs;
