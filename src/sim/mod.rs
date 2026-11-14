@@ -194,6 +194,7 @@ fn run_seed_unguarded(
     let mut world = SimWorld::new(program, target, mutation, seed, true);
     if strict != strict::Mode::Off {
         world.edges = Some(Edges::of(program));
+        world.greedy = Rng::derive(seed, "persona").chance(strict::GREEDY_MODEL_PPM);
     }
     if strict == strict::Mode::FromAny {
         let edges = world.edges.clone().expect("set above");

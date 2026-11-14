@@ -62,6 +62,7 @@ pub struct SimWorld<'a> {
     pub stats: Stats,
     pub trace: Option<Trace>,
     pub edges: Option<Edges>,
+    pub greedy: bool,
     pub worst_faults: Vec<String>,
     run_effects: u64,
     run_outbound: u64,
@@ -98,6 +99,7 @@ impl<'a> SimWorld<'a> {
             stats: Stats::default(),
             trace: None,
             edges: None,
+            greedy: false,
             worst_faults: Vec::new(),
             run_effects: 0,
             run_outbound: 0,
@@ -554,17 +556,19 @@ impl SimWorld<'_> {
             .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
-        if rng.chance(ANSWER_PPM) {
+        if !self.greedy && rng.chance(ANSWER_PPM) {
             return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
         }
-        let over_ppm = if self.edges.is_some() {
-            strict::OVER_CAPACITY_PPM
-        } else {
-            OVER_CAPACITY_PPM
+        let over_ppm = match (self.greedy, self.edges.is_some()) {
+            (true, _) => 0,
+            (false, true) => strict::OVER_CAPACITY_PPM,
+            (false, false) => OVER_CAPACITY_PPM,
         };
         let over = rng.chance(over_ppm);
         let count = if over {
             request.calls_max + 1
+        } else if self.greedy {
+            request.calls_max
         } else {
             rng.range(1, request.calls_max.max(1))
         };

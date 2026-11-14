@@ -17,6 +17,7 @@ pub const OVER_CAPACITY_PPM: u64 = 50_000;
 pub const EDGE_PPM: u64 = 500_000;
 pub const ALLOWED_TRAPS: [&str; 2] = ["requires(", "model reply: "];
 pub const ENTRY_DRAWS_MAX: u64 = 64;
+pub const GREEDY_MODEL_PPM: u64 = 250_000;
 const U64_BITS: u64 = u64::BITS as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
