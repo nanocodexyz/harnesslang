@@ -299,7 +299,12 @@ fn planned_tree(
             .position(|declared| declared.name == spawn.handler)
             .expect("the checker spawns only a handler the child harness declares");
         let child = &child_program.handlers[index];
-        let child_chain = format!("{chain} > {} runs {}.{}", tool.name, spawn.harness(), spawn.handler);
+        let child_chain = format!(
+            "{chain} > {} runs {}.{}",
+            tool.name,
+            spawn.harness(),
+            spawn.handler
+        );
         let child_tree = planned_tree(
             descent,
             child_program,
@@ -356,9 +361,15 @@ fn planned_tree(
         widest.requests = widest.requests.max(child_tree.requests);
         widest.sessions = widest.sessions.max(child_tree.sessions);
     }
-    tree.records = tree.records.checked_add(spawns.checked_mul(widest.records)?)?;
-    tree.requests = tree.requests.checked_add(spawns.checked_mul(widest.requests)?)?;
-    tree.sessions = tree.sessions.checked_add(spawns.checked_mul(widest.sessions)?)?;
+    tree.records = tree
+        .records
+        .checked_add(spawns.checked_mul(widest.records)?)?;
+    tree.requests = tree
+        .requests
+        .checked_add(spawns.checked_mul(widest.requests)?)?;
+    tree.sessions = tree
+        .sessions
+        .checked_add(spawns.checked_mul(widest.sessions)?)?;
     Some(tree)
 }
 

@@ -38,6 +38,7 @@ pub struct Options {
     pub twice: bool,
     pub mutation: Mutation,
     pub strict: strict::Mode,
+    pub scope: String,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +166,15 @@ pub fn run_seed_traced(
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
-    run_seed_checked(program, target, mutation, strict::Mode::Off, seed, trace)
+    run_seed_checked(
+        program,
+        target,
+        mutation,
+        strict::Mode::Off,
+        "",
+        seed,
+        trace,
+    )
 }
 
 pub fn run_seed_checked(
@@ -173,11 +182,12 @@ pub fn run_seed_checked(
     target: Target,
     mutation: Mutation,
     strict: strict::Mode,
+    scope: &str,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_seed_unguarded(program, target, mutation, strict, seed, trace)
+        run_seed_unguarded(program, target, mutation, strict, scope, seed, trace)
     }));
     ran.unwrap_or_else(|payload| {
         let detail = payload
@@ -204,6 +214,7 @@ fn run_seed_unguarded(
     target: Target,
     mutation: Mutation,
     strict: strict::Mode,
+    scope: &str,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
@@ -215,6 +226,7 @@ fn run_seed_unguarded(
     };
     let turns = workload.range(1, turns_max);
     let mut world = SimWorld::new(program, target, mutation, seed, true);
+    world.scope = scope.to_owned();
     if strict != strict::Mode::Off {
         world.edges = Some(Edges::of(program));
         world.greedy = Rng::derive(seed, "persona").chance(strict::GREEDY_MODEL_PPM);
@@ -230,12 +242,16 @@ fn run_seed_unguarded(
     world.trace = trace;
     let profile_name = world.profile.name;
     world.record("seed", || {
-        vec![
+        let mut fields = vec![
             ("seed", Json::Number(seed)),
             ("target", Json::text(target.name())),
             ("mutation", Json::text(mutation.name())),
             ("profile", Json::text(profile_name)),
-        ]
+        ];
+        if !scope.is_empty() {
+            fields.push(("scope", Json::text(scope)));
+        }
+        fields
     });
     let faulty = world.profile.crash_ppm > 0 || world.profile.lease_ppm > 0;
     let profile = world.profile.name;
@@ -292,6 +308,7 @@ fn run_seed_unguarded(
             target,
             mutation,
             strict,
+            scope,
             seed,
             records,
             &world.acks,
@@ -332,6 +349,7 @@ fn sequential_twin(
     target: Target,
     mutation: Mutation,
     strict: strict::Mode,
+    scope: &str,
     seed: u64,
     records: &[Record],
     acks: &[Finish],
@@ -341,7 +359,7 @@ fn sequential_twin(
         !twin.has_parallel(),
         "the sequential twin runs one call at a time"
     );
-    let (run, _) = run_seed_unguarded(&twin, target, mutation, strict, seed, None);
+    let (run, _) = run_seed_unguarded(&twin, target, mutation, strict, scope, seed, None);
     if invariants::trapped_in_body(&run.acks) {
         return Ok(());
     }
@@ -490,6 +508,7 @@ pub fn sweep_traced(
             options.target,
             options.mutation,
             options.strict,
+            &options.scope,
             seed,
             trace,
         );
@@ -508,6 +527,7 @@ pub fn sweep_traced(
                 options.target,
                 options.mutation,
                 options.strict,
+                &options.scope,
                 seed,
                 None,
             );

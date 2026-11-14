@@ -7,6 +7,13 @@ targets="${RUST_DIFF_TARGETS:-native-jsonl native-sqlite server-postgres}"
 files="${RUST_DIFF_FILES:-$(echo examples/*.hl)}"
 opt="${RUST_DIFF_OPT:-2}"
 plant="${RUST_DIFF_PLANT:-none}"
+scope="${RUST_DIFF_SCOPE:-}"
+scope_args=()
+suffix=
+if [ -n "$scope" ]; then
+  scope_args=(--scope "$scope")
+  suffix=-scoped
+fi
 hl=target/release/hl
 out=output/rust-diff/$plant
 mkdir -p "$out"
@@ -29,6 +36,7 @@ plant_expression() {
     mode_dropped) echo 's/                    mode: site.mode,$/                    mode: None,/' ;;
     text_before_whole) echo 's/Some((before, _)) => before.to_owned(),/Some(_) => subject.clone(),/' ;;
     blob_unjournaled) echo 's/Json::object(\[(BLOB_KEY, Json::text(\&digest)), (DATA_KEY, Json::text(base64))\])/digest_json(\&digest)/' ;;
+    grandchild_unscoped) echo 's/^    if scope.is_empty() {$/    if true {/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }
@@ -71,7 +79,7 @@ diff_one() {
   local file=$1 target=$2
   local name
   name=$(basename "$file" .hl)
-  local dir="$out/$target-$name"
+  local dir="$out/$target-$name$suffix"
   build "$file" "$target" "$dir"
   local fifo="$dir/trace"
   rm -f "$fifo"
@@ -81,7 +89,7 @@ diff_one() {
   local status=0
   local started ended
   started=$(date +%s%N)
-  "$hl" sim --target "$target" --seeds "$seeds" --trace "$fifo" "$file" > "$dir/sim.log" 2>&1 || status=$?
+  "$hl" sim --target "$target" --seeds "$seeds" --trace "$fifo" "${scope_args[@]}" "$file" > "$dir/sim.log" 2>&1 || status=$?
   wait "$driver" || status=1
   ended=$(date +%s%N)
   rm -f "$fifo"

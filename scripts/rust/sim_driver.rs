@@ -103,6 +103,7 @@ pub struct Driver {
     pub acks: u64,
     pub stats: Stats,
     pub store: store::State,
+    pub scope: String,
 }
 
 impl Driver {
@@ -238,6 +239,10 @@ fn step_from(json: &Json) -> Step {
 }
 
 impl World for Driver {
+    fn scope(&self) -> String {
+        self.scope.clone()
+    }
+
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
         let event = self.events.next("hook");
         let (name, kind, effect) = point_fields(point);
@@ -473,10 +478,18 @@ fn main() {
         acks: 0,
         stats: Stats::default(),
         store: store::State::default(),
+        scope: String::new(),
     };
     while let Some(event) = driver.events.peek().cloned() {
         let seed = driver.events.next("seed");
         expect(&seed, "target", &Json::text(program::TARGET));
+        driver.scope = match seed.get("scope") {
+            None => String::new(),
+            Some(scope) => scope
+                .as_str()
+                .unwrap_or_else(|| fail("a seed's scope is text"))
+                .to_owned(),
+        };
         let _ = event;
         driver.opened.clear();
         driver.request = None;

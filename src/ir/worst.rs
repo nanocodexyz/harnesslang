@@ -102,13 +102,10 @@ pub fn family_with(
                 loops: spawns.loops.clone(),
             })?;
     }
-    let sessions = spawns
-        .total
-        .checked_mul(sessions)
-        .ok_or_else(|| Overflow {
-            measure: MEASURES[5],
-            loops: spawns.loops.clone(),
-        })?;
+    let sessions = spawns.total.checked_mul(sessions).ok_or_else(|| Overflow {
+        measure: MEASURES[5],
+        loops: spawns.loops.clone(),
+    })?;
     Ok(Some(Family {
         child,
         total,

@@ -6,6 +6,13 @@ seeds="${JS_DIFF_SEEDS:-0..2000}"
 targets="${JS_DIFF_TARGETS:-cloudflare vercel}"
 files="${JS_DIFF_FILES:-$(echo examples/*.hl)}"
 plant="${JS_DIFF_PLANT:-none}"
+scope="${JS_DIFF_SCOPE:-}"
+scope_args=()
+suffix=
+if [ -n "$scope" ]; then
+  scope_args=(--scope "$scope")
+  suffix=-scoped
+fi
 hl=target/release/hl
 out=output/js-diff/$plant
 mkdir -p "$out"
@@ -22,6 +29,7 @@ plant_expression() {
     mode_dropped) echo 's/world.model({ turn: this.turn, seq, callsMax, mode: site.mode,/world.model({ turn: this.turn, seq, callsMax, mode: null,/' ;;
     blob_unjournaled) echo 's/this.blobs.journaled(data, true)/this.blobs.journaled(data, false)/' ;;
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
+    grandchild_unscoped) echo 's/return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };/return { tag: "ok", value: key };/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }
@@ -29,7 +37,7 @@ plant_expression() {
 diff_one() {
   local file=$1 target=$2
   local dir started ended
-  dir="$out/$target-$(basename "$file" .hl)"
+  dir="$out/$target-$(basename "$file" .hl)$suffix"
   mkdir -p "$dir"
   "$hl" emit --target "$target" "$file" | sed "$(plant_expression "$plant")" > "$dir/harness.mjs"
   if [ "$plant" != none ] && cmp -s <("$hl" emit --target "$target" "$file") "$dir/harness.mjs"; then
@@ -37,7 +45,7 @@ diff_one() {
     return 1
   fi
   started=$(date +%s%N)
-  if ! "$hl" sim --target "$target" --seeds "$seeds" --trace "$dir/trace.jsonl" "$file" > "$dir/sim.log" 2>&1; then
+  if ! "$hl" sim --target "$target" --seeds "$seeds" --trace "$dir/trace.jsonl" "${scope_args[@]}" "$file" > "$dir/sim.log" 2>&1; then
     echo "js-diff: the interpreter failed $file on $target:" >&2
     cat "$dir/sim.log" >&2
     return 1

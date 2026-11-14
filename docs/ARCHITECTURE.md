@@ -139,9 +139,12 @@ An effect is anything whose result the program cannot recompute: a tool, the
 model, `now()`, `random()`, `wait(c)` (and `wait(e) at most c`) and `suspend(key)`. Each effect site is
 journaled. A `spawn` tool (`spawn name runs handler from "file"`) is an external
 tool whose `ok` result the runtime records as the child's key, its own turn
-and sequence number `T.S`; the host keeps the child's session under the
-parent's and that key, and `join(key)`, a suspend, ends the parent's run until
-the child's completion resumes it with the child's result.
+and sequence number `T.S` (`K/T.S` in a session spawned under key `K`, so a
+family of any depth keys every session apart); the host keeps the child's
+session under that key, and `join(key)`, a suspend, ends the parent's run until
+the child's completion resumes it with the child's result. A child may spawn
+in turn when its spawn tool declares `sessions at most c`, which bounds the
+sessions of the tree one call starts.
 
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
@@ -659,8 +662,7 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
-- Subagent trees deeper than one level (a spawned harness spawns nothing
-  today), side questions answered from a snapshot of the transcript, and the
+- Side questions answered from a snapshot of the transcript, and the
   simulator at 100K children.
 - Waits as durable sleeps outside the run: on Vercel a workflow `sleep()`
   between steps and on Cloudflare the object's alarm, so a wait spends no

@@ -16,7 +16,7 @@ const SUMMARIZED_RESULT: &str = "summarized";
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -131,6 +131,7 @@ struct Flags {
     arguments: Vec<String>,
     seed: u64,
     trace: Option<String>,
+    scope: String,
     dump: Option<String>,
     summarize: Option<String>,
     exhaustive: bool,
@@ -151,6 +152,7 @@ fn flags(args: &[String]) -> Option<Flags> {
         arguments: Vec::new(),
         seed: 0,
         trace: None,
+        scope: String::new(),
         dump: None,
         summarize: None,
         exhaustive: false,
@@ -170,6 +172,7 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--arg" => flags.arguments.push(rest.next()?.clone()),
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
             "--trace" => flags.trace = Some(rest.next()?.clone()),
+            "--scope" => flags.scope = rest.next()?.clone(),
             "--dump-journal" => flags.dump = Some(rest.next()?.clone()),
             "--summarize" => flags.summarize = Some(rest.next()?.clone()),
             "--exhaustive" => flags.exhaustive = true,
@@ -530,6 +533,7 @@ fn sim_command(args: &[String]) -> ExitCode {
             (true, true) => sim::strict::Mode::FromAny,
             (false, true) => return usage(),
         },
+        scope: flags.scope.clone(),
     };
     let summary = match &flags.trace {
         None => sim::sweep(&program, &options),

@@ -64,7 +64,7 @@ function parseTrace(path) {
     const event = rt.decodeJson(line);
     if (rt.encodeJson(event) !== line) throw new Error(`the JavaScript codec does not round-trip trace line ${short(line)}`);
     if (event.event === "seed") {
-      current = { seed: event.seed, profile: event.profile, events: [], acks: [], turns: 0 };
+      current = { seed: event.seed, profile: event.profile, scope: event.scope, events: [], acks: [], turns: 0 };
       seeds.push(current);
     }
     if (event.event === "ack") current.acks.push(event);
@@ -387,6 +387,13 @@ class Seed {
   }
 }
 
+function turnBody(seed, turn) {
+  const body = Object.assign(Object.create(null), { arguments: turn.arguments, handler: turn.handler });
+  if (seed.seed.scope !== undefined) body.scope = seed.seed.scope;
+  body.turn = turn.turn;
+  return rt.encodeJson(body);
+}
+
 function statusIn(lines, turn) {
   let found = null;
   for (const line of lines) {
@@ -506,7 +513,7 @@ async function cloudflareSeed(seed) {
   while (seed.cursor.peek()?.event === "turn") {
     const turn = seed.cursor.next("turn", "next turn");
     seed.stats.turns += 1;
-    const body = rt.encodeJson(Object.assign(Object.create(null), { arguments: turn.arguments, handler: turn.handler, turn: turn.turn }));
+    const body = turnBody(seed, turn);
     let first = true;
     for (;;) {
       seed.opening(storage.medium());
@@ -689,7 +696,7 @@ async function vercelSeed(seed) {
   while (seed.cursor.peek()?.event === "turn") {
     const turn = seed.cursor.next("turn", "next turn");
     seed.stats.turns += 1;
-    state.requests.push(rt.encodeJson(Object.assign(Object.create(null), { arguments: turn.arguments, handler: turn.handler, turn: turn.turn })));
+    state.requests.push(turnBody(seed, turn));
     for (;;) {
       seed.opening(state.lines().map((line) => line + "\n").join(""));
       const workflow = new SimWorkflow(seed, state);

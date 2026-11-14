@@ -65,7 +65,9 @@ notice_dropped docs/snippets/catalog.hl --twice checkpoint_compacted
 search_unchecked docs/snippets/catalog.hl --twice search_listed
 discovery_unchecked docs/snippets/catalog.hl --twice tool_admitted
 blob_unjournaled docs/snippets/images.hl --twice blob_journaled
-blobs_unevicted docs/snippets/images.hl --twice checkpoint_compacted"
+blobs_unevicted docs/snippets/images.hl --twice checkpoint_compacted
+grandchild_unscoped docs/snippets/tree.hl --twice child_scoped
+family_one_level docs/snippets/tree.hl --twice family_bounded"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
@@ -87,7 +89,9 @@ js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
 js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
 js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal
 rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal"
+js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal
+rust grandchild_unscoped docs/snippets/tree_planner.hl native-jsonl,native-sqlite,server-postgres backend_equal 1.1
+js grandchild_unscoped docs/snippets/tree_planner.hl cloudflare,vercel backend_equal 1.1"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 
@@ -193,9 +197,9 @@ diff_targets() {
 }
 
 diff_run() {
-  local backend=$1 plant=$2 file=$3 target=$4 seeds=$5 prefix
+  local backend=$1 plant=$2 file=$3 target=$4 seeds=$5 scope=$6 prefix
   prefix=$(tr '[:lower:]' '[:upper:]' <<< "$backend")_DIFF
-  env "${prefix}_PLANT=$plant" "${prefix}_TARGETS=$target" "${prefix}_FILES=$file" "${prefix}_SEEDS=$seeds" "$(diff_script "$backend")" 2>&1
+  env "${prefix}_PLANT=$plant" "${prefix}_TARGETS=$target" "${prefix}_FILES=$file" "${prefix}_SEEDS=$seeds" "${prefix}_SCOPE=$scope" "$(diff_script "$backend")" 2>&1
 }
 
 diff_plants_of() {
@@ -210,12 +214,12 @@ diff_census() {
     if [ "$(diff_plants_of "$backend")" != "$planted" ]; then
       census_fail "the plants of $(diff_script "$backend") and the $backend plans of scripts/mutations.sh differ"
     fi
-    while read -r _ plant file targets _; do
+    while read -r _ plant file targets _ scope; do
       for target in $(diff_targets "$backend"); do
         grep -qw "$target" <<< "${targets//,/ }" && continue
         grep -q "^$backend $plant $target: " <<< "$diff_exempt" && continue
         set +e
-        output=$(diff_run "$backend" "$plant" "$file" "$target" 0..0)
+        output=$(diff_run "$backend" "$plant" "$file" "$target" 0..0 "$scope")
         set -e
         grep -q "plant $plant changes nothing in $file for $target" <<< "$output" ||
           census_fail "$backend plant $plant changes $file on $target, which its plan leaves out without an exemption"
@@ -234,13 +238,13 @@ diff_caught_by() {
 }
 
 diff_one() {
-  local backend plant target file targets expected output status invariant
+  local backend plant target file targets expected scope output status invariant
   IFS=: read -r backend plant target <<< "$1"
-  read -r _ _ file targets expected <<< "$(awk -v b="$backend" -v p="$plant" '$1 == b && $2 == p' <<< "$diff_plans")"
+  read -r _ _ file targets expected scope <<< "$(awk -v b="$backend" -v p="$plant" '$1 == b && $2 == p' <<< "$diff_plans")"
   [ -n "$file" ] || { echo "mutations: $backend plant $plant has no plan" >&2; exit 1; }
   grep -qw "$target" <<< "${targets//,/ }" || { echo "mutations: $backend plant $plant plans no $target" >&2; exit 1; }
   set +e
-  output=$(diff_run "$backend" "$plant" "$file" "$target" "$diff_seeds")
+  output=$(diff_run "$backend" "$plant" "$file" "$target" "$diff_seeds" "$scope")
   status=$?
   set -e
   invariant=$(diff_caught_by "$output")

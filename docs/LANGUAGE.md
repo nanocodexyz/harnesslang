@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `sessions` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -554,7 +554,7 @@ model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "m
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
-spawn      = "spawn" name "runs" name "from" text ;
+spawn      = "spawn" name "runs" name "from" text [ "sessions" "at" "most" name ] ;
 hook       = ( "before" | "after" ) "tool" params block ;
 lifecycle  = "on" ( "session" "start" | "prompt" "submit" | "pre" "compact" | "post" "compact"
                   | "stop" | "subagent" "start" | "subagent" "stop" ) [ params ] block
@@ -3698,7 +3698,7 @@ name. It is external in class, so its call record is durable before the host
 starts the child, and a crash then leaves it `unknown`, never started twice.
 
 - The key is the spawn's place in the parent's journal, `T.S` for turn `T` and
-  sequence number `S`: the host keeps the child's session and journal under the
+  sequence number `S` (under the parent's own key in a [tree](#spawn-trees)): the host keeps the child's session and journal under the
   parent's session and that key, and the runtime records the key as the
   spawn's `ok` result whatever the host answers, so a replay names the same
   child.
@@ -3710,8 +3710,8 @@ starts the child, and a crash then leaves it `unknown`, never started twice.
   each child's worst case to the parent's. The prover counts the same spawns on
   the plan and checks the child's outbound requests against the target's limit
   per invocation, since each child runs in its own.
-- A spawned harness declares no spawn tool of its own, so a parent's worst case
-  holds every session it can start.
+- A spawned harness may spawn children of its own, so a family is a tree
+  ([below](#spawn-trees)).
 
 ```hl docs/snippets/spawn.hl
 harness coordinator
@@ -3811,6 +3811,150 @@ of `examples/subagents.hl` on every target replay the same answers.
 `examples/subagents.hl` ports nanocode's subagent runtime: `spawn_agent` starts
 `examples/subagent_child.hl`, `wait_agent` joins the child the model names, and
 `on subagent start` and `on subagent stop` keep its roster.
+
+#### Spawn trees
+
+A child may spawn children of its own. `docs/snippets/tree.hl` starts a
+planner, which starts two reviewers of `spawn_child.hl` one after the other and
+joins each, so one review is a tree of three sessions under the lead:
+
+```hl docs/snippets/tree.hl
+harness lead
+
+const tree_sessions_max: u64 = 3
+
+type outcome = planned(text) | lost(text)
+
+spawn planner runs plan_change from "tree_planner.hl" sessions at most tree_sessions_max
+
+on resume
+
+on review(change: text) -> outcome {
+  match planner(change) {
+    ok(agent) => {
+      let verdict = join(agent)
+      return planned(verdict)
+    }
+    failed(error) => { return lost(error) }
+    unknown => { return lost("the spawn's outcome is unknown") }
+  }
+}
+```
+
+```hl docs/snippets/tree_planner.hl
+harness planner
+
+const parts_max: u64 = 2
+
+type verdict = planned(text) | lost(text)
+
+spawn reviewer runs review_change from "spawn_child.hl"
+
+on resume
+
+state {
+  notes: text
+}
+
+on plan_change(change: text) -> verdict {
+  notes = ""
+  loop part below parts_max {
+    match reviewer(change) {
+      ok(agent) => {
+        let notes_of_part = join(agent)
+        notes = notes ++ notes_of_part
+      }
+      failed(error) => { return lost(error) }
+      unknown => { return lost("the spawn's outcome is unknown") }
+    }
+  }
+  return planned(notes)
+}
+```
+
+- Keys are scoped. A session spawned under key `K` records its own children
+  as `K/T.S`, so every key of a family names one session and a host can keep
+  each session under its key alone. The host tells a session its key:
+  `Host::scope` in the generated Rust, and the turn request's `scope` field on
+  Cloudflare and Vercel. A root session's scope is empty, so its keys stay
+  `T.S`.
+- A spawn whose child spawns says how many sessions one call may start, the
+  child's and every descendant's: `sessions at most c`. `hl check` computes
+  the family from the bottom up, each child's family times the spawns that
+  reach it, refuses a spawn tool whose tree passes its `c`, and prints the
+  whole tree's totals and its sessions.
+- The prover lowers every descendant's handler for the same target and
+  recomputes the family from the plans, independently of the IR: records,
+  outbound requests and sessions on each plan's longest path, times the spawns
+  on its parent's. It checks the result against what `hl check` counts, each
+  descendant's outbound requests against the target's limit per invocation,
+  and each spawn's tree against its `sessions at most`, with the path of
+  spawns that passes it.
+- The files of a tree form no cycle, and a tree is at most `spawn_depth_max`
+  (16) levels deep, which bounds the checker's walk down the files. nanocode
+  bounds no depth (`DEFAULT_MAX_SUBAGENTS` is `usize::MAX`) but keeps at most
+  `DEFAULT_MAX_RESIDENT_SUBAGENTS` (16) subagents resident in a root
+  session's tree.
+
+```console
+$ hl check --target cloudflare docs/snippets/tree.hl | grep sessions
+    child sessions: 1, no loops
+      planner runs planner.plan_change: worst case 6 effects, 21 journal records, 4 outbound requests each, 3 sessions with its descendants (sessions at most tree_sessions_max (3))
+    with its child sessions: 8 effects, 28 journal records, 5 outbound requests
+    sessions in its tree: 3, 2 levels below it
+  proved handler review on cloudflare: worst_case: 3 sessions in its tree on the plans' longest paths, 28 journal records and 5 outbound requests with them, as hl check counts; every spawn within its sessions at most
+$ hl check examples/invalid/family_sessions.hl
+examples/invalid/family_sessions.hl:7:37: error: spawn tool 'planner' starts up to 3 sessions per call (planner.plan_change and 2 descendant sessions, part below parts_max (2)), over sessions at most two_sessions (2)
+$ hl check docs/snippets/errors/spawn-sessions.hl
+docs/snippets/errors/spawn-sessions.hl:3:37: error: handler 'plan_change' of harness 'planner' starts child sessions of its own: declare how many sessions one call of 'planner' starts, the child's and its descendants', as spawn planner runs plan_change from "../tree_planner.hl" sessions at most constant
+$ hl check docs/snippets/errors/spawn-cycle.hl
+docs/snippets/errors/spawn-cycle.hl:5:28: error: spawn tool 'again' cannot check "spawn-cycle.hl": docs/snippets/errors/spawn-cycle.hl: error: the spawn tree returns to a harness it is inside, so its sessions have no bound: docs/snippets/errors/spawn-cycle.hl spawns docs/snippets/errors/spawn-cycle.hl
+```
+
+```hl docs/snippets/errors/spawn-sessions.hl
+harness lead
+
+spawn planner runs plan_change from "../tree_planner.hl"
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/spawn-cycle.hl
+harness echo
+
+const echoes_max: u64 = 4
+
+spawn again runs ping from "spawn-cycle.hl" sessions at most echoes_max
+
+on ping() -> u64 { return 1 }
+```
+
+The simulator runs a grandchild as it runs a child, as a session of its own
+with a seed derived from its parent's, its own faults and every invariant,
+under its key's scope. `CHILD_SESSIONS_PER_SEED_MAX` bounds the sessions of
+the whole tree per seed, as nanocode's resident limit holds for a root
+session's whole tree. `child_scoped` holds at every level, and
+`family_bounded` requires the sessions a turn's tree starts to stay within its
+handler's family worst case, and each spawn's within its `sessions at most`.
+`grandchild_unscoped`, a runtime that keys a grandchild by `T.S` without its
+parent's scope, and `family_one_level`, a worst case that counts only the
+direct children, are caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/tree.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=1168 runs=3645 crashes=1793 power_losses=309 torn_writes=422 takeovers=0 fenced=0 dispatches=1276 unknown=186 sleeps=0 suspensions=684 children=664 joined=546 child_crashes=992
+$ hl sim --target native-jsonl --seeds 0..200 --mutation grandchild_unscoped docs/snippets/tree.hl
+FAIL invariant=child_scoped seed=1 target=native-jsonl profile=errors mutation=grandchild_unscoped: child session 3.1: spawn reviewer at turn 1 seq 1 records child key "1.1", but its call starts the child session "3.1/1.1"
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation grandchild_unscoped docs/snippets/tree.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation family_one_level docs/snippets/tree.hl
+FAIL invariant=family_bounded seed=1 target=native-jsonl profile=errors mutation=family_one_level: turn 3 (review) started 3 sessions in its tree, over its worst case of 1 (1 child sessions, no loops)
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation family_one_level docs/snippets/tree.hl
+```
+
+`hl sim --scope K` runs a harness as if it were spawned under `K`, and the
+differential runs use it, so generated Rust and JavaScript record scoped keys
+as the interpreter does (`scripts/check.sh` runs `docs/snippets/tree_planner.hl`
+under `1.1` on every target).
 
 ### Traps
 
