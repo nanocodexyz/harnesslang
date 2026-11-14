@@ -400,7 +400,9 @@ fn interrupt_honored(program: &Program, records: &[Record]) -> Result<(), Violat
         if interrupted && !caused {
             return violation(
                 Invariant::InterruptHonored,
-                format!("{id} records an interrupted outcome, yet no event that interrupts it was recorded"),
+                format!(
+                    "{id} records an interrupted outcome, yet no event that interrupts it was recorded"
+                ),
             );
         }
     }
@@ -805,8 +807,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             .get(id)
             .map_or(0, |dispatched| dispatched.external);
         let preempted = calls.results.get(id).is_some_and(|results| {
-            results.first()
-                == Some(&Output::Failed(crate::ir::INTERRUPTED_REASON.to_owned()))
+            results.first() == Some(&Output::Failed(crate::ir::INTERRUPTED_REASON.to_owned()))
         });
         if known && dispatches == 0 && !refused.contains(id) && !preempted {
             return violation(

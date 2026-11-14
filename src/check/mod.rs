@@ -885,13 +885,13 @@ fn tools(
             return error(
                 at,
                 format!(
-                    "tool '{}' is {}: only an external tool is recoverable, since only its outcome can be unknown",
+                    "tool '{}' has effect {}: only an external tool is recoverable, since only its outcome can be unknown",
                     tool.name.text,
                     tool.effect.name()
                 ),
             );
         }
-        let jobs = tool_jobs(program, globals, tool, &returns)?;
+        let jobs = tool_jobs(source, program, globals, tool, &returns)?;
         globals
             .tools
             .insert(tool.name.text.clone(), program.tools.len());
@@ -913,6 +913,7 @@ fn tools(
 }
 
 fn tool_jobs(
+    source: &ast::Program,
     program: &ir::Program,
     globals: &Globals,
     tool: &ast::Tool,
@@ -930,11 +931,32 @@ fn tool_jobs(
             ),
         );
     }
-    let jobs = bound(program, globals, name, "the jobs a tool keeps running at once")?;
+    let noted = source
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Event(event) if event.name.text == EVENT_JOB));
+    if !noted {
+        return error(
+            name.at,
+            format!(
+                "tool '{}' keeps jobs running, so the harness needs 'on {EVENT_JOB}({JOB_PARAMETER}: text) bound N' to take their notices",
+                tool.name.text
+            ),
+        );
+    }
+    let jobs = bound(
+        program,
+        globals,
+        name,
+        "the jobs a tool keeps running at once",
+    )?;
     if jobs.value == 0 {
         return error(
             name.at,
-            format!("tool '{}' keeps at most 0 jobs: drop 'jobs at most'", tool.name.text),
+            format!(
+                "tool '{}' keeps at most 0 jobs: drop 'jobs at most'",
+                tool.name.text
+            ),
         );
     }
     Ok(Some(jobs))
@@ -980,7 +1002,9 @@ fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
         }
         match owner {
             Some(tool) => {
-                let (id, _) = program.tool(tool).expect("tools are checked before interrupts");
+                let (id, _) = program
+                    .tool(tool)
+                    .expect("tools are checked before interrupts");
                 program.tools[id].interrupts = interrupts;
             }
             None => {
@@ -990,18 +1014,6 @@ fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
                     .expect("the model is checked before interrupts")
                     .interrupts = interrupts;
             }
-        }
-    }
-    let at = source.name.at;
-    for tool in &program.tools {
-        if tool.jobs.is_some() && program.events.jobs.is_none() {
-            return error(
-                at,
-                format!(
-                    "tool '{}' keeps jobs running, so the harness needs 'on {EVENT_JOB}({JOB_PARAMETER}: text) bound N' to take their notices",
-                    tool.name
-                ),
-            );
         }
     }
     Ok(())

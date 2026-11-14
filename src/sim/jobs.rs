@@ -49,7 +49,9 @@ pub fn started_text(key: &str) -> String {
 }
 
 pub fn notice_text(key: &str, status: &str) -> String {
-    format!("<task-notification>\n<task-id>{key}</task-id>\n<status>{status}</status>\n</task-notification>")
+    format!(
+        "<task-notification>\n<task-id>{key}</task-id>\n<status>{status}</status>\n</task-notification>"
+    )
 }
 
 impl Jobs {
@@ -140,7 +142,11 @@ impl Jobs {
     }
 
     pub fn next_due(&self) -> Option<u64> {
-        self.jobs.values().flat_map(Self::due).map(|(at, _)| at).min()
+        self.jobs
+            .values()
+            .flat_map(Self::due)
+            .map(|(at, _)| at)
+            .min()
     }
 
     pub fn owns(id: &str) -> bool {
@@ -169,7 +175,11 @@ impl Jobs {
         if answer == Answer::Recorded {
             self.notices += 1;
         }
-        let slot = if done { &mut job.done } else { &mut job.stalled };
+        let slot = if done {
+            &mut job.done
+        } else {
+            &mut job.stalled
+        };
         if !settled(*slot) {
             *slot = Some(answer);
         }

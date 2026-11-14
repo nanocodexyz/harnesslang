@@ -1160,8 +1160,8 @@ impl World for SimWorld<'_> {
     }
 
     fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
-        let pending = !self.inbox.arrived(turn).is_empty()
-            || !self.jobs.arrived(self.clock).is_empty();
+        let pending =
+            !self.inbox.arrived(turn).is_empty() || !self.jobs.arrived(self.clock).is_empty();
         let wake = if pending {
             self.clock
         } else {

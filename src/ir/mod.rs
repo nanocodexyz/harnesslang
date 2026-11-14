@@ -286,15 +286,19 @@ impl Program {
     }
 
     pub fn recoverable(&self, tool: &str) -> bool {
-        self.tool(tool).is_some_and(|(_, declared)| declared.recoverable)
+        self.tool(tool)
+            .is_some_and(|(_, declared)| declared.recoverable)
     }
 
     pub fn jobs_of(&self, tool: &str) -> Option<&Bound> {
-        self.tool(tool).and_then(|(_, declared)| declared.jobs.as_ref())
+        self.tool(tool)
+            .and_then(|(_, declared)| declared.jobs.as_ref())
     }
 
     pub fn any_interruptible(&self) -> bool {
-        self.model.as_ref().is_some_and(|model| model.interrupts.any())
+        self.model
+            .as_ref()
+            .is_some_and(|model| model.interrupts.any())
             || self.tools.iter().any(|tool| tool.interrupts.any())
     }
 

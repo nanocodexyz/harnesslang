@@ -1,0 +1,9 @@
+harness worker
+
+const calls_max: u64 = 4
+
+model infer calls calls_max interruptible by cancel
+
+on cancel
+
+on run() -> u64 { return 1 }

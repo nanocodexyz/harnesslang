@@ -1103,7 +1103,9 @@ impl<'a> Parser<'a> {
                 }
                 self.advance();
                 let mut args = self.arguments()?;
-                if (callee.text == WAIT_BUILTIN || callee.text == HOLD_BUILTIN) && self.is_word("at") {
+                if (callee.text == WAIT_BUILTIN || callee.text == HOLD_BUILTIN)
+                    && self.is_word("at")
+                {
                     self.advance();
                     self.word("most")?;
                     args.push(Expr::Name(self.bound("the most a wait sleeps")?));

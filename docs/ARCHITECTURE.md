@@ -236,6 +236,25 @@ prover bounds it and replay restores it. The Durable Object arms its alarm at
 the due, the Vercel session races its next prompt against a workflow
 `sleep()`, and `hl-agent --keep-warm` stays alive for the refreshes.
 
+### Effects in flight
+
+Three declarations concern effects still running or left open by a crash.
+`interruptible by cancel, steer` on a tool or the model lets those events
+abandon it: an effect that would start while one is pending does not run, and
+one during which one is recorded is abandoned, an external call reported
+`unknown` by a `recovery` record, a none or idempotent call `failed` with
+nanocode's interrupted text, the model's attempt `interrupted`. `jobs at most
+N` lets the host turn a call into a background job (`{"job": text}`, keyed
+`T.S`), whose notices arrive as a third event, `on job(notice: text) bound
+N`, read with `take jobs`; `hold(c)` waits for them as a wait does, and a
+turn over a session with open jobs asks the host which still run and records
+the others lost. `external recoverable` makes recovery ask the host about an
+open call before reporting it `unknown`: a reply becomes its result, not
+dispatched runs it under the same sequence number, and the recovery record
+lists each answer (`replied`, `not_dispatched`). LANGUAGE.md's Effects in
+flight has the semantics, the prover's added arms and the simulator's
+`interrupt_honored`, `job_once` and `job_reported`.
+
 ### Code mode
 
 `code exec { tools read, edit, bash  calls cell_calls_max  parallel ...  timers ...  timer_ms ...  journal_bytes ...  yield_ms ... }`

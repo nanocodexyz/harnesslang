@@ -336,9 +336,7 @@ fn run_seed_unguarded(
         );
     }
     let mut stats = world.stats.clone();
-    stats.unknown = records
-        .as_ref()
-        .map_or(0, |records| unknown_count(records));
+    stats.unknown = records.as_ref().map_or(0, |records| unknown_count(records));
     stats.events = program.events.any().then_some(world.inbox.recorded);
     stats.interrupted = records
         .as_ref()

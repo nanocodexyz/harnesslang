@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use crate::ir::{Handler, Program, Type};
 use crate::run::blob::Blobs;
 use crate::run::engine::{
-    End, Engine, Exit, Finish, Mode, Recovered, Setup, Suspension, ToolRequest, World,
-    close_inbox, steer_count,
+    End, Engine, Exit, Finish, Mode, Recovered, Setup, Suspension, ToolRequest, World, close_inbox,
+    steer_count,
 };
 use crate::run::journal::Inbound;
 use crate::run::journal::{Delivery, Output, Record, job_started, lost_delivery};

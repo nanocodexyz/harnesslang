@@ -342,9 +342,7 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
             let tool = call.tool.clone();
             *site = SiteLog::Done(call.clone(), output.clone());
             if job_started(output).is_some() {
-                session
-                    .jobs
-                    .insert(crate::ir::spawn_key(*turn, *seq), tool);
+                session.jobs.insert(crate::ir::spawn_key(*turn, *seq), tool);
             }
         }
         Record::Model {

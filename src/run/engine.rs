@@ -914,7 +914,10 @@ impl<'a> Engine<'a> {
             ir::Taken::Steers => &mut self.taken,
             ir::Taken::Jobs => &mut self.taken_jobs,
         };
-        assert!(*counter <= visible.len(), "the events a turn sees only grow");
+        assert!(
+            *counter <= visible.len(),
+            "the events a turn sees only grow"
+        );
         let fresh: Vec<Value> = visible[*counter..]
             .iter()
             .map(|(_, message)| Value::Text(message.clone()))
@@ -2094,7 +2097,9 @@ impl<'a> Engine<'a> {
             Recovered::Reply(output) if job_started(&output).is_some() => {
                 Recovered::Reply(self.job_output(&call.tool, seq, room, output))
             }
-            Recovered::Reply(output) => Recovered::Reply(self.checked(&call.tool, &returns, output)),
+            Recovered::Reply(output) => {
+                Recovered::Reply(self.checked(&call.tool, &returns, output))
+            }
             other => other,
         }
     }

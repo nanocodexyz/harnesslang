@@ -363,10 +363,7 @@ pub fn to_json(record: &Record) -> Json {
             let mut fields = BTreeMap::from([
                 ("attempt".to_owned(), Json::Number(*attempt)),
                 ("turn".to_owned(), turn_text(*turn)),
-                (
-                    "unknown".to_owned(),
-                    recovery_ids(*turn, unknown, nested),
-                ),
+                ("unknown".to_owned(), recovery_ids(*turn, unknown, nested)),
             ]);
             if !replied.is_empty() {
                 fields.insert(
@@ -508,7 +505,9 @@ fn attested_seqs(fields: &Fields<'_>, key: &str, turn: u64) -> Result<Vec<u64>, 
         seqs.push(seq);
     }
     if seqs.is_empty() || seqs.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(format!("recovery's {key} lists no calls, or lists them out of order"));
+        return Err(format!(
+            "recovery's {key} lists no calls, or lists them out of order"
+        ));
     }
     Ok(seqs)
 }

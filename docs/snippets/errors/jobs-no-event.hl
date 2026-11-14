@@ -1,0 +1,13 @@
+harness worker
+
+const jobs_max: u64 = 4
+
+tool Bash(command: text) -> text effect external jobs at most jobs_max
+
+on run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}

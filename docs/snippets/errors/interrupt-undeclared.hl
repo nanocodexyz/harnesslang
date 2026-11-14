@@ -1,0 +1,11 @@
+harness worker
+
+tool Bash(command: text) -> text effect external interruptible by cancel
+
+on run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}

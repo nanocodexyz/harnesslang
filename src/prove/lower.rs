@@ -5,10 +5,10 @@ use crate::ir::{
     BinaryOp, CodeId, Expr, Handler, Interrupts, Kept, Parallel, Program, SiteClass, SiteId,
     SiteKind, Stmt, ToolId,
 };
-use crate::target::inbound::{self, Drain};
 use crate::prove::Mutation;
 use crate::prove::text::Names;
 use crate::run::mutation::Mutation as RunMutation;
+use crate::target::inbound::{self, Drain};
 use crate::target::{self, AtomicUnit, Flush, Recovery};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -656,7 +656,9 @@ impl Lowering<'_> {
             group.push(Op::Choice(vec![
                 arm(format!("a group of {what} runs"), Entry::Plain, ran),
                 arm(
-                    format!("a group of {what} does not start: an event that interrupts it is pending"),
+                    format!(
+                        "a group of {what} does not start: an event that interrupts it is pending"
+                    ),
                     Entry::Plain,
                     vec![Op::Append(Record::BatchResult(other))],
                 ),
@@ -905,7 +907,7 @@ impl Lowering<'_> {
         vec![Op::Choice(arms)]
     }
 
-fn interrupts(&self, slot: Slot, class: EffectClass) -> Interrupts {
+    fn interrupts(&self, slot: Slot, class: EffectClass) -> Interrupts {
         let Slot::Site(site) = slot else {
             return Interrupts::default();
         };
