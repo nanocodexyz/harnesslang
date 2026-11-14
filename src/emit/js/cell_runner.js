@@ -91,6 +91,7 @@ class CellRunner {
       this.bytes = cellLogBytes(log);
       this.script = log.header.script;
     }
+    this.journaledCalls = new Map(site.cell.kind === "existing" ? [...site.cell.log.calls].map(([id, call]) => [id, call.state]) : []);
     this.consult = site.cell.kind === "existing" && !ignores;
     this.live = this.replay.length === 0;
     this.cursor = 0;
@@ -249,6 +250,7 @@ class CellRunner {
     this.freshEntries = [];
     const calls = [...this.changedCalls.entries()].sort((left, right) => left[0] - right[0]).map((pair) => pair[1]);
     this.changedCalls = new Map();
+    for (const call of calls) this.journaledCalls.set(call.id, call.state);
     const fresh = header !== null;
     assert(fresh === (this.nextSeq === 0), "the header rides the first update only");
     const update = {
@@ -278,7 +280,14 @@ class CellRunner {
   }
 
   changed(id) {
-    if (this.live) this.changedCalls.set(id, this.journaled(id));
+    if (!this.live) return;
+    const journaled = this.journaled(id);
+    const before = this.journaledCalls.get(id);
+    if (before !== undefined && jsonEqual(journaledCallJson({ ...journaled, state: before }), journaledCallJson(journaled))) {
+      this.changedCalls.delete(id);
+      return;
+    }
+    this.changedCalls.set(id, journaled);
   }
 
   running() {

@@ -172,7 +172,7 @@ class Seed {
     if (request.nested === null) return this.topTool(request, durable);
     this.nestedTool(request);
     if (durable !== null && durable.alarmed !== undefined) durable.alarmed(`${request.turn}/${request.seq}/code-${request.nested.id}`, request.effect);
-    const event = this.cursor.next("tool", short(rt.encodeJson({ ...request, nested: request.nested.id })));
+    const event = this.cursor.next("tool", short(rt.encodeJson({ ...request, nested: BigInt(request.nested.id) })));
     same("tool call turn", event.turn, request.turn);
     same("tool call seq", event.seq, request.seq);
     same("tool call nested", event.nested, BigInt(request.nested.id));
