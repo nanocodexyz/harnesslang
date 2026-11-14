@@ -38,6 +38,9 @@ plant_expression() {
     blob_unjournaled) echo 's/Json::object(\[(BLOB_KEY, Json::text(\&digest)), (DATA_KEY, Json::text(base64))\])/digest_json(\&digest)/' ;;
     grandchild_unscoped) echo 's/^    if scope.is_empty() {$/    if true {/' ;;
     idle_early) echo 's/^                if clock < due {$/                if false \&\& clock < due {/' ;;
+    interrupt_ignored) echo 's/let interrupted = self.drain_interrupting(interrupts)? \&\& !preempted;/let interrupted = self.drain_interrupting(interrupts)? \&\& false;/' ;;
+    recover_skipped) echo 's/let recovered = if program::recoverable(&call.tool) {/let recovered = if false {/' ;;
+    job_lost_dropped) echo 's/        .map(|key| lost_delivery(key))$/        .filter(|_| false).map(|key| lost_delivery(key))/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

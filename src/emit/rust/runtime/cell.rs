@@ -672,6 +672,8 @@ impl<'a, 'h> Runner<'a, 'h> {
             input: &input,
             returns: tool.returns,
             admitted: None,
+            job: false,
+            interrupts: Interrupts::NONE,
             nested: Some(NestedRef {
                 id,
                 cell: self.cell,

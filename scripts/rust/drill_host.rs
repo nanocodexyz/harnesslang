@@ -181,6 +181,7 @@ fn run(journal: &str, ledger: &str, acks: &str, seed: u64, turns: u64) {
     for turn in first..=turns {
         session = match session.run(&mut drill, &request(seed, turn)) {
             Ok((session, Ran::Finished(_) | Ran::AlreadyFinished(_))) => session,
+            Ok((_, ran @ (Ran::Suspended(_) | Ran::NotDue(_)))) => panic!("turn {turn}: the drill program neither suspends nor idles, found {ran:?}"),
             Err(RunError::Open(error)) => panic!("turn {turn}: {error}"),
             Err(RunError::Exit(exit)) => panic!("turn {turn}: {exit:?}"),
         };

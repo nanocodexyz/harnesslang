@@ -484,6 +484,14 @@ pub enum Output {
 pub enum Inbound {
     Cancel,
     Steer(String),
+    Job(JobNotice),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobNotice {
+    pub key: String,
+    pub notice: String,
+    pub done: bool,
 }
 
 impl Inbound {
@@ -491,8 +499,69 @@ impl Inbound {
         match self {
             Self::Cancel => "cancel",
             Self::Steer(_) => "steer",
+            Self::Job(_) => "job",
         }
     }
+
+    pub const fn interrupts(&self, interrupts: Interrupts) -> bool {
+        match self {
+            Self::Cancel => interrupts.cancel,
+            Self::Steer(_) => interrupts.steer,
+            Self::Job(_) => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Interrupts {
+    pub cancel: bool,
+    pub steer: bool,
+}
+
+impl Interrupts {
+    pub const NONE: Self = Self { cancel: false, steer: false };
+
+    pub const fn any(self) -> bool {
+        self.cancel || self.steer
+    }
+
+    pub const fn either(self, other: Self) -> Self {
+        Self { cancel: self.cancel || other.cancel, steer: self.steer || other.steer }
+    }
+}
+
+pub const JOB_KEY: &str = "job";
+pub const JOB_DONE: &str = "done";
+pub const JOB_KEY_FIELD: &str = "key";
+pub const JOB_NOTICE_FIELD: &str = "notice";
+pub const LOST_PREFIX: &str = "lost:";
+
+pub fn lost_notice(key: &str) -> String {
+    format!(
+        "<task-notification>\n<task-id>{key}</task-id>\n<status>killed</status>\n<summary>Background command {key} was still running when the harness that started it ended, so its completion was never reported and never will be. It was most likely stopped then; its outcome is unknown.</summary>\n</task-notification>\nRead its output file and check its effects before you rely on it or run it again."
+    )
+}
+
+pub fn lost_delivery(key: &str) -> Delivery {
+    Delivery {
+        id: format!("{LOST_PREFIX}{key}"),
+        inbound: Inbound::Job(JobNotice {
+            key: key.to_owned(),
+            notice: lost_notice(key),
+            done: true,
+        }),
+    }
+}
+
+pub fn job_started(output: &Output) -> Option<&str> {
+    match output {
+        Output::Ok(Json::Object(map)) if map.len() == 1 => map.get(JOB_KEY).and_then(Json::as_str),
+        _ => None,
+    }
+}
+
+pub fn job_key(turn: u64, seq: u64) -> String {
+    format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -503,8 +572,14 @@ pub struct Delivery {
 
 pub fn delivery_json(delivery: &Delivery) -> Json {
     let mut fields = vec![("id", Json::text(&delivery.id))];
-    if let Inbound::Steer(message) = &delivery.inbound {
-        fields.push(("message", Json::text(message)));
+    match &delivery.inbound {
+        Inbound::Cancel => {}
+        Inbound::Steer(message) => fields.push(("message", Json::text(message))),
+        Inbound::Job(job) => {
+            fields.push((JOB_DONE, Json::Bool(job.done)));
+            fields.push((JOB_KEY_FIELD, Json::text(&job.key)));
+            fields.push((JOB_NOTICE_FIELD, Json::text(&job.notice)));
+        }
     }
     Json::object(vec![(delivery.inbound.name(), Json::object(fields))])
 }
@@ -523,6 +598,14 @@ pub fn delivery_from(json: &Json) -> Result<Delivery, String> {
         "steer" => {
             fields.exact(&["id", "message"])?;
             Inbound::Steer(fields.text("message")?.to_owned())
+        }
+        "job" => {
+            fields.exact(&[JOB_DONE, "id", JOB_KEY_FIELD, JOB_NOTICE_FIELD])?;
+            Inbound::Job(JobNotice {
+                key: fields.text(JOB_KEY_FIELD)?.to_owned(),
+                notice: fields.text(JOB_NOTICE_FIELD)?.to_owned(),
+                done: fields.boolean(JOB_DONE)?,
+            })
         }
         other => return Err(format!("unknown event '{other}'")),
     };
@@ -579,6 +662,8 @@ pub enum Record {
         attempt: u64,
         unknown: Vec<u64>,
         nested: Vec<(u64, u64)>,
+        replied: Vec<u64>,
+        undispatched: Vec<u64>,
     },
     Status {
         turn: u64,
@@ -738,11 +823,22 @@ fn record_body(record: &Record) -> Json {
             attempt,
             unknown,
             nested,
-        } => Json::object(vec![
-            ("attempt", Json::Number(*attempt)),
-            ("turn", turn_text(*turn)),
-            ("unknown", recovery_ids(*turn, unknown, nested)),
-        ]),
+            replied,
+            undispatched,
+        } => {
+            let mut fields = vec![
+                ("attempt", Json::Number(*attempt)),
+                ("turn", turn_text(*turn)),
+                ("unknown", recovery_ids(*turn, unknown, nested)),
+            ];
+            if !replied.is_empty() {
+                fields.push((RECOVERY_REPLIED, recovery_ids(*turn, replied, &[])));
+            }
+            if !undispatched.is_empty() {
+                fields.push((RECOVERY_UNDISPATCHED, recovery_ids(*turn, undispatched, &[])));
+            }
+            Json::object(fields)
+        }
         Record::NestedCall {
             turn,
             seq,
@@ -1021,8 +1117,41 @@ fn cell_from(fields: &Fields<'_>) -> Result<Record, String> {
     })
 }
 
+pub const RECOVERY_REPLIED: &str = "replied";
+pub const RECOVERY_UNDISPATCHED: &str = "not_dispatched";
+
+fn attested_seqs(fields: &Fields<'_>, key: &str, turn: u64) -> Result<Vec<u64>, String> {
+    let Some(json) = fields.map.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Json::Array(items) = json else {
+        return Err(format!("recovery record's {key} is not a list"));
+    };
+    let mut seqs = Vec::with_capacity(items.len());
+    for item in items {
+        let id = item
+            .as_str()
+            .ok_or_else(|| format!("recovery's {key} lists a call id that is not text"))?;
+        let (call_turn, seq) = parse_call_id(id)?;
+        if call_turn != turn {
+            return Err(format!("recovery's {key} lists a call of another turn"));
+        }
+        seqs.push(seq);
+    }
+    if seqs.is_empty() || seqs.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(format!("recovery's {key} lists no calls, or lists them out of order"));
+    }
+    Ok(seqs)
+}
+
 fn recovery_from(fields: &Fields<'_>) -> Result<Record, String> {
-    fields.exact(&["attempt", "turn", "unknown"])?;
+    let mut keys = vec!["attempt", "turn", "unknown"];
+    for key in [RECOVERY_UNDISPATCHED, RECOVERY_REPLIED] {
+        if fields.map.contains_key(key) {
+            keys.push(key);
+        }
+    }
+    fields.exact(&keys)?;
     let turn = fields.turn()?;
     let Json::Array(items) = fields.get("unknown")? else {
         return Err("recovery record's unknown is not a list".to_owned());
@@ -1056,6 +1185,8 @@ fn recovery_from(fields: &Fields<'_>) -> Result<Record, String> {
         attempt: fields.number("attempt")?,
         unknown,
         nested,
+        replied: attested_seqs(fields, RECOVERY_REPLIED, turn)?,
+        undispatched: attested_seqs(fields, RECOVERY_UNDISPATCHED, turn)?,
     })
 }
 
@@ -1262,6 +1393,7 @@ pub struct Session {
     pub checkpoints: BTreeMap<u64, String>,
     pub cell_origins: BTreeMap<u64, (u64, u64)>,
     pub last_event: u64,
+    pub jobs: BTreeMap<String, String>,
 }
 
 impl Session {
@@ -1451,6 +1583,17 @@ fn event(session: &mut Session, turn: u64, seq: u64, at: u64, delivery: &Deliver
             session.last_event
         ));
     }
+    if let Inbound::Job(job) = &delivery.inbound {
+        if !session.jobs.contains_key(&job.key) {
+            return Err(format!(
+                "event '{}' of turn {turn} notes job {}, which is not running",
+                delivery.id, job.key
+            ));
+        }
+        if job.done {
+            session.jobs.remove(&job.key);
+        }
+    }
     let log = running(session, turn, "an event")?;
     if let Some(last) = log.events.last()
         && at < last.at
@@ -1492,12 +1635,24 @@ fn close(session: &mut Session, turn: u64, seq: u64, output: &Output) -> Result<
             "result for seq {seq} of turn {turn}, which is not open"
         ));
     };
+    let tool = call.tool.clone();
     *site = SiteLog::Done(call.clone(), output.clone());
+    if job_started(output).is_some() {
+        session.jobs.insert(job_key(turn, seq), tool);
+    }
     Ok(())
 }
 
-fn recover_record(session: &mut Session, turn: u64, attempt: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Result<(), String> {
+fn recover_record(session: &mut Session, turn: u64, attempt: u64, unknown: &[u64], nested: &[(u64, u64)], attested: &[u64]) -> Result<(), String> {
     let log = running(session, turn, "a recovery")?;
+    for seq in attested {
+        let open = matches!(log.sites.get(seq), Some(SiteLog::Open(call)) if call.effect.may_be_unknown());
+        if !open || unknown.contains(seq) {
+            return Err(format!(
+                "recovery attests seq {seq} of turn {turn}, which is not an open external call"
+            ));
+        }
+    }
     for id in nested {
         recover_nested(log, turn, *id)?;
     }
@@ -1593,7 +1748,12 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
             attempt,
             unknown,
             nested,
-        } => recover_record(session, *turn, *attempt, unknown, nested)?,
+            replied,
+            undispatched,
+        } => {
+            let attested: Vec<u64> = replied.iter().chain(undispatched).copied().collect();
+            recover_record(session, *turn, *attempt, unknown, nested, &attested)?
+        }
         Record::Status {
             turn,
             last,
