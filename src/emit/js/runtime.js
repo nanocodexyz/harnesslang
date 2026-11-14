@@ -19,6 +19,7 @@ const SUM_CALL = 0;
 const SUM_REPLY = 1;
 const SUM_ENTRY = 2;
 const CALL_FIELDS = ["id", "tool", "input"];
+const CALL_ID = 0;
 const CALL_TOOL = 1;
 const CALL_INPUT = 2;
 const VARIANT_OK = 0;

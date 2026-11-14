@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::check::{
-    BUILTIN_FUNCTIONS, CANCELLED_READ, Checked, Globals, WILDCARD, claim, error, variant_names,
+    ALLOW, BUILTIN_FUNCTIONS, CANCELLED_READ, Checked, DENY, Globals, WILDCARD, claim, error,
+    variant_names,
 };
 use crate::ir;
 use crate::syntax::Position;
-use crate::syntax::ast::{self, Arm, Block, Expr, Function, Item, Name, Pattern, Stmt};
+use crate::syntax::ast::{self, Arm, Block, Expr, Function, HookKind, Item, Name, Pattern, Stmt};
 use crate::syntax::parser::NESTING_DEPTH_MAX;
 
 pub const STATEMENTS_PER_HANDLER_MAX: u64 = 65_536;
@@ -21,6 +22,7 @@ enum Owner<'a> {
     Handler(&'a str),
     Function(&'a str),
     Invariant(&'a str),
+    Hook(HookKind),
 }
 
 impl Owner<'_> {
@@ -29,6 +31,7 @@ impl Owner<'_> {
             Self::Handler(name) => format!("handler '{name}'"),
             Self::Function(name) => format!("fn '{name}'"),
             Self::Invariant(name) => format!("invariant '{name}'"),
+            Self::Hook(kind) => format!("'{}'", kind.describe()),
         }
     }
 }
@@ -79,6 +82,12 @@ impl<'a> Walk<'a> {
     }
 
     fn reference(&self, declared: &BTreeSet<String>, name: &Name) -> Checked<()> {
+        if name.text.starts_with(WILDCARD) {
+            return error(
+                name.at,
+                format!("'{}': names starting with '_' are reserved", name.text),
+            );
+        }
         if self.visible(&name.text) {
             return Ok(());
         }
@@ -87,6 +96,14 @@ impl<'a> Walk<'a> {
                 name.at,
                 format!(
                     "fn '{function}' cannot see '{}': a fn sees its parameters, its own bindings and the harness's declarations",
+                    name.text
+                ),
+            ),
+            Owner::Hook(kind) if !declared.contains(&name.text) => error(
+                name.at,
+                format!(
+                    "'{}' cannot see '{}': a hook sees its parameters, its own bindings and the harness's declarations",
+                    kind.describe(),
                     name.text
                 ),
             ),
@@ -153,6 +170,7 @@ pub fn expand(
         match item {
             Item::Function(_) => {}
             Item::Handler(handler) => items.push(Item::Handler(inliner.handler(handler)?)),
+            Item::Hook(hook) => items.push(Item::Hook(inliner.hook(hook)?)),
             Item::Invariant(invariant) => {
                 let mut walk = Walk::new(Owner::Invariant(&invariant.name.text));
                 inliner.expr(&mut walk, &invariant.condition)?;
@@ -289,6 +307,60 @@ impl<'a> Inliner<'a> {
             returns: handler.returns.clone(),
             requires: handler.requires.clone(),
             body,
+            ends_session: handler.ends_session,
+        })
+    }
+
+    fn hook(&mut self, hook: &'a ast::Hook) -> Checked<ast::Hook> {
+        let mut walk = Walk::new(Owner::Hook(hook.kind));
+        hook.params.iter().for_each(|param| walk.bind(&param.name));
+        let body = self.block(&mut walk, &hook.body)?;
+        Ok(ast::Hook {
+            kind: hook.kind,
+            at: hook.at,
+            params: hook.params.clone(),
+            body,
+        })
+    }
+
+    fn verdict(
+        &mut self,
+        walk: &mut Walk<'a>,
+        callee: &'a Name,
+        args: &'a [Expr],
+    ) -> Checked<Stmt> {
+        let allowed = match walk.owner {
+            Owner::Hook(HookKind::BeforeTool) => true,
+            Owner::Hook(HookKind::AfterTool) => callee.text == DENY,
+            _ => false,
+        };
+        if !allowed {
+            let place = if callee.text == DENY {
+                "a 'before tool' or 'after tool' block"
+            } else {
+                "a 'before tool' block, which may rewrite a call before it runs"
+            };
+            return error(
+                callee.at,
+                format!(
+                    "'{}' belongs in {place}, not in {}",
+                    callee.text,
+                    walk.owner.describe()
+                ),
+            );
+        }
+        if args.len() != 1 {
+            return error(
+                callee.at,
+                format!("{} takes 1 argument(s), found {}", callee.text, args.len()),
+            );
+        }
+        for arg in args {
+            self.expr(walk, arg)?;
+        }
+        Ok(Stmt::Call {
+            callee: callee.clone(),
+            args: args.to_vec(),
         })
     }
 
@@ -340,6 +412,9 @@ impl<'a> Inliner<'a> {
             }
             Stmt::If { .. } | Stmt::Match { .. } | Stmt::Loop { .. } | Stmt::For { .. } => {
                 self.compound(walk, statement)
+            }
+            Stmt::Call { callee, args } if callee.text == DENY || callee.text == ALLOW => {
+                self.verdict(walk, callee, args)
             }
             Stmt::Call { callee, args } => self.call(walk, callee, args),
             Stmt::Inlined { .. } => panic!("the parser never writes an inlined block"),

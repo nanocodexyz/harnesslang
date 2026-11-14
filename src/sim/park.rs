@@ -95,6 +95,13 @@ impl SimWorld<'_> {
         } else {
             SimWorld::generated_text(&mut rng)
         };
+        let answer = match self.children.get(&suspension.key) {
+            Some(crate::sim::world::Child { result: Ok(result) }) => {
+                self.stats.joined += 1;
+                result.clone()
+            }
+            _ => answer,
+        };
         self.clock += rng.range(1, SUSPEND_DELAY_MS_MAX);
         self.parking.pending = Some((suspension.clone(), Resume { key, answer }));
         Ok(())

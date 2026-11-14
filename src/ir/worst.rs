@@ -31,6 +31,44 @@ pub struct WorstCase {
     pub records: Cost,
     pub requests: Cost,
     pub wait_ms: Cost,
+    pub spawns: Cost,
+    pub family: Option<Family>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Family {
+    pub child: [u64; 3],
+    pub total: [u64; 3],
+}
+
+fn family(program: &Program, own: [u64; 3], spawns: &Cost) -> Result<Option<Family>, Overflow> {
+    if spawns.total == 0 {
+        return Ok(None);
+    }
+    let mut child = [0; 3];
+    for (_, spawn) in program.spawns() {
+        let worst = &spawn.child().worst;
+        let measured = [
+            worst.effects.total,
+            worst.records.total,
+            worst.requests.total,
+        ];
+        for (widest, value) in child.iter_mut().zip(measured) {
+            *widest = (*widest).max(value);
+        }
+    }
+    let mut total = [0; 3];
+    for index in 0..3 {
+        total[index] = spawns
+            .total
+            .checked_mul(child[index])
+            .and_then(|children| children.checked_add(own[index]))
+            .ok_or_else(|| Overflow {
+                measure: MEASURES[index],
+                loops: spawns.loops.clone(),
+            })?;
+    }
+    Ok(Some(Family { child, total }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,14 +77,15 @@ pub struct Overflow {
     pub loops: Vec<Factor>,
 }
 
-pub const MEASURES: [&str; 4] = [
+pub const MEASURES: [&str; 5] = [
     "effects",
     "journal records",
     "outbound requests",
     "milliseconds of waits",
+    "child sessions",
 ];
 
-type Costs = [Cost; 4];
+type Costs = [Cost; 5];
 
 #[derive(Clone, Debug)]
 struct Paths {
@@ -113,6 +152,7 @@ fn zero() -> Costs {
         Cost::default(),
         Cost::default(),
         Cost::default(),
+        Cost::default(),
     ]
 }
 
@@ -143,9 +183,9 @@ fn repeated(costs: Costs, factor: &Factor, count: u64) -> Result<Costs, Overflow
 }
 
 fn widest(left: Costs, right: Costs) -> Costs {
-    let [a, b, c, d] = left;
-    let [w, x, y, z] = right;
-    [a.or(w), b.or(x), c.or(y), d.or(z)]
+    let [a, b, c, d, e] = left;
+    let [v, w, x, y, z] = right;
+    [a.or(v), b.or(w), c.or(x), d.or(y), e.or(z)]
 }
 
 fn either(left: Option<Costs>, right: Option<Costs>) -> Option<Costs> {
@@ -246,16 +286,23 @@ fn cell_cost(program: &Program, code: &Code) -> Result<Costs, Overflow> {
         Cost::of(records),
         Cost::of(calls),
         Cost::of(0),
+        Cost::of(0),
     ])
 }
 
 fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
+    let spawns = match kind {
+        SiteKind::Tool(tool) => program.tools[tool].spawn.is_some(),
+        SiteKind::Dispatch => program.spawns().next().is_some(),
+        _ => false,
+    };
     let plain = |records| {
         [
             Cost::of(1),
             Cost::of(records),
             Cost::of(u64::from(kind.outbound())),
             Cost::of(0),
+            Cost::of(u64::from(spawns)),
         ]
     };
     match kind {
@@ -272,14 +319,16 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
         | SiteKind::Listing(_)
         | SiteKind::Now
         | SiteKind::Random
-        | SiteKind::Suspend => Ok(plain(EFFECT_RECORDS)),
+        | SiteKind::Suspend
+        | SiteKind::Deny => Ok(plain(EFFECT_RECORDS)),
         SiteKind::Wait(constant) => {
-            let [effects, records, requests, _] = plain(EFFECT_RECORDS);
+            let [effects, records, requests, _, spawned] = plain(EFFECT_RECORDS);
             Ok([
                 effects,
                 records,
                 requests,
                 Cost::of(program.constants[constant].value),
+                spawned,
             ])
         }
     }
@@ -311,6 +360,7 @@ fn statement_cost(
             ended: Some([
                 Cost::of(0),
                 Cost::of(FINISH_RECORDS),
+                Cost::of(0),
                 Cost::of(0),
                 Cost::of(0),
             ]),
@@ -360,12 +410,20 @@ pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overfl
         Cost::of(ADMISSION_RECORDS),
         Cost::of(0),
         Cost::of(0),
+        Cost::of(0),
     ];
-    let [effects, records, requests, wait_ms] = combine(admission, longest)?;
+    let [effects, records, requests, wait_ms, spawns] = combine(admission, longest)?;
+    let family = family(
+        program,
+        [effects.total, records.total, requests.total],
+        &spawns,
+    )?;
     Ok(WorstCase {
         effects,
         records,
         requests,
         wait_ms,
+        spawns,
+        family,
     })
 }

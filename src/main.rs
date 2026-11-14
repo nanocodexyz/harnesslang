@@ -43,7 +43,15 @@ fn load(file: &str) -> Result<Program, String> {
     let source = std::fs::read_to_string(file)
         .map_err(|error| format!("{file}: error: cannot read: {error}"))?;
     let parsed = syntax::parse(&source).map_err(|diagnostic| diagnostic.render(file))?;
-    check::check(&parsed).map_err(|diagnostic| diagnostic.render(file))
+    let directory = std::path::Path::new(file)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    check::check_with(&parsed, &mut |child: &str| {
+        let path = directory.join(child);
+        load(&path.to_string_lossy())
+    })
+    .map_err(|diagnostic| diagnostic.render(file))
 }
 
 fn parse_seeds(value: &str) -> Option<std::ops::Range<u64>> {
@@ -160,6 +168,29 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
             "    milliseconds of waits: {}, {}",
             worst.wait_ms.total,
             worst.wait_ms.describe_loops()
+        ));
+    }
+    if let Some(family) = &worst.family {
+        lines.push(format!(
+            "    child sessions: {}, {}",
+            worst.spawns.total,
+            worst.spawns.describe_loops()
+        ));
+        for (tool, spawn) in program.spawns() {
+            let child = &spawn.child().worst;
+            lines.push(format!(
+                "      {} runs {}.{}: worst case {} effects, {} journal records, {} outbound requests each",
+                tool.name,
+                spawn.harness(),
+                spawn.handler,
+                child.effects.total,
+                child.records.total,
+                child.requests.total
+            ));
+        }
+        lines.push(format!(
+            "    with its child sessions: {} effects, {} journal records, {} outbound requests",
+            family.total[0], family.total[1], family.total[2]
         ));
     }
     lines.push("    plus one recovery record per restart".to_owned());

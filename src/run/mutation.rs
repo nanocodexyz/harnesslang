@@ -54,10 +54,12 @@ pub enum Mutation {
     WaitOversleeps,
     DefaultUnfilled,
     ModeDropped,
+    DenyDispatches,
+    SpawnKeyUnscoped,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 52] = [
+    pub const ALL: [Self; 54] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -110,6 +112,8 @@ impl Mutation {
         Self::WaitOversleeps,
         Self::DefaultUnfilled,
         Self::ModeDropped,
+        Self::DenyDispatches,
+        Self::SpawnKeyUnscoped,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -166,6 +170,8 @@ impl Mutation {
             Self::WaitOversleeps => "wait_oversleeps",
             Self::DefaultUnfilled => "default_unfilled",
             Self::ModeDropped => "mode_dropped",
+            Self::DenyDispatches => "deny_dispatches",
+            Self::SpawnKeyUnscoped => "spawn_key_unscoped",
         }
     }
 
@@ -232,7 +238,9 @@ impl Mutation {
             | Self::WaitRerunSkips
             | Self::WaitOversleeps
             | Self::DefaultUnfilled
-            | Self::ModeDropped => all,
+            | Self::ModeDropped
+            | Self::DenyDispatches
+            | Self::SpawnKeyUnscoped => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

@@ -153,6 +153,7 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Random
         | SiteKind::Wait(_)
         | SiteKind::Suspend
+        | SiteKind::Deny
         | SiteKind::Cell(_) => "null".to_owned(),
     };
     let ms = match site.kind {
@@ -218,12 +219,17 @@ fn program_literal(program: &Program) -> String {
     for tool in &program.tools {
         writeln!(
             out,
-            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\" }},",
+            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\"{} }},",
             js_string(&tool.name),
             fields_literal(&tool.params),
             defaults_literal(&tool.defaults),
             type_literal(&tool.returns),
-            tool.effect.name()
+            tool.effect.name(),
+            if tool.spawn.is_some() {
+                ", spawn: true"
+            } else {
+                ""
+            }
         )
         .expect("writing to a string succeeds");
     }

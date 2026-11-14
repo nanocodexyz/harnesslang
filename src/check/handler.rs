@@ -1,6 +1,6 @@
 use crate::check::{
-    CANCELLED_READ, Checked, EVENT_RESUME, EVENT_STEER, Globals, STEER_PARAMETER, STEERS_READ,
-    WILDCARD, bound, error, quoted, resolve,
+    ALLOW, CANCELLED_READ, Checked, DENY, EVENT_RESUME, EVENT_STEER, Globals, JOIN,
+    STEER_PARAMETER, STEERS_READ, WILDCARD, bound, error, quoted, resolve,
 };
 use crate::effect::EffectClass;
 use crate::ir::{
@@ -8,6 +8,8 @@ use crate::ir::{
 };
 use crate::syntax::Position;
 use crate::syntax::ast;
+
+mod hooks;
 
 struct Checker<'a> {
     program: &'a ir::Program,
@@ -17,6 +19,8 @@ struct Checker<'a> {
     sites: Vec<Site>,
     returns: Type,
     reads_events: bool,
+    in_hook: bool,
+    spawn_subject: bool,
 }
 
 pub fn check(
@@ -33,6 +37,8 @@ pub fn check(
         sites: Vec::new(),
         returns: returns.clone(),
         reads_events: false,
+        in_hook: false,
+        spawn_subject: false,
     };
     let mut params = Vec::new();
     for param in &definition.params {
@@ -47,7 +53,9 @@ pub fn check(
         None => None,
     };
     checker.reads_events = true;
-    let (body, returned) = checker.block(&definition.body)?;
+    let mut body = checker.opening(&params, definition.body.at)?;
+    let (rest, returned) = checker.block(&definition.body)?;
+    body.extend(rest);
     if !returned {
         return error(
             definition.body.at,
@@ -98,6 +106,8 @@ pub fn invariant(
         sites: Vec::new(),
         returns: Type::Bool,
         reads_events: false,
+        in_hook: false,
+        spawn_subject: false,
     };
     let condition = checker.condition(
         &definition.condition,
@@ -333,16 +343,25 @@ impl Checker<'_> {
                 out.push(Stmt::Push { field, value });
                 Ok(false)
             }
-            ast::Stmt::Clear { list, .. } => {
-                let (field, _) = self.list_field(list, "clear")?;
+            ast::Stmt::Clear { at, list } => {
+                let (field, element) = self.list_field(list, "clear")?;
+                let compacts = element == Type::Sum(ir::ENTRY);
+                self.compaction(ast::HookKind::PreCompact, compacts, *at, out)?;
                 out.push(Stmt::Shrink {
                     field,
                     kept: Kept::Nothing,
                 });
+                self.compaction(ast::HookKind::PostCompact, compacts, *at, out)?;
                 Ok(false)
             }
-            ast::Stmt::Keep { list, count, .. } => {
-                let (field, _) = self.list_field(list, "keep the end of")?;
+            ast::Stmt::Keep {
+                at: keep_at,
+                list,
+                count,
+            } => {
+                let (field, element) = self.list_field(list, "keep the end of")?;
+                let compacts = element == Type::Sum(ir::ENTRY);
+                self.compaction(ast::HookKind::PreCompact, compacts, *keep_at, out)?;
                 let at = count.at();
                 let (count, ty) = self.expr(count, Some(&Type::U64), out)?;
                 self.expect(at, &Type::U64, &ty)?;
@@ -350,6 +369,7 @@ impl Checker<'_> {
                     field,
                     kept: Kept::Last(count),
                 });
+                self.compaction(ast::HookKind::PostCompact, compacts, *keep_at, out)?;
                 Ok(false)
             }
             ast::Stmt::If {
@@ -378,7 +398,11 @@ impl Checker<'_> {
                     self.for_statement(name, list, body, out)
                 }
             }
-            ast::Stmt::Return { value, .. } => {
+            ast::Stmt::Return {
+                at: return_at,
+                value,
+            } => {
+                self.lifecycle(ast::HookKind::Stop, Vec::new(), *return_at, out)?;
                 let wanted = self.returns.clone();
                 let at = value.at();
                 let (value, ty) = self.expr(value, Some(&wanted), out)?;
@@ -389,6 +413,13 @@ impl Checker<'_> {
             ast::Stmt::Inlined {
                 arguments, body, ..
             } => self.inlined(arguments, body, out),
+            ast::Stmt::Call { callee, .. } if callee.text == DENY || callee.text == ALLOW => error(
+                callee.at,
+                format!(
+                    "'{}' decides the call of a 'before tool' or 'after tool' block: nothing follows it, and an if or match that holds it ends its block",
+                    callee.text
+                ),
+            ),
             ast::Stmt::Call { callee, .. } => {
                 panic!(
                     "fn calls are inlined before checking, yet '{}' is still a call",
@@ -521,6 +552,15 @@ impl Checker<'_> {
                 ),
             );
         }
+        if let Some(kind) = self.dispatch_hooks().first() {
+            return error(
+                at,
+                format!(
+                    "a parallel for dispatches its calls at once, so '{}' cannot run at each: use a sequential for",
+                    kind.describe()
+                ),
+            );
+        }
         let list_at = list.at();
         let (list, ty) = self.expr(list, None, out)?;
         let Type::List { element, capacity } = ty else {
@@ -614,8 +654,33 @@ impl Checker<'_> {
         arms: &[ast::Arm],
         out: &mut Vec<Stmt>,
     ) -> Checked<bool> {
+        if let Some(handled) = self.hooked_match(at, subject, arms, out)? {
+            return Ok(handled);
+        }
         let subject_at = subject.at();
         let (subject, ty) = self.expr(subject, None, out)?;
+        self.match_with(
+            at,
+            subject_at,
+            (subject, ty),
+            arms,
+            &mut |checker, block| checker.block(block),
+            None,
+            out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn match_with(
+        &mut self,
+        at: Position,
+        subject_at: Position,
+        (subject, ty): (Expr, Type),
+        arms: &[ast::Arm],
+        body: &mut dyn FnMut(&mut Self, &ast::Block) -> Checked<(Vec<Stmt>, bool)>,
+        spawned: Option<hooks::Spawned>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
         let Some(variants) = ty.variants(self.program) else {
             return error(
                 subject_at,
@@ -652,16 +717,23 @@ impl Checker<'_> {
                     ),
                 );
             }
+            let opens = spawned.filter(|_| index == ir::OK && matches!(ty, Type::Maybe(_)));
             let arm_checked = self.scoped(|checker| {
                 let mut bindings = Vec::new();
                 for (binding, field) in names.iter().zip(fields) {
                     bindings.push(if binding.text == WILDCARD {
-                        None
+                        opens.map(|_| checker.hidden("spawned", field.clone()))
                     } else {
                         Some(checker.declare(binding, field.clone())?)
                     });
                 }
-                let (body, returned) = checker.block(&arm.body)?;
+                let mut prelude = Vec::new();
+                if let (Some(spawned), [Some(agent)]) = (opens, bindings.as_slice()) {
+                    checker.spawned(spawned, *agent, arm.body.at, &mut prelude)?;
+                }
+                let (rest, returned) = body(checker, &arm.body)?;
+                prelude.extend(rest);
+                let body = prelude;
                 Ok((
                     ir::Arm {
                         variant: index,
@@ -895,6 +967,9 @@ impl Checker<'_> {
         }
         if let Some(&tool_id) = self.globals.tools.get(&callee.text) {
             let tool = &self.program.tools[tool_id];
+            if tool.spawn.is_some() {
+                self.plain_spawn(callee)?;
+            }
             let wanted: Vec<Type> = tool.params.iter().map(|param| param.ty.clone()).collect();
             let args = self.args(at, &format!("tool '{}'", callee.text), args, &wanted, out)?;
             let inner = Box::new(tool.returns.clone());
@@ -1002,6 +1077,7 @@ impl Checker<'_> {
                 Ok((Expr::Len(Box::new(value)), Type::U64))
             }
             "dispatch" => {
+                self.plain_dispatch(at)?;
                 let args = self.args(at, "dispatch", args, &[Type::Sum(ir::CALL)], out)?;
                 Ok(self.site(
                     SiteKind::Dispatch,
@@ -1012,6 +1088,14 @@ impl Checker<'_> {
                 ))
             }
             "wait" => self.wait(at, args, out),
+            JOIN => self.join(at, args, out),
+            DENY | ALLOW => error(
+                at,
+                format!(
+                    "'{}' is a statement of a 'before tool' or 'after tool' block, not a value",
+                    callee.text
+                ),
+            ),
             "suspend" => {
                 if !self.program.events.resume {
                     return error(
@@ -1282,7 +1366,7 @@ impl Checker<'_> {
     }
 }
 
-const EFFECT_BUILTINS: [&str; 5] = ["dispatch", "now", "random", "wait", "suspend"];
+const EFFECT_BUILTINS: [&str; 6] = ["dispatch", "now", "random", "wait", "suspend", "join"];
 
 fn parallel_body<'b>(
     at: Position,

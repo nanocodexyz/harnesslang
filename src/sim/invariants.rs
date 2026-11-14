@@ -47,10 +47,12 @@ pub enum Invariant {
     WaitUntil,
     WallLimit,
     ModeSent,
+    DeniedUnrun,
+    ChildScoped,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -83,6 +85,8 @@ impl Invariant {
         Self::WaitUntil,
         Self::WallLimit,
         Self::ModeSent,
+        Self::DeniedUnrun,
+        Self::ChildScoped,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -119,6 +123,8 @@ impl Invariant {
             Self::WaitUntil => "wait_until",
             Self::WallLimit => "wall_limit",
             Self::ModeSent => "mode_sent",
+            Self::DeniedUnrun => "denied_unrun",
+            Self::ChildScoped => "child_scoped",
         }
     }
 }
@@ -487,7 +493,50 @@ pub fn checkpoint_compacted(
     Ok(())
 }
 
+fn sessions_and_denials(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    for (key, child) in &world.children {
+        if let Err(failed) = &child.result {
+            return violation(
+                failed.invariant,
+                format!("child session {key}: {}", failed.detail),
+            );
+        }
+    }
+    if let Some(detail) = world.denied_ran.first() {
+        return violation(Invariant::DeniedUnrun, detail.clone());
+    }
+    let mut spawned: BTreeMap<(u64, u64), String> = BTreeMap::new();
+    for record in records {
+        match record {
+            Record::Call {
+                turn, seq, tool, ..
+            } if world.program.spawn_of(tool).is_some() => {
+                spawned.insert((*turn, *seq), tool.clone());
+            }
+            Record::Result {
+                turn,
+                seq,
+                output: Output::Ok(Json::String(key)),
+            } if spawned.contains_key(&(*turn, *seq)) => {
+                let scoped = crate::ir::spawn_key(*turn, *seq);
+                if *key != scoped || !world.children.contains_key(key) {
+                    return violation(
+                        Invariant::ChildScoped,
+                        format!(
+                            "spawn {} at turn {turn} seq {seq} records child key {key:?}, but its call starts the child session {scoped:?}",
+                            spawned[&(*turn, *seq)]
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violation> {
+    sessions_and_denials(world, records)?;
     for (id, dispatched) in &world.dispatched {
         if dispatched.external > 1 {
             return violation(

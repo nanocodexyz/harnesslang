@@ -406,6 +406,19 @@ fn dispatch(out: &mut String, program: &Program) {
         EffectClass::undeclared()
     )
     .expect("writing to a string succeeds");
+    let spawns: Vec<String> = program
+        .spawns()
+        .map(|(tool, _)| format!("{:?}", tool.name))
+        .collect();
+    let pattern = if spawns.is_empty() {
+        "_tool: &str) -> bool {\n    false".to_owned()
+    } else {
+        format!(
+            "tool: &str) -> bool {{\n    matches!(tool, {})",
+            spawns.join(" | ")
+        )
+    };
+    writeln!(out, "pub fn spawns({pattern}\n}}\n").expect("writing to a string succeeds");
 }
 
 fn limit(bound: &ir::Bound) -> String {

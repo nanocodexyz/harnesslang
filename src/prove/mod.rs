@@ -224,8 +224,82 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
         records(&program, &plan, mutation, &mut report);
         bounds(&program, &plan, &mut report);
         waits(&program, &plan, &mut report);
+        children(&program, &plan, &mut report);
     }
     report
+}
+
+fn spawning(program: &Program, kind: crate::ir::SiteKind) -> bool {
+    match kind {
+        crate::ir::SiteKind::Tool(tool) => program.tools[tool].spawn.is_some(),
+        crate::ir::SiteKind::Dispatch => program.spawns().next().is_some(),
+        _ => false,
+    }
+}
+
+fn children(program: &Program, plan: &Plan, report: &mut Report) {
+    let model = &plan.model;
+    for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
+        let Some(family) = &handler.worst.family else {
+            continue;
+        };
+        let spawns = |op: &Op| match op {
+            Op::Run {
+                slot: lower::Slot::Site(site),
+                ..
+            } => Count {
+                total: u64::from(spawning(program, handler.sites[*site].kind)),
+                nested: 0,
+            },
+            _ => Count::default(),
+        };
+        let planned = planned_max(&lowered.ops, &spawns)
+            .expect("the IR's child session count fits u64, and the plan starts no more")
+            .total;
+        assert!(
+            planned <= handler.worst.spawns.total,
+            "the IR's child session worst case covers every path of the plan"
+        );
+        let mut fits = true;
+        for (tool, spawn) in program.spawns() {
+            let child = &spawn.child().worst.requests;
+            let Some(limit) = model.limits.outbound_requests_per_invocation else {
+                continue;
+            };
+            if child.total > limit.value {
+                fits = false;
+                report.add(Finding {
+                    handler: handler.name.clone(),
+                    target: Some(model.target),
+                    property: "worst_case",
+                    message: format!(
+                        "child session {}.{} that {} starts has worst case {} outbound requests, over {}'s limit of {} {}",
+                        spawn.harness(),
+                        spawn.handler,
+                        tool.name,
+                        child.total,
+                        model.target.name(),
+                        limit.value,
+                        limit.unit
+                    ),
+                    path: child.describe_loops(),
+                    counterexample: None,
+                });
+            }
+        }
+        if !fits {
+            continue;
+        }
+        report.proved.push(format!(
+            "handler {} on {}: worst_case: {planned} child session(s) on the plan's longest path, as hl check counts ({}), each in its own run; with them {} effects, {} journal records, {} outbound requests",
+            handler.name,
+            model.target.name(),
+            handler.worst.spawns.describe_loops(),
+            family.total[0],
+            family.total[1],
+            family.total[2]
+        ));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]

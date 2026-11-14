@@ -72,9 +72,16 @@ impl<'a, 'p> Body<'a, 'p> {
     fn statement(&mut self, statement: &Stmt) {
         match statement {
             Stmt::Let { local, value } => {
+                let annotation = match value {
+                    Expr::Construct {
+                        ty: ty @ (Type::Known(_) | Type::Maybe(_)),
+                        ..
+                    } => format!(": {}", self.types.rust(ty)),
+                    _ => String::new(),
+                };
                 let value = self.expr(value);
                 let local = self.local(*local);
-                self.line(&format!("let {local} = {value};"));
+                self.line(&format!("let {local}{annotation} = {value};"));
             }
             Stmt::Assign { field, value } => {
                 let value = self.expr(value);
@@ -396,6 +403,20 @@ impl<'a, 'p> Body<'a, 'p> {
                     "Suspend",
                     "Run::Suspend".to_owned(),
                     "answer_text(engine, answer)?".to_owned(),
+                )
+            }
+            SiteKind::Deny => {
+                let call = super::types::sum_name(self.program, ir::CALL);
+                self.line(&format!("let {call}::Call(id, tool, raw) = argument0;"));
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: deny_input(&id, &tool, &raw, &argument1) }};",
+                    ir::DENY_TOOL,
+                    EffectClass::None
+                ));
+                (
+                    "Deny",
+                    "Run::Deny(argument1)".to_owned(),
+                    decode(self.types),
                 )
             }
             SiteKind::Now | SiteKind::Random => {

@@ -8,6 +8,7 @@ pub enum Kind {
     Random,
     Wait,
     Suspend,
+    Deny,
 }
 
 impl Kind {
@@ -21,6 +22,7 @@ impl Kind {
             Self::Random => "random",
             Self::Wait => "wait",
             Self::Suspend => "suspend",
+            Self::Deny => "deny",
         }
     }
 }
@@ -97,6 +99,24 @@ pub const WAIT_MS: &str = "ms";
 pub const WAIT_UNTIL: &str = "until";
 pub const SUSPEND_TOOL: &str = "suspend";
 pub const SUSPEND_KEY: &str = "key";
+pub const DENY_TOOL: &str = "deny";
+pub const SPAWN_KEY_SEPARATOR: &str = ".";
+
+pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
+    Json::object(vec![
+        ("id", Json::String(id.to_owned())),
+        ("input", Json::String(input.to_owned())),
+        ("reason", Json::String(reason.to_owned())),
+        ("tool", Json::String(tool.to_owned())),
+    ])
+}
+
+pub fn spawn_output(turn: u64, seq: u64, tool: &str, output: Output) -> Output {
+    if !matches!(output, Output::Ok(_)) || !program::spawns(tool) {
+        return output;
+    }
+    Output::Ok(Json::String(format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")))
+}
 
 pub fn wait_until(input: &Json) -> Option<u64> {
     input.get(WAIT_UNTIL).and_then(Json::as_u64)
@@ -583,6 +603,7 @@ pub enum Run<'a> {
     Random,
     Wait,
     Suspend,
+    Deny(String),
 }
 
 pub enum Answer {
@@ -1199,6 +1220,7 @@ impl<'a> Engine<'a> {
                 Output::Ok(Json::Number(world.sleep(turn, seq, until)?))
             }
             Run::Random => Output::Ok(Json::Number(world.random())),
+            Run::Deny(reason) => Output::Failed(reason),
             Run::Listing(listing) => {
                 let output = world.listing(&ListingRequest {
                     turn,
@@ -1220,7 +1242,7 @@ impl<'a> Engine<'a> {
                         admitted: admitted.as_deref(),
                         nested: None,
                     });
-                    checked_output(&call.tool, returns, output)
+                    spawn_output(turn, seq, &call.tool, checked_output(&call.tool, returns, output))
                 }
             },
         };
@@ -1369,7 +1391,7 @@ impl<'a> Engine<'a> {
         completed.sort_by_key(|(position, _)| *position);
         for (position, output) in completed {
             let (index, seq) = group[position];
-            let output = checked_output(&calls[index].tool, returns, output);
+            let output = spawn_output(turn, seq, &calls[index].tool, checked_output(&calls[index].tool, returns, output));
             self.append(Record::Result {
                 turn,
                 seq,

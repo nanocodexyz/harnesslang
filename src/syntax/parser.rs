@@ -1,8 +1,8 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Invariant, Item,
-    Listing, Model, Name, Param, Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr,
-    VariantDef,
+    Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
+    Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
+    TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -39,8 +39,8 @@ pub const KEYWORDS: [&str; 27] = [
     "requires",
 ];
 
-const ITEMS: &str =
-    "'const', 'type', 'tool', 'tools', 'code', 'model', 'state', 'invariant', 'fn' or 'on'";
+const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'code', 'spawn', 'model', 'state', 'invariant', 'fn', 'before', 'after' or 'on'";
+pub const SESSION_END_HANDLER: &str = "session_end";
 pub const CODE_TOOLS_FIELD: &str = "tools";
 
 pub struct Parser<'a> {
@@ -182,6 +182,8 @@ impl<'a> Parser<'a> {
             "state" => self.state().map(Item::State),
             "invariant" => self.invariant().map(Item::Invariant),
             "fn" => self.function().map(Item::Function),
+            "spawn" => self.spawn().map(Item::Spawn),
+            "before" | "after" => self.tool_hook().map(Item::Hook),
             "on" => self.handler_or_event(),
             _ => Err(self.unexpected(ITEMS)),
         }
@@ -400,8 +402,90 @@ impl<'a> Parser<'a> {
         Ok(Function { name, params, body })
     }
 
+    fn spawn(&mut self) -> Parsed<Spawn> {
+        self.word("spawn")?;
+        let name = self.name("a spawn tool name")?;
+        self.word("runs")?;
+        let handler = self.name("the handler the child session runs")?;
+        self.word("from")?;
+        let file = self.text_value("the child harness's file, as text")?;
+        Ok(Spawn {
+            name,
+            handler,
+            file,
+        })
+    }
+
+    fn tool_hook(&mut self) -> Parsed<Hook> {
+        let at = self.at();
+        let kind = if self.is_word("before") {
+            HookKind::BeforeTool
+        } else {
+            HookKind::AfterTool
+        };
+        self.advance();
+        self.word("tool")?;
+        let params = self.params()?;
+        let body = self.block()?;
+        Ok(Hook {
+            kind,
+            at,
+            params,
+            body,
+        })
+    }
+
+    fn lifecycle(&mut self) -> Parsed<Option<Item>> {
+        let at = self.at();
+        let Token::Name(first) = self.peek().token.clone() else {
+            return Ok(None);
+        };
+        let second = match self.peek_second() {
+            Token::Name(word) => Some(word.clone()),
+            Token::Symbol(Symbol::LeftBrace) => None,
+            _ => return Ok(None),
+        };
+        if first == "session" && second.as_deref() == Some("end") {
+            self.advance();
+            self.advance();
+            let name = Name {
+                text: SESSION_END_HANDLER.to_owned(),
+                at,
+            };
+            let params = self.params()?;
+            let mut handler = self.handler(name, params)?;
+            handler.ends_session = true;
+            return Ok(Some(Item::Handler(handler)));
+        }
+        let Some(kind) = HookKind::ALL.into_iter().find(|kind| {
+            let (one, two) = kind.words();
+            !kind.denies() && one == first && second.as_deref() == (!two.is_empty()).then_some(two)
+        }) else {
+            return Ok(None);
+        };
+        self.advance();
+        if second.is_some() {
+            self.advance();
+        }
+        let params = if self.is_symbol(Symbol::LeftParen) {
+            self.params()?
+        } else {
+            Vec::new()
+        };
+        let body = self.block()?;
+        Ok(Some(Item::Hook(Hook {
+            kind,
+            at,
+            params,
+            body,
+        })))
+    }
+
     fn handler_or_event(&mut self) -> Parsed<Item> {
         self.word("on")?;
+        if let Some(item) = self.lifecycle()? {
+            return Ok(item);
+        }
         let name = self.name("a handler or event name")?;
         if !self.is_symbol(Symbol::LeftParen) {
             return Ok(Item::Event(Event {
@@ -444,6 +528,7 @@ impl<'a> Parser<'a> {
             returns,
             requires,
             body,
+            ends_session: false,
         })
     }
 

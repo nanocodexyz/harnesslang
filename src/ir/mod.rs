@@ -179,6 +179,17 @@ impl Program {
         self.handlers.iter().find(|handler| handler.name == name)
     }
 
+    pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
+        self.tool(tool)
+            .and_then(|(_, declared)| declared.spawn.as_ref())
+    }
+
+    pub fn spawns(&self) -> impl Iterator<Item = (&Tool, &Spawn)> {
+        self.tools
+            .iter()
+            .filter_map(|tool| tool.spawn.as_ref().map(|spawn| (tool, spawn)))
+    }
+
     pub fn text_enum(&self, ty: &Type) -> Option<&Sum> {
         match ty {
             Type::Sum(sum) if self.sums[*sum].kind == SumKind::Text => {
@@ -311,7 +322,33 @@ pub struct Tool {
     pub defaults: Vec<Option<Literal>>,
     pub returns: Type,
     pub effect: EffectClass,
+    pub spawn: Option<Spawn>,
 }
+
+#[derive(Clone, Debug)]
+pub struct Spawn {
+    pub file: String,
+    pub handler: String,
+    pub program: Box<Program>,
+}
+
+impl Spawn {
+    pub fn child(&self) -> &Handler {
+        self.program
+            .handler(&self.handler)
+            .expect("the checker spawns only a handler the child harness declares")
+    }
+
+    pub fn harness(&self) -> &str {
+        &self.program.name
+    }
+}
+
+pub fn spawn_key(turn: u64, seq: u64) -> String {
+    format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")
+}
+
+pub const SPAWN_KEY_SEPARATOR: &str = ".";
 
 #[derive(Clone, Debug)]
 pub struct Listing {
@@ -409,6 +446,7 @@ pub enum SiteKind {
     Cell(CodeId),
     Wait(ConstId),
     Suspend,
+    Deny,
 }
 
 impl SiteKind {
@@ -430,6 +468,7 @@ impl SiteKind {
             Self::Cell(_) => "cell",
             Self::Wait(_) => "wait",
             Self::Suspend => "suspend",
+            Self::Deny => "deny",
         }
     }
 
@@ -440,6 +479,13 @@ impl SiteKind {
 
 pub const WAIT_TOOL: &str = "wait";
 pub const SUSPEND_TOOL: &str = "suspend";
+pub const DENY_TOOL: &str = "deny";
+pub const SESSION_STARTED_FIELD: &str = "_session_started";
+pub const SESSION_ENDED_FIELD: &str = "_session_ended";
+pub const HOOK_DECIDED_FIELD: &str = "_hook_decided";
+pub const HOOK_DENIED_FIELD: &str = "_hook_denied";
+pub const HOOK_REASON_FIELD: &str = "_hook_reason";
+pub const HOOK_INPUT_FIELD: &str = "_hook_input";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteClass {

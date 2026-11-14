@@ -3,6 +3,14 @@ const WAIT_MS = "ms";
 const WAIT_UNTIL = "until";
 const SUSPEND_TOOL = "suspend";
 const SUSPEND_KEY = "key";
+const DENY_TOOL = "deny";
+const SPAWN_KEY_SEPARATOR = ".";
+
+function spawnOutput(tool, turn, seq, output) {
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  if (output.tag !== "ok" || declared === undefined || !declared.spawn) return output;
+  return { tag: "ok", value: String(turn) + SPAWN_KEY_SEPARATOR + String(seq) };
+}
 
 class Suspended {
   constructor(suspension) {
@@ -178,6 +186,11 @@ class Engine {
         return { tool: WAIT_TOOL, effect: "none", input: object([[WAIT_MS, site.ms]]) };
       case "suspend":
         return { tool: SUSPEND_TOOL, effect: "none", input: object([[SUSPEND_KEY, args[0]]]) };
+      case "deny": {
+        const fields = args[0].f;
+        const input = object([["id", fields[CALL_ID]], ["input", fields[CALL_INPUT]], ["reason", args[1]], ["tool", fields[CALL_TOOL]]]);
+        return { tool: DENY_TOOL, effect: "none", input };
+      }
       default:
         return { tool: site.kind, effect: "none", input: null };
     }
@@ -508,7 +521,7 @@ class Engine {
     const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
     for (const [position, raw] of ordered) {
       const waiting = group[position];
-      const output = checkedOutput(waiting.call.tool, returns, raw);
+      const output = spawnOutput(waiting.call.tool, this.turn, waiting.seq, checkedOutput(waiting.call.tool, returns, raw));
       this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output });
       this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output });
       values[waiting.index] = this.decode(site, output);
@@ -538,6 +551,8 @@ class Engine {
       output = { tag: "ok", value: await world.now() };
     } else if (site.kind === "random") {
       output = { tag: "ok", value: await world.random() };
+    } else if (site.kind === "deny") {
+      output = { tag: "failed", error: args[1] };
     } else if (site.kind === "listing") {
       const listing = PROGRAM.listings[site.tool];
       output = checkedListing(listing, await world.listing({ turn: this.turn, seq, listing: listing.name }));
@@ -549,7 +564,7 @@ class Engine {
         output = { tag: "failed", error: gate.refused };
       } else {
         const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted };
-        output = checkedOutput(call.tool, returns, await world.tool(request));
+        output = spawnOutput(call.tool, this.turn, seq, checkedOutput(call.tool, returns, await world.tool(request)));
       }
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));

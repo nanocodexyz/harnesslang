@@ -379,7 +379,7 @@ pub struct Summary {
     pub failure: Option<Failure>,
 }
 
-fn add(total: &mut Stats, more: &Stats) {
+pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.turns += more.turns;
     total.runs += more.runs;
     total.crashes += more.crashes;
@@ -400,6 +400,60 @@ fn add(total: &mut Stats, more: &Stats) {
         (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
     };
     total.entry_states += more.entry_states;
+    total.children += more.children;
+    total.joined += more.joined;
+}
+
+pub fn run_child(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    seed: u64,
+    handler: &str,
+    input: &Json,
+) -> (Result<String, Violation>, Stats) {
+    let declared = program
+        .handler(handler)
+        .expect("the checker spawns only a handler the child harness declares");
+    let arguments = match crate::run::turn::arguments_from_json(program, declared, input) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return (
+                Err(liveness(format!(
+                    "the spawn's input {} does not fit handler {handler}: {error}",
+                    input.encode()
+                ))),
+                Stats::default(),
+            );
+        }
+    };
+    let mut world = SimWorld::new(program, target, mutation, seed, true);
+    let faulty = world.profile.crash_ppm > 0 || world.profile.lease_ppm > 0;
+    let request = TurnRequest {
+        turn: 1,
+        handler: handler.to_owned(),
+        arguments,
+    };
+    world.begin_turn(&request, faulty);
+    let driven = drive_turn(program, &mut world, &request);
+    world.inbox.end_turn(request.turn);
+    let result = driven.and_then(|()| {
+        let records = world
+            .medium
+            .durable()
+            .map_err(|error| liveness(format!("the child's journal cannot be read: {error}")))?;
+        invariants::check(program, &world, request.turn, &records)?;
+        records
+            .iter()
+            .find_map(|record| match record {
+                Record::Status { turn, result, .. } if *turn == request.turn => {
+                    Some(result.encode())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| liveness("the child's turn finished without a status".to_owned()))
+    });
+    (result, world.stats.clone())
 }
 
 pub fn sweep(program: &Program, options: &Options) -> Summary {
@@ -526,7 +580,7 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             stats.dispatches,
             stats.unknown,
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 if stats.cells > 0 {
                     format!(
                         " cells={} nested={} divergences={} waits={}",
@@ -540,6 +594,11 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                     .map_or_else(String::new, |events| format!(" events={events}")),
                 if stats.sleeps + stats.suspensions > 0 {
                     format!(" sleeps={} suspensions={}", stats.sleeps, stats.suspensions)
+                } else {
+                    String::new()
+                },
+                if stats.children > 0 {
+                    format!(" children={} joined={}", stats.children, stats.joined)
                 } else {
                     String::new()
                 }
