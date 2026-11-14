@@ -17,7 +17,6 @@ pub const READ_BYTES_MAX: u64 = 262_144;
 pub const READ_TOKENS_MAX: usize = 25_000;
 pub const BYTES_PER_TOKEN: usize = 4;
 pub const SELECTED_BYTES_PER_TOKEN: u64 = 128;
-pub const RESULT_TOKENS_MAX: u64 = 25_000;
 pub const PIPE_CHUNK_BYTES: usize = 8192;
 pub const MILLISECONDS_PER_MINUTE: u128 = 60_000;
 pub const MILLISECONDS_PER_SECOND: u128 = 1_000;
@@ -133,42 +132,6 @@ fn bool_field(input: &Value, key: &str) -> Result<bool, String> {
     }
 }
 
-fn estimate_tokens(text: &str) -> u64 {
-    (text.encode_utf16().count() as u64).div_ceil(BYTES_PER_TOKEN as u64)
-}
-
-pub fn truncate_middle(text: &str, tokens_max: u64) -> String {
-    let total = estimate_tokens(text);
-    if total <= tokens_max {
-        return text.to_owned();
-    }
-    let side = usize::try_from(tokens_max.saturating_mul(2)).expect("a token bound fits in usize");
-    let mut units = 0;
-    let head = text
-        .char_indices()
-        .find(|(_, c)| {
-            units += c.len_utf16();
-            units > side
-        })
-        .map_or(text.len(), |(end, _)| end);
-    units = 0;
-    let tail = text
-        .char_indices()
-        .rev()
-        .find(|(_, c)| {
-            units += c.len_utf16();
-            units > side
-        })
-        .map_or(0, |(start, c)| start + c.len_utf8())
-        .max(head);
-    format!(
-        "{}\u{2026}{} tokens truncated\u{2026}{}",
-        &text[..head],
-        total - tokens_max,
-        &text[tail..]
-    )
-}
-
 impl Workspace {
     pub fn run(&self, tool: &str, input: &Value) -> Ran {
         let outcome = match tool {
@@ -182,12 +145,8 @@ impl Workspace {
             ))),
         };
         match outcome {
-            Ok(Ran::Ok(text)) => Ran::Ok(truncate_middle(&text, RESULT_TOKENS_MAX)),
-            Ok(Ran::Failed(text)) => Ran::Failed(truncate_middle(&text, RESULT_TOKENS_MAX)),
-            Err(error) => Ran::Failed(truncate_middle(
-                &format!("<tool_use_error>{error}</tool_use_error>"),
-                RESULT_TOKENS_MAX,
-            )),
+            Ok(ran) => ran,
+            Err(error) => Ran::Failed(format!("<tool_use_error>{error}</tool_use_error>")),
         }
     }
 

@@ -373,7 +373,10 @@ impl<'a, 'p> Body<'a, 'p> {
                 );
                 let decode = match (result, &model.window) {
                     (Type::Sum(attempt), Some(window)) => {
-                        assert_eq!(*attempt, window.attempt, "a model with a window yields an attempt");
+                        assert_eq!(
+                            *attempt, window.attempt,
+                            "a model with a window yields an attempt"
+                        );
                         let rejected = format!(
                             "{}::{}",
                             super::types::sum_name(self.program, *attempt),
@@ -509,11 +512,9 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.expr(text),
                 constant(&self.program.constants[*tokens].name)
             ),
-            Expr::With { list, entry } => format!(
-                "with_entry({}, {})",
-                self.expr(list),
-                self.expr(entry)
-            ),
+            Expr::With { list, entry } => {
+                format!("with_entry({}, {})", self.expr(list), self.expr(entry))
+            }
             Expr::Cancelled => "engine.cancelled()".to_owned(),
         }
     }

@@ -237,8 +237,8 @@ pub fn without_retry_after(response: &Json) -> Json {
     let Json::Object(map) = response else {
         return response.clone();
     };
-    let delayed = [ir::ATTEMPT_THROTTLED, ir::ATTEMPT_TRANSIENT]
-        .map(|variant| ir::ATTEMPT_VARIANTS[variant]);
+    let delayed =
+        [ir::ATTEMPT_THROTTLED, ir::ATTEMPT_TRANSIENT].map(|variant| ir::ATTEMPT_VARIANTS[variant]);
     let mut out = map.clone();
     for name in delayed {
         if let Some(Json::Array(fields)) = out.get_mut(name)

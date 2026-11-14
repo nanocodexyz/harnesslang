@@ -61,16 +61,9 @@ pub struct Usage {
     pub cache_write: u64,
 }
 
-impl Usage {
-    pub fn context(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
-    }
-}
 
-pub enum Answer {
-    Reply(Value, Usage),
-    Retry(String),
-}
+pub const MILLISECONDS_PER_SECOND: u64 = 1000;
+pub const HTTP_OVERLOADED: u16 = 529;
 
 pub struct Client {
     pub base_url: String,
@@ -146,20 +139,26 @@ impl Transcript {
     fn reply(&mut self, reply: &Value) -> Result<(), String> {
         let (name, payload) = tagged(reply)?;
         match (name, payload) {
-            ("answer", Some(Value::Array(fields))) => self.content(
-                fields
+            ("answer", Some(Value::Array(fields))) => {
+                let content = fields
                     .get(1)
                     .and_then(Value::as_str)
-                    .ok_or("an answer has no content")?,
-            )?,
+                    .ok_or("an answer has no content")?;
+                if content.is_empty() {
+                    self.text(
+                        "assistant",
+                        fields.first().and_then(Value::as_str).unwrap_or(""),
+                    );
+                } else {
+                    self.content(content)?;
+                }
+            }
             ("calls", Some(Value::Array(fields))) => self.content(
                 fields
-                    .get(1)
+                    .get(2)
                     .and_then(Value::as_str)
                     .ok_or("calls have no content")?,
             )?,
-            ("truncated", Some(Value::String(text))) => self.text("assistant", text),
-            ("paused" | "context_full" | "refused" | "rejected", _) => {}
             (other, _) => return Err(format!("context holds an unknown reply {other}")),
         }
         Ok(())
@@ -266,7 +265,7 @@ impl Client {
         Ok(body)
     }
 
-    pub fn send(&self, body: &Value) -> Result<(u16, String), String> {
+    pub fn send(&self, body: &Value) -> Result<(u16, String, u64), String> {
         if let Some(rest) = self.base_url.strip_prefix("http://") {
             let request = self.scratch.join("request.json");
             let encoded = body.encode();
@@ -276,15 +275,18 @@ impl Client {
         }
         let request = self.scratch.join("request.json");
         let response = self.scratch.join("response.json");
+        let headers = self.scratch.join("headers.txt");
         std::fs::write(&request, body.encode())
             .map_err(|error| format!("write request: {error}"))?;
         let _ = std::fs::remove_file(&response);
+        let _ = std::fs::remove_file(&headers);
         let config = format!(
-            "url = \"{}/v1/messages\"\nheader = \"x-api-key: {}\"\nheader = \"anthropic-version: {ANTHROPIC_VERSION}\"\nheader = \"content-type: application/json\"\ndata-binary = \"@{}\"\noutput = \"{}\"\n",
+            "url = \"{}/v1/messages\"\nheader = \"x-api-key: {}\"\nheader = \"anthropic-version: {ANTHROPIC_VERSION}\"\nheader = \"content-type: application/json\"\ndata-binary = \"@{}\"\noutput = \"{}\"\ndump-header = \"{}\"\n",
             self.base_url.trim_end_matches('/'),
             self.key,
             request.display(),
-            response.display()
+            response.display(),
+            headers.display()
         );
         let mut child = Command::new("curl")
             .args([
@@ -328,7 +330,8 @@ impl Client {
             .map_err(|_| "curl printed no HTTP status".to_owned())?;
         let text = std::fs::read_to_string(&response)
             .map_err(|error| format!("read response: {error}"))?;
-        Ok((status, text))
+        let head = std::fs::read_to_string(&headers).unwrap_or_default();
+        Ok((status, text, retry_after_ms(&head)))
     }
 }
 
@@ -368,34 +371,90 @@ fn error_text(status: u16, body: &str) -> (String, String) {
     }
 }
 
-pub fn interpret(status: u16, body: &str) -> Answer {
+pub fn retry_after_ms(head: &str) -> u64 {
+    let header = |name: &str| {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    if let Some(ms) = header("retry-after-ms").and_then(|value| value.parse::<u64>().ok()) {
+        return ms;
+    }
+    header("retry-after")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(0, |seconds| seconds.saturating_mul(MILLISECONDS_PER_SECOND))
+}
+
+fn attempt(name: &str, fields: Vec<Value>) -> Value {
+    Value::object([(name, Value::Array(fields))])
+}
+
+pub fn transient(error: &str, retry_after_ms: u64) -> Value {
+    attempt(
+        "transient",
+        vec![Value::text(error), Value::number(retry_after_ms)],
+    )
+}
+
+fn ok(reply: Value, stop: &str, used: Usage) -> Value {
+    attempt(
+        "ok",
+        vec![
+            reply,
+            Value::text(stop),
+            Value::number(used.input),
+            Value::number(used.output),
+            Value::number(used.cache_read),
+            Value::number(used.cache_write),
+        ],
+    )
+}
+
+pub fn interpret(status: u16, body: &str, retry_after_ms: u64) -> (Value, Usage) {
     if status != HTTP_OK {
         let (kind, text) = error_text(status, body);
         if status == HTTP_TOO_LARGE || text.contains(PROMPT_TOO_LONG) {
-            return Answer::Reply(Value::text("context_full"), Usage::default());
-        }
-        let retryable = matches!(status, HTTP_REQUEST_TIMEOUT | HTTP_CONFLICT | HTTP_TOO_MANY)
-            || status >= HTTP_SERVER_ERROR_MIN
-            || matches!(
-                kind.as_str(),
-                "overloaded_error" | "api_error" | "rate_limit_error"
-            );
-        return if retryable {
-            Answer::Retry(text)
-        } else {
-            Answer::Reply(
-                Value::object([("rejected", Value::text(&text))]),
+            let empty = Value::object([(
+                "answer",
+                Value::Array(vec![Value::text(""), Value::text("")]),
+            )]);
+            return (
+                ok(empty, "context_exceeded", Usage::default()),
                 Usage::default(),
+            );
+        }
+        let throttled = matches!(status, HTTP_TOO_MANY | HTTP_OVERLOADED)
+            || matches!(kind.as_str(), "overloaded_error" | "rate_limit_error");
+        let retryable = matches!(status, HTTP_REQUEST_TIMEOUT | HTTP_CONFLICT)
+            || status >= HTTP_SERVER_ERROR_MIN
+            || kind == "api_error";
+        let answer = if throttled {
+            attempt(
+                "throttled",
+                vec![Value::text(&text), Value::number(retry_after_ms)],
             )
+        } else if retryable {
+            transient(&text, retry_after_ms)
+        } else {
+            attempt("rejected", vec![Value::text(&text)])
         };
+        return (answer, Usage::default());
     }
     let value = match Value::decode(body) {
         Ok(value) => value,
-        Err(error) => return Answer::Retry(format!("response is not JSON: {error}")),
+        Err(error) => {
+            return (
+                transient(&format!("response is not JSON: {error}"), 0),
+                Usage::default(),
+            );
+        }
     };
     let used = usage(&value);
     let Some(content) = value.get("content").and_then(Value::as_array) else {
-        return Answer::Retry("response has no content".to_owned());
+        return (transient("response has no content", 0), used);
     };
     let mut text = String::new();
     let mut calls = Vec::new();
@@ -415,35 +474,30 @@ pub fn interpret(status: u16, body: &str) -> Answer {
             _ => {}
         }
     }
-    let tokens = Value::number(used.context());
     let raw = Value::String(Value::Array(content.to_vec()).encode());
-    let reply = match value.get("stop_reason").and_then(Value::as_str) {
-        Some("tool_use") if !calls.is_empty() => Value::object([(
-            "calls",
-            Value::Array(vec![Value::Array(calls), raw, tokens]),
-        )]),
-        Some("end_turn" | "stop_sequence") if calls.is_empty() => Value::object([(
-            "answer",
-            Value::Array(vec![Value::String(text), raw, tokens]),
-        )]),
-        Some("end_turn" | "stop_sequence") => Value::object([(
-            "calls",
-            Value::Array(vec![Value::Array(calls), raw, tokens]),
-        )]),
-        Some("max_tokens") => Value::object([("truncated", Value::String(text))]),
-        Some("pause_turn") => Value::text("paused"),
-        Some("refusal") => Value::object([(
-            "refused",
-            Value::String(if text.is_empty() {
-                "refusal".to_owned()
-            } else {
-                text
-            }),
-        )]),
-        Some("model_context_window_exceeded") => Value::text("context_full"),
-        other => return Answer::Retry(format!("unexpected stop_reason {other:?}")),
+    let stop = match value.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn" | "stop_sequence") => "end",
+        Some("tool_use") => "tool_use",
+        Some("max_tokens") => "max_tokens",
+        Some("pause_turn") => "pause",
+        Some("refusal") => "refusal",
+        Some("model_context_window_exceeded") => "context_exceeded",
+        other => {
+            return (
+                transient(&format!("unexpected stop_reason {other:?}"), 0),
+                used,
+            );
+        }
     };
-    Answer::Reply(reply, used)
+    let reply = if calls.is_empty() {
+        Value::object([("answer", Value::Array(vec![Value::String(text), raw]))])
+    } else {
+        Value::object([(
+            "calls",
+            Value::Array(vec![Value::Array(calls), Value::String(text), raw]),
+        )])
+    };
+    (ok(reply, stop, used), used)
 }
 
 mod plain {
@@ -455,7 +509,7 @@ mod plain {
     pub const HTTP_PORT: u16 = 80;
     const HEADER_END: &[u8] = b"\r\n\r\n";
 
-    pub fn post(rest: &str, key: &str, body: &str) -> Result<(u16, String), String> {
+    pub fn post(rest: &str, key: &str, body: &str) -> Result<(u16, String, u64), String> {
         let (authority, prefix) = rest
             .split_once('/')
             .map_or((rest, ""), |(authority, path)| (authority, path));
@@ -498,7 +552,7 @@ mod plain {
         parse(&response)
     }
 
-    fn parse(response: &[u8]) -> Result<(u16, String), String> {
+    fn parse(response: &[u8]) -> Result<(u16, String, u64), String> {
         let end = response
             .windows(HEADER_END.len())
             .position(|window| window == HEADER_END)
@@ -534,6 +588,7 @@ mod plain {
         Ok((
             status,
             String::from_utf8(body).map_err(|error| format!("response body: {error}"))?,
+            super::retry_after_ms(&head),
         ))
     }
 

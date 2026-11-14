@@ -332,7 +332,11 @@ pub const ATTEMPT_RETRY_AFTER: usize = 1;
 pub fn attempt_variants(stop: SumId) -> Vec<Variant> {
     let mut ok = vec![Type::Sum(REPLY), Type::Sum(stop)];
     ok.extend(USAGE_FIELDS.iter().map(|_| Type::U64));
-    assert_eq!(ok.len(), ATTEMPT_OK_FIELDS, "ok carries the reply, the stop and the usage");
+    assert_eq!(
+        ok.len(),
+        ATTEMPT_OK_FIELDS,
+        "ok carries the reply, the stop and the usage"
+    );
     let fields = [
         ok,
         vec![Type::Text, Type::U64],
@@ -751,9 +755,7 @@ fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
                     .for_each(|arg| expr_cuts(arg, constants, out));
                 block_cuts(&parallel.body, constants, out);
             }
-            Stmt::Effect { args, .. } => args
-                .iter()
-                .for_each(|arg| expr_cuts(arg, constants, out)),
+            Stmt::Effect { args, .. } => args.iter().for_each(|arg| expr_cuts(arg, constants, out)),
             Stmt::Take { .. } => {}
         }
     }

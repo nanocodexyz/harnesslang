@@ -265,11 +265,7 @@ fn declared_window(source: &ast::Program) -> Option<&ast::Name> {
     })
 }
 
-fn window(
-    source: &ast::Program,
-    program: &mut ir::Program,
-    globals: &mut Globals,
-) -> Checked<()> {
+fn window(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals) -> Checked<()> {
     let Some(name) = declared_window(source) else {
         return Ok(());
     };

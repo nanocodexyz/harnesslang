@@ -49,7 +49,14 @@ pub const STOP_FAULT_PPM: u64 = 60_000;
 pub const STOP_FAULTS: [&str; 4] = ["max_tokens", "refusal", "context_exceeded", "pause"];
 pub const USAGE_EDGE_PPM: u64 = 10_000;
 pub const LONG_TEXT_PPM: u64 = 20_000;
-pub const LONG_TEXT_PIECES: [&str; 6] = ["alpha ", "beta\n", "\u{e9}t\u{e9} ", "\u{1f600}", "gamma\t", "\u{4e2d}\u{6587}"];
+pub const LONG_TEXT_PIECES: [&str; 6] = [
+    "alpha ",
+    "beta\n",
+    "\u{e9}t\u{e9} ",
+    "\u{1f600}",
+    "gamma\t",
+    "\u{4e2d}\u{6587}",
+];
 pub const WORDS: [&str; 8] = [
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
 ];
@@ -504,7 +511,10 @@ impl<'a> SimWorld<'a> {
             written += ir::utf16_len(piece);
             text.push_str(piece);
         }
-        assert!(written >= units, "a long text reaches the length it was drawn for");
+        assert!(
+            written >= units,
+            "a long text reaches the length it was drawn for"
+        );
         text
     }
 
@@ -1155,7 +1165,8 @@ impl SimWorld<'_> {
 
     fn attempt_reply(&self, rng: &mut Rng, request: &ModelRequest<'_>, window: u64) -> Json {
         let name = |variant: usize| ir::ATTEMPT_VARIANTS[variant];
-        let error = |rng: &mut Rng| Json::String(format!("model failed: {}", Self::generated_text(rng)));
+        let error =
+            |rng: &mut Rng| Json::String(format!("model failed: {}", Self::generated_text(rng)));
         let retry_after = |rng: &mut Rng, edges: Option<&Edges>| {
             Json::Number(match edges {
                 Some(edges) => edges.draw(rng),

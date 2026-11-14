@@ -383,19 +383,17 @@ impl Writer<'_> {
             Stmt::Push { field, value } => {
                 self.line(&format!("rt.push({field}, {});", expr(program, value)))
             }
-            Stmt::Shrink { field, kept } => {
-                match kept {
-                    Kept::Nothing => self.line(&format!("rt.keep({field}, 0n);")),
-                    Kept::Last(count) => {
-                        self.line(&format!("rt.keep({field}, {});", expr(program, count)));
-                    }
-                    Kept::LastAfter { count, first } => self.line(&format!(
-                        "rt.keepAfter({field}, {}, {});",
-                        expr(program, count),
-                        expr(program, first)
-                    )),
+            Stmt::Shrink { field, kept } => match kept {
+                Kept::Nothing => self.line(&format!("rt.keep({field}, 0n);")),
+                Kept::Last(count) => {
+                    self.line(&format!("rt.keep({field}, {});", expr(program, count)));
                 }
-            }
+                Kept::LastAfter { count, first } => self.line(&format!(
+                    "rt.keepAfter({field}, {}, {});",
+                    expr(program, count),
+                    expr(program, first)
+                )),
+            },
             Stmt::If {
                 condition,
                 then,
@@ -552,11 +550,9 @@ fn expr(program: &Program, expression: &Expr) -> String {
             expr(program, text),
             program.constants[*tokens].name
         ),
-        Expr::With { list, entry } => format!(
-            "[...({}), {}]",
-            expr(program, list),
-            expr(program, entry)
-        ),
+        Expr::With { list, entry } => {
+            format!("[...({}), {}]", expr(program, list), expr(program, entry))
+        }
         Expr::Cancelled => "rt.cancelled()".to_owned(),
     }
 }

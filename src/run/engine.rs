@@ -1110,8 +1110,8 @@ impl<'a> Engine<'a> {
                     self.program.state[field].name
                 )));
             }
-            let dropped = usize::try_from(length - count.min(length))
-                .expect("a list's length fits usize");
+            let dropped =
+                usize::try_from(length - count.min(length)).expect("a list's length fits usize");
             let retired: Vec<Value> = items.drain(..dropped).collect();
             items.insert(0, first);
             assert_eq!(

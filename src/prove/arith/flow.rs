@@ -254,7 +254,9 @@ impl Prover<'_> {
                 format!("keep {name} last {}", self.names.expr(count)),
                 self.value(&mut state, count),
             ),
-            Kept::LastAfter { .. } => unreachable!("keep after shrinks with keep last, then pushes"),
+            Kept::LastAfter { .. } => {
+                unreachable!("keep after shrinks with keep last, then pushes")
+            }
         };
         let Some(count) = count else {
             let var = self.fresh(&mut state, &label, cap);

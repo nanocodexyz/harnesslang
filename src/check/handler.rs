@@ -897,10 +897,7 @@ impl Checker<'_> {
         let [subject, tokens] = args else {
             return error(
                 at,
-                format!(
-                    "truncate_middle takes 2 argument(s), found {}",
-                    args.len()
-                ),
+                format!("truncate_middle takes 2 argument(s), found {}", args.len()),
             );
         };
         let constant = match tokens {
