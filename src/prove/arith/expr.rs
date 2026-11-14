@@ -1,5 +1,5 @@
 use crate::ir::{BinaryOp, Expr, Type};
-use crate::prove::arith::{Alternatives, Prover, State, U64_MAX, product};
+use crate::prove::arith::{Alternatives, Prover, State, TEMPORARY, U64_MAX, product};
 use crate::prove::linear::{self, Extent, Linear};
 
 impl Prover<'_> {
@@ -54,6 +54,34 @@ impl Prover<'_> {
         }
     }
 
+    fn opaque(&mut self, state: &mut State, value: &Linear) -> Linear {
+        let low = self.extent(state, value, false);
+        let high = self.extent(state, value, true);
+        let var = Linear::var(self.fresh(state, &format!("{TEMPORARY}operand"), U64_MAX));
+        if let Extent::At(low) = low {
+            state.facts.extend(Linear::constant(low).subtract(&var));
+        }
+        if let Extent::At(high) = high {
+            state.facts.extend(var.plus(-high));
+        }
+        var
+    }
+
+    fn formed<T>(
+        &mut self,
+        state: &mut State,
+        left: &Linear,
+        right: &Linear,
+        form: impl Fn(&Linear, &Linear) -> Option<T>,
+    ) -> T {
+        if let Some(formed) = form(left, right) {
+            return formed;
+        }
+        let left = self.opaque(state, left);
+        let right = self.opaque(state, right);
+        form(&left, &right).expect("two u64 variables combine within i128")
+    }
+
     fn add(
         &mut self,
         state: &mut State,
@@ -61,8 +89,11 @@ impl Prover<'_> {
         right: &Linear,
         text: String,
     ) -> Option<Linear> {
-        let sum = left.add(right)?;
-        let goal = sum.plus(-U64_MAX)?;
+        let (sum, goal) = self.formed(state, left, right, |left, right| {
+            let sum = left.add(right)?;
+            let goal = sum.plus(-U64_MAX)?;
+            Some((sum, goal))
+        });
         self.obligation(
             state,
             goal,
@@ -79,8 +110,9 @@ impl Prover<'_> {
         right: &Linear,
         text: String,
     ) -> Option<Linear> {
-        let difference = left.subtract(right)?;
-        let goal = right.subtract(left)?;
+        let (difference, goal) = self.formed(state, left, right, |left, right| {
+            Some((left.subtract(right)?, right.subtract(left)?))
+        });
         self.obligation(
             state,
             goal,
@@ -216,11 +248,20 @@ impl Prover<'_> {
     }
 
     pub(super) fn assume(&mut self, mut state: State, condition: &Expr, truth: bool) -> State {
-        match self.goals(&state, condition, truth) {
-            Some(alternatives) if alternatives.is_empty() => state.facts.push(Linear::constant(1)),
-            Some(mut alternatives) if alternatives.len() == 1 => {
-                state.facts.extend(alternatives.remove(0));
+        let Some(alternatives) = self.goals(&state, condition, truth) else {
+            return state;
+        };
+        let mut possible = Vec::new();
+        for alternative in alternatives {
+            let mut system = state.facts.clone();
+            system.extend(alternative.iter().cloned());
+            if linear::feasible(&system, &mut self.budget).unwrap_or(true) {
+                possible.push(alternative);
             }
+        }
+        match possible.len() {
+            0 => state.facts.push(Linear::constant(1)),
+            1 => state.facts.extend(possible.remove(0)),
             _ => {}
         }
         state
@@ -252,12 +293,77 @@ impl Prover<'_> {
         Err(first_failure.and_then(|goal| self.counterexample(state, &goal)))
     }
 
+    fn range_goals(&self, state: &State, expr: &Expr, out: &mut Vec<(Option<Linear>, String)>) {
+        let (op, left, right) = match expr {
+            Expr::Binary {
+                op, left, right, ..
+            } => (*op, left, right),
+            Expr::Not(operand) => return self.range_goals(state, operand, out),
+            _ => return,
+        };
+        self.range_goals(state, left, out);
+        self.range_goals(state, right, out);
+        let text = self.names.expr(expr);
+        let operands = self
+            .linear_of(state, left)
+            .zip(self.linear_of(state, right));
+        let goal = match op {
+            BinaryOp::Add => operands.and_then(|(left, right)| left.add(&right)?.plus(-U64_MAX)),
+            BinaryOp::Subtract => operands.and_then(|(left, right)| right.subtract(&left)),
+            BinaryOp::Multiply => operands.and_then(|(left, right)| {
+                let scaled = match (left.as_constant(), right.as_constant()) {
+                    (Some(factor), _) => right.scale(factor),
+                    (_, Some(factor)) => left.scale(factor),
+                    _ => None,
+                };
+                scaled?.plus(-U64_MAX)
+            }),
+            _ => return,
+        };
+        let what = match op {
+            BinaryOp::Subtract => "underflow",
+            _ => "overflow",
+        };
+        out.push((goal, format!("u64 {what} in '{text}'")));
+    }
+
+    pub(super) fn assume_in_range(&self, state: &mut State, condition: &Expr) {
+        let mut goals = Vec::new();
+        self.range_goals(state, condition, &mut goals);
+        state
+            .facts
+            .extend(goals.into_iter().filter_map(|(goal, _)| goal));
+    }
+
+    fn in_range(&mut self, state: &State, condition: &Expr) -> Result<(), String> {
+        let mut goals = Vec::new();
+        self.range_goals(state, condition, &mut goals);
+        for (goal, what) in goals {
+            if !goal.is_some_and(|goal| self.proves(&state.facts, &goal)) {
+                return Err(what);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn invariants_hold(&mut self, state: &State, when: &str, property: &'static str) {
         if self.quiet > 0 {
             return;
         }
         let program = self.program;
         for invariant in &program.invariants {
+            if let Err(what) = self.in_range(state, &invariant.condition) {
+                let text = self.names.expr(&invariant.condition);
+                self.report(
+                    property,
+                    format!(
+                        "invariant '{}' ({text}) may trap with {what} {when}",
+                        invariant.name
+                    ),
+                    None,
+                );
+                continue;
+            }
             match self.holds(state, &invariant.condition) {
                 Ok(()) => *self.proved.entry(property).or_insert(0) += 1,
                 Err(counterexample) => {

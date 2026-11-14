@@ -1,0 +1,12 @@
+harness enum_unknown_value
+
+type status = "completed" | "failed" | "interrupted"
+
+state {
+  last: status
+}
+
+on cancel(agent: text) -> status {
+  last = "cancelled"
+  return last
+}

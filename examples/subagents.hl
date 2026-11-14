@@ -1,0 +1,89 @@
+harness subagents
+
+const rounds_max: u64 = 64
+const calls_per_round_max: u64 = 16
+const context_entries_max: u64 = 4096
+const agents_max: u64 = 4096
+const turns_max: u64 = 1000000
+
+type outcome = completed(text) | exhausted
+type status = "completed" | "failed" | "interrupted"
+
+tool Read(file_path: text) -> text effect none
+tool Bash(command: text) -> text effect external
+tool spawn_agent(task: text) -> text effect external
+tool wait_agent(agent: text) -> text effect none
+tool list_agents(filter: text) -> text effect none
+tool send_agent_message(agent: text, message: text) -> text effect external
+
+model messages calls calls_per_round_max
+
+state {
+  context: list<entry, context_entries_max>
+  agents: list<text, agents_max>
+  turns: u64
+}
+
+invariant turns_bounded: turns <= turns_max
+invariant context_bounded: len(context) <= context_entries_max
+invariant agents_bounded: len(agents) <= agents_max
+
+fn model_loop() {
+  turns = turns + 1
+  loop round below rounds_max {
+    let reply = messages(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          if call.tool == "spawn_agent" {
+            match spawn_agent(call.input) {
+              ok(spawned) => {
+                push agents spawned
+                push context result(call, spawned)
+              }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          } else {
+            match dispatch(call) {
+              ok(output) => { push context result(call, output) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on prompt(input: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
+    and len(agents) + rounds_max * calls_per_round_max <= agents_max
+{
+  push context user(input)
+  model_loop()
+}
+
+on completion(agent: text, status: status, detail: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
+    and len(agents) + rounds_max * calls_per_round_max <= agents_max
+{
+  match status {
+    "completed" => {
+      push context user("Subagent " ++ agent ++ " completed with this structured result: " ++ detail ++ " Continue the current task using only the result fields needed for the next step.")
+    }
+    "failed" => {
+      push context user("Subagent " ++ agent ++ " failed: " ++ detail ++ " Continue the current task: decide whether to retry, recover, or report the failure.")
+    }
+    "interrupted" => {
+      push context user("Subagent " ++ agent ++ " was interrupted before finishing. Continue the current task: call list_agents to inspect it.")
+    }
+  }
+  model_loop()
+}

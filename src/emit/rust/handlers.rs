@@ -3,7 +3,7 @@ use std::fmt::Write;
 use crate::effect::EffectClass;
 use crate::ir::{self, BinaryOp, Durability, Expr, Handler, Program, SiteKind, Stmt, Type};
 
-use super::types::{Types, camel, constant, ident};
+use super::types::{Types, constant, ident, variant_ident};
 
 pub struct Body<'a, 'p> {
     pub program: &'p Program,
@@ -161,7 +161,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 .iter()
                 .map(|binding| binding.map_or_else(|| "_".to_owned(), |local| self.local(local)))
                 .collect();
-            let path = format!("{prefix}::{}", camel(&variant.name));
+            let path = format!("{prefix}::{}", variant_ident(&variant.name));
             let pattern = if variant.fields.is_empty() {
                 path
             } else {
@@ -236,8 +236,8 @@ impl<'a, 'p> Body<'a, 'p> {
             Type::Maybe(inner) => format!("maybe(engine, answer, {})?", types.from_json(inner)),
             other => panic!("a tool site yields known or maybe, found {other:?}"),
         };
-        let returns = |result: &Type| match result {
-            Type::Known(inner) | Type::Maybe(inner) => Types::returns(inner),
+        let returns = |types: &Types<'p>, result: &Type| match result {
+            Type::Known(inner) | Type::Maybe(inner) => types.returns(inner),
             other => panic!("a tool site yields known or maybe, found {other:?}"),
         };
         match kind {
@@ -254,7 +254,7 @@ impl<'a, 'p> Body<'a, 'p> {
                     tool.effect,
                     entries.join(", ")
                 ));
-                let run = format!("Run::Tool({})", returns(result));
+                let run = format!("Run::Tool({})", returns(self.types, result));
                 ("Tool", run, decode(self.types))
             }
             SiteKind::Dispatch => {
@@ -262,7 +262,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.line(&format!("let {call}::Call(_, tool, input) = argument0;"));
                 self.line("let effect = dispatch_class(&tool);");
                 self.line("let call = Call { tool, effect, input: Json::String(input) };");
-                let run = format!("Run::Tool({})", returns(result));
+                let run = format!("Run::Tool({})", returns(self.types, result));
                 ("Dispatch", run, decode(self.types))
             }
             SiteKind::Model => {
@@ -381,7 +381,7 @@ impl<'a, 'p> Body<'a, 'p> {
             Type::Maybe(_) => "Maybe".to_owned(),
             other => panic!("only sums have constructors, found {other:?}"),
         };
-        let path = format!("{prefix}::{}", camel(&variants[variant].name));
+        let path = format!("{prefix}::{}", variant_ident(&variants[variant].name));
         if fields.is_empty() {
             return path;
         }

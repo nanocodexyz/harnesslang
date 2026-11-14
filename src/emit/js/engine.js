@@ -279,7 +279,7 @@ class Engine {
     } else {
       const returns = site.result.known ?? site.result.maybe;
       assert(returns !== undefined, "a tool site yields known or maybe");
-      output = await world.tool({ turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns });
+      output = checkedOutput(call.tool, returns, await world.tool({ turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns }));
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));
     this.append({ kind: "result", turn: this.turn, seq, output });

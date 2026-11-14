@@ -95,6 +95,32 @@ pub enum Returns {
     U64,
     Bool,
     Text,
+    Values {
+        name: &'static str,
+        values: &'static [&'static str],
+    },
+}
+
+pub fn checked_output(tool: &str, returns: Returns, output: Output) -> Output {
+    let Output::Ok(json) = &output else {
+        return output;
+    };
+    let (fits, expected) = match returns {
+        Returns::U64 => (json.as_u64().is_some(), "a u64".to_owned()),
+        Returns::Bool => (matches!(json, Json::Bool(_)), "a bool".to_owned()),
+        Returns::Text => (json.as_str().is_some(), "text".to_owned()),
+        Returns::Values { name, values } => (
+            json.as_str().is_some_and(|text| values.contains(&text)),
+            format!("a value of {name}"),
+        ),
+    };
+    if fits {
+        return output;
+    }
+    Output::Failed(format!(
+        "{tool} returned {}, which is not {expected}",
+        json.encode()
+    ))
 }
 
 pub struct ToolRequest<'a> {
@@ -515,15 +541,18 @@ impl<'a> Engine<'a> {
             }
             Run::Now => Output::Ok(Json::Number(world.now())),
             Run::Random => Output::Ok(Json::Number(world.random())),
-            Run::Tool(returns) => world.tool(&ToolRequest {
-                turn,
-                seq,
-                tool: &call.tool,
-                effect: call.effect,
-                input: &call.input,
-                returns,
-                nested: None,
-            }),
+            Run::Tool(returns) => {
+                let output = world.tool(&ToolRequest {
+                    turn,
+                    seq,
+                    tool: &call.tool,
+                    effect: call.effect,
+                    input: &call.input,
+                    returns,
+                    nested: None,
+                });
+                checked_output(&call.tool, returns, output)
+            }
         };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
         self.append(Record::Result {

@@ -173,7 +173,7 @@ impl Plan<'_> {
         let tool = &self.program.tools[self.code.tools[rng.pick(self.code.tools.len())]];
         let mut input = BTreeMap::new();
         for param in &tool.params {
-            let generated = crate::sim::generate(self.program, &param.ty, rng);
+            let generated = crate::sim::generate(self.program, &param.ty, rng, None);
             input.insert(
                 param.name.clone(),
                 value::to_json(self.program, &param.ty, &generated),

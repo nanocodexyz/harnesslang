@@ -23,6 +23,7 @@ plant_expression() {
     recovery_skipped) echo 's/SiteLog::Open(call) if call.effect.may_be_unknown() => Some(\*seq),/SiteLog::Open(call) if false => Some(*seq),/' ;;
     nested_flush_after_dispatch) echo 's/if tool.effect.may_be_unknown() {/if false \&\& tool.effect.may_be_unknown() {/' ;;
     timeout_rides) echo 's/if self.header_unsaved {/if false \&\& self.header_unsaved {/' ;;
+    enum_unchecked) echo 's/checked_output(&call.tool, returns, output)$/output/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

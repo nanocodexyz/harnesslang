@@ -1,11 +1,11 @@
 #[path = "drill_cells.rs"]
 mod drill_cells;
+#[path = "sql_drill_checks.rs"]
+mod checks;
 #[path = "harness.rs"]
 mod harness;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-
+use checks::{append_synced, open_append};
 use harness::program::{self, Arguments};
 use harness::{
     CellEngine, Disk, EffectClass, FileDisk, Finish, Host, Json, JsonlJournal, ModelRequest, Output,
@@ -20,8 +20,7 @@ const ANSWER_PPM: u64 = 350_000;
 const UNDECLARED_TOOL_PPM: u64 = 250_000;
 const TOOL_FAILURE_PPM: u64 = 150_000;
 const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
-const BUILTIN_EFFECTS: [&str; 2] = ["now", "random"];
-const RUN_MARKER: &str = "run";
+const RUN_OWNER: &str = "jsonl";
 
 struct Rng(u64);
 
@@ -44,26 +43,13 @@ impl Rng {
     }
 }
 
-fn append_synced(file: &mut std::fs::File, line: &str) {
-    file.write_all(line.as_bytes())
-        .expect("the drill file takes the line");
-    file.sync_data().expect("the drill file syncs");
-}
-
-fn open_append(path: &str) -> std::fs::File {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .unwrap_or_else(|error| panic!("{path}: {error}"))
-}
-
 struct Drill {
     ledger: std::fs::File,
     acks: std::fs::File,
     rng: Rng,
     clock: u64,
     engine: drill_cells::ScriptEngine,
+    tag: String,
 }
 
 impl Host for Drill {
@@ -77,10 +63,8 @@ impl Host for Drill {
         {
             drill_cells::check_c1(&self.engine.journal, request.turn, request.seq, nested.id, request.tool);
         }
-        append_synced(
-            &mut self.ledger,
-            &format!("{id} {} {}\n", request.tool, request.effect.name()),
-        );
+        let line = checks::dispatch_line(&id, request.tool, request.effect, &self.tag);
+        append_synced(&mut self.ledger, &line);
         if self.rng.chance(TOOL_FAILURE_PPM) {
             return Output::Failed(format!("{} failed at {id}", request.tool));
         }
@@ -88,6 +72,9 @@ impl Host for Drill {
             Returns::U64 => Json::Number(self.rng.draw() >> 32),
             Returns::Bool => Json::Bool(self.rng.draw() & 1 == 1),
             Returns::Text => Json::String(format!("{}-{id}", request.tool)),
+            Returns::Values { values, .. } => {
+                Json::String(values[(self.rng.draw() % values.len() as u64) as usize].to_owned())
+            }
         })
     }
 
@@ -173,8 +160,10 @@ fn run(journal: &str, ledger: &str, acks: &str, seed: u64, turns: u64) {
         rng: Rng(seed ^ started),
         clock: 0,
         engine: drill_cells::ScriptEngine::new(journal),
+        tag: checks::run_tag(RUN_OWNER),
     };
-    append_synced(&mut drill.ledger, &format!("{RUN_MARKER}\n"));
+    let run_line = checks::run_line(&drill.tag);
+    append_synced(&mut drill.ledger, &run_line);
     let first = acknowledged_last(acks) + 1;
     let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
     let mut session = JsonlJournal::open(&mut disk).unwrap_or_else(|error| panic!("{error}"));
@@ -188,6 +177,8 @@ fn run(journal: &str, ledger: &str, acks: &str, seed: u64, turns: u64) {
             Err(RunError::Exit(exit)) => panic!("turn {turn}: {exit:?}"),
         };
     }
+    let finished = checks::finished_line(&drill.tag);
+    append_synced(&mut drill.ledger, &finished);
 }
 
 fn acknowledged_last(acks: &str) -> u64 {
@@ -204,256 +195,25 @@ fn acknowledged_last(acks: &str) -> u64 {
     last
 }
 
-struct Logged {
-    tool: String,
-    done: bool,
-}
-
-struct Calls {
-    external: BTreeMap<String, Logged>,
-    other: BTreeMap<String, Logged>,
-    unknown: BTreeSet<String>,
-    statuses: BTreeMap<u64, Vec<(String, String)>>,
-}
-
-fn calls(records: &[Record]) -> Calls {
-    let mut calls = Calls {
-        external: BTreeMap::new(),
-        other: BTreeMap::new(),
-        unknown: BTreeSet::new(),
-        statuses: BTreeMap::new(),
-    };
-    for record in records {
-        match record {
-            Record::Call {
-                turn,
-                seq,
-                tool,
-                effect,
-                ..
-            } => {
-                let map = if *effect == EffectClass::External {
-                    &mut calls.external
-                } else {
-                    &mut calls.other
-                };
-                let logged = Logged {
-                    tool: tool.clone(),
-                    done: false,
-                };
-                if map.insert(call_id(*turn, *seq), logged).is_some() {
-                    panic!("seq_unique: call {} recorded twice", call_id(*turn, *seq));
-                }
-            }
-            Record::Result { turn, seq, .. } => {
-                let id = call_id(*turn, *seq);
-                let logged = calls
-                    .external
-                    .get_mut(&id)
-                    .or_else(|| calls.other.get_mut(&id))
-                    .expect("a result follows its call");
-                logged.done = true;
-            }
-            Record::Recovery { turn, unknown, .. } => {
-                for seq in unknown {
-                    calls.unknown.insert(call_id(*turn, *seq));
-                }
-            }
-            Record::Status {
-                turn,
-                outcome,
-                result,
-                ..
-            } => {
-                calls
-                    .statuses
-                    .entry(*turn)
-                    .or_default()
-                    .push((outcome.name().to_owned(), result.encode()));
-            }
-            _ => {}
-        }
-    }
-    calls
-}
-
-struct Dispatch {
-    nested: bool,
-    id: String,
-    tool: String,
-    external: bool,
-}
-
-fn ledger_runs(ledger: &str) -> Vec<Vec<Dispatch>> {
-    let text = std::fs::read_to_string(ledger).unwrap_or_default();
-    let mut runs: Vec<Vec<Dispatch>> = Vec::new();
-    for line in text.lines() {
-        if line == RUN_MARKER {
-            runs.push(Vec::new());
-            continue;
-        }
-        let mut parts = line.split(' ');
-        let (Some(id), Some(tool), Some(effect), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            panic!("ledger line {line:?} is not 'id tool effect'");
-        };
-        let run = runs
-            .last_mut()
-            .unwrap_or_else(|| panic!("ledger line {line:?} comes before any run marker"));
-        run.push(Dispatch {
-            nested: id.contains(harness::NESTED_ID_INFIX),
-            id: id.to_owned(),
-            tool: tool.to_owned(),
-            external: effect == EffectClass::External.name(),
-        });
-    }
-    runs
-}
-
-fn check_finished(session: &harness::Session, calls: &Calls, turns: u64) {
-    for turn in 1..=turns {
-        let finished = session
-            .turns
-            .get(&turn)
-            .is_some_and(|log| log.finished.is_some());
-        assert!(finished, "liveness: turn {turn} finished");
-        let statuses = calls.statuses.get(&turn).map_or(0, Vec::len);
-        assert_eq!(statuses, 1, "finish_once: turn {turn} has one status");
-    }
-}
-
-fn check_external(calls: &Calls, runs: &[Vec<Dispatch>]) {
-    let mut dispatched: BTreeMap<&str, u64> = BTreeMap::new();
-    for dispatch in runs.iter().flatten().filter(|dispatch| dispatch.external && !dispatch.nested) {
-        *dispatched.entry(&dispatch.id).or_default() += 1;
-        let logged = calls.external.get(&dispatch.id);
-        assert!(
-            logged.is_some(),
-            "external {} ran before its call record was durable",
-            dispatch.id
-        );
-        assert_eq!(
-            logged.map(|logged| logged.tool.as_str()),
-            Some(dispatch.tool.as_str()),
-            "external {} ran as its recorded tool",
-            dispatch.id
-        );
-    }
-    for (id, count) in &dispatched {
-        assert_eq!(*count, 1, "external_once: {id} dispatched {count} times");
-    }
-    for (id, logged) in &calls.external {
-        let unknown = calls.unknown.contains(id);
-        assert!(
-            logged.done ^ unknown,
-            "unknown_reported: external {id} has a result {} and is reported unknown {unknown}",
-            logged.done
-        );
-        if logged.done {
-            assert_eq!(
-                dispatched.get(id.as_str()),
-                Some(&1),
-                "external {id} has a result without a dispatch"
-            );
-        }
-    }
-}
-
-fn check_other(calls: &Calls, runs: &[Vec<Dispatch>]) {
-    let (finished_run, killed_runs) = runs
-        .split_last()
-        .expect("the ledger holds the run that finished");
-    for dispatch in finished_run.iter().filter(|dispatch| !dispatch.external && !dispatch.nested) {
-        let logged = calls.other.get(&dispatch.id);
-        assert!(
-            logged.is_some(),
-            "{} ran in the run that finished but its call record is not durable",
-            dispatch.id
-        );
-        assert_eq!(
-            logged.map(|logged| logged.tool.as_str()),
-            Some(dispatch.tool.as_str()),
-            "{} ran as its recorded tool",
-            dispatch.id
-        );
-    }
-    let ran: BTreeSet<(&str, &str)> = finished_run
-        .iter()
-        .chain(killed_runs.iter().flatten())
-        .filter(|dispatch| !dispatch.external)
-        .map(|dispatch| (dispatch.id.as_str(), dispatch.tool.as_str()))
-        .collect();
-    for (id, logged) in &calls.other {
-        assert!(logged.done, "idempotent_known: {id} ends without a result");
-        if !BUILTIN_EFFECTS.contains(&logged.tool.as_str()) && program::code_of(&logged.tool).is_none() {
-            assert!(
-                ran.contains(&(id.as_str(), logged.tool.as_str())),
-                "{id} has a result without a dispatch of {}",
-                logged.tool
-            );
-        }
-    }
-}
-
-fn check_acks(calls: &Calls, acks: &str, turns: u64) -> usize {
-    let acks_text = std::fs::read_to_string(acks).unwrap_or_default();
-    let mut acked = BTreeSet::new();
-    for line in acks_text.lines() {
-        let mut parts = line.splitn(3, ' ');
-        let (Some(turn), Some(outcome), Some(result)) = (parts.next(), parts.next(), parts.next())
-        else {
-            panic!("ack line {line:?} is not 'turn outcome result'");
-        };
-        let turn: u64 = turn.parse().expect("an ack names its turn");
-        let status = &calls
-            .statuses
-            .get(&turn)
-            .expect("an acknowledged turn has a status")[0];
-        assert_eq!(
-            (outcome, result),
-            (status.0.as_str(), status.1.as_str()),
-            "finish_once: turn {turn} acknowledged as its status"
-        );
-        acked.insert(turn);
-    }
-    assert_eq!(acked.len() as u64, turns, "every turn is acknowledged");
-    acks_text.lines().count()
-}
-
 fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
     let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
     let opened = harness::jsonl_open(&mut disk).expect("the journal reads");
     let session =
         harness::fold(&opened.records).unwrap_or_else(|error| panic!("the journal folds: {error}"));
-    let calls = calls(&opened.records);
-    check_finished(&session, &calls, turns);
-    let runs = ledger_runs(ledger);
-    check_external(&calls, &runs);
-    check_other(&calls, &runs);
-    let acks_count = check_acks(&calls, acks, turns);
+    let verified = checks::check_all(&opened.records, ledger, acks, turns, 0);
     let tail = check_tail(journal, &session);
-    let cells = drill_cells::check_cells(&session, &opened.records, &runs);
-    let dispatches: usize = runs.iter().map(Vec::len).sum();
-    let unrecorded = runs
-        .iter()
-        .flatten()
-        .filter(|dispatch| {
-            !dispatch.external
-                && !dispatch.nested
-                && !calls
-                    .other
-                    .get(&dispatch.id)
-                    .is_some_and(|logged| logged.tool == dispatch.tool)
-        })
-        .count();
+    let lines = checks::read_ledger(ledger);
+    let cells = drill_cells::check_cells(&session, &opened.records, &lines);
     println!(
-        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={dispatches} other_dispatches_lost_in_a_kill={unrecorded} acks={acks_count} {tail} torn_bytes_dropped={} cells={} cells_threw={} nested_external={} nested_unknown={} nested_other={}",
-        runs.len(),
+        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={} other_dispatches_lost_in_a_kill={} acks={} {tail} torn_bytes_dropped={} cells={} cells_threw={} nested_external={} nested_unknown={} nested_other={}",
+        verified.runs,
         opened.records.len(),
-        calls.external.len(),
-        calls.unknown.len(),
-        calls.other.len(),
+        verified.external,
+        verified.unknown,
+        verified.other,
+        verified.dispatches,
+        verified.other_lost,
+        verified.acks,
         opened.dropped_bytes,
         cells.cells,
         cells.threw,
@@ -519,7 +279,8 @@ fn open_timing(journal: &str, repeats: u64) {
         let mut bytes_read = 0;
         let mut records = 0;
         for _ in 0..repeats {
-            let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
+            let mut disk =
+                FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
             let opened = match mode {
                 "whole" => harness::jsonl_open(&mut disk),
                 _ => harness::jsonl_open_tail(&mut disk),
@@ -578,6 +339,7 @@ fn bench(journal: &str, ledger: &str, acks: &str, turns: u64, mode: &str) {
         rng: Rng(turns),
         clock: 0,
         engine: drill_cells::ScriptEngine::new(journal),
+        tag: checks::run_tag(RUN_OWNER),
     };
     let started = std::time::Instant::now();
     let file = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");

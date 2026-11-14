@@ -1,0 +1,8 @@
+{
+  "name": "harnesslang-cloudflare-oracle",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "workerd": "1.20261107.1"
+  }
+}

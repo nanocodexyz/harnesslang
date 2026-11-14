@@ -29,10 +29,11 @@ pub enum Mutation {
     CellGateReleasesEarly,
     PostgresCellUnfenced,
     NestedIdempotentReportedUnknown,
+    EnumUnchecked,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -60,6 +61,7 @@ impl Mutation {
         Self::CellGateReleasesEarly,
         Self::PostgresCellUnfenced,
         Self::NestedIdempotentReportedUnknown,
+        Self::EnumUnchecked,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -91,6 +93,7 @@ impl Mutation {
             Self::CellGateReleasesEarly => "cell_gate_releases_early",
             Self::PostgresCellUnfenced => "postgres_cell_unfenced",
             Self::NestedIdempotentReportedUnknown => "nested_idempotent_reported_unknown",
+            Self::EnumUnchecked => "enum_unchecked",
         }
     }
 
@@ -137,7 +140,7 @@ impl Mutation {
                 Target::Cloudflare,
             ],
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
-            Self::CheckpointHashOrder => all,
+            Self::CheckpointHashOrder | Self::EnumUnchecked => all,
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

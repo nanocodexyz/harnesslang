@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Code, CodeField, Const, Expr, Handler, Invariant, Item, Model, Name,
-    Param, Program, State, Stmt, Tool, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Code, CodeField, Const, Expr, Function, Handler, Invariant, Item, Model,
+    Name, Param, Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -36,7 +36,7 @@ pub const KEYWORDS: [&str; 25] = [
     "requires",
 ];
 
-const ITEMS: &str = "'const', 'type', 'tool', 'code', 'model', 'state', 'invariant' or 'on'";
+const ITEMS: &str = "'const', 'type', 'tool', 'code', 'model', 'state', 'invariant', 'fn' or 'on'";
 pub const CODE_TOOLS_FIELD: &str = "tools";
 
 pub struct Parser<'a> {
@@ -176,6 +176,7 @@ impl<'a> Parser<'a> {
             "model" => self.model().map(Item::Model),
             "state" => self.state().map(Item::State),
             "invariant" => self.invariant().map(Item::Invariant),
+            "fn" => self.function().map(Item::Function),
             "on" => self.handler().map(Item::Handler),
             _ => Err(self.unexpected(ITEMS)),
         }
@@ -206,12 +207,35 @@ impl<'a> Parser<'a> {
         self.word("type")?;
         let name = self.name("a type name")?;
         self.symbol(Symbol::Assign)?;
+        if matches!(self.peek().token, Token::Text(_)) {
+            let mut values = vec![self.text_value("a text value")?];
+            while self.is_symbol(Symbol::Bar) {
+                self.advance();
+                values.push(self.text_value("a text value")?);
+            }
+            return Ok(TypeDef {
+                name,
+                body: TypeBody::Values(values),
+            });
+        }
         let mut variants = vec![self.variant()?];
         while self.is_symbol(Symbol::Bar) {
             self.advance();
             variants.push(self.variant()?);
         }
-        Ok(TypeDef { name, variants })
+        Ok(TypeDef {
+            name,
+            body: TypeBody::Variants(variants),
+        })
+    }
+
+    fn text_value(&mut self, what: &str) -> Parsed<Name> {
+        let at = self.at();
+        let Token::Text(text) = self.peek().token.clone() else {
+            return Err(self.unexpected(what));
+        };
+        self.advance();
+        Ok(Name { text, at })
     }
 
     fn variant(&mut self) -> Parsed<VariantDef> {
@@ -315,6 +339,14 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         Ok(State { at, fields })
+    }
+
+    fn function(&mut self) -> Parsed<Function> {
+        self.word("fn")?;
+        let name = self.name("a fn name")?;
+        let params = self.params()?;
+        let body = self.block()?;
+        Ok(Function { name, params, body })
     }
 
     fn handler(&mut self) -> Parsed<Handler> {
@@ -428,9 +460,15 @@ impl<'a> Parser<'a> {
             "let" => {
                 self.advance();
                 let name = self.name("a binding name")?;
+                let ty = if self.is_symbol(Symbol::Colon) {
+                    self.advance();
+                    Some(self.type_expr()?)
+                } else {
+                    None
+                };
                 self.symbol(Symbol::Assign)?;
                 let value = self.expr()?;
-                Ok(Stmt::Let { name, value })
+                Ok(Stmt::Let { name, ty, value })
             }
             "push" => {
                 self.advance();
@@ -473,8 +511,13 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let name = self.name("a statement")?;
+                if self.is_symbol(Symbol::LeftParen) {
+                    self.advance();
+                    let args = self.arguments()?;
+                    return Ok(Stmt::Call { callee: name, args });
+                }
                 if !self.is_symbol(Symbol::Assign) {
-                    return Err(self.unexpected("'=' after a name that starts a statement"));
+                    return Err(self.unexpected("'=' or '(' after a name that starts a statement"));
                 }
                 self.advance();
                 let value = self.expr()?;
@@ -517,33 +560,37 @@ impl<'a> Parser<'a> {
         self.symbol(Symbol::LeftBrace)?;
         let mut arms = Vec::new();
         while !self.is_symbol(Symbol::RightBrace) {
-            let variant = self.name("a variant pattern")?;
-            let mut bindings = Vec::new();
-            if self.is_symbol(Symbol::LeftParen) {
-                self.advance();
-                loop {
-                    bindings.push(self.name("a binding name")?);
-                    if self.is_symbol(Symbol::Comma) {
-                        self.advance();
-                        continue;
-                    }
-                    self.symbol(Symbol::RightParen)?;
-                    break;
-                }
-            }
+            let pattern = self.pattern()?;
             self.symbol(Symbol::FatArrow)?;
             let body = self.block()?;
-            arms.push(Arm {
-                variant,
-                bindings,
-                body,
-            });
+            arms.push(Arm { pattern, body });
             if self.is_symbol(Symbol::Comma) {
                 self.advance();
             }
         }
         self.advance();
         Ok(Stmt::Match { at, subject, arms })
+    }
+
+    fn pattern(&mut self) -> Parsed<Pattern> {
+        if matches!(self.peek().token, Token::Text(_)) {
+            return Ok(Pattern::Value(self.text_value("a value pattern")?));
+        }
+        let name = self.name("a variant pattern")?;
+        let mut bindings = Vec::new();
+        if self.is_symbol(Symbol::LeftParen) {
+            self.advance();
+            loop {
+                bindings.push(self.name("a binding name")?);
+                if self.is_symbol(Symbol::Comma) {
+                    self.advance();
+                    continue;
+                }
+                self.symbol(Symbol::RightParen)?;
+                break;
+            }
+        }
+        Ok(Pattern::Variant { name, bindings })
     }
 
     pub fn expr(&mut self) -> Parsed<Expr> {
@@ -559,7 +606,10 @@ impl<'a> Parser<'a> {
         operator: fn(&Self) -> Option<BinaryOp>,
     ) -> Parsed<Expr> {
         let mut left = next(self)?;
+        let mut entered = 0;
         while let Some(op) = operator(self) {
+            self.enter()?;
+            entered += 1;
             let at = self.advance().at;
             let right = next(self)?;
             left = Expr::Binary {
@@ -568,6 +618,9 @@ impl<'a> Parser<'a> {
                 left: Box::new(left),
                 right: Box::new(right),
             };
+        }
+        for _ in 0..entered {
+            self.leave();
         }
         Ok(left)
     }
@@ -633,7 +686,10 @@ impl<'a> Parser<'a> {
 
     fn postfix(&mut self) -> Parsed<Expr> {
         let mut expr = self.primary()?;
+        let mut entered = 0;
         while self.is_symbol(Symbol::Dot) {
+            self.enter()?;
+            entered += 1;
             self.advance();
             let at = self.at();
             let Token::Name(text) = self.peek().token.clone() else {
@@ -645,6 +701,9 @@ impl<'a> Parser<'a> {
                 base: Box::new(expr),
                 field,
             };
+        }
+        for _ in 0..entered {
+            self.leave();
         }
         Ok(expr)
     }
@@ -676,22 +735,27 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Name(callee));
                 }
                 self.advance();
-                let mut args = Vec::new();
-                if self.is_symbol(Symbol::RightParen) {
-                    self.advance();
-                    return Ok(Expr::Call { callee, args });
-                }
-                loop {
-                    args.push(self.expr()?);
-                    if self.is_symbol(Symbol::Comma) {
-                        self.advance();
-                        continue;
-                    }
-                    self.symbol(Symbol::RightParen)?;
-                    return Ok(Expr::Call { callee, args });
-                }
+                let args = self.arguments()?;
+                Ok(Expr::Call { callee, args })
             }
             _ => Err(self.unexpected("an expression")),
+        }
+    }
+
+    fn arguments(&mut self) -> Parsed<Vec<Expr>> {
+        let mut args = Vec::new();
+        if self.is_symbol(Symbol::RightParen) {
+            self.advance();
+            return Ok(args);
+        }
+        loop {
+            args.push(self.expr()?);
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+                continue;
+            }
+            self.symbol(Symbol::RightParen)?;
+            return Ok(args);
         }
     }
 }

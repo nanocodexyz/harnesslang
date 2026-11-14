@@ -109,6 +109,12 @@ pub struct Limit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fact {
+    pub claim: &'static str,
+    pub source: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub memory: Option<Limit>,
     pub outbound_requests_per_invocation: Option<Limit>,
@@ -127,6 +133,7 @@ pub struct Model {
     pub gate_before_outbound: bool,
     pub limits: Limits,
     pub cells: CellPlacement,
+    pub facts: &'static [Fact],
 }
 
 impl Model {
@@ -159,6 +166,29 @@ const CLOUDFLARE_LIMITS: Limits = Limits {
     duration_per_invocation: None,
 };
 
+const CLOUDFLARE_FACTS: &[Fact] = &[
+    Fact {
+        claim: "an outbound fetch or a response leaves only after the event's earlier writes commit",
+        source: "blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it",
+    },
+    Fact {
+        claim: "writes with no await between them commit together, and none commits while the event runs synchronously",
+        source: "developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields",
+    },
+    Fact {
+        claim: "a flush is committed once storage.sync() resolves; an awaited microtask commits nothing",
+        source: "developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit",
+    },
+    Fact {
+        claim: "a committed alarm runs after the object resets",
+        source: "developers.cloudflare.com/durable-objects/api/alarms (at-least-once); oracle/cloudflare/storage.mjs alarm_runs_after_reset",
+    },
+    Fact {
+        claim: "another event enters the object at any await of non-storage I/O",
+        source: "blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (input gates); oracle/cloudflare/storage.mjs event_enters_at_await",
+    },
+];
+
 const VERCEL_LIMITS: Limits = Limits {
     memory: None,
     outbound_requests_per_invocation: None,
@@ -182,6 +212,7 @@ pub const fn model(target: Target) -> Model {
             gate_before_outbound: false,
             limits: NO_LIMITS,
             cells: CellPlacement::HostProcess,
+            facts: &[],
         },
         Target::NativeSqlite => Model {
             target,
@@ -194,6 +225,7 @@ pub const fn model(target: Target) -> Model {
             gate_before_outbound: false,
             limits: NO_LIMITS,
             cells: CellPlacement::HostProcess,
+            facts: &[],
         },
         Target::ServerPostgres => Model {
             target,
@@ -206,6 +238,7 @@ pub const fn model(target: Target) -> Model {
             gate_before_outbound: false,
             limits: NO_LIMITS,
             cells: CellPlacement::LeaseHolder,
+            facts: &[],
         },
         Target::Cloudflare => Model {
             target,
@@ -218,6 +251,7 @@ pub const fn model(target: Target) -> Model {
             gate_before_outbound: true,
             limits: CLOUDFLARE_LIMITS,
             cells: CellPlacement::WorkerIsolate,
+            facts: CLOUDFLARE_FACTS,
         },
         Target::Vercel => Model {
             target,
@@ -232,6 +266,7 @@ pub const fn model(target: Target) -> Model {
             gate_before_outbound: false,
             limits: VERCEL_LIMITS,
             cells: CellPlacement::WorkflowFunction,
+            facts: &[],
         },
     }
 }
@@ -300,6 +335,9 @@ pub fn describe(model: &Model) -> String {
                 limit.value, limit.unit, limit.source
             ));
         }
+    }
+    for fact in model.facts {
+        lines.push(format!("  fact: {} ({})", fact.claim, fact.source));
     }
     lines.join("\n")
 }

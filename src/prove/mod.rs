@@ -16,6 +16,7 @@ use crate::target::{self, Target};
 
 pub const PROOF_STEPS_PER_HANDLER_MAX: u64 = 4_000_000;
 pub const PROOF_CONSTRAINTS_MAX: usize = 4_096;
+pub const PROOF_MEMO_ENTRIES_PER_HANDLER_MAX: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Finding {

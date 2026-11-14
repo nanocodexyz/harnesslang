@@ -14,6 +14,7 @@ use crate::sim::cell::{CELL_CALL_PPM, DIVERGENCE_PPM, Plan, SimEngine};
 use crate::sim::faults::{PowerLoss, Profile, SECTOR_PERSISTED_PPM};
 use crate::sim::invariants::{Invariant, Violation};
 use crate::sim::rng::Rng;
+use crate::sim::strict::{self, Edges};
 use crate::sim::trace::{self, Trace};
 use crate::target::medium::Medium;
 use crate::target::{self, Recovery, Target};
@@ -23,6 +24,7 @@ pub const ANSWER_PPM: u64 = 350_000;
 pub const UNDECLARED_TOOL_PPM: u64 = 250_000;
 pub const OVER_CAPACITY_PPM: u64 = 5_000;
 pub const TOOL_FAILURE_PPM: u64 = 150_000;
+pub const TEXT_ENUM_INVALID_PPM: u64 = 100_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
 pub const CLOCK_JUMP_MS_MAX: u64 = 60_000;
 pub const OWNERS: usize = 2;
@@ -37,6 +39,15 @@ pub struct Dispatched {
     pub external: u64,
     pub other: u64,
     pub outputs: Vec<Output>,
+    pub values: Vec<Returned>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Returned {
+    pub tool: String,
+    pub input: Json,
+    pub output: Output,
+    pub expected: Output,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,6 +65,7 @@ pub struct Stats {
     pub nested: u64,
     pub divergences: u64,
     pub waits: u64,
+    pub entry_states: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,6 +77,7 @@ struct DurableCell {
     reported: BTreeSet<String>,
 }
 
+#[derive(Clone)]
 pub struct SimWorld<'a> {
     pub program: &'a Program,
     pub target: target::Model,
@@ -87,6 +100,11 @@ pub struct SimWorld<'a> {
     cell_calls: BTreeMap<u64, BTreeSet<u64>>,
     cell_timers: BTreeMap<u64, BTreeSet<u64>>,
     cell_codes: BTreeMap<u64, usize>,
+    pub edges: Option<Edges>,
+    pub greedy: bool,
+    pub worst_faults: Vec<String>,
+    run_effects: u64,
+    run_outbound: u64,
     rng: Rng,
     faults_left: u64,
     armed: bool,
@@ -129,6 +147,11 @@ impl<'a> SimWorld<'a> {
             cell_calls: BTreeMap::new(),
             cell_timers: BTreeMap::new(),
             cell_codes: BTreeMap::new(),
+            edges: None,
+            greedy: false,
+            worst_faults: Vec::new(),
+            run_effects: 0,
+            run_outbound: 0,
             rng: Rng::derive(seed, "faults"),
             faults_left: 0,
             armed: faults,
@@ -179,8 +202,21 @@ impl<'a> SimWorld<'a> {
         self.stats.turns += 1;
     }
 
+    pub fn seed_entry(&mut self, record: &Record) {
+        match &mut self.medium {
+            Medium::Jsonl(file) => {
+                let bytes = journal::encode_lines(std::slice::from_ref(record), file.checksum);
+                file.write(&bytes);
+                file.sync();
+            }
+            Medium::Rows(rows) => rows.commit(std::slice::from_ref(record)),
+        }
+    }
+
     pub fn begin_run(&mut self) -> Result<(Vec<Record>, u64), String> {
         self.stats.runs += 1;
+        self.run_effects = 0;
+        self.run_outbound = 0;
         if self.faults_left == 0 {
             self.armed = false;
         }
@@ -271,9 +307,12 @@ impl<'a> SimWorld<'a> {
                 return;
             }
         };
+        let counted = (self.run_effects, self.run_outbound);
+        (self.run_effects, self.run_outbound) = (0, 0);
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
+        (self.run_effects, self.run_outbound) = counted;
         if let Some(trace) = &mut self.trace {
             trace.exit(&ran);
         }
@@ -294,12 +333,67 @@ impl<'a> SimWorld<'a> {
         )
     }
 
-    fn tool_value(rng: &mut Rng, returns: &Type) -> Json {
+    fn tool_value(program: &Program, rng: &mut Rng, returns: &Type, edges: Option<&Edges>) -> Json {
         match returns {
-            Type::U64 => Json::Number(rng.draw() >> 32),
+            Type::U64 => Json::Number(match edges {
+                Some(edges) => edges.draw(rng),
+                None => rng.draw() >> 32,
+            }),
             Type::Bool => Json::Bool(rng.draw() & 1 == 1),
             Type::Text => Json::String(Self::generated_text(rng)),
+            Type::Sum(_) => {
+                let sum = program
+                    .text_enum(returns)
+                    .expect("the checker admits only text enums among sum tool results");
+                if rng.chance(TEXT_ENUM_INVALID_PPM) {
+                    return Json::String(Self::generated_text(rng));
+                }
+                Json::String(sum.variants[rng.pick(sum.variants.len())].name.clone())
+            }
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
+        }
+    }
+
+    fn count_effect(&mut self, outbound: bool) {
+        if self.edges.is_none() {
+            return;
+        }
+        let request = self.current.as_ref().expect("an effect runs within a turn");
+        let worst = &self
+            .program
+            .handler(&request.handler)
+            .expect("a turn request names a handler of the program")
+            .worst;
+        self.run_effects += 1;
+        let mut faults = Vec::new();
+        if self.run_effects == worst.effects.total + 1 {
+            faults.push(format!(
+                "{} effects, over the worst case of {}",
+                self.run_effects, worst.effects.total
+            ));
+        }
+        if outbound {
+            self.run_outbound += 1;
+            if self.run_outbound == worst.requests.total + 1 {
+                faults.push(format!(
+                    "{} outbound requests, over the worst case of {}",
+                    self.run_outbound, worst.requests.total
+                ));
+            }
+            if let Some(limit) = &self.target.limits.outbound_requests_per_invocation
+                && self.run_outbound == limit.value + 1
+            {
+                faults.push(format!(
+                    "{} outbound requests, over the limit of {} {}",
+                    self.run_outbound, limit.value, limit.unit
+                ));
+            }
+        }
+        for fault in faults {
+            self.worst_faults.push(format!(
+                "turn {} ({}): one run made {fault}",
+                request.turn, request.handler
+            ));
         }
     }
 
@@ -370,6 +464,7 @@ impl World for SimWorld<'_> {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        self.count_effect(true);
         let output = match request.nested {
             Some(_) => self.nested_output(request),
             None => self.tool_output(request),
@@ -394,6 +489,7 @@ impl World for SimWorld<'_> {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        self.count_effect(true);
         let response = self.reply(request);
         let program = self.program;
         self.record("model", || {
@@ -422,14 +518,24 @@ impl World for SimWorld<'_> {
     }
 
     fn now(&mut self) -> u64 {
-        self.clock += self.rng.range(1, CLOCK_STEP_MAX);
-        let clock = self.clock;
+        self.count_effect(false);
+        let clock = match &self.edges {
+            Some(edges) => edges.draw(&mut self.rng),
+            None => {
+                self.clock += self.rng.range(1, CLOCK_STEP_MAX);
+                self.clock
+            }
+        };
         self.record("now", || vec![("answer", Json::Number(clock))]);
         clock
     }
 
     fn random(&mut self) -> u64 {
-        let random = self.rng.draw();
+        self.count_effect(false);
+        let random = match &self.edges {
+            Some(edges) => edges.draw(&mut self.rng),
+            None => self.rng.draw(),
+        };
         self.record("random", || vec![("answer", Json::Number(random))]);
         random
     }
@@ -489,6 +595,7 @@ impl World for SimWorld<'_> {
 
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
         self.check_wait(wait);
+        self.count_effect(false);
         self.stats.waits += 1;
         self.clock = self.clock.max(wait.until_ms);
         if let (Medium::Rows(rows), Recovery::InStep { .. }) =
@@ -620,14 +727,30 @@ impl SimWorld<'_> {
                 Self::generated_text(&mut rng)
             ))
         } else {
-            Output::Ok(Self::tool_value(&mut rng, request.returns))
+            Output::Ok(Self::tool_value(
+                self.program,
+                &mut rng,
+                request.returns,
+                self.edges.as_ref(),
+            ))
         };
+        let expected =
+            value::checked_output(self.program, request.tool, request.returns, output.clone());
+        let checked = self.program.text_enum(request.returns).is_some();
         let entry = self
             .dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
             .expect("inserted above");
         if request.effect == EffectClass::External {
-            entry.outputs.push(output.clone());
+            entry.outputs.push(expected.clone());
+        }
+        if checked {
+            entry.values.push(Returned {
+                tool: request.tool.to_owned(),
+                input: request.input.clone(),
+                output: output.clone(),
+                expected,
+            });
         }
         output
     }
@@ -639,12 +762,19 @@ impl SimWorld<'_> {
             .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
-        if rng.chance(ANSWER_PPM) {
+        if !self.greedy && rng.chance(ANSWER_PPM) {
             return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
         }
-        let over = rng.chance(OVER_CAPACITY_PPM);
+        let over_ppm = match (self.greedy, self.edges.is_some()) {
+            (true, _) => 0,
+            (false, true) => strict::OVER_CAPACITY_PPM,
+            (false, false) => OVER_CAPACITY_PPM,
+        };
+        let over = rng.chance(over_ppm);
         let count = if over {
             request.calls_max + 1
+        } else if self.greedy {
+            request.calls_max
         } else {
             rng.range(1, request.calls_max.max(1))
         };
@@ -888,7 +1018,12 @@ impl SimWorld<'_> {
                 Self::generated_text(&mut rng)
             ))
         } else {
-            Output::Ok(Self::tool_value(&mut rng, request.returns))
+            Output::Ok(Self::tool_value(
+                self.program,
+                &mut rng,
+                request.returns,
+                self.edges.as_ref(),
+            ))
         };
         if request.effect == EffectClass::External {
             self.nested_dispatched

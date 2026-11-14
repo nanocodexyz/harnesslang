@@ -242,17 +242,26 @@ the handler, and `spawn` or the model are not nested tools.
 | --- | --- | --- |
 | native-jsonl, native-sqlite | the host's `CellEngine` in the harness process (djs through `nanocode-code-mode-engine` in a real host and in the drills) | a crash kills the cell with the process; group commit covers C1 and C2 like point 1 |
 | server-postgres | the host's engine in the process holding the session's lease | every cell flush is fenced by the owner's epoch like any other; takeover mid-cell is a fault the simulator drives |
-| cloudflare | a dynamic Worker isolate loaded through the object's Worker Loader binding, with `globalOutbound: null`, whose `tools`, timers, clocks and random numbers are RPC calls into the session's Durable Object | the object journals every step inside its event, so the output gate holds a nested external's outbound request until the C1 records commit, as for top-level effects; the isolate has no network, so nothing it does escapes the gate; a timer wait arms the object's alarm at the timer's end; the isolate's memory is not the object's 128 MB |
+| cloudflare | a dynamic Worker isolate loaded through the object's Worker Loader binding, with `globalOutbound: null`, whose `tools`, timers, clocks and random numbers are RPC calls into the session's Durable Object through a stub of the object (or a `ctx.exports` entrypoint) in the loaded Worker's `env`; an `RpcTarget` or the namespace binding cannot be passed there | each nested call reaches the object as its own RPC event, interleaved with the event that awaits the cell, so it must not wait behind the object's turn serialization; that event journals the call and its output gate holds the nested external's outbound request until the C1 records commit, as for top-level effects; with `globalOutbound: null` the isolate's own `fetch()` and `connect()` throw, so nothing it does escapes the gate (left out, the isolate inherits the object's network); a timer wait arms the object's alarm at the timer's end; the isolate has its own global scope, and whether its memory is outside the object's 128 MB is not verified |
 | vercel | the workflow function, which re-executes on every resume: the engine runs there and every nested call is a step (`none` and `idempotent` neighbours grouped, `external` alone with its attempt check), every timer a durable workflow sleep | the Workflow's event log is the replay source; C1 is the step boundary before the external step; `at_ms` and clocks come from the journal, never the workflow's own clock |
 
-Unverified platform facts, to be recorded in `src/target/mod.rs` and
-DECISIONS.md by whoever reads the pages: the Worker Loader binding's
-availability, its `globalOutbound: null` isolation and how RPC calls from
-the loaded isolate count against the object's subrequest limit (the model
-counts every nested call to a tool that leaves the object as one outbound
-request, and RPC into the object as none); whether the Vercel workflow
-sandbox lets the engine compile a script (`node:vm` or an equivalent) and
-the longest workflow sleep. Where a fact turns out false the target says
+Cloudflare facts checked on local workerd by `oracle/cloudflare/loader.mjs`
+(run by `scripts/cloudflare-drill.sh`, measurements in DECISIONS.md): the
+Worker Loader binding exists and needs workerd's `--experimental` flag, an
+object stub in the loaded Worker's `env` carries nested calls into the
+object, `globalOutbound: null` makes `fetch()` and `connect()` throw, and
+every nested call's outbound request left the object only after its call row
+committed. Still unverified, to be recorded in `src/target/mod.rs` when
+cells land: production availability (an open beta on Workers Paid, per a
+search summary of the vendor docs) and how subrequests are counted, which
+local workerd does not enforce at all. The vendor's limits page counts
+Durable Object RPC as subrequests to internal services, under the same
+per-invocation limit as outbound requests, so the model counts a cell's
+nested calls as `calls` internal subrequests of the loaded Worker's
+invocation and each nested call's outbound request against the RPC event
+that makes it, not none as first assumed. Unverified for Vercel: whether
+the workflow sandbox lets the engine compile a script (`node:vm` or an
+equivalent) and the longest workflow sleep. Where a fact turns out false the target says
 `cells: unsupported` and `hl check` refuses `code` there; at-most-once is
 never weakened to make a target fit.
 

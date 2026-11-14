@@ -22,6 +22,7 @@ pub enum Item {
     Model(Model),
     State(State),
     Invariant(Invariant),
+    Function(Function),
     Handler(Handler),
 }
 
@@ -41,7 +42,13 @@ pub struct Const {
 #[derive(Clone, Debug)]
 pub struct TypeDef {
     pub name: Name,
-    pub variants: Vec<VariantDef>,
+    pub body: TypeBody,
+}
+
+#[derive(Clone, Debug)]
+pub enum TypeBody {
+    Variants(Vec<VariantDef>),
+    Values(Vec<Name>),
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +97,13 @@ pub struct Param {
 }
 
 #[derive(Clone, Debug)]
+pub struct Function {
+    pub name: Name,
+    pub params: Vec<Param>,
+    pub body: Block,
+}
+
+#[derive(Clone, Debug)]
 pub struct Handler {
     pub name: Name,
     pub params: Vec<Param>,
@@ -135,6 +149,7 @@ pub struct Block {
 pub enum Stmt {
     Let {
         name: Name,
+        ty: Option<TypeExpr>,
         value: Expr,
     },
     Assign {
@@ -173,13 +188,36 @@ pub enum Stmt {
         at: Position,
         value: Expr,
     },
+    Call {
+        callee: Name,
+        args: Vec<Expr>,
+    },
+    Inlined {
+        at: Position,
+        function: Name,
+        arguments: Vec<(Param, Expr)>,
+        body: Block,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct Arm {
-    pub variant: Name,
-    pub bindings: Vec<Name>,
+    pub pattern: Pattern,
     pub body: Block,
+}
+
+#[derive(Clone, Debug)]
+pub enum Pattern {
+    Variant { name: Name, bindings: Vec<Name> },
+    Value(Name),
+}
+
+impl Pattern {
+    pub const fn name(&self) -> &Name {
+        match self {
+            Self::Variant { name, .. } | Self::Value(name) => name,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

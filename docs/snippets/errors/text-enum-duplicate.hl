@@ -1,0 +1,5 @@
+harness notes
+
+type status = "completed" | "failed" | "completed"
+
+on ping() -> u64 { return 1 }

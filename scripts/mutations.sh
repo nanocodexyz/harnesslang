@@ -4,13 +4,20 @@ cd "$(dirname "$0")/.."
 
 seeds="${MUTATION_SEEDS:-0..200}"
 hl=target/release/hl
-file=examples/agent.hl
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
-mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early recovery_reports_failed rerun_rewrites_call checkpoint_hash_order recovery_skipped"
+mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early recovery_reports_failed rerun_rewrites_call checkpoint_hash_order recovery_skipped enum_unchecked"
+
+file_of() {
+  case $1 in
+    enum_unchecked) echo examples/hooks.hl ;;
+    *) echo examples/agent.hl ;;
+  esac
+}
 
 [ -x "$hl" ] || cargo build --release --locked
 
 for mutation in $mutations; do
+  file=$(file_of "$mutation")
   applied=0
   for target in $targets; do
     set +e

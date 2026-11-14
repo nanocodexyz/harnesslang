@@ -16,7 +16,7 @@ const SUMMARIZED_RESULT: &str = "summarized";
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -55,6 +55,9 @@ fn main() -> ExitCode {
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
+        "gen" => harnesslang::generate::cli::gen_command(rest),
+        "fuzz-parse" => harnesslang::generate::cli::fuzz_parse_command(rest),
+        "fuzz-prove" => harnesslang::generate::cli::fuzz_prove_command(rest),
         _ => usage(),
     }
 }
@@ -64,6 +67,8 @@ struct Flags {
     target: Option<Target>,
     seeds: Option<std::ops::Range<u64>>,
     twice: bool,
+    strict: bool,
+    any_state: bool,
     mutation: Mutation,
     handler: Option<String>,
     arguments: Vec<String>,
@@ -71,6 +76,9 @@ struct Flags {
     trace: Option<String>,
     dump: Option<String>,
     summarize: Option<String>,
+    exhaustive: bool,
+    depth: u64,
+    cuts: sim::exhaustive::Cuts,
 }
 
 fn flags(args: &[String]) -> Option<Flags> {
@@ -79,6 +87,8 @@ fn flags(args: &[String]) -> Option<Flags> {
         target: None,
         seeds: None,
         twice: false,
+        strict: false,
+        any_state: false,
         mutation: Mutation::None,
         handler: None,
         arguments: Vec::new(),
@@ -86,6 +96,9 @@ fn flags(args: &[String]) -> Option<Flags> {
         trace: None,
         dump: None,
         summarize: None,
+        exhaustive: false,
+        depth: sim::exhaustive::FAULTS_PER_SESSION_DEFAULT,
+        cuts: sim::exhaustive::Cuts::Lines,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -93,6 +106,8 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--target" => flags.target = Some(Target::parse(rest.next()?)?),
             "--seeds" => flags.seeds = Some(parse_seeds(rest.next()?)?),
             "--twice" => flags.twice = true,
+            "--strict" => flags.strict = true,
+            "--any-state" => flags.any_state = true,
             "--mutation" => flags.mutation = Mutation::parse(rest.next()?)?,
             "--handler" => flags.handler = Some(rest.next()?.clone()),
             "--arg" => flags.arguments.push(rest.next()?.clone()),
@@ -100,6 +115,9 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--trace" => flags.trace = Some(rest.next()?.clone()),
             "--dump-journal" => flags.dump = Some(rest.next()?.clone()),
             "--summarize" => flags.summarize = Some(rest.next()?.clone()),
+            "--exhaustive" => flags.exhaustive = true,
+            "--depth" => flags.depth = rest.next()?.parse().ok()?,
+            "--cuts" => flags.cuts = sim::exhaustive::Cuts::parse(rest.next()?)?,
             file if !file.starts_with("--") && flags.file.is_none() => {
                 flags.file = Some(file.to_owned())
             }
@@ -207,6 +225,9 @@ fn argument(program: &Program, ty: &Type, text: &str) -> Result<Value, String> {
             .parse()
             .map(Value::Bool)
             .map_err(|_| format!("'{text}' is not a bool")),
+        other if program.text_enum(other).is_some() => {
+            value::from_json(program, other, &json::Json::text(text))
+        }
         other => value::from_json(program, other, &json::decode(text)?),
     }
 }
@@ -343,8 +364,26 @@ fn sim_command(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(USAGE_EXIT);
     }
+    if flags.exhaustive {
+        if flags.twice
+            || flags.strict
+            || flags.any_state
+            || flags.trace.is_some()
+            || flags.dump.is_some()
+        {
+            return usage();
+        }
+        let options = sim::exhaustive::Options {
+            target,
+            seeds,
+            mutation: flags.mutation,
+            faults_per_session: flags.depth,
+            cuts: flags.cuts,
+        };
+        return exhaustive_command(&program, &options, &file);
+    }
     if let Some(directory) = flags.dump {
-        if flags.twice || flags.trace.is_some() {
+        if flags.twice || flags.strict || flags.any_state || flags.trace.is_some() {
             return usage();
         }
         return dump_command(&program, target, flags.mutation, seeds, &directory, &file);
@@ -354,6 +393,12 @@ fn sim_command(args: &[String]) -> ExitCode {
         seeds,
         twice: flags.twice,
         mutation: flags.mutation,
+        strict: match (flags.strict, flags.any_state) {
+            (false, false) => sim::strict::Mode::Off,
+            (true, false) => sim::strict::Mode::FromZero,
+            (true, true) => sim::strict::Mode::FromAny,
+            (false, true) => return usage(),
+        },
     };
     let summary = match &flags.trace {
         None => sim::sweep(&program, &options),
@@ -367,6 +412,24 @@ fn sim_command(args: &[String]) -> ExitCode {
     };
     println!("{}", sim::report(&summary, &options, &file));
     if summary.failure.is_some() {
+        ExitCode::from(FAILURE_EXIT)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn exhaustive_command(
+    program: &Program,
+    options: &sim::exhaustive::Options,
+    file: &str,
+) -> ExitCode {
+    if let Err(error) = sim::exhaustive::validate(options) {
+        eprintln!("{file}: error: {error}");
+        return ExitCode::from(USAGE_EXIT);
+    }
+    let summary = sim::exhaustive::explore(program, options);
+    println!("{}", sim::exhaustive::report(&summary, options, file));
+    if summary.stopped.is_some() {
         ExitCode::from(FAILURE_EXIT)
     } else {
         ExitCode::SUCCESS

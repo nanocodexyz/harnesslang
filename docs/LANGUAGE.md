@@ -115,7 +115,7 @@ docs/snippets/tutorial/2-requires.hl: harness agent: 0 tool(s), 1 state field(s)
     outbound requests: no loops
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
-  proved handler prompt: no_overflow: 1 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 2 push(es) proved below capacity (14 prover steps)
+  proved handler prompt: no_overflow: 1 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 2 push(es) proved below capacity (15 prover steps)
   proved handler prompt on native-jsonl: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
   proved handler prompt on native-jsonl: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
   proved handler prompt on native-sqlite: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
@@ -393,7 +393,7 @@ examples/agent.hl: harness agent: 3 tool(s), 2 state field(s), 1 handler(s)
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
   proved zero state: invariant_initial: 2 invariant(s) hold
-  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4098 prover steps)
+  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4192 prover steps)
   proved handler prompt on cloudflare: durability: 1 external effect site(s) run only after a flush of their call and every record before it; 10 acknowledgement point(s) follow their status flush
   proved handler prompt on cloudflare: worst_case: 2115 journal records per run on the plan's longest path, as hl check counts (step below turn_steps_max (64) x call below calls_per_step_max (16))
   proved handler prompt on cloudflare: worst_case: 1088 outbound requests <= 10000 outbound requests per invocation (step below turn_steps_max (64) x call below calls_per_step_max (16))
@@ -401,6 +401,11 @@ examples/agent.hl: proved for cloudflare
 target cloudflare: runs in a Durable Object; journal: the object's SQLite; flush: OutputGate; atomic unit: Event; who else may run: AlarmAfterReset
   limit memory: 134217728 bytes per isolate (developers.cloudflare.com/durable-objects/platform/limits)
   limit outbound requests: 10000 outbound requests per invocation (developers.cloudflare.com/workers/platform/limits (Workers Paid default))
+  fact: an outbound fetch or a response leaves only after the event's earlier writes commit (blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it)
+  fact: writes with no await between them commit together, and none commits while the event runs synchronously (developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields)
+  fact: a flush is committed once storage.sync() resolves; an awaited microtask commits nothing (developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit)
+  fact: a committed alarm runs after the object resets (developers.cloudflare.com/durable-objects/api/alarms (at-least-once); oracle/cloudflare/storage.mjs alarm_runs_after_reset)
+  fact: another event enters the object at any await of non-storage I/O (blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (input gates); oracle/cloudflare/storage.mjs event_enters_at_await)
   not checked: memory (134217728 bytes per isolate), since text values carry no bound
 examples/agent.hl: ok for cloudflare
 ```
@@ -487,7 +492,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `in` `known` `maybe`
+Contextual words: `below` `calls` `fn` `in` `known` `maybe`
 
 Builtin functions, whose names declarations may not take:
 
@@ -533,9 +538,9 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | code | model | state | invariant | handler ;
+item       = const | type | tool | code | model | state | invariant | function | handler ;
 const      = "const" name ":" type_expr "=" number ;
-type       = "type" name "=" variant { "|" variant } ;
+type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
@@ -543,6 +548,7 @@ code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
 model      = "model" name "calls" bound ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
+function   = "fn" name params block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
 bound      = name ;
@@ -551,16 +557,17 @@ type_expr  = "list" "<" type_expr "," bound ">"
            | "maybe" "<" type_expr ">"
            | name ;
 block      = "{" { statement } "}" ;
-statement  = "let" name "=" expr
+statement  = "let" name [ ":" type_expr ] "=" expr
            | "push" name expr
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
            | "for" name "in" expr block
            | "return" expr
-           | name "=" expr ;
+           | name "=" expr
+           | name "(" [ expr { "," expr } ] ")" ;
 if         = "if" expr block [ "else" ( if | block ) ] ;
-arm        = name [ "(" name { "," name } ")" ] "=>" block ;
+arm        = ( name [ "(" name { "," name } ")" ] | text ) "=>" block ;
 expr       = and { "or" and } ;
 and        = not { "and" not } ;
 not        = "not" not | comparison ;
@@ -634,7 +641,8 @@ on ping(limit: u64) -> u64 {
 `type name = variant | variant(type, ...) | ...` declares a sum type. Variants
 carry only what that case has. A variant name may appear in several types; a
 type may not contain itself, directly or through other types or lists, since
-its values would have no bound.
+its values would have no bound. `type name = "value" | "value" | ...` declares
+a [text enum](#text-enums) instead.
 
 ```console
 $ hl check docs/snippets/errors/recursive-type.hl
@@ -652,13 +660,15 @@ on ping() -> u64 { return 1 }
 ### tool
 
 `tool name(param: type, ...) -> type effect class` declares a tool the model
-may call and the program may call directly. It returns `u64`, `bool` or
-`text`, so that every target and the simulator can carry its result. The class
-is `none`, `idempotent` or `external` ([Effects](#effects)).
+may call and the program may call directly. It returns `u64`, `bool`, `text`
+or a text enum, so that every target and the simulator can carry its result. A
+result that does not fit the declared type is recorded as the call's failure
+([Text enums](#text-enums)). The class is `none`, `idempotent` or `external`
+([Effects](#effects)).
 
 ```console
 $ hl check docs/snippets/errors/tool-returns.hl
-docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool or text
+docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text or a text enum
 ```
 
 ```hl docs/snippets/errors/tool-returns.hl
@@ -695,13 +705,14 @@ on ping(said: entry) -> u64 { return 1 }
 ### state
 
 `state { name: type ... }` is the session's state, the only thing that lives
-across turns. Fields start at zero (`0`, `false`, empty text, an empty list),
-so a field is `u64`, `bool`, `text` or a list. State is not journaled: it is a
+across turns. Fields start at zero (`0`, `false`, empty text, a text enum's
+first value, an empty list), so a field is `u64`, `bool`, `text`, a text enum
+or a list. State is not journaled: it is a
 function of the journal, rebuilt by replay from the latest checkpoint.
 
 ```console
 $ hl check docs/snippets/errors/state-sum.hl
-docs/snippets/errors/state-sum.hl:6:12: error: state field 'current' has no initial value: state fields are u64, bool, text or lists
+docs/snippets/errors/state-sum.hl:6:12: error: state field 'current' has no initial value: state fields are u64, bool, text, text enums or lists
 ```
 
 ```hl docs/snippets/errors/state-sum.hl
@@ -772,6 +783,260 @@ on ping() -> u64
 }
 ```
 
+### fn
+
+`fn name(param: type, ...) { ... }` names a block of statements that handlers
+share, and the statement `name(argument, ...)` runs it. The checker inlines the
+body at each call before it lowers the handler, so every handler that calls a
+fn gets its own effect sites, sequence numbers, worst case and proofs, as if
+the body were written there. A call is the same as writing, in a block of its
+own, `let param: type = argument` for each parameter in order, then the body:
+
+- A fn sees its parameters, its own bindings and the harness's declarations
+  (constants, types and their variants, tools, the model, state fields), never
+  its caller's locals, so its names may repeat its caller's.
+- A fn has no value. A `return` in its body finishes the turn of the handler
+  that called it, with that handler's result type; a body that does not
+  return goes on to the statement after the call.
+- A fn may call another fn but never itself, directly or through others.
+- Every fn is called somewhere: only an inlined body is checked.
+
+`examples/subagents.hl` shares its model loop between its two handlers this way.
+This program shares a comment and a log line between two handlers:
+
+```hl docs/snippets/fn.hl
+harness reporter
+
+const lines_max: u64 = 64
+
+type report = posted(text) | refused(text) | lost
+
+tool comment(change: text, body: text) -> text effect external
+
+state {
+  lines: list<text, lines_max>
+}
+
+fn note(label: text, detail: text) {
+  push lines label ++ ": " ++ detail
+}
+
+fn post(target: text, body: text) {
+  match comment(target, body) {
+    ok(link) => {
+      note("posted", link)
+      return posted(link)
+    }
+    failed(error) => {
+      note("refused", error)
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+
+on approve(change: text) -> report
+  requires len(lines) < lines_max
+{
+  post(change, "approved")
+}
+
+on withdraw(change: text, reason: text) -> report
+  requires len(lines) < lines_max
+{
+  post(change, "withdrawn: " ++ reason)
+}
+```
+
+Written out by hand, it is this program, and every target emits the same code
+for both:
+
+```hl docs/snippets/fn_inline.hl
+harness reporter
+
+const lines_max: u64 = 64
+
+type report = posted(text) | refused(text) | lost
+
+tool comment(change: text, body: text) -> text effect external
+
+state {
+  lines: list<text, lines_max>
+}
+
+on approve(change: text) -> report
+  requires len(lines) < lines_max
+{
+  let target: text = change
+  let body: text = "approved"
+  match comment(target, body) {
+    ok(link) => {
+      let label: text = "posted"
+      let detail: text = link
+      push lines label ++ ": " ++ detail
+      return posted(link)
+    }
+    failed(error) => {
+      let label: text = "refused"
+      let detail: text = error
+      push lines label ++ ": " ++ detail
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+
+on withdraw(change: text, reason: text) -> report
+  requires len(lines) < lines_max
+{
+  let target: text = change
+  let body: text = "withdrawn: " ++ reason
+  match comment(target, body) {
+    ok(link) => {
+      let label: text = "posted"
+      let detail: text = link
+      push lines label ++ ": " ++ detail
+      return posted(link)
+    }
+    failed(error) => {
+      let label: text = "refused"
+      let detail: text = error
+      push lines label ++ ": " ++ detail
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+```
+
+```console
+$ for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do hl emit --target $target docs/snippets/fn_inline.hl > output/fn_inline.out; hl emit --target $target docs/snippets/fn.hl | cmp - output/fn_inline.out && echo "$target: identical"; done
+native-jsonl: identical
+native-sqlite: identical
+server-postgres: identical
+cloudflare: identical
+vercel: identical
+```
+
+A model loop that asks again after running tools by calling itself is
+recursion, which the checker refuses, naming the cycle; a `loop` with a named
+bound is how a harness repeats:
+
+```hl examples/invalid/fn_recursion.hl
+harness fn_recursion
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = completed(text) | failed(text)
+
+tool read(path: text) -> text effect none
+
+model infer calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+fn ask() {
+  let reply = infer(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return completed(words) }
+    calls(requested) => { run_tools(requested) }
+  }
+}
+
+fn run_tools(requested: list<call, calls_max>) {
+  for call in requested {
+    match dispatch(call) {
+      ok(output) => { push context result(call, output) }
+      failed(error) => { push context error(call, error) }
+      unknown => { push context unknown(call) }
+    }
+  }
+  ask()
+}
+
+on prompt(input: text) -> outcome {
+  push context user(input)
+  ask()
+}
+```
+
+```console
+$ hl check examples/invalid/fn_recursion.hl
+examples/invalid/fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask; a fn is inlined where it is called, so it cannot call itself, directly or through another fn
+$ hl check docs/snippets/errors/fn-self.hl
+docs/snippets/errors/fn-self.hl:9:3: error: fn 'again' is recursive: again -> again; a fn is inlined where it is called, so it cannot call itself, directly or through another fn
+$ hl check examples/invalid/fn_arity.hl
+examples/invalid/fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1
+$ hl check examples/invalid/fn_hidden_name.hl
+examples/invalid/fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input': a fn sees its parameters, its own bindings and the harness's declarations
+$ hl check docs/snippets/errors/fn-expression.hl
+docs/snippets/errors/fn-expression.hl:8:15: error: fn 'greet' has no value: call it as a statement of its own, not inside an expression
+$ hl check docs/snippets/errors/fn-statement.hl
+docs/snippets/errors/fn-statement.hl:6:3: error: 'read' is not a fn: only a fn is called as a statement; bind an effect's result with let or match it
+$ hl check docs/snippets/errors/fn-unused.hl
+docs/snippets/errors/fn-unused.hl:7:4: error: fn 'reset' is never called
+```
+
+```hl docs/snippets/errors/fn-self.hl
+harness notes
+
+state {
+  count: u64
+}
+
+fn again() {
+  count = count + 1
+  again()
+}
+
+on ping() -> u64 {
+  again()
+  return count
+}
+```
+
+```hl docs/snippets/errors/fn-expression.hl
+harness notes
+
+fn greet(name: text) {
+  return "hello " ++ name
+}
+
+on ping(name: text) -> text {
+  let words = greet(name)
+  return words
+}
+```
+
+```hl docs/snippets/errors/fn-statement.hl
+harness notes
+
+tool read(path: text) -> text effect none
+
+on ping(path: text) -> u64 {
+  read(path)
+  return 1
+}
+```
+
+```hl docs/snippets/errors/fn-unused.hl
+harness notes
+
+state {
+  count: u64
+}
+
+fn reset() {
+  count = 0
+}
+
+on ping() -> u64 { return count }
+```
+
 ## Types
 
 | Type | Values | Operations |
@@ -780,6 +1045,7 @@ on ping() -> u64
 | `bool` | `true`, `false` | `and`, `or`, `not`, `== !=` |
 | `text` | UTF-8 text | `++` (concatenate), `== !=` |
 | a declared sum | its variants | construct, `match` |
+| a text enum | its listed texts | a text literal where it is expected, `match` |
 | `list<T, N>` | up to `N` values of `T` | `push` (state fields only), `for`, `len(list)` |
 | `known<T>` | `ok(T)`, `failed(text)` | `match` |
 | `maybe<T>` | `ok(T)`, `failed(text)`, `unknown` | `match`, which must have an `unknown` arm |
@@ -800,7 +1066,8 @@ Rules:
   takes the one sum that has the variant; `ok`, `failed` and `unknown` always
   need an expected type.
 - Names are bound once per handler: no shadowing, and a local may not reuse
-  a state field's, constant's, tool's or the model's name.
+  a state field's, constant's, tool's or the model's name. A fn's body is a
+  scope of its own, so its names may repeat its caller's.
 - Locals (`let`, parameters, loop variables, pattern bindings) never change.
   Only state fields are assigned and pushed.
 
@@ -965,21 +1232,161 @@ on echo(input: text) -> text {
 }
 ```
 
+### Text enums
+
+`type name = "value" | "value" | ...` declares a text enum: a type whose
+values are the listed texts and nothing else, such as a subagent's completion
+status or a hook's decision. It is a parameter, state field, tool result or
+handler result type like any other, and its values are any texts, spaces
+included.
+
+- A text literal where a text enum is expected (an assignment's field, a
+  `push`'s list, a `return`, an argument) must be one of its values, and is
+  that value. Anywhere else a literal is `text`. There is no conversion
+  between a text enum and `text`, and `==` does not compare text enums:
+  `match` them.
+- `match` takes one arm per value, written as the text. It is exhaustive like
+  a sum's: a missing value, an unlisted one or a variant pattern is an error.
+- A state field of a text enum starts at its first value.
+- The journal holds the text itself: an argument in the `admitted` record, a
+  field in a checkpoint and a tool's result are JSON strings.
+- Every boundary checks the value and never falls back to another one. An
+  argument, or a value read back from the journal, that is not one of the
+  values is refused: `hl run` and the generated code's argument decoding
+  reject it, and a journal holding one is corrupt. A tool result that is not
+  one of them is recorded as the call's failure, `TOOL returned JSON, which is
+  not a value of TYPE`, so the program meets it in its `failed` arm. The same
+  rule holds for every tool result: one that does not fit the declared type is
+  recorded as failed.
+- `hl sim` draws arguments from the values, every value as likely as the
+  next, and tool results from them too, except
+  `TEXT_ENUM_INVALID_PPM` = 100000 results per million that lie outside them
+  and must come back as failures (the `enum_valid` invariant).
+
+```hl docs/snippets/text_enums.hl
+harness reviews
+
+const approvals_max: u64 = 1000
+
+type verdict = "approve" | "request changes" | "comment"
+type outcome = merged(text) | blocked(text)
+
+tool review(change: text) -> verdict effect idempotent
+
+state {
+  last: verdict
+  approvals: u64
+}
+
+on submit(change: text) -> outcome
+  requires approvals < approvals_max
+{
+  match review(change) {
+    ok(said) => {
+      last = said
+      match said {
+        "approve" => {
+          approvals = approvals + 1
+          return merged(change)
+        }
+        "request changes" => { return blocked("changes requested") }
+        "comment" => { return blocked("no verdict yet") }
+      }
+    }
+    failed(error) => { return blocked(error) }
+  }
+}
+
+on record(said: verdict) -> verdict {
+  last = said
+  return "comment"
+}
+```
+
+```console
+$ hl run docs/snippets/text_enums.hl --handler record --arg "request changes"
+{"crc":1525710037,"record":{"admitted":{"digest":"record","first":1,"hand":null,"metadata":{"handler":"record"},"prompt":{"said":"request changes"},"turn":"1"}}}
+{"crc":2322276109,"record":{"status":{"status":{"finished":{"last":0,"outcome":"completed","result":"comment"}},"turn":"1"}}}
+{"crc":2374166743,"record":{"checkpoint":{"payload":"{\"approvals\":0,\"last\":\"request changes\"}","revision":1,"state":"reviews"}}}
+$ hl run docs/snippets/text_enums.hl --handler record --arg approved
+docs/snippets/text_enums.hl: error: argument 'said': 'approved' is not a variant of verdict
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/text_enums.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=846 crashes=342 power_losses=40 torn_writes=47 takeovers=0 fenced=0 dispatches=359 unknown=0
+```
+
+The planted bug `enum_unchecked` skips the check and takes an unlisted result
+as the enum's last value, the fallback an `else` branch writes by hand. The
+simulator catches it in `examples/hooks.hl`, whose stop hook returns a
+decision:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation enum_unchecked examples/hooks.hl
+FAIL invariant=enum_valid seed=0 target=native-jsonl profile=errors mutation=enum_unchecked: call 2/28 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("eta-1"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation enum_unchecked examples/hooks.hl
+```
+
+The checker's text enum errors:
+
+```console
+$ hl check examples/invalid/enum_missing_value.hl
+examples/invalid/enum_missing_value.hl:6:3: error: match on status is missing "interrupted"
+$ hl check examples/invalid/enum_unknown_value.hl
+examples/invalid/enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status
+$ hl check docs/snippets/errors/text-enum-pattern.hl
+docs/snippets/errors/text-enum-pattern.hl:7:5: error: status is a text enum: match its values as text, such as "completed"
+$ hl check docs/snippets/errors/text-enum-compare.hl
+docs/snippets/errors/text-enum-compare.hl:5:49: error: '==' compares u64, bool or text, not status
+$ hl check docs/snippets/errors/text-enum-duplicate.hl
+docs/snippets/errors/text-enum-duplicate.hl:3:40: error: value "completed" appears twice in 'status'
+```
+
+```hl docs/snippets/errors/text-enum-pattern.hl
+harness notes
+
+type status = "completed" | "failed"
+
+on show(status: status) -> text {
+  match status {
+    completed => { return "done" }
+    failed => { return "failed" }
+  }
+}
+```
+
+```hl docs/snippets/errors/text-enum-compare.hl
+harness notes
+
+type status = "completed" | "failed"
+
+on show(status: status) -> bool { return status == "completed" }
+```
+
+```hl docs/snippets/errors/text-enum-duplicate.hl
+harness notes
+
+type status = "completed" | "failed" | "completed"
+
+on ping() -> u64 { return 1 }
+```
+
 ## Statements
 
 | Statement | Meaning |
 | --- | --- |
 | `let x = e` | bind a new local |
+| `let x: T = e` | bind a new local of type `T`; `e` is checked against `T`, so a variant constructor takes its type from it |
 | `field = e` | assign a state field |
 | `push field e` | append to a state list; a full list traps with `bound(field)` |
 | `if c { } else if c { } else { }` | `c` is `bool` |
-| `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas |
+| `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas; a text enum's arms are its values, `"value" => { }` |
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
 | `for x in list { }` | runs the body once per element of the list as it was when the loop started |
 | `return e` | finish the turn with `e`, of the handler's result type |
+| `f(a, ...)` | run [fn](#fn) `f`'s body here |
 
-There is no `while`, no recursion and no user function: a handler is
-straight-line code over bounded loops, so its worst case is a number.
+There is no `while` and no recursion, and a fn is inlined where it is
+called: a handler is straight-line code over bounded loops, so its worst
+case is a number.
 
 ```console
 $ hl check docs/snippets/errors/missing-variant.hl
@@ -1175,7 +1582,8 @@ The compiler's own bounds:
 
 | Bound | Value | Source |
 | --- | --- | --- |
-| nesting of blocks, types, expressions | `NESTING_DEPTH_MAX` = 64 | policy |
+| nesting of blocks, types, expressions | `NESTING_DEPTH_MAX` = 64 | policy; also bounds the blocks of a handler once its fns are inlined |
+| statements per handler once its fns are inlined | `STATEMENTS_PER_HANDLER_MAX` = 65,536 | policy: over a thousand times the largest example handler; a program whose fns double at each level reaches it in milliseconds |
 | prover steps per handler | `PROOF_STEPS_PER_HANDLER_MAX` = 4,000,000 | policy; reaching it fails the obligation and says so |
 | constraints per prover step | `PROOF_CONSTRAINTS_MAX` = 4,096 | policy; same |
 | nesting of a journal's JSON | `JSON_DEPTH_MAX` = 128 | policy |
@@ -1276,7 +1684,8 @@ and the kill -9 drill of generated code.
 | --- | --- |
 | `hl check [--target T] FILE` | parse, type-check, report each handler's worst case and prove it; with a target, also check the target's limits |
 | `hl prove [--target T] [--mutation M] FILE` | the proofs alone; a mutation plants a lowering bug the proofs must catch |
-| `hl sim --target T --seeds A..B [--twice] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs |
+| `hl sim --target T --seeds A..B [--twice] [--strict [--any-state]] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs; `--strict` also checks what the proofs promise (no trap but requires and model replies, invariants after every turn, the worst case within the target's limit), and `--any-state` starts each session from a drawn state that satisfies the invariants |
+| `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal` |
 | `hl run FILE --handler NAME [--arg VALUE]... [--seed S]` | run one turn in the interpreter and print the journal |
 | `hl emit --target T FILE` | print the generated program |
 

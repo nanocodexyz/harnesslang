@@ -13,6 +13,8 @@ const RAN_HEADER = "hl-ran";
 const HTTP_BAD_REQUEST = 400;
 const HTTP_NOT_FOUND = 404;
 const HTTP_INTERNAL_ERROR = 500;
+const HTTP_SERVICE_UNAVAILABLE = 503;
+const REQUESTS_QUEUED_MAX = 16;
 const NO_SIMULATION = { mutation: "none", hook() {}, gate() {} };
 
 class CloudflareWorld {
@@ -116,7 +118,26 @@ class HarnessObject {
     this.position = 0;
     this.armed = false;
     this.running = false;
+    this.queued = 0;
+    this.tail = Promise.resolve();
     this.storageWrites = [];
+  }
+
+  async serialized(work) {
+    if (this.queued >= REQUESTS_QUEUED_MAX) return null;
+    this.queued += 1;
+    const previous = this.tail;
+    let release;
+    this.tail = new Promise((resolve) => {
+      release = resolve;
+    });
+    try {
+      await previous;
+      return await work();
+    } finally {
+      this.queued -= 1;
+      release();
+    }
   }
 
   load() {
@@ -147,6 +168,7 @@ class HarnessObject {
 
   async settle() {
     await Promise.all(this.storageWrites.splice(0));
+    await this.storage.sync();
   }
 
   async drive(request) {
@@ -160,6 +182,10 @@ class HarnessObject {
       await this.settle();
       assert(world.finish !== null, "a driven turn is acknowledged");
       return { ran: ran.ran, finish: world.finish };
+    } catch (error) {
+      this.armed = false;
+      await Promise.allSettled(this.storageWrites.splice(0));
+      throw error;
     } finally {
       this.running = false;
     }
@@ -176,7 +202,8 @@ class HarnessObject {
       throw error;
     }
     try {
-      const driven = await this.drive(turn);
+      const driven = await this.serialized(() => this.drive(turn));
+      if (driven === null) return new Response(`REQUESTS_QUEUED_MAX (${REQUESTS_QUEUED_MAX}) requests already wait for this object`, { status: HTTP_SERVICE_UNAVAILABLE });
       return new Response(encodeJson(finishJson(driven.finish)), { headers: { "content-type": "application/json", [RAN_HEADER]: driven.ran } });
     } catch (error) {
       if (error instanceof Corrupt) return new Response(error.message, { status: HTTP_INTERNAL_ERROR });
@@ -185,10 +212,13 @@ class HarnessObject {
   }
 
   async alarm() {
-    if (this.running) {
-      await this.storage.setAlarm(Date.now() + ALARM_RESUME_DELAY_MS);
-      return { ran: "busy" };
-    }
+    const resumed = await this.serialized(() => this.resume());
+    if (resumed !== null) return resumed;
+    await this.storage.setAlarm(Date.now() + ALARM_RESUME_DELAY_MS);
+    return { ran: "busy" };
+  }
+
+  async resume() {
     try {
       const session = fold(this.load());
       const log = session.turns.get(session.lastTurn);

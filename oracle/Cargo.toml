@@ -15,6 +15,7 @@ crc = "3"
 nanocode-code-mode = { git = "https://github.com/nanocodexyz/nanocode", rev = "395967ffd227ef2158ea824df6ee4c6054d30293" }
 nanocode-code-mode-engine = { git = "https://github.com/nanocodexyz/nanocode", rev = "395967ffd227ef2158ea824df6ee4c6054d30293" }
 nanocode-platform = { git = "https://github.com/nanocodexyz/nanocode", rev = "395967ffd227ef2158ea824df6ee4c6054d30293" }
+nanocode-durability-core = { git = "https://github.com/nanocodexyz/nanocode", rev = "395967ffd227ef2158ea824df6ee4c6054d30293" }
 nanocode-turnlog = { git = "https://github.com/nanocodexyz/nanocode", rev = "395967ffd227ef2158ea824df6ee4c6054d30293" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
@@ -25,6 +26,13 @@ serde_derive = { git = "https://github.com/nanocodexyz/nanocode", rev = "395967f
 [[bin]]
 name = "hl-oracle"
 path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "turnlog_bench"
+path = "src/bin/turnlog_bench.rs"
 test = false
 doctest = false
 bench = false

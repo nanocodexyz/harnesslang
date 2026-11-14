@@ -106,11 +106,17 @@ on prompt(input: text) -> outcome
   the trap is a typed failure of the handler, never a wrapped value.
 - Sum types: `type name = variant(type, ...) | ...`. Variants carry only what
   that case has.
+- Text enums: `type name = "value" | ...`, a sum of fieldless values lowered as
+  `ir::Sum` with `SumKind::Text`, written in the journal as the text. Matched
+  by value, exhaustively; a text literal is a value where the enum is
+  expected.
 - `list<T, N>`: a list with capacity `N`, a named constant. `push` onto a full
   list fails the handler with `bound(name)`, naming the list.
-- State fields start at zero (`0`, `false`, empty text, an empty list), so
-  they are `u64`, `bool`, `text` or lists. A tool returns `u64`, `bool` or
-  `text`. In a pattern, `_` ignores a field.
+- State fields start at zero (`0`, `false`, empty text, a text enum's first
+  value, an empty list), so they are `u64`, `bool`, `text`, text enums or
+  lists. A tool returns `u64`, `bool`, `text` or a text enum; every backend
+  records a result that does not fit as the call's failure before it is
+  journaled. In a pattern, `_` ignores a field.
 - Builtins every program has:
   - `call = call(id: text, tool: text, input: text)`, with fields `id`, `tool`, `input`
   - `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's
@@ -140,9 +146,11 @@ yields `unknown`.
 
 `let`, assignment to a state field, `push list value`, `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
-`return value`. There is no recursion, no unbounded loop and no user function:
-a handler is straight-line code over bounded loops, so its worst case is a
-number the checker computes.
+`return value`, and a call of a `fn`, whose body the checker inlines at each
+call before lowering, in a scope that sees only its parameters and the
+harness's declarations. There is no recursion (a fn may not call itself,
+directly or through others) and no unbounded loop: a handler is straight-line
+code over bounded loops, so its worst case is a number the checker computes.
 
 ### Code mode
 
@@ -253,7 +261,7 @@ A target is a durability model and a place.
 | `native-jsonl` | a process | append-only JSONL file, one per session | write and fsync | one record (checksummed; a torn tail is dropped) | nobody | the program's own |
 | `native-sqlite` | a process | SQLite rows through a host `Sql` | one transaction | one transaction | nobody | the program's own |
 | `server-postgres` | a server pool | Postgres rows through a host `Sql` | one transaction fenced by the owner's epoch | one transaction | a second owner after a lease expires; the fence refuses its writes | the program's own |
-| `cloudflare` | a Durable Object | the object's SQLite | none: writes in one event are atomic and the output gate holds outgoing requests until they commit | one event | nobody (one object per session); an alarm restarts it after a reset | outbound requests per invocation (memory is reported, not checked) |
+| `cloudflare` | a Durable Object | the object's SQLite | `storage.sync()`, which the output gate already waits for before the outbound request or response that follows every flush | one event | nobody else (one object per session), though another event enters it at any await; an alarm restarts it after a reset | outbound requests per invocation (memory is reported, not checked) |
 | `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | none (Function duration is reported, not checked) |
 
 Vercel documents no limit on the outbound requests of a Function
@@ -272,10 +280,15 @@ What the compiler does differently per target:
 - **server-postgres**: one transaction per durability point that first checks
   the session's owner epoch (`update ... where epoch = $owner`). A fenced write
   stops the handler; the new owner's recovery reports the open external calls.
-- **cloudflare**: no flushes. Journal inserts and the outgoing `fetch` are
-  issued in program order inside one event; the output gate makes the fetch
-  wait for the insert to commit. The alarm is armed before the first external
-  effect so a reset object resumes. When a handler's worst case exceeds the
+- **cloudflare**: journal inserts and the outgoing `fetch` are issued in
+  program order inside one event; the output gate makes the fetch wait for
+  the inserts to commit, and a flush awaits `storage.sync()` so the rows the
+  simulator counts as committed are. Turn requests and alarms queue behind
+  each other, since another event enters the object at any await. The alarm
+  is armed before the first external effect so a reset object resumes. Each
+  of these platform facts is a `Fact` in `src/target/mod.rs` with its
+  documentation and the probe in `oracle/cloudflare/storage.mjs` that
+  measures it on local workerd; `hl check --target cloudflare` prints them. When a handler's worst case exceeds the
   per-invocation request limit, `hl check --target cloudflare` refuses it;
   splitting it into continuations driven by the alarm is future work (see
   Next).
@@ -467,6 +480,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a

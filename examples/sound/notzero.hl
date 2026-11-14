@@ -1,0 +1,16 @@
+harness notzero
+
+state {
+  credits: u64
+}
+
+on use(note: text) -> u64 {
+  if credits != 0 {
+    credits = credits - 1
+  }
+  if credits == 0 {
+    return 0
+  } else {
+    return credits - 1
+  }
+}

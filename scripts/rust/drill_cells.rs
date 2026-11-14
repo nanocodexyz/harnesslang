@@ -4,7 +4,8 @@ use crate::harness::{
     self, CALL_INTERRUPTED, CallState, CellEngine, EffectClass, Entry, Input, Json, Record, Step,
     Stop, Wait, decode_checksummed_lines, nested_call_id, program,
 };
-use crate::{Dispatch, Rng};
+use crate::Rng;
+use crate::checks::{self, Line};
 
 pub const CELL_REPLY_PPM: u64 = 200_000;
 pub const OPS_MAX: u64 = 6;
@@ -302,7 +303,7 @@ fn unknown_entry(log: &harness::CellLog, id: u64) -> Option<bool> {
     })
 }
 
-pub fn check_cells(session: &harness::Session, records: &[Record], runs: &[Vec<Dispatch>]) -> CellCounts {
+pub fn check_cells(session: &harness::Session, records: &[Record], lines: &[Line]) -> CellCounts {
     let mut reported: BTreeSet<String> = BTreeSet::new();
     let mut recorded: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for record in records {
@@ -325,7 +326,7 @@ pub fn check_cells(session: &harness::Session, records: &[Record], runs: &[Vec<D
         }
     }
     let mut dispatched: BTreeMap<&str, u64> = BTreeMap::new();
-    for dispatch in runs.iter().flatten().filter(|dispatch| dispatch.external && dispatch.id.contains(harness::NESTED_ID_INFIX)) {
+    for dispatch in checks::dispatches(lines).filter(|dispatch| dispatch.external && dispatch.nested()) {
         *dispatched.entry(&dispatch.id).or_default() += 1;
         let logged = recorded.get(&dispatch.id).map(|(tool, _)| tool.as_str());
         assert_eq!(logged, Some(dispatch.tool.as_str()), "nested_external_once: {} ran without its durable call record", dispatch.id);

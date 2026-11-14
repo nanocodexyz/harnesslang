@@ -75,8 +75,9 @@ for plant in "${plants[@]}"; do
   fi
 done
 cp scripts/rust/drill_host.rs scripts/rust/drill_cells.rs "$out/"
+cp scripts/rust/sql_drill_checks.rs "$out/sql_drill_checks.rs"
 mv "$out/harness.rs.new" "$out/harness.rs"
-key=$(cat "$out/harness.rs" "$out/drill_host.rs" "$out/drill_cells.rs" | cksum | cut -d' ' -f1)
+key=$(cat "$out/harness.rs" "$out/drill_host.rs" "$out/drill_cells.rs" "$out/sql_drill_checks.rs" | cksum | cut -d' ' -f1)
 if [ ! -x "$out/drill_host" ] || [ "$(cat "$out/key" 2>/dev/null)" != "$key" ]; then
   rustc --edition 2024 -O -o "$out/drill_host" "$out/drill_host.rs"
   echo "$key" > "$out/key"

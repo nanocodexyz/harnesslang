@@ -97,6 +97,7 @@ dependencies = [
  "crc",
  "nanocode-code-mode",
  "nanocode-code-mode-engine",
+ "nanocode-durability-core",
  "nanocode-platform",
  "nanocode-turnlog",
  "serde",
