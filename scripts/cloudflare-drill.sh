@@ -23,7 +23,12 @@ if [ ! -x "$workerd" ] || ! cmp -s "$oracle/package-lock.json" "$npm_prefix/pack
   (cd "$npm_prefix" && npm ci --no-audit --no-fund > /dev/null)
 fi
 echo "cloudflare drill: $("$workerd" --version)"
-node "$oracle/loader.mjs" --dir "$scratch/loader" | grep -E '^(fact|FAIL|loader facts)' | cut -c1-160
+loader_log="$scratch/loader.log"
+if ! node "$oracle/loader.mjs" --dir "$scratch/loader" > "$loader_log" 2>&1; then
+  cat "$loader_log" >&2
+  exit 1
+fi
+grep -E '^(fact|FAIL|loader facts)' "$loader_log" | cut -c1-160
 storage_log="$scratch/storage.log"
 if ! node "$oracle/storage.mjs" --dir "$scratch/storage" > "$storage_log" 2>&1; then
   cat "$storage_log" >&2
@@ -42,6 +47,18 @@ for fact in $cited; do
   fi
 done
 echo "cloudflare drill: $(echo "$cited" | wc -l) facts src/target/mod.rs cites were measured"
+loader_cited=$(grep -oE 'loader\.mjs [a-z]+(_[a-z]+)+(, [a-z]+(_[a-z]+)+)*' src/target/mod.rs | cut -d' ' -f2- | tr -d ',' | tr ' ' '\n' | sort -u)
+if [ -z "$loader_cited" ]; then
+  echo "cloudflare drill: src/target/mod.rs cites no fact of oracle/cloudflare/loader.mjs" >&2
+  exit 1
+fi
+for fact in $loader_cited; do
+  if ! grep -q "^fact $fact:" "$loader_log"; then
+    echo "cloudflare drill: src/target/mod.rs cites $fact, which oracle/cloudflare/loader.mjs did not establish" >&2
+    exit 1
+  fi
+done
+echo "cloudflare drill: $(echo "$loader_cited" | wc -l) cell facts src/target/mod.rs cites were measured"
 
 drill() {
   node "$oracle/drill.mjs" "$@"

@@ -188,7 +188,7 @@ fn check_command(args: &[String]) -> ExitCode {
     let model = target::model(target);
     println!("{}", target::describe(&model));
     if !program.codes.is_empty() {
-        println!("  cells run in: {}", model.cells.describe());
+        println!("{}", target::describe_cells(&model));
     }
     if let Some(limit) = model.limits.memory {
         println!(

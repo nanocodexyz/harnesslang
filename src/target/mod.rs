@@ -91,10 +91,10 @@ impl CellPlacement {
             Self::HostProcess => "the host's engine in the harness process",
             Self::LeaseHolder => "the host's engine in the process holding the session's lease",
             Self::WorkerIsolate => {
-                "a dynamic Worker isolate without network whose steps are RPC calls into the object (Worker Loader, unverified)"
+                "a dynamic Worker isolate loaded through the object's Worker Loader binding with globalOutbound: null, whose steps are RPC calls into the object"
             }
             Self::WorkflowFunction => {
-                "the re-executed workflow function, every nested call a step (script compilation in the workflow sandbox unverified)"
+                "the workflow's steps: each replays the cell from the run's journal in a node:vm context and ends at its flush, so a nested external is a step of its own and a timer a durable sleep"
             }
             Self::Unsupported { reason } => reason,
         }
@@ -109,7 +109,14 @@ pub struct Limit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum About {
+    Journal,
+    Cells,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fact {
+    pub about: About,
     pub claim: &'static str,
     pub source: &'static str,
 }
@@ -168,24 +175,82 @@ const CLOUDFLARE_LIMITS: Limits = Limits {
 
 const CLOUDFLARE_FACTS: &[Fact] = &[
     Fact {
+        about: About::Journal,
         claim: "an outbound fetch or a response leaves only after the event's earlier writes commit",
         source: "blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it",
     },
     Fact {
+        about: About::Journal,
         claim: "writes with no await between them commit together, and none commits while the event runs synchronously",
         source: "developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields",
     },
     Fact {
+        about: About::Journal,
         claim: "a flush is committed once storage.sync() resolves; an awaited microtask commits nothing",
         source: "developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit",
     },
     Fact {
+        about: About::Journal,
         claim: "a committed alarm runs after the object resets",
         source: "developers.cloudflare.com/durable-objects/api/alarms (at-least-once); oracle/cloudflare/storage.mjs alarm_runs_after_reset",
     },
     Fact {
+        about: About::Journal,
         claim: "another event enters the object at any await of non-storage I/O",
         source: "blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (input gates); oracle/cloudflare/storage.mjs event_enters_at_await",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "the Worker Loader binding is experimental: workerd refuses it without --experimental, and production offers it as an open beta on Workers Paid (unverified)",
+        source: "developers.cloudflare.com/workers/runtime-apis/bindings/worker-loader (search summary, not read); oracle/cloudflare/loader.mjs worker_loader_needs_experimental",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "a loaded Worker reaches the object through an object stub or a ctx.exports entrypoint in WorkerCode.env; a namespace binding or an RpcTarget is refused",
+        source: "oracle/cloudflare/loader.mjs object_stub_and_entrypoint_accepted, namespace_binding_refused, rpc_target_refused",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "with globalOutbound: null the isolate's fetch() and connect() throw, and left out the isolate inherits the network",
+        source: "oracle/cloudflare/loader.mjs null_outbound_blocks_fetch, null_outbound_blocks_connect, omitted_outbound_inherits_network",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "each nested call enters the object as its own RPC event while the loading event awaits the cell, and its outbound request reached the host after its call row committed, consistent with the output gate but not isolating it",
+        source: "oracle/cloudflare/loader.mjs rpc_into_object, gate_holds_nested_outbound, gate_holds_every_nested_outbound",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "Durable Object RPC counts as subrequests to internal services under the per-invocation limit, so a cell's nested calls count as calls; workerd enforces no subrequest limit (unverified in production)",
+        source: "developers.cloudflare.com/workers/platform/limits (search summary, not read); oracle/cloudflare/loader.mjs rpc_volume_stub, rpc_volume_exports",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "the isolate has its own global scope; whether its memory counts against the object's isolate limit is not verified",
+        source: "oracle/cloudflare/loader.mjs separate_global_scope",
+    },
+];
+
+const VERCEL_FACTS: &[Fact] = &[
+    Fact {
+        about: About::Cells,
+        claim: "a step function has the full Node.js runtime, so a step compiles a cell with node:vm; a workflow function runs sandboxed, without Node.js modules, fetch or timers",
+        source: "workflow-sdk.dev/docs/foundations/workflows-and-steps (search summary, not read; not measured)",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "sleep() is recorded in the run's event log and replays after a crash, so a cell's timer is a durable workflow sleep",
+        source: "workflow-sdk.dev/docs/api-reference/workflow (sleep; search summary, not read; not measured)",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "getStepMetadata().attempt counts the executions of the current step from 1, and a step runs at most maxRetries + 1 = 4 times by default; that the count is durable before the step body runs is assumed",
+        source: "workflow-sdk.dev/docs/api-reference/workflow/get-step-metadata, workflow-sdk.dev/docs/foundations/errors-and-retries (search summary, not read; not measured)",
+    },
+    Fact {
+        about: About::Cells,
+        claim: "step inputs and results are serialized to the run's event log, which a resumed workflow replays",
+        source: "workflow-sdk.dev/docs/foundations/workflows-and-steps (search summary, not read; not measured)",
     },
 ];
 
@@ -266,7 +331,7 @@ pub const fn model(target: Target) -> Model {
             gate_before_outbound: false,
             limits: VERCEL_LIMITS,
             cells: CellPlacement::WorkflowFunction,
-            facts: &[],
+            facts: VERCEL_FACTS,
         },
     }
 }
@@ -336,8 +401,20 @@ pub fn describe(model: &Model) -> String {
             ));
         }
     }
-    for fact in model.facts {
+    for fact in model
+        .facts
+        .iter()
+        .filter(|fact| fact.about == About::Journal)
+    {
         lines.push(format!("  fact: {} ({})", fact.claim, fact.source));
+    }
+    lines.join("\n")
+}
+
+pub fn describe_cells(model: &Model) -> String {
+    let mut lines = vec![format!("  cells run in: {}", model.cells.describe())];
+    for fact in model.facts.iter().filter(|fact| fact.about == About::Cells) {
+        lines.push(format!("  cell fact: {} ({})", fact.claim, fact.source));
     }
     lines.join("\n")
 }
