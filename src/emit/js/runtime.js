@@ -1358,9 +1358,19 @@ function listed(tool) {
   return listing < 0 ? null : { listing, name };
 }
 
+function waitsNamed(tool) {
+  const index = PROGRAM.codes.findIndex((code) => code.waits !== null && code.waits.name === tool);
+  return index < 0 ? null : index;
+}
+
+function cellsYield() {
+  return PROGRAM.codes.some((code) => code.waits !== null);
+}
+
 function dispatchClass(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.effect;
+  if (waitsNamed(tool) !== null) return "none";
   const found = listed(tool);
   return found === null ? "external" : PROGRAM.listings[found.listing].effect;
 }
@@ -1370,6 +1380,8 @@ const MODEL_MODE = "mode";
 function inputDefaults(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.defaults;
+  const waits = waitsNamed(tool);
+  if (waits !== null) return PROGRAM.codes[waits].waits.defaults;
   const found = listed(tool);
   return found === null ? null : PROGRAM.listings[found.listing].defaults;
 }
@@ -1377,6 +1389,8 @@ function inputDefaults(tool) {
 function inputParams(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.params;
+  const waits = waitsNamed(tool);
+  if (waits !== null) return PROGRAM.codes[waits].waits.params;
   const found = listed(tool);
   return found === null ? null : PROGRAM.listings[found.listing].params;
 }

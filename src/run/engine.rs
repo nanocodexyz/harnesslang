@@ -199,6 +199,10 @@ pub trait World {
     ) -> Result<u64, Stop>;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn waited(&mut self, wait: &Wait) -> bool;
+    fn cell_deadline(&mut self, turn: u64, site: u64, cell: u64) -> u64 {
+        let _ = (turn, site, cell);
+        self.now()
+    }
     fn observe(&mut self, event: &CellEvent);
     fn clock(&mut self) -> u64;
     fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop>;
@@ -2005,6 +2009,7 @@ impl<'a> Engine<'a> {
             },
             nested: &nested,
             header_buffered: false,
+            site: seq,
         };
         if existing.is_none() {
             self.next_cell += 1;
@@ -2123,6 +2128,7 @@ impl<'a> Engine<'a> {
             script: &log.header.script,
             cell: cell::Cell::Existing(&log),
             nested: &nested,
+            site: seq,
             header_buffered: self.buffer.iter().any(
                 |record| matches!(record, Record::Cell { cell, fresh: true, .. } if *cell == log.cell),
             ),
@@ -2885,6 +2891,14 @@ impl CellHost for Engine<'_> {
     }
 
     fn clock(&mut self) -> u64 {
+        self.world().now()
+    }
+
+    fn deadline(&mut self, site: u64, cell: u64) -> u64 {
+        let turn = self.turn;
+        if matches!(self.target.recovery, Recovery::InStep { .. }) {
+            return self.world().cell_deadline(turn, site, cell);
+        }
         self.world().now()
     }
 

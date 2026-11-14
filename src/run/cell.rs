@@ -257,6 +257,7 @@ pub trait CellHost {
     fn attempt(&mut self, seq: u64, nested: u64, first: bool) -> Result<u64, Stop>;
     fn recovered(&mut self, seq: u64, nested: u64) -> Result<(), Stop>;
     fn clock(&mut self) -> u64;
+    fn deadline(&mut self, site: u64, cell: u64) -> u64;
     fn random(&mut self) -> u64;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn waited(&mut self, wait: &Wait) -> bool;
@@ -281,6 +282,7 @@ pub struct CellSite<'a> {
     pub cell: Cell<'a>,
     pub nested: &'a BTreeMap<(u64, u64), SiteLog>,
     pub header_buffered: bool,
+    pub site: u64,
 }
 
 pub fn header_tools(program: &Program, code: &Code) -> Vec<Json> {
@@ -1149,7 +1151,7 @@ impl<'a, 'h> Runner<'a, 'h> {
         if self.code.waits.is_none() {
             return;
         }
-        let clock = self.host.clock();
+        let clock = self.host.deadline(self.site.site, self.cell);
         self.deadline = Some(clock.saturating_add(self.code.yield_ms.value));
     }
 

@@ -34,6 +34,7 @@ plant_expression() {
     interrupt_ignored) echo 's/const interrupted = !ran.preempted\[0\] \&\& /const interrupted = false \&\& /' ;;
     recover_reply_ignored) echo 's/if (recovered.kind !== "reply") return recovered;/return { kind: "unknown" };/' ;;
     job_unopened) echo 's/if (jobStarted(record.output) !== null) session.jobs.set/if (false) session.jobs.set/' ;;
+    cell_leaks) echo 's/^    if (!cellsYield()) return;$/    return;/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

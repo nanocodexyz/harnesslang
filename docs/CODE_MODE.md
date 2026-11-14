@@ -425,6 +425,12 @@ across all its sites. A wait site counts as a cell site in the worst case, and
 the turn-end stop uses the finish its code site counted. LANGUAGE.md, Cells
 across calls, has the example.
 
+The clock a site's deadline starts from is read once per site. On Vercel,
+where every flush ends a step and the next step replays the turn, the step
+that reads it returns it with its output and the workflow hands it to the
+site's later steps, as it hands them the timers already waited on, so a
+replayed site decides against the same deadline.
+
 ## Not in this spec
 
 - Detached cells: nanocode's Codex detaches the cells of a failed turn with no
