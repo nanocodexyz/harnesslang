@@ -197,6 +197,94 @@ class Engine {
     return this.dispatch(siteId, seq, call, args, inStep);
   }
 
+  async parallel(siteId, items) {
+    const site = this.handler.sites[siteId];
+    assert(site.kind === "dispatch", "a parallel for dispatches");
+    const values = new Array(items.length);
+    const pending = [];
+    for (let index = 0; index < items.length; index++) {
+      this.seq += 1;
+      const seq = this.seq;
+      const call = this.resolve(site, [items[index]]);
+      const logged = this.sites.get(seq);
+      if (logged === undefined) {
+        this.requireLive(seq);
+        this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
+        this.sites.set(seq, { kind: "open", call });
+        pending.push({ index, seq, call, reopened: false });
+        continue;
+      }
+      switch (logged.kind) {
+        case "done":
+          this.same(seq, logged.call, call);
+          values[index] = this.decode(site, logged.output);
+          break;
+        case "reply":
+          throw this.diverged(seq, "a model reply", call.tool);
+        case "unknown":
+          this.same(seq, logged.call, call);
+          values[index] = variant(VARIANT_UNKNOWN, []);
+          break;
+        case "open": {
+          this.same(seq, logged.call, call);
+          this.requireLive(seq);
+          const recovered = !mayBeUnknown(call.effect) || this.target.recovery === "in_step";
+          const mutated = this.mutation === "recovery_redispatches_external" || this.mutation === "recovery_reports_failed";
+          assert(recovered || mutated, "recovery turns every open external call unknown before the turn runs again");
+          pending.push({ index, seq, call, reopened: true });
+          break;
+        }
+        default:
+          throw new Panic(`unknown site log ${logged.kind}`);
+      }
+    }
+    let start = 0;
+    while (start < pending.length) {
+      const alone = mayBeUnknown(pending[start].call.effect);
+      let end = start + 1;
+      while (!alone && end < pending.length && !mayBeUnknown(pending[end].call.effect)) end += 1;
+      await this.batchGroup(site, pending.slice(start, end), values);
+      start = end;
+    }
+    return values;
+  }
+
+  async batchGroup(site, group, values) {
+    const external = mayBeUnknown(group[0].call.effect);
+    assert(!external || group.length === 1, "an external call of a parallel for runs alone");
+    const gate = this.target.gateBeforeOutbound;
+    const inStep = external && this.target.recovery === "in_step";
+    const late = external && !gate && this.mutation === "batch_flush_after_dispatch";
+    if (external) await this.mode.world.beforeExternal();
+    if ((external || gate) && !late) {
+      await this.flush();
+      assert(this.buffer.length === 0, "every call record of a parallel for is durable before an external call of it runs");
+    }
+    if (inStep) {
+      const first = group[0];
+      const attempt = await this.mode.world.attempt(this.turn, first.seq);
+      if (first.reopened && attempt > 1 && this.mutation !== "vercel_retry_redispatches") {
+        values[first.index] = await this.unknown(first.seq, first.call);
+        return;
+      }
+      assert(first.reopened || attempt === 1, "a fresh external step starts at its first attempt");
+    }
+    const returns = site.result.maybe;
+    assert(returns !== undefined, "a dispatch yields maybe");
+    const requests = group.map((waiting) => ({ turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns }));
+    const completed = await this.mode.world.tools(requests, CONCURRENT_REQUESTS_MAX);
+    assert(completed.length === group.length, "a batch returns one output per request");
+    const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
+    for (const [position, raw] of ordered) {
+      const waiting = group[position];
+      const output = checkedOutput(waiting.call.tool, returns, raw);
+      this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output });
+      this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output });
+      values[waiting.index] = this.decode(site, output);
+    }
+    if (late || inStep) await this.flush();
+  }
+
   async dispatch(siteId, seq, call, args, step) {
     const site = this.handler.sites[siteId];
     const world = this.mode.world;

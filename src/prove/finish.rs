@@ -121,6 +121,7 @@ impl Walk<'_> {
                 self.branch(label, body);
                 true
             }
+            Stmt::Parallel(parallel) => self.statement(&parallel.sequential()),
             Stmt::Let { .. }
             | Stmt::Assign { .. }
             | Stmt::Push { .. }

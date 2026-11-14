@@ -19,10 +19,13 @@ pub enum Mutation {
     ModelFailureUnrecorded,
     RetireSkipped,
     SealSkipped,
+    BatchFlushAfterDispatch,
+    ResultsInCompletionOrder,
+    BatchPushesReversed,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 20] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -40,6 +43,9 @@ impl Mutation {
         Self::ModelFailureUnrecorded,
         Self::RetireSkipped,
         Self::SealSkipped,
+        Self::BatchFlushAfterDispatch,
+        Self::ResultsInCompletionOrder,
+        Self::BatchPushesReversed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -61,6 +67,9 @@ impl Mutation {
             Self::ModelFailureUnrecorded => "model_failure_unrecorded",
             Self::RetireSkipped => "retire_skipped",
             Self::SealSkipped => "seal_skipped",
+            Self::BatchFlushAfterDispatch => "batch_flush_after_dispatch",
+            Self::ResultsInCompletionOrder => "results_in_completion_order",
+            Self::BatchPushesReversed => "batch_pushes_reversed",
         }
     }
 
@@ -111,7 +120,15 @@ impl Mutation {
             | Self::EnumUnchecked
             | Self::ModelFailureUnrecorded
             | Self::RetireSkipped
-            | Self::SealSkipped => all,
+            | Self::SealSkipped
+            | Self::ResultsInCompletionOrder
+            | Self::BatchPushesReversed => all,
+            Self::BatchFlushAfterDispatch => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Vercel,
+            ],
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

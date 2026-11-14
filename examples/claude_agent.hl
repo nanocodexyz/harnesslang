@@ -95,7 +95,7 @@ on prompt(input: text) -> outcome
           calls(requested, tokens) => {
             context_tokens = tokens
             output_continuations = 0
-            for call in requested {
+            for call in requested parallel {
               match dispatch(call) {
                 ok(output) => { push context result(call, output) }
                 failed(error) => { push context error(call, error) }

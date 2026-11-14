@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::effect::EffectClass;
 use crate::ir::{self, Program, Type};
-use crate::run::engine::{Finish, ModelRequest, Point, Stop, ToolRequest, World};
+use crate::run::engine::{
+    Finish, ModelRequest, Point, Stop, ToolRequest, World, batch_width, run_batch,
+};
 use crate::run::journal::{self, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
@@ -93,6 +95,7 @@ pub struct SimWorld<'a> {
     current: Option<TurnRequest>,
     clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
+    batch_calls: BTreeMap<(u64, u64), u64>,
 }
 
 impl<'a> SimWorld<'a> {
@@ -131,6 +134,7 @@ impl<'a> SimWorld<'a> {
             current: None,
             clock: 0,
             model_calls: BTreeMap::new(),
+            batch_calls: BTreeMap::new(),
         }
     }
 
@@ -451,6 +455,29 @@ impl World for SimWorld<'_> {
         output
     }
 
+    fn tools(
+        &mut self,
+        requests: &[ToolRequest<'_>],
+        limit: Option<u64>,
+    ) -> Result<Vec<(usize, Output)>, Stop> {
+        let order = self.completion_order(requests, limit);
+        self.record("batch", || {
+            vec![
+                (
+                    "order",
+                    Json::Array(
+                        order
+                            .iter()
+                            .map(|index| Json::Number(*index as u64))
+                            .collect(),
+                    ),
+                ),
+                ("limit", limit.map_or(Json::Null, Json::Number)),
+            ]
+        });
+        run_batch(self, requests, limit, &order)
+    }
+
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         self.count_effect(true);
         let response = self.reply(request);
@@ -599,6 +626,27 @@ impl SimWorld<'_> {
             });
         }
         output
+    }
+
+    fn completion_order(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Vec<usize> {
+        let first = requests.first().expect("a batch has a request");
+        let count = self.batch_calls.entry((first.turn, first.seq)).or_insert(0);
+        *count += 1;
+        let mut rng = Rng::derive_keyed(self.seed, "batch", &[first.turn, first.seq, *count]);
+        let width = batch_width(requests.len(), limit);
+        let mut running: Vec<usize> = (0..width).collect();
+        let mut next = width;
+        let mut order = Vec::with_capacity(requests.len());
+        for _ in 0..requests.len() {
+            let finished = running.remove(rng.pick(running.len()));
+            order.push(finished);
+            if next < requests.len() {
+                running.push(next);
+                next += 1;
+            }
+        }
+        assert!(running.is_empty(), "every request of a batch completes");
+        order
     }
 
     fn reply(&mut self, request: &ModelRequest<'_>) -> Json {

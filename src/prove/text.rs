@@ -103,6 +103,10 @@ fn collect<'a>(statements: &'a [Stmt], effects: &mut BTreeMap<LocalId, (SiteId, 
             }
             Stmt::Match { arms, .. } => arms.iter().for_each(|arm| collect(&arm.body, effects)),
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => collect(body, effects),
+            Stmt::Parallel(parallel) => {
+                effects.insert(parallel.result, (parallel.site, parallel.args.as_slice()));
+                collect(&parallel.body, effects);
+            }
             Stmt::Let { .. }
             | Stmt::Assign { .. }
             | Stmt::Push { .. }

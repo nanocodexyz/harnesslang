@@ -1,0 +1,19 @@
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    let name = call.tool
+    match dispatch(call) {
+      ok(output) => { push notes output }
+      failed(error) => { push notes error }
+      unknown => { push notes "lost" }
+    }
+  }
+  return 0
+}

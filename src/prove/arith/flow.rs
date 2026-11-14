@@ -87,6 +87,7 @@ impl Prover<'_> {
                 },
                 body,
             ),
+            Stmt::Parallel(parallel) => self.statement(&parallel.sequential(), state),
             Stmt::Effect { site, args, result } => {
                 for arg in args {
                     self.value(&mut state, arg);
