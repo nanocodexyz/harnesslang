@@ -22,6 +22,7 @@ use crate::target::Target;
 pub const TURNS_PER_SESSION_MAX: u64 = 4;
 pub const RUNS_PER_TURN_MAX: u64 = RESTARTS_PER_TURN_MAX + 2;
 pub const ARGUMENT_U64_MAX: u64 = u32::MAX as u64;
+pub const ARGUMENT_LIST_LENGTH_MAX: u64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -40,35 +41,19 @@ pub struct SeedRun {
     pub result: Result<(), Violation>,
 }
 
-pub fn supported(program: &Program) -> Result<(), String> {
-    for handler in &program.handlers {
-        for local in &handler.params {
-            let param = &handler.locals[*local];
-            if contains_list(&param.ty) {
-                return Err(format!(
-                    "handler '{}': the simulator cannot generate the list argument '{}'",
-                    handler.name, param.name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn contains_list(ty: &Type) -> bool {
-    match ty {
-        Type::List { .. } => true,
-        Type::Known(inner) | Type::Maybe(inner) => contains_list(inner),
-        Type::U64 | Type::Bool | Type::Text | Type::Sum(_) => false,
-    }
-}
-
 pub fn generate(program: &Program, ty: &Type, rng: &mut Rng) -> Value {
     match ty {
         Type::U64 => Value::U64(rng.below(ARGUMENT_U64_MAX)),
         Type::Bool => Value::Bool(rng.draw() & 1 == 1),
         Type::Text => Value::Text(SimWorld::generated_text(rng)),
-        Type::List { .. } => panic!("supported() refuses list arguments"),
+        Type::List { element, capacity } => {
+            let length = rng.below(capacity.value.min(ARGUMENT_LIST_LENGTH_MAX) + 1);
+            Value::List(
+                (0..length)
+                    .map(|_| generate(program, element, rng))
+                    .collect(),
+            )
+        }
         Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => {
             let variants = ty.variants(program).expect("a sum has variants");
             let variant = rng.pick(variants.len());

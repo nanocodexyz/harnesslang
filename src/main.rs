@@ -54,6 +54,8 @@ fn main() -> ExitCode {
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
+        "gen" => harnesslang::generate::cli::gen_command(rest),
+        "fuzz-parse" => harnesslang::generate::cli::fuzz_parse_command(rest),
         _ => usage(),
     }
 }
@@ -147,7 +149,9 @@ fn check_command(args: &[String]) -> ExitCode {
     for handler in &program.handlers {
         println!("{}", worst_lines(handler));
     }
-    let proved_targets = flags.target.map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
+    let proved_targets = flags
+        .target
+        .map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
     let proved = harnesslang::prove::cli::report(
         &file,
         &program,
@@ -283,10 +287,6 @@ fn sim_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
-    if let Err(error) = sim::supported(&program) {
-        eprintln!("{file}: error: {error}");
-        return ExitCode::from(FAILURE_EXIT);
-    }
     if !flags.mutation.targets().contains(&target) {
         eprintln!(
             "{file}: error: mutation {} does not apply to {}",
