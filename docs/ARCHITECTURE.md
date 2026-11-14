@@ -120,7 +120,9 @@ on prompt(input: text) -> outcome
 - Builtins every program has:
   - `call = call(id: text, tool: text, input: text)`, with fields `id`, `tool`, `input`
   - `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's
-    `calls` bound
+    `calls` bound, unless the model declares its own reply type
+    (`model name calls M reply type`), whose one variant carrying
+    `list<call, M>` the worst case multiplies
   - `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`
   - `known<T> = ok(T) | failed(text)` and `maybe<T> = ok(T) | failed(text) | unknown`
 
@@ -133,7 +135,7 @@ sessions and waiting on them are not in the language yet (see Next).
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
 | `none` | `effect none`, `now()`, `random()` | `known<T>` (`now` and `random` return `u64`) | run again |
-| `idempotent` | `effect idempotent`, the model | `known<T>` (the model returns `reply`) | run again with the same idempotency key |
+| `idempotent` | `effect idempotent`, the model | `known<T>` (the model returns `reply`, or `known<R>` for a declared reply type `R`, whose `failed` is a provider failure or a reply that does not fit) | run again with the same idempotency key |
 | `external` | `effect external`, `dispatch` of a tool the program does not declare | `maybe<T>` | never run again: the result is `unknown` |
 
 These are nanocode's `EffectClass` (`None`, `Idempotent`, `External`), and an
@@ -185,7 +187,7 @@ journal and a nanocode journal fold the same way:
 | `admitted` | a handler starts | turn, handler, arguments |
 | `call` | before an effect runs | sequence, tool, effect class, input |
 | `result` | after it returns | sequence, `ok` or `failed` and the value |
-| `model` | after the model returns | sequence, the reply |
+| `model` | after the model returns | sequence, the reply, or `{"failed": error}` for a failed call to a model with a declared reply type |
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
@@ -360,8 +362,9 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target; outbound requests per invocation, counted on the plan, are within the target's limit |
 
 With `no_overflow` and `push_bound` proved, a turn of a proving program
-finishes `failed` only when its `requires` is false or a model reply does not
-decode: never by a trap in its own code. A push that may
+finishes `failed` only when its `requires` is false or a reply of a model
+without a declared reply type does not decode: never by a trap in its own
+code. A push that may
 find its list full is an error, not a warning: `requires` bounds the room a
 turn needs, as `examples/minimal.hl` does.
 
@@ -391,6 +394,9 @@ How:
   iteration; iteration `k` then starts from the entry value plus `k` times
   that change, and the loop exits after its exact count (`loop` runs its
   bound, `for` the list's length at entry, which the interpreter snapshots).
+  An invariant that holds where a loop starts, and still holds at the end of
+  a body run from any state satisfying it, is assumed at every iteration's
+  start and at the exit, so a counter a guard keeps below its bound proves.
   At a branch join the prover keeps the facts both sides imply and the hull
   of each changed quantity. A product of two variables is bounded by the
   product of their upper bounds. Every approximation drops facts and never
@@ -438,7 +444,8 @@ trap, in the zero state or stated over a `bool`.
 ### Deterministic simulation
 
 `hl sim` runs a program on a simulated target from a seed: a scripted model
-(answers and tool calls drawn from the seed), a tool host that counts real
+(answers and tool calls drawn from the seed, or a declared reply type's
+variants and provider failures), a tool host that counts real
 dispatches per call, and the target's fault model:
 
 - crashes at any effect or durability point, before or after the write;

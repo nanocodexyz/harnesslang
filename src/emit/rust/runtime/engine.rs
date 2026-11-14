@@ -474,6 +474,28 @@ pub fn scalar(engine: &Engine<'_>, answer: Answer) -> Result<u64, Halt> {
     }
 }
 
+pub const MODEL_FAILED: &str = "failed";
+
+pub fn model_failure(response: &Json) -> Option<&str> {
+    match response {
+        Json::Object(map) if map.len() == 1 => map.get(MODEL_FAILED).and_then(Json::as_str),
+        _ => None,
+    }
+}
+
+pub fn known_reply<T>(answer: Answer, parse: fn(&Json) -> Result<T, String>) -> Known<T> {
+    match answer {
+        Answer::Reply(response) => match model_failure(&response) {
+            Some(error) => Known::Failed(error.to_owned()),
+            None => match parse(&response) {
+                Ok(reply) => Known::Ok(reply),
+                Err(error) => Known::Failed(format!("model reply: {error}")),
+            },
+        },
+        Answer::Output(_) | Answer::Unknown => panic!("a model site gets a reply"),
+    }
+}
+
 pub fn reply<T>(answer: Answer, parse: fn(&Json) -> Result<T, String>) -> Result<T, Halt> {
     match answer {
         Answer::Reply(response) => parse(&response).map_err(|error| Halt::Trap(format!("model reply: {error}"))),

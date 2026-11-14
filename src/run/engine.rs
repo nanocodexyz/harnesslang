@@ -609,6 +609,9 @@ impl<'a> Engine<'a> {
                     context: &args[0],
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
+                if self.reply_unrecorded(&response) {
+                    return self.reply(&response);
+                }
                 self.append(Record::Model {
                     turn: self.turn,
                     seq,
@@ -654,8 +657,22 @@ impl<'a> Engine<'a> {
     }
 
     fn reply(&self, response: &Json) -> Result<Value, Halt> {
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        if model.declared() {
+            return Ok(value::model_outcome(self.program, response));
+        }
         value::from_json(self.program, &Type::Sum(ir::REPLY), response)
             .map_err(|error| Halt::Trap(format!("model reply: {error}")))
+    }
+
+    fn reply_unrecorded(&self, response: &Json) -> bool {
+        self.mutation == Mutation::ModelFailureUnrecorded
+            && self.program.model.as_ref().is_some_and(ir::Model::declared)
+            && value::model_failure(response).is_some()
     }
 
     fn decode(&self, site: &Site, output: &Output) -> Result<Value, Halt> {

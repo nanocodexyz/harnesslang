@@ -1,4 +1,6 @@
-use crate::ir::{Durability, Expr, Handler, Program, SiteClass, SiteKind, Stmt, Type};
+use crate::ir::{
+    self, Durability, Expr, Handler, Program, SiteClass, SiteKind, Stmt, SumKind, Type,
+};
 
 pub fn program(program: &Program) {
     assert!(
@@ -11,9 +13,48 @@ pub fn program(program: &Program) {
             "an invariant reads only state and constants"
         );
     }
+    reply(program);
     for handler in &program.handlers {
         self::handler(program, handler);
     }
+}
+
+fn reply(program: &Program) {
+    let Some(model) = &program.model else {
+        return;
+    };
+    let sum = &program.sums[ir::REPLY];
+    assert_eq!(sum.kind, SumKind::Tagged, "a reply is a tagged sum");
+    let calls = Type::List {
+        element: Box::new(Type::Sum(ir::CALL)),
+        capacity: model.calls.clone(),
+    };
+    let carriers: Vec<(usize, usize)> = sum
+        .variants
+        .iter()
+        .enumerate()
+        .flat_map(|(variant, definition)| {
+            definition
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| **field == calls)
+                .map(move |(field, _)| (variant, field))
+        })
+        .collect();
+    assert_eq!(
+        carriers,
+        vec![model.calls_at()],
+        "exactly one reply variant carries the model's list of calls, where the model says"
+    );
+    assert!(
+        !model.declared()
+            || sum
+                .variants
+                .iter()
+                .all(|variant| variant.name != ir::MODEL_FAILED),
+        "a declared reply has no variant named like a failed model call"
+    );
 }
 
 fn reads_local(value: &Expr) -> bool {
@@ -40,6 +81,14 @@ fn handler(program: &Program, handler: &Handler) {
                 site.class,
                 SiteClass::Fixed(program.tools[tool].effect),
                 "a tool site has its tool's class"
+            );
+        }
+        if site.kind == SiteKind::Model {
+            let model = program.model.as_ref().expect("a model site needs a model");
+            assert_eq!(
+                site.result,
+                model.result(),
+                "a model site yields the model's result"
             );
         }
         if site.kind == SiteKind::Dispatch {

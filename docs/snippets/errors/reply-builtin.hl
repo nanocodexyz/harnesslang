@@ -1,0 +1,9 @@
+harness notes
+
+const calls_max: u64 = 4
+
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply
+
+on show(said: reply) -> u64 { return 1 }

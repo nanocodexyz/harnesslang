@@ -50,6 +50,10 @@ expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: erro
 expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
 expect_error examples/invalid/enum_missing_value.hl any 'enum_missing_value.hl:6:3: error: match on status is missing "interrupted"'
 expect_error examples/invalid/enum_unknown_value.hl any 'enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status'
+expect_error examples/invalid/reply_two_call_lists.hl any "reply_two_call_lists.hl:7:73: error: reply type 'split_reply' carries list<call, calls_max> in 'reads' and 'writes': exactly one variant carries the model's calls"
+expect_error examples/invalid/reply_no_call_list.hl any "reply_no_call_list.hl:6:6: error: reply type 'text_reply' has no variant carrying list<call, calls_max>"
+expect_error examples/invalid/reply_missing_variant.hl any "reply_missing_variant.hl:21:7: error: match on turn_reply is missing 'paused'"
+expect_error examples/invalid/reply_unmatched_failure.hl any "reply_unmatched_failure.hl:20:5: error: 'answer' is not a variant of known<turn_reply>"
 expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': worst case 17408 outbound requests exceeds cloudflare's limit of 10000 outbound requests per invocation; loops: step below turn_steps_max (1024) x call below calls_per_step_max (16)"
 expect_error examples/invalid/fn_recursion.hl any "fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask"
 expect_error examples/invalid/fn_arity.hl any "fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1"

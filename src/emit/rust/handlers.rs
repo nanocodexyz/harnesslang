@@ -259,8 +259,13 @@ impl<'a, 'p> Body<'a, 'p> {
                     "Run::Model {{ calls_max: {}, context: &context }}",
                     constant(&model.calls.name)
                 );
-                let parse = self.types.from_json(result);
-                ("Model", run, format!("reply(answer, {parse})?"))
+                let decode = match result {
+                    Type::Known(inner) => {
+                        format!("known_reply(answer, {})", self.types.from_json(inner))
+                    }
+                    other => format!("reply(answer, {})?", self.types.from_json(other)),
+                };
+                ("Model", run, decode)
             }
             SiteKind::Now | SiteKind::Random => {
                 let (name, variant) = if kind == SiteKind::Now {

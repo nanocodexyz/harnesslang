@@ -20,6 +20,7 @@ pub const ANSWER_PPM: u64 = 350_000;
 pub const UNDECLARED_TOOL_PPM: u64 = 250_000;
 pub const OVER_CAPACITY_PPM: u64 = 5_000;
 pub const TOOL_FAILURE_PPM: u64 = 150_000;
+pub const MODEL_FAILURE_PPM: u64 = 150_000;
 pub const TEXT_ENUM_INVALID_PPM: u64 = 100_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
@@ -588,9 +589,61 @@ impl SimWorld<'_> {
             .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
-        if !self.greedy && rng.chance(ANSWER_PPM) {
-            return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        if model.declared() && !self.greedy && rng.chance(MODEL_FAILURE_PPM) {
+            let error = format!("{} failed: {}", model.name, Self::generated_text(&mut rng));
+            return Json::object([(ir::MODEL_FAILED, Json::String(error))]);
         }
+        let (calls_variant, calls_field) = model.calls_at();
+        let variants = &self.program.sums[ir::REPLY].variants;
+        let others: Vec<usize> = (0..variants.len())
+            .filter(|variant| *variant != calls_variant)
+            .collect();
+        if !others.is_empty() && !self.greedy && rng.chance(ANSWER_PPM) {
+            let variant = match others.as_slice() {
+                [only] => *only,
+                _ => others[rng.pick(others.len())],
+            };
+            let fields = variants[variant]
+                .fields
+                .iter()
+                .map(|field| Self::tool_value(self.program, &mut rng, field, self.edges.as_ref()))
+                .collect();
+            return Self::variant_json(&variants[variant].name, fields);
+        }
+        let calls = self.drawn_calls(&mut rng, request);
+        let definition = &self.program.sums[ir::REPLY].variants[calls_variant];
+        let mut calls = Some(calls);
+        let fields = (0..definition.fields.len())
+            .map(|field| {
+                if field == calls_field {
+                    calls.take().expect("one field carries the calls")
+                } else {
+                    Self::tool_value(
+                        self.program,
+                        &mut rng,
+                        &definition.fields[field],
+                        self.edges.as_ref(),
+                    )
+                }
+            })
+            .collect();
+        Self::variant_json(&definition.name, fields)
+    }
+
+    fn variant_json(name: &str, mut fields: Vec<Json>) -> Json {
+        match fields.len() {
+            0 => Json::String(name.to_owned()),
+            1 => Json::object([(name, fields.pop().expect("one field"))]),
+            _ => Json::object([(name, Json::Array(fields))]),
+        }
+    }
+
+    fn drawn_calls(&self, rng: &mut Rng, request: &ModelRequest<'_>) -> Json {
         let over_ppm = match (self.greedy, self.edges.is_some()) {
             (true, _) => 0,
             (false, true) => strict::OVER_CAPACITY_PPM,
@@ -624,11 +677,11 @@ impl SimWorld<'_> {
             );
             fields.insert(
                 ir::CALL_FIELDS[ir::CALL_INPUT].to_owned(),
-                Json::String(Self::generated_text(&mut rng)),
+                Json::String(Self::generated_text(rng)),
             );
             calls.push(Json::Object(fields));
         }
-        Json::object([("calls", Json::Array(calls))])
+        Json::Array(calls)
     }
 
     fn check_acknowledge(&mut self, finish: &Finish) {

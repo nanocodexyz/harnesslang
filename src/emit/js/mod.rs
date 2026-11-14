@@ -166,9 +166,10 @@ fn program_literal(program: &Program) -> String {
     }
     let model = program.model.as_ref().map_or("null".to_owned(), |model| {
         format!(
-            "{{ name: {}, calls: {}n }}",
+            "{{ name: {}, calls: {}n, declared: {} }}",
             js_string(&model.name),
-            model.calls.value
+            model.calls.value,
+            model.declared()
         )
     });
     write!(

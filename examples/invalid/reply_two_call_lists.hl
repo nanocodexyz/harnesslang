@@ -1,0 +1,20 @@
+harness reply_two_call_lists
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = done(text) | stopped(text)
+type split_reply = answer(text) | reads(list<call, calls_max>) | writes(list<call, calls_max>)
+
+model think calls calls_max reply split_reply
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 2 <= context_max
+{
+  push context user(question)
+  return done(question)
+}

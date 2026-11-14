@@ -393,7 +393,7 @@ examples/agent.hl: harness agent: 3 tool(s), 2 state field(s), 1 handler(s)
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
   proved zero state: invariant_initial: 2 invariant(s) hold
-  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4192 prover steps)
+  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4202 prover steps)
   proved handler prompt on cloudflare: durability: 1 external effect site(s) run only after a flush of their call and every record before it; 10 acknowledgement point(s) follow their status flush
   proved handler prompt on cloudflare: worst_case: 2115 journal records per run on the plan's longest path, as hl check counts (step below turn_steps_max (64) x call below calls_per_step_max (16))
   proved handler prompt on cloudflare: worst_case: 1088 outbound requests <= 10000 outbound requests per invocation (step below turn_steps_max (64) x call below calls_per_step_max (16))
@@ -492,7 +492,7 @@ Keywords: `harness` `const` `type` `tool` `model` `state` `on` `let` `push` `if`
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `fn` `in` `known` `maybe`
+Contextual words: `below` `calls` `fn` `in` `known` `maybe` `reply`
 
 Builtin functions, whose names declarations may not take:
 
@@ -544,7 +544,7 @@ type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
-model      = "model" name "calls" bound ;
+model      = "model" name "calls" bound [ "reply" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -687,8 +687,10 @@ on ping() -> u64 { return 1 }
 `model name calls bound` declares the model. Calling it, `name(context)`, takes a
 `list<entry, N>` and returns a `reply`; `bound` caps the tool calls in one
 reply, so `calls(requested)` binds a `list<call, bound>`. A reply with more
-calls, or one that does not decode, traps the turn. The `reply` and `entry` types
-exist only when a model is declared:
+calls, or one that does not decode, traps the turn. `model name calls bound
+reply type` declares the reply's type instead, and calling the model then
+returns `known<type>` ([Model replies](#model-replies)). The `reply` and
+`entry` types exist only when a model is declared:
 
 ```console
 $ hl check docs/snippets/errors/needs-model.hl
@@ -1052,7 +1054,8 @@ on ping() -> u64 { return count }
 Builtin sum types:
 
 - `call = call(text, text, text)`, read with `.id`, `.tool` and `.input`.
-- `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's `calls`.
+- `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's `calls`,
+  unless the model declares its reply type, which then takes `reply`'s place.
 - `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`.
 
 Rules:
@@ -1368,6 +1371,192 @@ type status = "completed" | "failed" | "completed"
 on ping() -> u64 { return 1 }
 ```
 
+### Model replies
+
+`model name calls bound reply type` declares the type of the model's replies,
+so a harness can branch on everything its provider reports, such as Claude's
+stop reasons. The type is a sum this harness declares, and:
+
+- Exactly one variant carries `list<call, bound>`, the model's calls; the
+  worst case multiplies that list's capacity like any `for` over it.
+- Every other field is `u64`, `bool`, `text` or a text enum, so every
+  target and the simulator can carry it.
+- No variant is named `failed`, the name a failed model call is recorded
+  under.
+- It takes the builtin `reply`'s place: `entry`'s `assistant` variant
+  carries it, and the name `reply` is free.
+
+Calling the model returns `known<type>`: the model is idempotent, so its
+outcome is never unknown, but the provider can fail. `failed(error)` is a
+host reporting a failure, as the reply `{"failed": "error"}`, or a reply that
+does not fit the type (`model reply: ...`, a list over the calls bound
+included), so the program handles both, typically by asking again under a
+named bound. Nothing traps. Matching the reply is exhaustive like any sum.
+
+```hl docs/snippets/model_reply.hl
+harness replies
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 16
+const attempts_max: u64 = 5
+const continuations_max: u64 = 3
+const context_max: u64 = 256
+
+type outcome = done(text) | stopped(text) | exhausted
+type turn_reply = answer(text, u64)
+  | calls(list<call, calls_max>, u64)
+  | truncated(text)
+  | refused(text)
+
+tool read(path: text) -> text effect none
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  failures: u64
+  continuations: u64
+}
+
+invariant failures_bounded: failures < attempts_max
+invariant continuations_bounded: continuations <= continuations_max
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  failures = 0
+  continuations = 0
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => {
+        if failures + 1 >= attempts_max { return stopped(error) }
+        failures = failures + 1
+      }
+      ok(reply) => {
+        failures = 0
+        push context assistant(reply)
+        match reply {
+          answer(words, _) => { return done(words) }
+          calls(requested, _) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+          truncated(partial) => {
+            if continuations >= continuations_max { return stopped(partial) }
+            continuations = continuations + 1
+          }
+          refused(reason) => { return stopped(reason) }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+The prover bounds both counters. Each holds its invariant where the loop
+starts and every iteration that falls through keeps it, so it holds at every
+iteration's start ([Invariants and requires](#invariants-and-requires)). Each
+retry and each continuation spends one of `rounds_max` rounds, so the worst
+case is the same as without them:
+
+```console
+$ hl check docs/snippets/model_reply.hl | grep -E 'worst case|no_overflow'
+  handler ask: worst case 80 effects, 147 journal records, 80 outbound requests
+  proved handler ask: no_overflow: 7 arithmetic operation(s) proved in range; invariant_preserved: 10 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (17036 prover steps)
+```
+
+The journal is unchanged. A `model` record holds the reply as the host
+returned it, and a failed call writes a `model` record too, holding
+`{"failed": error}`, so a rerun replays the failure and takes the same path:
+
+```console
+$ hl run docs/snippets/model_reply.hl --handler ask --arg hi --seed 2 | sed -n 2p
+{"crc":1388021480,"record":{"model":{"call_id":"1/1","response":{"failed":"think failed: epsilon-53"},"seq":1,"turn":"1"}}}
+```
+
+`hl sim` draws a failure in `MODEL_FAILURE_PPM` = 150000 calls per million to
+a model with a declared reply, and otherwise a variant of the type: one other
+than the calls' in `ANSWER_PPM` = 350000 replies per million, every one as
+likely as the next, and the calls' variant in the rest, with fields drawn as
+tool results are, values outside a text enum included.
+`examples/claude_agent.hl` ports Claude's stop reasons this way: `max_tokens`
+continues at most `continuations_max` times, `pause_turn` sends the context
+again, `model_context_window_exceeded` is handled once, `refusal` stops the
+turn, and a failed call is asked again up to `throttled_attempts_max` times
+in a row.
+
+The planted bug `model_failure_unrecorded` writes no record for a failed
+call, as a harness that treats provider errors as transient might. A rerun
+asks the model again, and replaying the journal from nothing finds the call
+missing:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
+FAIL invariant=replay_equal seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: replaying the journal failed: Corrupt("replay of turn 3 needs seq 23, which the journal does not record")
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation model_failure_unrecorded examples/claude_agent.hl
+```
+
+The checker's reply errors:
+
+```console
+$ hl check examples/invalid/reply_two_call_lists.hl
+examples/invalid/reply_two_call_lists.hl:7:73: error: reply type 'split_reply' carries list<call, calls_max> in 'reads' and 'writes': exactly one variant carries the model's calls
+$ hl check examples/invalid/reply_no_call_list.hl
+examples/invalid/reply_no_call_list.hl:6:6: error: reply type 'text_reply' has no variant carrying list<call, calls_max>: exactly one variant carries the model's calls
+$ hl check examples/invalid/reply_unmatched_failure.hl
+examples/invalid/reply_unmatched_failure.hl:20:5: error: 'answer' is not a variant of known<turn_reply>
+$ hl check docs/snippets/errors/reply-failed-variant.hl
+docs/snippets/errors/reply-failed-variant.hl:5:65: error: reply type 'turn_reply' has a variant named 'failed', the name a failed model call is recorded under
+$ hl check docs/snippets/errors/reply-field.hl
+docs/snippets/errors/reply-field.hl:6:71: error: variant 'notes' of reply type 'turn_reply' carries list<text, notes_max>: a reply's fields are u64, bool, text, text enums and the one list<call, calls_max>
+$ hl check docs/snippets/errors/reply-builtin.hl
+docs/snippets/errors/reply-builtin.hl:9:15: error: unknown type 'reply': the model replies with 'turn_reply'
+```
+
+```hl docs/snippets/errors/reply-failed-variant.hl
+harness notes
+
+const calls_max: u64 = 4
+
+type turn_reply = answer(text) | calls(list<call, calls_max>) | failed(text)
+
+model think calls calls_max reply turn_reply
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/reply-field.hl
+harness notes
+
+const calls_max: u64 = 4
+const notes_max: u64 = 8
+
+type turn_reply = answer(text) | calls(list<call, calls_max>) | notes(list<text, notes_max>)
+
+model think calls calls_max reply turn_reply
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/reply-builtin.hl
+harness notes
+
+const calls_max: u64 = 4
+
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply
+
+on show(said: reply) -> u64 { return 1 }
+```
+
 ## Statements
 
 | Statement | Meaning |
@@ -1421,7 +1610,7 @@ Effects inside an expression run before the expression, left to right.
 | Class | Declared by | Result | When a crash lost its result |
 | --- | --- | --- | --- |
 | `none` | `effect none`, `now()`, `random()` | `known<T>` for a tool; `now()` and `random()` give a plain `u64` | runs again |
-| `idempotent` | `effect idempotent`, the model | `known<T>` for a tool; the model gives a plain `reply` | runs again with the same turn and sequence number, its idempotency key |
+| `idempotent` | `effect idempotent`, the model | `known<T>` for a tool; the model gives a plain `reply`, or `known<R>` when it declares its reply type `R` | runs again with the same turn and sequence number, its idempotency key |
 | `external` | `effect external`, a tool the program does not declare | `maybe<T>` | never runs again: the result is `unknown` |
 
 These are nanocode's `EffectClass`. `dispatch(call)` looks `call.tool` up among
@@ -1525,8 +1714,8 @@ points above, never less.
 
 A turn ends `failed` without running further when `requires` is false
 (`requires(handler)`, state unchanged), a `u64` operation overflows or
-underflows, a `push` finds its list full (`bound(list)`), or a model reply does
-not decode. A trap still writes `status` and is acknowledged once. The prover
+underflows, a `push` finds its list full (`bound(list)`), or a reply of a model
+without a declared reply type does not decode. A trap still writes `status` and is acknowledged once. The prover
 rules out the overflow and full-list traps, so in a proving program only the
 first and last remain.
 
@@ -1600,6 +1789,58 @@ and proves each obligation by showing its negation has no solution. A failure
 names the handler, the property, the path and, where it can, values that
 reach it. Those values solve the prover's facts; after a branch join or a loop
 they can be values no run reaches.
+
+Inside a loop the prover assumes an invariant at every iteration's start when
+the invariant holds where the loop starts and every iteration that goes on to
+the next keeps it. A counter that a guard keeps below its bound, such as a
+retry count, then proves ([Model replies](#model-replies)); without the guard
+it does not:
+
+```console
+$ cat examples/invalid/retry_unbounded.hl
+harness retry_unbounded
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 16
+const attempts_max: u64 = 5
+const context_max: u64 = 64
+
+type outcome = done(text) | stopped(text) | exhausted
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  failures: u64
+}
+
+invariant failures_bounded: failures < attempts_max
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max <= context_max
+{
+  push context user(question)
+  failures = 0
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => { failures = failures + 1 }
+      ok(reply) => {
+        failures = 0
+        push context assistant(reply)
+        match reply {
+          answer(words) => { return done(words) }
+          calls(requested) => { return stopped("no tools") }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+$ hl check examples/invalid/retry_unbounded.hl > /dev/null
+examples/invalid/retry_unbounded.hl: error: handler 'ask': invariant_preserved: invariant 'failures_bounded' (failures < attempts_max) may not hold when the handler returns; path: entry; counterexample: failures = 16
+examples/invalid/retry_unbounded.hl: error: 1 proof obligation(s) failed for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+```
 
 The prover's own examples, under `examples/invalid/`:
 
