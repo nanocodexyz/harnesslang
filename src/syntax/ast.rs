@@ -103,6 +103,7 @@ pub struct Model {
     pub calls: Name,
     pub reply: Option<Name>,
     pub modes: Vec<Name>,
+    pub window: Option<Name>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +191,7 @@ pub enum Stmt {
         at: Position,
         list: Name,
         count: Expr,
+        first: Option<Expr>,
     },
     If {
         at: Position,
@@ -315,6 +317,11 @@ pub enum Expr {
         at: Position,
         events: Name,
     },
+    With {
+        at: Position,
+        list: Box<Expr>,
+        entry: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -324,7 +331,10 @@ impl Expr {
             Self::Name(name) => name.at,
             Self::Member { base, .. } => base.at(),
             Self::Call { callee, .. } => callee.at,
-            Self::Binary { at, .. } | Self::Not { at, .. } | Self::Take { at, .. } => *at,
+            Self::Binary { at, .. }
+            | Self::Not { at, .. }
+            | Self::Take { at, .. }
+            | Self::With { at, .. } => *at,
         }
     }
 }

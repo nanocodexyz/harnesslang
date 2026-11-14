@@ -55,7 +55,10 @@ suspend_before_flush examples/hooks.hl --twice suspend_durable
 resume_unmatched examples/hooks.hl --twice resume_matched
 wait_unjournaled examples/subagents.hl --twice idempotent_known
 wait_rerun_skips examples/subagents.hl --twice wait_until
-wait_oversleeps examples/subagents.hl --twice wait_until"
+wait_oversleeps examples/subagents.hl --twice wait_until
+truncate_uncut docs/snippets/recovery.hl --twice checkpoint_compacted
+usage_unchecked docs/snippets/recovery.hl --twice replay_equal
+retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

@@ -1,0 +1,126 @@
+harness recovery
+
+const rounds_max: u64 = 16
+const calls_max: u64 = 4
+const context_max: u64 = 128
+const kept_max: u64 = 8
+const window_tokens: u64 = 200000
+const compact_tokens: u64 = 167000
+const result_tokens_max: u64 = 25000
+const result_units_max: u64 = 100039
+const continuations_max: u64 = 3
+const throttled_max: u64 = 10
+const retry_base_ms: u64 = 500
+const retry_cap_ms: u64 = 32000
+
+type outcome = done(text) | failed(text) | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model think calls calls_max window window_tokens
+
+state {
+  context: list<entry, context_max>
+  context_tokens: u64
+  pending_units: u64
+  continuations: u64
+  throttled: u64
+  backoff_ms: u64
+  refused: bool
+}
+
+invariant tokens_bounded: context_tokens <= 4 * window_tokens
+invariant continuations_bounded: continuations <= continuations_max
+invariant throttled_bounded: throttled < throttled_max
+invariant backoff_bounded: backoff_ms <= retry_cap_ms
+invariant pending_bounded: pending_units <= calls_max * result_units_max
+
+fn back_off(error: text, after_ms: u64) {
+  if throttled + 1 >= throttled_max { return failed(error) }
+  if after_ms > retry_cap_ms { return failed("Retry-After past the cap: " ++ error) }
+  throttled = throttled + 1
+  if after_ms > backoff_ms {
+    let woke = wait(after_ms) at most retry_cap_ms
+  } else {
+    let woke = wait(backoff_ms) at most retry_cap_ms
+  }
+  if backoff_ms * 2 > retry_cap_ms { backoff_ms = retry_cap_ms } else { backoff_ms = backoff_ms * 2 }
+}
+
+fn compact() {
+  match think(context with user("Summarize the conversation so far.")) {
+    ok(summary, stop, _, _, _, _) => {
+      match summary {
+        answer(words) => {
+          keep context last kept_max after user("Summary of the earlier conversation:\n" ++ words)
+          context_tokens = 0
+          pending_units = 0
+        }
+        calls(_) => { return failed("the summary asked for tools") }
+      }
+    }
+    throttled(error, _) => { return failed("compaction throttled: " ++ error) }
+    transient(error, _) => { return failed("compaction failed: " ++ error) }
+    rejected(error) => { return failed("compaction rejected: " ++ error) }
+  }
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (2 + calls_max) <= context_max
+{
+  push context user(question)
+  continuations = 0
+  throttled = 0
+  backoff_ms = retry_base_ms
+  refused = false
+  loop round below rounds_max {
+    if context_tokens * 4 + pending_units >= compact_tokens * 4 { compact() }
+    match think(context) {
+      throttled(error, after_ms) => { back_off(error, after_ms) }
+      transient(error, after_ms) => { back_off(error, after_ms) }
+      rejected(error) => { return failed(error) }
+      ok(reply, stop, input_tokens, output_tokens, cache_read, cache_write) => {
+        throttled = 0
+        backoff_ms = retry_base_ms
+        context_tokens = input_tokens + output_tokens + cache_read + cache_write
+        pending_units = 0
+        push context assistant(reply)
+        match reply {
+          answer(words) => {
+            match stop {
+              "end" => { return done(words) }
+              "tool_use" => { return done(words) }
+              "max_tokens" => {
+                if continuations >= continuations_max { return failed("output token limit after every continuation") }
+                continuations = continuations + 1
+                push context user("Output token limit hit. Resume directly.")
+              }
+              "refusal" => {
+                if refused { return failed("refused twice: " ++ words) }
+                refused = true
+                push context user("Continue.")
+              }
+              "context_exceeded" => { compact() }
+              "pause" => {}
+            }
+          }
+          calls(requested) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => {
+                  let cut = truncate_middle(output, result_tokens_max)
+                  pending_units = pending_units + len(cut)
+                  push context result(call, cut)
+                }
+                failed(error) => { push context error(call, truncate_middle(error, result_tokens_max)) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}

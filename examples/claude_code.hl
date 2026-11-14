@@ -3,47 +3,103 @@ harness claude_code
 const rounds_max: u64 = 512
 const calls_per_round_max: u64 = 16
 const context_entries_max: u64 = 4096
-const context_tokens_compact: u64 = 167000
+const context_window_tokens: u64 = 200000
+const compaction_reserved_tokens: u64 = 33000
+const result_tokens_max: u64 = 12000
+const direct_result_tokens_max: u64 = 25000
+const direct_result_units_max: u64 = 100039
 const turns_max: u64 = 1000000
 const continuations_max: u64 = 3
 const throttled_attempts_max: u64 = 10
+const attempts_max: u64 = 11
+const compaction_attempts_max: u64 = 3
+const retry_base_ms: u64 = 500
+const retry_cap_ms: u64 = 32000
+const retry_delay_max_ms: u64 = 60000
+const throttled_wait_ms: u64 = 180000
 const bash_timeout_ms: u64 = 120000
 const read_offset_first: u64 = 1
 const read_limit_whole: u64 = 0
 
 type outcome = completed(text) | failed(text) | exhausted
-type claude_reply = answer(text, text, u64)
-  | calls(list<call, calls_per_round_max>, text, u64)
-  | truncated(text)
-  | paused
-  | context_full
-  | refused(text)
-  | rejected(text)
+type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
 
 tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
 tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text effect none
 tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool = false) -> text effect external
 tool Write(file_path: text, content: text) -> text effect external
 
-model messages calls calls_per_round_max reply claude_reply modes text_only
+model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only
 
 state {
   context: list<entry, context_entries_max>
   turns: u64
   output_continuations: u64
-  throttled: u64
+  attempts: u64
+  waited_ms: u64
+  backoff_ms: u64
+  refusal_recovered: bool
   context_recovery_attempted: bool
   context_tokens: u64
+  pending_units: u64
+  round_entries: u64
+  compact_pending: bool
+  delay_ms: u64
+  calls_run: bool
+  compaction_prompt: text
+  summary_text: text
+  summary_ready: bool
 }
 
 invariant turns_bounded: turns <= turns_max
 invariant context_room: len(context) < context_entries_max
 invariant continuations_bounded: output_continuations <= continuations_max
-invariant throttled_bounded: throttled < throttled_attempts_max
+invariant attempts_bounded: attempts < attempts_max
+invariant waited_bounded: waited_ms <= throttled_wait_ms
+invariant backoff_bounded: backoff_ms <= retry_cap_ms
+invariant tokens_bounded: context_tokens <= 4 * context_window_tokens
+invariant pending_bounded: pending_units <= calls_per_round_max * direct_result_units_max
+invariant round_bounded: round_entries <= 1 + calls_per_round_max
+invariant delay_bounded: delay_ms <= retry_delay_max_ms
+
+fn back_off(error: text, after_ms: u64, limit: u64, throttled: bool) {
+  if attempts + 1 >= limit {
+    return failed("model failed on every attempt: " ++ error)
+  }
+  if after_ms > retry_delay_max_ms {
+    return failed("the provider asked to wait longer than a retry waits: " ++ error)
+  }
+  delay_ms = backoff_ms
+  if after_ms > backoff_ms { delay_ms = after_ms }
+  if throttled {
+    if waited_ms + delay_ms > throttled_wait_ms {
+      return failed("model throttled past the throttled wait: " ++ error)
+    }
+    waited_ms = waited_ms + delay_ms
+  }
+  let woke = wait(delay_ms) at most retry_delay_max_ms
+  attempts = attempts + 1
+  if backoff_ms * 2 > retry_cap_ms { backoff_ms = retry_cap_ms } else { backoff_ms = backoff_ms * 2 }
+}
+
+fn continued(summary: text) {
+  if round_entries > 0 {
+    keep context last round_entries after user("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" ++ summary ++ "\n" ++ "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened." ++ "\n\n" ++ "The messages after this summary are the most recent messages from before compaction, kept verbatim. The summary was written while seeing them, so they repeat its last steps.")
+  } else {
+    keep context last 0 after user("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" ++ summary ++ "\n" ++ "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.")
+  }
+  context_tokens = 0
+  pending_units = 0
+  round_entries = 0
+  compact_pending = false
+  attempts = 0
+  backoff_ms = retry_base_ms
+}
 
 fn compact() {
+  summary_ready = false
   keep context last context_entries_max - 2
-  push context user("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n- You already have all the context you need in the conversation above.\n- Tool calls will be REJECTED and will waste your only turn — you will fail the task.\n- Your entire response must be plain text: an <analysis> block followed by a <summary> block.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.\n"
+  compaction_prompt = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n- You already have all the context you need in the conversation above.\n- Tool calls will be REJECTED and will waste your only turn — you will fail the task.\n- Your entire response must be plain text: an <analysis> block followed by a <summary> block.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.\n"
     ++ "This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.\n\nBefore providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:\n\n1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:\n   - The user's explicit requests and intents\n   - Your approach to addressing the user's requests\n   - Key decisions, technical concepts and code patterns\n"
     ++ "   - Specific details like:\n     - file names\n     - full code snippets\n     - function signatures\n     - file edits\n   - Errors that you ran into and how you fixed them\n   - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.\n   - Note any security-relevant instructions or constraints the user stated (e.g., sensitive files or data to avoid, operations that must not be performed, credential or secret handling rules). These MUST be preserved verbatim in the summary so they continue to apply after compaction.\n"
     ++ "2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.\n\nYour summary should include the following sections:\n\n1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail\n2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.\n3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.\n4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.\n"
@@ -56,122 +112,195 @@ fn compact() {
     ++ "   - [...]\n\n8. Current Work:\n   [Precise description of current work]\n\n9. Optional Next Step:\n   [Optional Next step to take]\n\n"
     ++ "</summary>\n</example>\n\nPlease provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response. \n\nThere may be additional summarization instructions provided in the included context. If so, remember to follow these instructions when creating the above summary. Examples of instructions include:\n<example>\n## Compact Instructions\n"
     ++ "When summarizing the conversation focus on typescript code changes and also remember the mistakes you made and how you fixed them.\n</example>\n\n<example>\n# Summary instructions\nWhen you are using compact - please focus on test output and code changes. Include file reads verbatim.\n</example>\n\n"
-    ++ "\nREMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task.")
-  match messages(context) {
-    failed(error) => { return failed("compaction failed: " ++ error) }
-    ok(summary) => {
+    ++ "\nREMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task."
+  match messages(context with user(compaction_prompt)) {
+    ok(summary, stop, _, _, _, _) => {
       match summary {
-        answer(words, _, _) => { summarized(words) }
+        answer(words, _) => { summary_stopped(words, stop) }
         calls(_, _, _) => { forced_summary() }
-        truncated(_) => { return failed("compaction summary did not end normally") }
-        paused => { return failed("compaction summary did not end normally") }
-        context_full => { return failed("compaction exhausted the context window") }
-        refused(reason) => { return failed("provider refused compaction: " ++ reason) }
-        rejected(reason) => { return failed("provider rejected compaction: " ++ reason) }
       }
     }
+    throttled(error, after_ms) => { back_off("compaction: " ++ error, after_ms, compaction_attempts_max, false) }
+    transient(error, after_ms) => { back_off("compaction: " ++ error, after_ms, compaction_attempts_max, false) }
+    rejected(error) => { return failed("provider rejected compaction: " ++ error) }
+  }
+  compaction_prompt = ""
+  if summary_ready {
+    continued(summary_text)
+    summary_text = ""
+    summary_ready = false
   }
 }
 
 fn forced_summary() {
-  match messages(context) mode text_only {
-    failed(error) => { return failed("compaction failed: " ++ error) }
-    ok(summary) => {
+  match messages(context with user(compaction_prompt)) mode text_only {
+    ok(summary, stop, _, _, _, _) => {
       match summary {
-        answer(words, _, _) => { summarized(words) }
+        answer(words, _) => { summary_stopped(words, stop) }
         calls(_, _, _) => { return failed("compaction returned a tool block") }
-        truncated(_) => { return failed("compaction summary did not end normally") }
-        paused => { return failed("compaction summary did not end normally") }
-        context_full => { return failed("compaction exhausted the context window") }
-        refused(reason) => { return failed("provider refused compaction: " ++ reason) }
-        rejected(reason) => { return failed("provider rejected compaction: " ++ reason) }
       }
     }
+    throttled(error, after_ms) => { back_off("compaction: " ++ error, after_ms, compaction_attempts_max, false) }
+    transient(error, after_ms) => { back_off("compaction: " ++ error, after_ms, compaction_attempts_max, false) }
+    rejected(error) => { return failed("provider rejected compaction: " ++ error) }
+  }
+}
+
+fn summary_stopped(words: text, stop: stop) {
+  match stop {
+    "end" => { summarized(words) }
+    "tool_use" => { summarized(words) }
+    "max_tokens" => { return failed("compaction summary did not end normally") }
+    "refusal" => { return failed("provider refused compaction") }
+    "context_exceeded" => { return failed("compaction exhausted the context window") }
+    "pause" => { return failed("compaction summary did not end normally") }
   }
 }
 
 fn summarized(words: text) {
-  if contains(words, "<analysis>") and contains(after(words, "<analysis>"), "</analysis>") {
-    summary_tagged(before(words, "<analysis>") ++ after(after(words, "<analysis>"), "</analysis>"))
-  } else {
-    summary_tagged(words)
+  summary_text = words
+  if contains(summary_text, "<analysis>") and contains(after(summary_text, "<analysis>"), "</analysis>") {
+    summary_text = before(summary_text, "<analysis>") ++ after(after(summary_text, "<analysis>"), "</analysis>")
   }
+  if contains(summary_text, "<summary>") and contains(after(summary_text, "<summary>"), "</summary>") {
+    summary_text = trim(before(summary_text, "<summary>") ++ "Summary:\n" ++ trim(before(after(summary_text, "<summary>"), "</summary>")) ++ after(after(summary_text, "<summary>"), "</summary>"))
+  } else {
+    summary_text = trim(summary_text)
+  }
+  summary_ready = true
 }
 
-fn summary_tagged(stripped: text) {
-  if contains(stripped, "<summary>") and contains(after(stripped, "<summary>"), "</summary>") {
-    continued(trim(before(stripped, "<summary>") ++ "Summary:\n" ++ trim(before(after(stripped, "<summary>"), "</summary>")) ++ after(after(stripped, "<summary>"), "</summary>")))
-  } else {
-    continued(trim(stripped))
+fn refused(words: text) {
+  if refusal_recovered {
+    return failed("provider refused the request; turn stopped")
   }
+  refusal_recovered = true
+  push context assistant(answer(words, ""))
+  push context user("Your response above was stopped by a safety classifier — this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.")
 }
 
-fn continued(summary: text) {
-  clear context
-  context_tokens = 0
-  push context user("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" ++ summary ++ "\n" ++ "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.")
+fn context_exceeded() {
+  if context_recovery_attempted {
+    return failed("context window exhausted after recovery")
+  }
+  context_recovery_attempted = true
+  compact_pending = true
+}
+
+fn run_calls(requested: list<call, calls_per_round_max>) {
+  pending_units = 0
+  for call in requested parallel {
+    match dispatch(call) {
+      ok(output) => {
+        if call.tool == "exec" or call.tool == "wait" {
+          let cut = truncate_middle(output, result_tokens_max)
+          pending_units = pending_units + len(cut)
+          push context result(call, cut)
+        } else {
+          let cut = truncate_middle(output, direct_result_tokens_max)
+          pending_units = pending_units + len(cut)
+          push context result(call, cut)
+        }
+      }
+      failed(error) => {
+        let cut = truncate_middle(error, direct_result_tokens_max)
+        pending_units = pending_units + len(cut)
+        push context error(call, cut)
+      }
+      unknown => { push context unknown(call) }
+    }
+  }
+  round_entries = 1 + len(requested)
 }
 
 on prompt(input: text, rounds: u64) -> outcome
   requires turns < turns_max
 {
+  if len(context) + 1 >= context_entries_max {
+    keep context last context_entries_max - 2
+  }
   push context user(input)
   turns = turns + 1
   output_continuations = 0
-  throttled = 0
+  attempts = 0
+  waited_ms = 0
+  backoff_ms = retry_base_ms
+  refusal_recovered = false
   context_recovery_attempted = false
+  compact_pending = false
+  round_entries = 0
   loop round below rounds_max {
-    if len(context) + 1 + (1 + calls_per_round_max) > context_entries_max {
+    if len(context) + 4 + calls_per_round_max > context_entries_max {
+      compact_pending = true
+    }
+    if context_tokens * 4 + pending_units >= (context_window_tokens - compaction_reserved_tokens) * 4 {
+      compact_pending = true
+    }
+    if compact_pending {
       compact()
     } else {
-      if context_tokens >= context_tokens_compact {
-        compact()
+      if len(context) + 4 + calls_per_round_max > context_entries_max {
+        return failed("the context has no room for a round after compaction")
       }
-    }
-    if round >= rounds { return exhausted }
-    match messages(context) {
-      failed(error) => {
-        if throttled + 1 >= throttled_attempts_max {
-          return failed("model failed on every throttled attempt: " ++ error)
-        }
-        throttled = throttled + 1
-      }
-      ok(reply) => {
-        throttled = 0
-        push context assistant(reply)
-        match reply {
-          answer(words, _, tokens) => {
-            context_tokens = tokens
-            return completed(words)
-          }
-          calls(requested, _, tokens) => {
-            context_tokens = tokens
-            output_continuations = 0
-            for call in requested parallel {
-              match dispatch(call) {
-                ok(output) => { push context result(call, output) }
-                failed(error) => { push context error(call, error) }
-                unknown => { push context unknown(call) }
+      if round >= rounds { return exhausted }
+      match messages(context) {
+        throttled(error, after_ms) => { back_off(error, after_ms, throttled_attempts_max, true) }
+        transient(error, after_ms) => { back_off(error, after_ms, attempts_max, false) }
+        rejected(error) => { return failed("provider rejected the request: " ++ error) }
+        ok(reply, stop, input_tokens, output_tokens, cache_read, cache_write) => {
+          attempts = 0
+          waited_ms = 0
+          backoff_ms = retry_base_ms
+          context_tokens = input_tokens + output_tokens + cache_read + cache_write
+          pending_units = 0
+          round_entries = 0
+          match reply {
+            answer(words, _) => {
+              match stop {
+                "end" => {
+                  push context assistant(reply)
+                  return completed(words)
+                }
+                "tool_use" => {
+                  push context assistant(reply)
+                  return completed(words)
+                }
+                "max_tokens" => {
+                  push context assistant(reply)
+                  if output_continuations >= continuations_max {
+                    return failed("Claude output token limit exhausted after 3 continuations; partial output and completed tool results retained")
+                  }
+                  output_continuations = output_continuations + 1
+                  push context user("Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces.")
+                }
+                "refusal" => { refused(words) }
+                "context_exceeded" => { context_exceeded() }
+                "pause" => { push context assistant(reply) }
+              }
+            }
+            calls(requested, words, _) => {
+              calls_run = true
+              match stop {
+                "end" => {}
+                "tool_use" => {}
+                "max_tokens" => {}
+                "pause" => {}
+                "refusal" => {
+                  calls_run = false
+                  refused(words)
+                }
+                "context_exceeded" => {
+                  calls_run = false
+                  context_exceeded()
+                }
+              }
+              if calls_run {
+                push context assistant(reply)
+                output_continuations = 0
+                run_calls(requested)
               }
             }
           }
-          truncated(_) => {
-            if output_continuations >= continuations_max {
-              return failed("output token limit exhausted after every continuation")
-            }
-            output_continuations = output_continuations + 1
-            push context user("Continue the current task from the interrupted response. The output token limit was reached. Do not repeat completed tool actions.")
-          }
-          paused => { output_continuations = 0 }
-          context_full => {
-            if context_recovery_attempted {
-              return failed("context window exhausted after recovery")
-            }
-            context_recovery_attempted = true
-            compact()
-          }
-          refused(reason) => { return failed("provider refused the request; turn stopped: " ++ reason) }
-          rejected(reason) => { return failed("provider rejected the request: " ++ reason) }
         }
       }
     }

@@ -41,6 +41,23 @@ pub const INPUT_INVALID_PPM: u64 = 100_000;
 pub const DEFAULT_OMITTED_PPM: u64 = 500_000;
 pub const INVALID_INPUT_KINDS: u64 = 3;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
+pub const MODEL_THROTTLED_PPM: u64 = 100_000;
+pub const MODEL_TRANSIENT_PPM: u64 = 50_000;
+pub const MODEL_REJECTED_PPM: u64 = 20_000;
+pub const RETRY_AFTER_ABSENT_PPM: u64 = 500_000;
+pub const RETRY_AFTER_MS_MAX: u64 = 120_000;
+pub const STOP_FAULT_PPM: u64 = 60_000;
+pub const STOP_FAULTS: [&str; 4] = ["max_tokens", "refusal", "context_exceeded", "pause"];
+pub const USAGE_EDGE_PPM: u64 = 10_000;
+pub const LONG_TEXT_PPM: u64 = 20_000;
+pub const LONG_TEXT_PIECES: [&str; 6] = [
+    "alpha ",
+    "beta\n",
+    "\u{e9}t\u{e9} ",
+    "\u{1f600}",
+    "gamma\t",
+    "\u{4e2d}\u{6587}",
+];
 pub const WORDS: [&str; 8] = [
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
 ];
@@ -483,6 +500,27 @@ impl<'a> SimWorld<'a> {
         )
     }
 
+    pub fn long_text(rng: &mut Rng, tokens: u64) -> String {
+        let kept_units = tokens.saturating_mul(ir::UTF16_UNITS_PER_TOKEN);
+        let units = kept_units.saturating_add(rng.range(1, kept_units.max(1)));
+        let mut text = String::new();
+        let mut written = 0_u64;
+        let pieces_max = units;
+        for _ in 0..pieces_max {
+            if written >= units {
+                break;
+            }
+            let piece = LONG_TEXT_PIECES[rng.pick(LONG_TEXT_PIECES.len())];
+            written += ir::utf16_len(piece);
+            text.push_str(piece);
+        }
+        assert!(
+            written >= units,
+            "a long text reaches the length it was drawn for"
+        );
+        text
+    }
+
     pub fn tool_value(
         program: &Program,
         rng: &mut Rng,
@@ -495,7 +533,14 @@ impl<'a> SimWorld<'a> {
                 None => rng.draw() >> 32,
             }),
             Type::Bool => Json::Bool(rng.draw() & 1 == 1),
-            Type::Text => Json::String(Self::generated_text(rng)),
+            Type::Text => match program.cut_tokens() {
+                [] => Json::String(Self::generated_text(rng)),
+                cuts if rng.chance(LONG_TEXT_PPM) => {
+                    let tokens = cuts[rng.pick(cuts.len())];
+                    Json::String(Self::long_text(rng, tokens))
+                }
+                _ => Json::String(Self::generated_text(rng)),
+            },
             Type::Sum(_) => {
                 let sum = program
                     .text_enum(returns)
@@ -1119,10 +1164,76 @@ impl SimWorld<'_> {
             .model
             .as_ref()
             .expect("the checker admits model calls only with a model");
+        if let Some(window) = &model.window {
+            return self.attempt_reply(&mut rng, request, window.tokens.value);
+        }
         if model.declared() && !self.greedy && rng.chance(MODEL_FAILURE_PPM) {
             let error = format!("{} failed: {}", model.name, Self::generated_text(&mut rng));
             return Json::object([(ir::MODEL_FAILED, Json::String(error))]);
         }
+        self.reply_value(&mut rng, request)
+    }
+
+    fn attempt_reply(&self, rng: &mut Rng, request: &ModelRequest<'_>, window: u64) -> Json {
+        let name = |variant: usize| ir::ATTEMPT_VARIANTS[variant];
+        let error =
+            |rng: &mut Rng| Json::String(format!("model failed: {}", Self::generated_text(rng)));
+        let retry_after = |rng: &mut Rng, edges: Option<&Edges>| {
+            Json::Number(match edges {
+                Some(edges) => edges.draw(rng),
+                None if rng.chance(RETRY_AFTER_ABSENT_PPM) => 0,
+                None => rng.below(RETRY_AFTER_MS_MAX + 1),
+            })
+        };
+        let edges = self.edges.as_ref();
+        if !self.greedy && rng.chance(MODEL_THROTTLED_PPM) {
+            let fields = vec![error(rng), retry_after(rng, edges)];
+            return Self::variant_json(name(ir::ATTEMPT_THROTTLED), fields);
+        }
+        if !self.greedy && rng.chance(MODEL_TRANSIENT_PPM) {
+            let fields = vec![error(rng), retry_after(rng, edges)];
+            return Self::variant_json(name(ir::ATTEMPT_TRANSIENT), fields);
+        }
+        if !self.greedy && rng.chance(MODEL_REJECTED_PPM) {
+            return Self::variant_json(name(ir::ATTEMPT_REJECTED), vec![error(rng)]);
+        }
+        let reply = self.reply_value(rng, request);
+        let (calls_variant, _) = self
+            .program
+            .model
+            .as_ref()
+            .expect("an attempt belongs to a model")
+            .calls_at();
+        let calls_name = &self.program.sums[ir::REPLY].variants[calls_variant].name;
+        let called = matches!(&reply, Json::Object(map) if map.contains_key(calls_name));
+        let stop = if !self.greedy && rng.chance(STOP_FAULT_PPM) {
+            STOP_FAULTS[rng.pick(STOP_FAULTS.len())].to_owned()
+        } else if !self.greedy && rng.chance(TEXT_ENUM_INVALID_PPM) {
+            Self::generated_text(rng)
+        } else if called {
+            ir::STOP_VALUES[1].to_owned()
+        } else {
+            ir::STOP_VALUES[0].to_owned()
+        };
+        let mut fields = vec![reply, Json::String(stop)];
+        for _ in ir::USAGE_FIELDS {
+            let used = match edges {
+                Some(edges) if rng.chance(USAGE_EDGE_PPM) => edges.draw(rng),
+                _ if !self.greedy && rng.chance(USAGE_EDGE_PPM) => window + rng.below(2),
+                _ => rng.below(window + 1),
+            };
+            fields.push(Json::Number(used));
+        }
+        Self::variant_json(name(ir::ATTEMPT_OK), fields)
+    }
+
+    fn reply_value(&self, rng: &mut Rng, request: &ModelRequest<'_>) -> Json {
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        let mut rng = rng;
         let (calls_variant, calls_field) = model.calls_at();
         let variants = &self.program.sums[ir::REPLY].variants;
         let others: Vec<usize> = (0..variants.len())

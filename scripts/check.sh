@@ -207,12 +207,15 @@ invalid_fail() {
   expect_error examples/invalid/listing_unknown.hl any "listing_unknown.hl:11:5: error: 'unknown' is not a variant of known<u64>"
   expect_error examples/invalid/suspend_undeclared.hl any "suspend_undeclared.hl:6:16: error: 'suspend' needs 'on resume' on the harness"
   expect_error examples/invalid/wait_literal.hl any "wait_literal.hl:6:19: error: the duration of 'wait' must be a named constant in milliseconds"
-  expect_error examples/invalid/over_wait.hl cloudflare "handler 'watch': worst case 2400000 milliseconds of waits exceeds cloudflare's limit of 900000 milliseconds of waits per run; loops: poll below polls_max (4)"
-  expect_error examples/invalid/long_wait.hl cloudflare "handler 'nap': worst case 3600000 milliseconds of waits exceeds cloudflare's limit of 900000 milliseconds of waits per run; loops: no loops"
+  expect_error examples/invalid/long_wait.hl cloudflare "handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds cloudflare's limit of 900000 milliseconds per wait"
+  expect_error examples/invalid/wait_uncapped.hl any "wait_bound: wait(after_ms) may sleep past its cap retry_cap_ms and trap with bound(retry_cap_ms)"
+  expect_error examples/invalid/with_outside_model.hl any "with_outside_model.hl:13:23: error: 'with' adds an entry to the context a model call reads: it is only a model call's argument"
   expect_error examples/invalid/long_wait.hl vercel "handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds vercel's limit of 800000 milliseconds per wait"
   local target
   for target in native-jsonl native-sqlite server-postgres vercel; do
     "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
+  done
+  for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do
     "$hl" check --target "$target" examples/invalid/over_wait.hl > /dev/null
   done
   for target in native-jsonl native-sqlite server-postgres; do
@@ -363,7 +366,7 @@ for file in $examples; do
     queue js-diff js_diff_one "$target" "$file"
   done
 done
-for file in $examples docs/snippets/compaction.hl; do
+for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
   done

@@ -135,6 +135,7 @@ pub struct Program {
     pub invariants: Vec<Invariant>,
     pub handlers: Vec<Handler>,
     pub events: Events,
+    pub cuts: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -334,7 +335,62 @@ pub struct Model {
     pub name: String,
     pub calls: Bound,
     pub reply: Reply,
+    pub window: Option<Window>,
     pub modes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub tokens: Bound,
+    pub stop: SumId,
+    pub attempt: SumId,
+}
+
+pub const STOP_TYPE: &str = "stop";
+pub const STOP_VALUES: [&str; 6] = [
+    "end",
+    "tool_use",
+    "max_tokens",
+    "refusal",
+    "context_exceeded",
+    "pause",
+];
+pub const ATTEMPT_TYPE: &str = "attempt";
+pub const ATTEMPT_OK: VariantId = 0;
+pub const ATTEMPT_THROTTLED: VariantId = 1;
+pub const ATTEMPT_TRANSIENT: VariantId = 2;
+pub const ATTEMPT_REJECTED: VariantId = 3;
+pub const ATTEMPT_VARIANTS: [&str; 4] = ["ok", "throttled", "transient", "rejected"];
+pub const ATTEMPT_REPLY: usize = 0;
+pub const ATTEMPT_STOP: usize = 1;
+pub const USAGE_FIELDS: [&str; 4] = ["input", "output", "cache_read", "cache_write"];
+pub const ATTEMPT_USAGE: usize = 2;
+pub const ATTEMPT_OK_FIELDS: usize = ATTEMPT_USAGE + USAGE_FIELDS.len();
+pub const ATTEMPT_ERROR: usize = 0;
+pub const ATTEMPT_RETRY_AFTER: usize = 1;
+
+pub fn attempt_variants(stop: SumId) -> Vec<Variant> {
+    let mut ok = vec![Type::Sum(REPLY), Type::Sum(stop)];
+    ok.extend(USAGE_FIELDS.iter().map(|_| Type::U64));
+    assert_eq!(
+        ok.len(),
+        ATTEMPT_OK_FIELDS,
+        "ok carries the reply, the stop and the usage"
+    );
+    let fields = [
+        ok,
+        vec![Type::Text, Type::U64],
+        vec![Type::Text, Type::U64],
+        vec![Type::Text],
+    ];
+    ATTEMPT_VARIANTS
+        .iter()
+        .zip(fields)
+        .map(|(name, fields)| Variant {
+            name: (*name).to_owned(),
+            fields,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,9 +408,20 @@ impl Model {
     }
 
     pub fn result(&self) -> Type {
+        if let Some(window) = &self.window {
+            return Type::Sum(window.attempt);
+        }
         match self.reply {
             Reply::Builtin => Type::Sum(REPLY),
             Reply::Declared { .. } => Type::Known(Box::new(Type::Sum(REPLY))),
+        }
+    }
+
+    pub const fn outcome(&self) -> ModelOutcome {
+        match (&self.window, self.reply) {
+            (Some(_), _) => ModelOutcome::Attempt,
+            (None, Reply::Declared { .. }) => ModelOutcome::Known,
+            (None, Reply::Builtin) => ModelOutcome::Trap,
         }
     }
 
@@ -364,6 +431,13 @@ impl Model {
 }
 
 pub const MODEL_FAILED: &str = "failed";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelOutcome {
+    Trap,
+    Known,
+    Attempt,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
@@ -394,7 +468,7 @@ pub struct Site {
 
 impl Site {
     pub fn traps_on_decode(&self) -> bool {
-        self.kind == SiteKind::Model && !matches!(self.result, Type::Known(_))
+        self.kind == SiteKind::Model && self.result == Type::Sum(REPLY)
     }
 }
 
@@ -541,6 +615,7 @@ pub enum Stmt {
 pub enum Kept {
     Nothing,
     Last(Expr),
+    LastAfter { count: Expr, first: Expr },
 }
 
 #[derive(Clone, Debug)]
@@ -648,7 +723,100 @@ pub fn has_parallel(statements: &[Stmt]) -> bool {
     })
 }
 
+fn expr_cuts(value: &Expr, constants: &[Constant], out: &mut Vec<u64>) {
+    match value {
+        Expr::Truncate { text, tokens } => {
+            out.push(constants[*tokens].value);
+            expr_cuts(text, constants, out);
+        }
+        Expr::Member { base: operand, .. }
+        | Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand) => expr_cuts(operand, constants, out),
+        Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => fields
+            .iter()
+            .for_each(|field| expr_cuts(field, constants, out)),
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        } => {
+            expr_cuts(left, constants, out);
+            expr_cuts(right, constants, out);
+        }
+        Expr::U64(_)
+        | Expr::Bool(_)
+        | Expr::Text(_)
+        | Expr::Constant(_)
+        | Expr::Local(_)
+        | Expr::Field(_)
+        | Expr::Cancelled => {}
+    }
+}
+
+fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
+    for statement in statements {
+        match statement {
+            Stmt::Let { value, .. }
+            | Stmt::Assign { value, .. }
+            | Stmt::Push { value, .. }
+            | Stmt::Finish { value } => expr_cuts(value, constants, out),
+            Stmt::Shrink { kept, .. } => match kept {
+                Kept::Nothing => {}
+                Kept::Last(count) => expr_cuts(count, constants, out),
+                Kept::LastAfter { count, first } => {
+                    expr_cuts(count, constants, out);
+                    expr_cuts(first, constants, out);
+                }
+            },
+            Stmt::If {
+                condition,
+                then,
+                otherwise,
+            } => {
+                expr_cuts(condition, constants, out);
+                block_cuts(then, constants, out);
+                block_cuts(otherwise, constants, out);
+            }
+            Stmt::Match { subject, arms, .. } => {
+                expr_cuts(subject, constants, out);
+                arms.iter()
+                    .for_each(|arm| block_cuts(&arm.body, constants, out));
+            }
+            Stmt::Loop { body, .. } => block_cuts(body, constants, out),
+            Stmt::For { list, body, .. } => {
+                expr_cuts(list, constants, out);
+                block_cuts(body, constants, out);
+            }
+            Stmt::Parallel(parallel) => {
+                expr_cuts(&parallel.list, constants, out);
+                parallel
+                    .args
+                    .iter()
+                    .for_each(|arg| expr_cuts(arg, constants, out));
+                block_cuts(&parallel.body, constants, out);
+            }
+            Stmt::Effect { args, .. } => args.iter().for_each(|arg| expr_cuts(arg, constants, out)),
+            Stmt::Take { .. } => {}
+        }
+    }
+}
+
 impl Program {
+    pub fn cut_tokens(&self) -> &[u64] {
+        &self.cuts
+    }
+
+    pub fn find_cuts(&self) -> Vec<u64> {
+        let mut cuts = Vec::new();
+        for handler in &self.handlers {
+            block_cuts(&handler.body, &self.constants, &mut cuts);
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts
+    }
+
     pub fn has_parallel(&self) -> bool {
         self.handlers
             .iter()
@@ -696,11 +864,80 @@ pub enum Expr {
     },
     Not(Box<Expr>),
     Len(Box<Expr>),
+    TextLen(Box<Expr>),
+    Truncate {
+        text: Box<Expr>,
+        tokens: ConstId,
+    },
+    With {
+        list: Box<Expr>,
+        entry: Box<Expr>,
+    },
     TextBuiltin {
         op: TextOp,
         args: Vec<Expr>,
     },
     Cancelled,
+}
+
+pub const UTF16_UNITS_PER_TOKEN: u64 = 4;
+pub const TRUNCATION_OPEN: &str = "\u{2026}";
+pub const TRUNCATION_CLOSE: &str = " tokens truncated\u{2026}";
+pub const U64_DECIMAL_DIGITS_MAX: u64 = 20;
+
+pub fn estimated_tokens(text: &str) -> u64 {
+    (text.encode_utf16().count() as u64).div_ceil(UTF16_UNITS_PER_TOKEN)
+}
+
+pub fn utf16_len(text: &str) -> u64 {
+    text.encode_utf16().count() as u64
+}
+
+pub fn truncation_marker_units_max() -> u64 {
+    utf16_len(TRUNCATION_OPEN) + U64_DECIMAL_DIGITS_MAX + utf16_len(TRUNCATION_CLOSE)
+}
+
+pub fn truncated_units_max(tokens: u64) -> Option<u64> {
+    tokens
+        .checked_mul(UTF16_UNITS_PER_TOKEN)?
+        .checked_add(truncation_marker_units_max())
+}
+
+pub fn truncate_middle(text: &str, tokens_max: u64) -> String {
+    let total = estimated_tokens(text);
+    if total <= tokens_max {
+        return text.to_owned();
+    }
+    let side = tokens_max.saturating_mul(UTF16_UNITS_PER_TOKEN / 2);
+    let mut units = 0_u64;
+    let head = text
+        .char_indices()
+        .find(|(_, character)| {
+            units += character.len_utf16() as u64;
+            units > side
+        })
+        .map_or(text.len(), |(end, _)| end);
+    units = 0;
+    let tail = text
+        .char_indices()
+        .rev()
+        .find(|(_, character)| {
+            units += character.len_utf16() as u64;
+            units > side
+        })
+        .map_or(0, |(start, character)| start + character.len_utf8())
+        .max(head);
+    let cut = format!(
+        "{}{TRUNCATION_OPEN}{}{TRUNCATION_CLOSE}{}",
+        &text[..head],
+        total - tokens_max,
+        &text[tail..]
+    );
+    assert!(
+        truncated_units_max(tokens_max).is_none_or(|max| utf16_len(&cut) <= max),
+        "a cut text fits its declared bound"
+    );
+    cut
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

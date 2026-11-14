@@ -7,9 +7,9 @@ include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anthropic::{Answer, Client, Usage};
+use anthropic::{Client, Usage};
 use harness::program::{self, Arguments};
 use harness::{
     Exit, FileDisk, Finish, Host, Json, ListingRequest, ModelRequest, Output, Ran, RunError,
@@ -20,12 +20,6 @@ use json::Value;
 const EXIT_HARNESS_ERROR: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const FIRST_TURN: u64 = 1;
-const RETRY_BASE_MS: u64 = 500;
-const RETRY_CAP_MS: u64 = 32_000;
-const RETRY_DOUBLINGS_MAX: u32 = 6;
-const _: () = assert!(RETRY_BASE_MS << RETRY_DOUBLINGS_MAX == RETRY_CAP_MS);
-const RETRY_JITTER_PERCENT: u64 = 25;
-const PERCENT: u64 = 100;
 const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N]";
@@ -111,7 +105,6 @@ struct Agent {
     client: Client,
     workspace: tools::Workspace,
     ledger: Ledger,
-    failures: u32,
 }
 
 fn to_value(json: &Json) -> Value {
@@ -122,23 +115,11 @@ fn to_json(value: &Value) -> Json {
     Json::decode(&value.encode()).expect("a reply the host built decodes as harness JSON")
 }
 
-fn failed(text: &str) -> Json {
-    Json::object(vec![(harness::MODEL_FAILED, Json::String(text.to_owned()))])
-}
-
 impl Agent {
     fn stream_file(&self, request: &ModelRequest<'_>) -> PathBuf {
         self.workspace
             .state
             .join(format!("stream-{}-{}.sse", request.turn, request.seq))
-    }
-
-    fn backoff(&mut self) {
-        let base = (RETRY_BASE_MS << self.failures.min(RETRY_DOUBLINGS_MAX)).min(RETRY_CAP_MS);
-        let jitter = base * RETRY_JITTER_PERCENT / PERCENT;
-        let delay = base - jitter + now_ms() % (2 * jitter + 1);
-        self.failures += 1;
-        std::thread::sleep(Duration::from_millis(delay));
     }
 
     fn record_model(&mut self, used: Usage, outcome: &str) {
@@ -192,7 +173,12 @@ impl Host for Agent {
         let context = to_value(&(request.context)());
         let body = match self.client.body(&context, request.mode) {
             Ok(body) => body,
-            Err(error) => return failed(&format!("context does not render: {error}")),
+            Err(error) => {
+                return to_json(&anthropic::transient(
+                    &format!("context does not render: {error}"),
+                    0,
+                ));
+            }
         };
         let partial = self.stream_file(request);
         if let Ok(cut) = std::fs::metadata(&partial) {
@@ -208,33 +194,34 @@ impl Host for Agent {
             ]));
         }
         if let Err(error) = std::fs::write(&partial, "") {
-            return failed(&format!("{}: {error}", partial.display()));
+            return to_json(&anthropic::transient(
+                &format!("{}: {error}", partial.display()),
+                0,
+            ));
         }
         let mode = request
             .mode
             .map(|mode| format!(" mode {mode}"))
             .unwrap_or_default();
         eprintln!("hl-agent: {call} model {}{mode}", self.client.model);
-        let answer = match self.client.send(&body, &partial) {
-            Ok((status, text)) => anthropic::interpret_stream(status, &text),
-            Err(error) => Answer::Retry(error),
+        let (reply, used) = match self.client.send(&body, &partial) {
+            Ok((status, text, retry_after_ms)) => {
+                anthropic::interpret_stream(status, &text, retry_after_ms)
+            }
+            Err(error) => (anthropic::transient(&error, 0), Usage::default()),
         };
         if let Err(error) = std::fs::remove_file(&partial) {
             eprintln!("hl-agent: {}: {error}", partial.display());
         }
-        match answer {
-            Answer::Reply(reply, used) => {
-                self.failures = 0;
-                self.record_model(used, "reply");
-                to_json(&reply)
-            }
-            Answer::Retry(error) => {
-                self.record_model(Usage::default(), "failed");
-                eprintln!("hl-agent: model call failed: {error}");
-                self.backoff();
-                failed(&error)
-            }
+        let outcome = match &reply {
+            Value::Object(entries) if entries.len() == 1 => entries[0].0.clone(),
+            _ => "reply".to_owned(),
+        };
+        if outcome != "ok" {
+            eprintln!("hl-agent: model call {outcome}: {}", reply.encode());
         }
+        self.record_model(used, &outcome);
+        to_json(&reply)
     }
 
     fn now(&mut self) -> u64 {
@@ -463,7 +450,6 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
             client,
             workspace,
             ledger: Ledger { file },
-            failures: 0,
         },
         instruction,
     ))

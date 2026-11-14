@@ -22,6 +22,7 @@ enum Quantity {
     FieldLen(FieldId),
     Local(LocalId),
     LocalLen(LocalId),
+    TextLen(LocalId),
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +123,7 @@ fn quantity_name(program: &Program, handler: Option<&Handler>, quantity: Quantit
         Quantity::Field(field) => program.state[field].name.clone(),
         Quantity::FieldLen(field) => format!("len({})", program.state[field].name),
         Quantity::Local(id) => local(id),
-        Quantity::LocalLen(id) => format!("len({})", local(id)),
+        Quantity::LocalLen(id) | Quantity::TextLen(id) => format!("len({})", local(id)),
     }
 }
 
@@ -346,6 +347,28 @@ impl<'a> Prover<'a> {
         }
     }
 
+    fn bind_bounded(&mut self, state: &mut State, local: LocalId, max: i128) {
+        let handler = self.handler.expect("a local belongs to a handler");
+        let name = handler.locals[local].name.clone();
+        let quantity = match handler.locals[local].ty {
+            Type::U64 => Quantity::Local(local),
+            Type::Text => Quantity::TextLen(local),
+            ref other => panic!("only u64 and text locals carry a bound, found {other:?}"),
+        };
+        let shown = match quantity {
+            Quantity::TextLen(_) => format!("len({name})"),
+            _ => name,
+        };
+        let var = self.fresh(state, &shown, max);
+        state.env.insert(quantity, var);
+    }
+
+    fn cut_max(&self, tokens: crate::ir::ConstId) -> i128 {
+        let units = crate::ir::truncated_units_max(self.program.constants[tokens].value)
+            .expect("the checker refuses a cut whose bound passes u64");
+        i128::from(units)
+    }
+
     fn list_len(&self, state: &State, list: &Expr) -> Option<Linear> {
         let quantity = match list {
             Expr::Field(field) => Quantity::FieldLen(*field),
@@ -370,6 +393,13 @@ impl<'a> Prover<'a> {
                 .get(&Quantity::Field(*field))
                 .map(|var| Linear::var(*var)),
             Expr::Len(list) => self.list_len(state, list),
+            Expr::TextLen(text) => match &**text {
+                Expr::Local(local) => state
+                    .env
+                    .get(&Quantity::TextLen(*local))
+                    .map(|var| Linear::var(*var)),
+                _ => None,
+            },
             Expr::Binary {
                 op, left, right, ..
             } => {
