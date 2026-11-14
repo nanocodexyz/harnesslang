@@ -309,7 +309,15 @@ diverged). Obligations:
 | `header_before_wait` | every wait in the plan follows a flush that included the header |
 | `cell_finish_once` | every path through the cell site, divergence and limits included, appends one `finished` and one site `result`, and a replayed finished cell runs nothing |
 | `worst_case` | a cell site's outbound requests (`calls` times the nested tools that leave the process) and records (header, two entries and two records per nested external, one entry and one record per other call, two entries per timer, one finish) are inside the target's limits; Cloudflare counts nested outbound requests per invocation |
-| `cell_bounds` | `parallel <= calls`, `timer_ms` within the target's sleep limit, `journal_bytes` at most `JOURNAL_LIMIT_BYTES` |
+| `cell_bounds` | `parallel <= calls`, `timer_ms` within the target's sleep limit, `journal_bytes` at most `JOURNAL_LIMIT_BYTES` and at least `ENTRY_BYTES` per entry of `calls` nested calls and `timers` timers |
+| `cell_replay_equal` | nothing is dispatched after a divergence |
+| `unknown_nested_reported`, `nested_known` | a reopened nested external reaches the script as the unknown outcome, after a `recovery` record lists it, and the cell runs on; a reopened none or idempotent nested call runs again |
+
+No target model gives a sleep limit yet, so `timer_ms` is reported, not
+checked; `parallel <= calls` is the checker's, asserted by the prover.
+`nested_ids_restart`, `postgres_cell_unfenced` and `cell_limit_unchecked`
+are checks of the lowering, like `liveness`: the plan abstracts nested ids
+and owners away.
 
 The arithmetic proofs see a cell's result as an unconstrained `maybe<text>`,
 so a handler that pushes a cell's output needs room for one entry per cell,

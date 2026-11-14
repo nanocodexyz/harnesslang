@@ -335,7 +335,7 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | Property | Proved |
 | --- | --- |
 | `finish_once` | every path of the body ends in exactly one `return`; on every target, every path of the lowered plan, traps included, appends one `status`, flushes it, then acknowledges, never twice |
-| `durable_before_external` | an external effect runs only when nothing is buffered and its own `call` record is flushed, on first runs and on every rerun after a crash |
+| `durable_before_external` | an external effect, top-level or nested in a cell, runs only when nothing is buffered (a cell's header included) and its own `call` record is flushed, on first runs and on every rerun after a crash |
 | `external_once` | an external call whose `call` record a crash left open is never run again: at-load recovery reports it `unknown`, Vercel's in-step recovery runs it only on attempt 1; Postgres flushes are fenced |
 | `unknown_reported`, `idempotent_known` | a reopened external call yields `unknown`, a reopened none or idempotent call runs again |
 | `seq_unique` | no path appends a second `call` record for a sequence number already in the journal |
@@ -344,7 +344,12 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | `no_overflow` | every `+`, `-` and `*` on `u64`, in `requires` too, stays in range |
 | `push_bound` | every `push` finds its list below capacity |
 | `invariant_initial`, `invariant_preserved` | invariants hold in the zero state, at every `return`, and where a model reply fails to decode: the one trap left once `no_overflow` and `push_bound` hold |
-| `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target; outbound requests per invocation, counted on the plan, are within the target's limit |
+| `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target; outbound requests per invocation, counted on the plan with every nested call of a cell as one, are within the target's limit |
+| `header_before_wait` | a cell waits on a timer only after its header is durable (C2) |
+| `cell_finish_once` | every path through a code site, divergence and the journal limit included, appends one `finished` update and one site `result`, and a cell whose result is recorded never starts its engine again |
+| `cell_replay_equal` | nothing is dispatched after a replayed cell diverges from its journal |
+| `unknown_nested_reported`, `nested_known` | a reopened nested external call reaches the script as the unknown outcome after a `recovery` record lists it, and the cell runs on; a reopened none or idempotent nested call runs again |
+| `cell_bounds` | `journal_bytes` is at most nanocode's `JOURNAL_LIMIT_BYTES` and holds the entries of `calls` nested calls and `timers` timers at `ENTRY_BYTES` each; the runner enforces the limits (a check of the lowering) |
 
 With `no_overflow` and `push_bound` proved, a turn of a proving program
 finishes `failed` only when its `requires` is false or a model reply does not
@@ -385,6 +390,16 @@ How:
   `PROOF_STEPS_PER_HANDLER_MAX` bounds the elimination steps per handler and
   `PROOF_CONSTRAINTS_MAX` the constraints per step; reaching either fails
   the obligation and says so.
+- **Cells** lower to a choice between a fresh cell, a cell restarted because
+  its header never became durable, a cell replayed from its durable header and
+  a finished cell taken from its recorded result. Inside, a loop of at most
+  `calls` steps chooses a nested call of each listed tool (run, reopened or
+  replayed from the journal), a divergence (on replay only) or the journal
+  limit, with up to `timers` waits before and after each step; a wait flushes
+  when the header is still buffered (C2; on Cloudflare the output gate always
+  commits). The abstract state adds each cell's phase (recorded, running,
+  diverged, finished, closed), the nested calls replayed from the journal and
+  whether a `recovery` record was written.
 - **Worst case** is the longest path of appended records and of outbound
   runs in the plan, a path ending where the plan ends it (after a finish's
   acknowledgement), loops multiplied by their bounds. Neither may exceed the
@@ -411,16 +426,21 @@ invariant over `bool` or `text` fails rather than being assumed, and a
 condition the prover cannot read adds no fact to its branch).
 
 Every property comes with a planted bug: `hl prove --mutation M` takes the
-simulator's lowering mutations and four of its own (`drop_flush`,
-`drop_finish`, `drop_requires`, `repeat_assign`), and
-`scripts/prove-mutations.sh` requires each to fail proving `agent.hl` and
-`reviewer.hl` on every target it applies to, naming the property it breaks.
+simulator's lowering mutations and five of its own (`drop_flush`,
+`drop_finish`, `drop_requires`, `repeat_assign`, `drop_cell_finish`), and
+`scripts/prove-mutations.sh` requires each to fail proving `agent.hl`,
+`reviewer.hl` and `code_agent.hl` on every target it applies to, naming the
+property it breaks; a cell mutation must fail `code_agent.hl` and leave the
+programs without a `code` tool proved.
 The same script requires every example to prove and the prover's invalid
 examples under `examples/invalid/` to fail with their message: overflow in a
 loop, across a branch join and of a product, underflow, a push that can fill
 its list without a `requires`, on an `unknown` arm, in a `for` over the list
-itself or after an early return, and invariants broken at a return, at a
-trap, in the zero state or stated over a `bool`.
+itself or after an early return, invariants broken at a return, at a trap,
+in the zero state or stated over a `bool`, and cells: a `journal_bytes` past
+nanocode's limit or too small for its `calls` and `timers`, nested calls
+that take a handler past Cloudflare's outbound limit, and a cell's output
+pushed without room.
 
 ### Deterministic simulation
 
