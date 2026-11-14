@@ -573,7 +573,12 @@ async function cloudflareSeed(seed) {
     for (;;) {
       seed.opening(storage.medium());
       instance ??= new loaded.HarnessObject(ctx, env);
-      const byAlarm = !first && storage.alarm !== null;
+      const idles = turn.handler === rt.PROGRAM.idle?.handler;
+      const admitted = storage.lines().some((line) => {
+        const record = rt.decodeLine(line, false);
+        return record.kind === "admitted" && Number(record.turn) === Number(turn.turn);
+      });
+      const byAlarm = idles ? first || storage.alarm !== null : !first && storage.alarm !== null && (admitted || rt.PROGRAM.idle === null);
       first = false;
       let kind;
       try {
@@ -589,8 +594,8 @@ async function cloudflareSeed(seed) {
         }
         if (storage.pendingRows.length > 0) throw new Failure("backend_equal", "rows were written after the turn's last flush");
         storage.commit();
-        if (driven.ran !== "finished" && driven.ran !== "already_finished" && driven.ran !== "suspended") throw new Failure("liveness", `the alarm found ${driven.ran}`);
-        if (driven.ran !== "suspended") seed.acknowledged(driven.finish, durableStatus);
+        if (driven.ran !== "finished" && driven.ran !== "already_finished" && driven.ran !== "suspended" && driven.ran !== "not_due") throw new Failure("liveness", `the alarm found ${driven.ran}`);
+        if (driven.ran !== "suspended" && driven.ran !== "not_due") seed.acknowledged(driven.finish, durableStatus);
         kind = driven.ran;
       } catch (error) {
         if (!(error instanceof SimReset)) throw error;
@@ -618,6 +623,7 @@ class SimWorkflow {
     this.turnsMax = seed.seed.turns;
     this.stepIndex = 0;
     this.statusLive = false;
+    this.notDueLive = false;
     this.slept = new Set();
     this.lastInbox = null;
   }
@@ -650,6 +656,10 @@ class SimWorkflow {
   async request(index) {
     if (index < this.state.requests.length) return this.state.requests[index];
     throw new Suspend();
+  }
+
+  async requestOrIdle(index) {
+    return this.request(index);
   }
 
   async hook(point) {
@@ -702,7 +712,8 @@ class SimWorkflow {
       answer: async (turn, position, answers) => seed.answered(turn, position, answers),
     };
     const output = await harness.runStep(input, context);
-    if (input.kind === "run" && output.wait === undefined && output.suspended === undefined) {
+    if (input.kind === "run" && output.notDue === true) this.notDueLive = true;
+    if (input.kind === "run" && output.wait === undefined && output.suspended === undefined && output.notDue === undefined) {
       this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
       this.seed.checks.flushed([...this.state.lines(), ...output.lines]);
       const request = rt.decodeJson(input.request);
@@ -766,9 +777,9 @@ async function vercelSeed(seed) {
       let kind;
       try {
         await harness.session(workflow);
-        kind = workflow.statusLive ? "finished" : "already_finished";
+        kind = workflow.statusLive ? "finished" : workflow.notDueLive ? "not_due" : "already_finished";
       } catch (error) {
-        if (error instanceof Suspend) kind = workflow.statusLive ? "finished" : "already_finished";
+        if (error instanceof Suspend) kind = workflow.statusLive ? "finished" : workflow.notDueLive ? "not_due" : "already_finished";
         else if (error instanceof ParkEnd) kind = "suspended";
         else if (error instanceof SimReset) kind = "crash";
         else throw error;

@@ -209,6 +209,13 @@ pub struct Handler {
     pub body: Block,
     pub ends_session: bool,
     pub side: bool,
+    pub idle: Option<Idle>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Idle {
+    pub due: Name,
+    pub bound: Name,
 }
 
 #[derive(Clone, Debug)]

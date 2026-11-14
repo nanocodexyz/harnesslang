@@ -163,6 +163,40 @@ pub enum Ran {
     Finished(Finish),
     AlreadyFinished(Finish),
     Suspended(Suspension),
+    NotDue(NotDue),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotDue {
+    Busy,
+    Unarmed,
+    Early { due: u64, clock: u64 },
+}
+
+pub const IDLE_AT: &str = "at";
+pub const IDLE_DUE: &str = "due";
+
+pub fn idle_arguments(clock: u64, due: u64) -> Json {
+    Json::object(vec![(IDLE_AT, Json::Number(clock)), (IDLE_DUE, Json::Number(due))])
+}
+
+pub fn next_turn(start: Start, records: &[Record]) -> Result<u64, Exit> {
+    let session = fold_from(start, records).map_err(corrupt)?;
+    Ok(session.turns.last_key_value().map_or(session.start.first_turn(), |(last, _)| last + 1))
+}
+
+pub fn idle_due(start: Start, records: &[Record]) -> Result<Option<u64>, Exit> {
+    if program::IDLE_HANDLER.is_none() {
+        return Ok(None);
+    }
+    let session = fold_from(start, records).map_err(corrupt)?;
+    let next = match session.turns.last_key_value() {
+        Some((_, log)) if log.finished.is_none() => return Ok(None),
+        Some((last, _)) => last + 1,
+        None => session.start.first_turn(),
+    };
+    let state = state_before(&session, next)?;
+    Ok(program::idle_armed(&state))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2096,6 +2130,11 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             result: finished.result.clone(),
         }));
     }
+    let idles = program::IDLE_HANDLER == Some(handler);
+    let fresh = !session.turns.contains_key(&request.turn);
+    if idles && fresh && session.turns.last_key_value().is_some_and(|(_, log)| log.finished.is_none()) {
+        return Ok(Ran::NotDue(NotDue::Busy));
+    }
     let state = state_before(&session, request.turn)?;
     let blobs = Blobs::of_session(&session).map_err(corrupt)?;
     blobs.check_state(&state).map_err(corrupt)?;
@@ -2104,7 +2143,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
     let mut nested = Vec::new();
     let log = match session.turns.get(&request.turn) {
         Some(log) => {
-            if log.handler != handler || log.arguments != arguments {
+            if log.handler != handler || (!idles && log.arguments != arguments) {
                 return Err(corrupt(format!(
                     "turn {} was admitted with other arguments",
                     request.turn
@@ -2127,6 +2166,18 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
                     request.turn
                 )));
             }
+            let arguments = if idles {
+                let Some(due) = program::idle_armed(&state) else {
+                    return Ok(Ran::NotDue(NotDue::Unarmed));
+                };
+                let clock = world.clock();
+                if clock < due {
+                    return Ok(Ran::NotDue(NotDue::Early { due, clock }));
+                }
+                idle_arguments(clock, due)
+            } else {
+                arguments
+            };
             pending = Some(Record::Admitted {
                 turn: request.turn,
                 handler: handler.to_owned(),

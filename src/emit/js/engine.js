@@ -925,6 +925,25 @@ function cloneLog(log) {
   return { ...log, sites: new Map(log.sites), nested: new Map(log.nested), lastNested: new Map(log.lastNested), cells, events: log.events.slice() };
 }
 
+const IDLE_AT = "at";
+const IDLE_DUE = "due";
+
+function idleArmed(state) {
+  const idle = PROGRAM.idle;
+  if (idle === null) return null;
+  const due = state[idle.due];
+  return due !== 0n && state[idle.runs] < idle.bound ? due : null;
+}
+
+async function idleDue(setup, records) {
+  if (PROGRAM.idle === null) return null;
+  const session = fold(records);
+  const last = session.turns.get(session.lastTurn);
+  if (last !== undefined && last.finished === null) return null;
+  const state = await stateBefore(setup, session, session.lastTurn + 1);
+  return idleArmed(state);
+}
+
 async function runTurn(setup, world, epoch, records, request) {
   const session = fold(records);
   const handler = handlerNamed(request.handler);
@@ -935,6 +954,9 @@ async function runTurn(setup, world, epoch, records, request) {
     if (eventsTaken()) await closeInbox(world, request.turn, existing.finished.last, existing.events);
     return { ran: "already_finished", finish: { turn: request.turn, outcome: existing.finished.outcome, result: existing.finished.result } };
   }
+  const idles = PROGRAM.idle !== null && PROGRAM.idle.handler === request.handler;
+  const lastLog = session.turns.get(session.lastTurn);
+  if (idles && existing === undefined && lastLog !== undefined && lastLog.finished === null) return { ran: "not_due", notDue: { kind: "busy" } };
   const state = await stateBefore(setup, session, request.turn);
   const blobs = sessionBlobs(session);
   blobs.checkState(state);
@@ -942,7 +964,7 @@ async function runTurn(setup, world, epoch, records, request) {
   let unknown = { unknown: [], nested: [] };
   let log;
   if (existing !== undefined) {
-    if (existing.handler !== request.handler || !jsonEqual(existing.arguments, args)) {
+    if (existing.handler !== request.handler || (!idles && !jsonEqual(existing.arguments, args))) {
       throw new Corrupt(`turn ${request.turn} was admitted with other arguments`);
     }
     checkEvents(request.turn, existing);
@@ -951,7 +973,15 @@ async function runTurn(setup, world, epoch, records, request) {
   } else {
     const next = session.turns.size === 0 ? 1 : session.lastTurn + 1;
     if (request.turn !== next) throw new Corrupt(`turn ${request.turn} is requested when turn ${next} is next`);
-    pending.push({ kind: "admitted", turn: request.turn, handler: request.handler, arguments: args });
+    let admitted = args;
+    if (idles) {
+      const due = idleArmed(state);
+      if (due === null) return { ran: "not_due", notDue: { kind: "unarmed" } };
+      const clock = await world.clock();
+      if (clock < due) return { ran: "not_due", notDue: { kind: "early", due, clock } };
+      admitted = object([[IDLE_AT, clock], [IDLE_DUE, due]]);
+    }
+    pending.push({ kind: "admitted", turn: request.turn, handler: request.handler, arguments: admitted });
     log = newTurnLog(request.handler, null);
   }
   const assumed = setup.mutation === "cell_recovery_reports_failed" ? assumeNestedFailed(log, unknown.nested.splice(0)) : [];
@@ -1252,4 +1282,5 @@ const runtime = {
   Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
   deliveryJson, deliveryFrom, suspensionJson, suspensionFrom, resumeJson, resumeFrom,
   SIDE_TURN, answerSide, sideRequestFromJson, sideAnswerJson,
+  idleDue,
 };

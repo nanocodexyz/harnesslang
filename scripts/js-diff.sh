@@ -30,6 +30,7 @@ plant_expression() {
     blob_unjournaled) echo 's/this.blobs.journaled(data, true)/this.blobs.journaled(data, false)/' ;;
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
     grandchild_unscoped) echo 's/return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };/return { tag: "ok", value: key };/' ;;
+    idle_early) echo 's/if (clock < due) return { ran: "not_due"/if (false \&\& clock < due) return { ran: "not_due"/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

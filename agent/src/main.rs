@@ -22,7 +22,8 @@ const EXIT_USAGE: i32 = 2;
 const FIRST_TURN: u64 = 1;
 const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N]";
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N]";
+const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 
 struct Options {
     instruction: PathBuf,
@@ -30,6 +31,7 @@ struct Options {
     model: String,
     journal: PathBuf,
     rounds: u64,
+    keep_warm: u64,
 }
 
 fn fail_usage(message: &str) -> ! {
@@ -44,6 +46,7 @@ fn options() -> Options {
     }
     let (mut instruction, mut cwd, mut model, mut journal, mut rounds) =
         (None, None, None, None, None);
+    let mut keep_warm = 0;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let value = rest
@@ -67,6 +70,17 @@ fn options() -> Options {
                 }
                 rounds = Some(parsed);
             }
+            "--keep-warm" => {
+                keep_warm = value.parse().unwrap_or_else(|_| {
+                    fail_usage(&format!("--keep-warm {value} is not a number"))
+                });
+                if keep_warm > program::CACHE_REFRESHES {
+                    fail_usage(&format!(
+                        "--keep-warm must be at most the harness's cache_refreshes ({})",
+                        program::CACHE_REFRESHES
+                    ));
+                }
+            }
             other => fail_usage(&format!("unknown flag {other}")),
         }
     }
@@ -76,6 +90,63 @@ fn options() -> Options {
         model: model.unwrap_or_else(|| fail_usage("--model is required")),
         journal: journal.unwrap_or_else(|| fail_usage("--journal is required")),
         rounds: rounds.unwrap_or(program::ROUNDS_MAX),
+        keep_warm,
+    }
+}
+
+fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
+    let mut refreshed = 0;
+    for _ in 0..refreshes * IDLE_REQUESTS_PER_REFRESH_MAX {
+        if refreshed == refreshes {
+            return;
+        }
+        let journal = match harness::JsonlJournal::open(disk) {
+            Ok(journal) => journal,
+            Err(error) => {
+                eprintln!("hl-agent: journal: {error}");
+                return;
+            }
+        };
+        let (due, turn) = match (journal.idle_due(), journal.next_turn()) {
+            (Ok(Some(due)), Ok(turn)) => (due, turn),
+            (Ok(None), _) => {
+                eprintln!("hl-agent: no prompt cache refresh is armed");
+                return;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("hl-agent: journal: {error:?}");
+                return;
+            }
+        };
+        let now = now_ms();
+        if due > now {
+            eprintln!(
+                "hl-agent: idle {} ms until the prompt cache refresh due at {due}",
+                due - now
+            );
+            std::thread::sleep(std::time::Duration::from_millis(due - now));
+        }
+        let request = TurnRequest {
+            turn,
+            arguments: Arguments::Refresh,
+        };
+        match journal.run(agent, &request) {
+            Ok((_, Ran::Finished(finish))) => {
+                refreshed += 1;
+                eprintln!("hl-agent: idle turn {turn}: {}", finish.result.encode());
+            }
+            Ok((_, Ran::NotDue(not_due))) => {
+                eprintln!("hl-agent: idle turn {turn} is not due: {not_due:?}")
+            }
+            Ok((_, other)) => {
+                eprintln!("hl-agent: idle turn {turn} ended {other:?}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("hl-agent: idle turn {turn}: {error:?}");
+                return;
+            }
+        }
     }
 }
 
@@ -214,6 +285,9 @@ impl Host for Agent {
             .unwrap_or_default();
         eprintln!("hl-agent: {call} model {}{mode}", self.client.model);
         let (reply, used) = match self.client.send(&body, &partial) {
+            Ok((status, text, retry_after_ms)) if request.mode == Some(anthropic::MODE_REFRESH) => {
+                anthropic::interpret(status, &text, retry_after_ms)
+            }
             Ok((status, text, retry_after_ms)) => {
                 anthropic::interpret_stream(status, &text, retry_after_ms)
             }
@@ -490,6 +564,9 @@ fn main() {
         arguments: Arguments::Prompt(instruction, options.rounds),
     };
     let ran = harness::run_jsonl(&mut agent, &mut disk, &request);
+    if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
+        keep_warm(&mut agent, &mut disk, options.keep_warm);
+    }
     agent.ledger.append(Value::object([
         ("kind", Value::text("end")),
         ("at_ms", Value::number(now_ms())),
@@ -512,6 +589,10 @@ fn main() {
                 suspension.turn, suspension.seq, suspension.key
             );
             ("suspended".to_owned(), EXIT_HARNESS_ERROR)
+        }
+        Ok(Ran::NotDue(not_due)) => {
+            eprintln!("hl-agent: the prompt turn was refused as an idle turn: {not_due:?}");
+            ("error".to_owned(), EXIT_HARNESS_ERROR)
         }
         Err(RunError::Open(error)) => {
             eprintln!("hl-agent: journal: {error}");

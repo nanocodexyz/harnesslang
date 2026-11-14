@@ -91,6 +91,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
         cuts: Vec::new(),
         notice: None,
         blobs: None,
+        idle: None,
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -115,6 +116,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
     globals.hooks = hooks(&expanded, &program, &globals)?;
     let expanded = session_end(&expanded).unwrap_or(expanded);
+    let expanded = idle(&expanded, &mut program, &globals)?.unwrap_or(expanded);
     invariants(&expanded, &mut program, &globals)?;
     handlers(&expanded, &mut program, &globals)?;
     program.cuts = program.find_cuts();
@@ -1481,6 +1483,10 @@ fn state(
         .items
         .iter()
         .any(|item| matches!(item, Item::Handler(handler) if handler.ends_session));
+    let idles = source
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Handler(handler) if handler.idle.is_some()));
     let decides = source.items.iter().any(|item| {
         matches!(item, Item::Hook(hook) if matches!(hook.kind, ast::HookKind::BeforeTool | ast::HookKind::AfterTool))
     });
@@ -1491,6 +1497,7 @@ fn state(
         (ir::HOOK_DENIED_FIELD, Type::Bool, decides),
         (ir::HOOK_REASON_FIELD, Type::Text, decides),
         (ir::HOOK_INPUT_FIELD, Type::Text, decides),
+        (ir::IDLE_RUNS_FIELD, Type::U64, idles),
     ] {
         if !wanted {
             continue;
@@ -1504,6 +1511,160 @@ fn state(
         });
     }
     Ok(())
+}
+
+fn idle_handler<'s>(
+    source: &'s ast::Program,
+    program: &ir::Program,
+    globals: &Globals,
+) -> Checked<Option<(&'s ast::Handler, ir::FieldId, Bound)>> {
+    let mut found: Option<(&ast::Handler, ir::FieldId, Bound)> = None;
+    for item in &source.items {
+        let Item::Handler(handler) = item else {
+            continue;
+        };
+        let Some(clause) = &handler.idle else {
+            continue;
+        };
+        if let Some((previous, _, _)) = &found {
+            return error(
+                handler.name.at,
+                format!(
+                    "a harness has one idle handler; '{}' is already declared at {}",
+                    previous.name.text, previous.name.at
+                ),
+            );
+        }
+        if !handler.params.is_empty() {
+            return error(
+                handler.name.at,
+                format!(
+                    "idle handler '{}' takes no parameters: the host admits it with none",
+                    handler.name.text
+                ),
+            );
+        }
+        let due = globals
+            .fields
+            .get(&clause.due.text)
+            .copied()
+            .filter(|field| program.state[*field].ty == Type::U64);
+        let Some(due) = due else {
+            return error(
+                clause.due.at,
+                format!(
+                    "an idle handler's due time is a u64 state field: '{}' is not one",
+                    clause.due.text
+                ),
+            );
+        };
+        let limit = bound(
+            program,
+            globals,
+            &clause.bound,
+            "the idle turns after each other turn",
+        )?;
+        found = Some((handler, due, limit));
+    }
+    Ok(found)
+}
+
+fn idle(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &Globals,
+) -> Checked<Option<ast::Program>> {
+    let Some((idler, due, limit)) = idle_handler(source, program, globals)? else {
+        return Ok(None);
+    };
+    let at = idler.name.at;
+    let named = |text: &str| ast::Name {
+        text: text.to_owned(),
+        at,
+    };
+    let name = |text: &str| ast::Expr::Name(named(text));
+    let binary = |op, left, right| ast::Expr::Binary {
+        at,
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+    let bound_name = idler
+        .idle
+        .as_ref()
+        .expect("the idle handler has its clause")
+        .bound
+        .clone();
+    let room = binary(
+        ast::BinaryOp::Less,
+        name(ir::IDLE_RUNS_FIELD),
+        ast::Expr::Name(bound_name.clone()),
+    );
+    let idle_name = idler.name.text.clone();
+    let mut items: Vec<Item> = source
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Handler(handler) if handler.name.text == idle_name => {
+                let mut handler = handler.clone();
+                handler.requires = Some(match handler.requires.take() {
+                    Some(requires) => binary(ast::BinaryOp::And, requires, room.clone()),
+                    None => room.clone(),
+                });
+                let prologue = [
+                    ast::Stmt::Assign {
+                        name: named(ir::IDLE_RUNS_FIELD),
+                        value: binary(
+                            ast::BinaryOp::Add,
+                            name(ir::IDLE_RUNS_FIELD),
+                            ast::Expr::Number(1, at),
+                        ),
+                    },
+                    ast::Stmt::Assign {
+                        name: handler
+                            .idle
+                            .as_ref()
+                            .expect("the idle handler has its clause")
+                            .due
+                            .clone(),
+                        value: ast::Expr::Number(0, at),
+                    },
+                ];
+                handler.body.statements.splice(0..0, prologue);
+                Item::Handler(handler)
+            }
+            Item::Handler(handler) => {
+                let mut handler = handler.clone();
+                handler.body.statements.insert(
+                    0,
+                    ast::Stmt::Assign {
+                        name: named(ir::IDLE_RUNS_FIELD),
+                        value: ast::Expr::Number(0, at),
+                    },
+                );
+                Item::Handler(handler)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    items.push(Item::Invariant(ast::Invariant {
+        name: named(ir::IDLE_BOUNDED_INVARIANT),
+        condition: binary(
+            ast::BinaryOp::LessEqual,
+            name(ir::IDLE_RUNS_FIELD),
+            ast::Expr::Name(bound_name),
+        ),
+    }));
+    program.idle = Some(ir::Idle {
+        handler: idle_name,
+        due,
+        bound: limit,
+        runs: globals.fields[ir::IDLE_RUNS_FIELD],
+    });
+    Ok(Some(ast::Program {
+        name: source.name.clone(),
+        items,
+    }))
 }
 
 fn session_end(source: &ast::Program) -> Option<ast::Program> {

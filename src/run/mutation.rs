@@ -68,10 +68,11 @@ pub enum Mutation {
     FamilyOneLevel,
     SideLiveState,
     SideJournaled,
+    IdleEarly,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 66] = [
+    pub const ALL: [Self; 67] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -138,6 +139,7 @@ impl Mutation {
         Self::FamilyOneLevel,
         Self::SideLiveState,
         Self::SideJournaled,
+        Self::IdleEarly,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -208,6 +210,7 @@ impl Mutation {
             Self::FamilyOneLevel => "family_one_level",
             Self::SideLiveState => "side_live_state",
             Self::SideJournaled => "side_journaled",
+            Self::IdleEarly => "idle_early",
         }
     }
 
@@ -288,7 +291,8 @@ impl Mutation {
             | Self::GrandchildUnscoped
             | Self::FamilyOneLevel
             | Self::SideLiveState
-            | Self::SideJournaled => all,
+            | Self::SideJournaled
+            | Self::IdleEarly => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

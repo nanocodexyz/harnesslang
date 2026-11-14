@@ -309,6 +309,18 @@ fn program_literal(program: &Program) -> String {
         ));
     }
     out.push_str("  ],\n");
+    match &program.idle {
+        Some(idle) => writeln!(
+            out,
+            "  idle: {{ handler: {}, due: {}, runs: {}, bound: {}n }},",
+            js_string(&idle.handler),
+            idle.due,
+            idle.runs,
+            idle.bound.value
+        )
+        .expect("writing to a string succeeds"),
+        None => out.push_str("  idle: null,\n"),
+    }
     if let Some(blobs) = &program.blobs {
         writeln!(
             out,

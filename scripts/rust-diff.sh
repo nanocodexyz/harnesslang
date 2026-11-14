@@ -37,6 +37,7 @@ plant_expression() {
     text_before_whole) echo 's/Some((before, _)) => before.to_owned(),/Some(_) => subject.clone(),/' ;;
     blob_unjournaled) echo 's/Json::object(\[(BLOB_KEY, Json::text(\&digest)), (DATA_KEY, Json::text(base64))\])/digest_json(\&digest)/' ;;
     grandchild_unscoped) echo 's/^    if scope.is_empty() {$/    if true {/' ;;
+    idle_early) echo 's/^                if clock < due {$/                if false \&\& clock < due {/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

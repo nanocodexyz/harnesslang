@@ -252,6 +252,26 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
         }
     }
     lines.push("    plus one recovery record per restart".to_owned());
+    if let Some(idle) = program
+        .idle
+        .as_ref()
+        .filter(|idle| idle.handler == handler.name)
+    {
+        let times = |measure: u64| {
+            measure
+                .checked_mul(idle.bound.value)
+                .map_or_else(|| "more than u64".to_owned(), |total| total.to_string())
+        };
+        lines.push(format!(
+            "    runs when the session idles until {}, at most {} ({}) time(s) after each other turn: {} effects, {} journal records, {} outbound requests in all",
+            program.state[idle.due].name,
+            idle.bound.name,
+            idle.bound.value,
+            times(worst.effects.total),
+            times(worst.records.total),
+            times(worst.requests.total)
+        ));
+    }
     let events = &program.events;
     if events.any() {
         let steers = events.steers.as_ref().map_or_else(String::new, |bound| {

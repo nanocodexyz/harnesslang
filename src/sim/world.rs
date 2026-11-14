@@ -140,6 +140,8 @@ pub struct Stats {
     pub joined: u64,
     pub child_crashes: u64,
     pub side_questions: u64,
+    pub idle_turns: u64,
+    pub idle_refused: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -202,8 +204,9 @@ pub struct SimWorld<'a> {
     armed: bool,
     pub(crate) nested: bool,
     lease_spent: bool,
-    current: Option<TurnRequest>,
+    pub(crate) current: Option<TurnRequest>,
     pub(crate) clock: u64,
+    pub idle_log: Vec<(u64, crate::run::turn::NotDue)>,
     model_calls: BTreeMap<(u64, u64), u64>,
     pub model_modes: BTreeMap<(u64, u64), Vec<(Option<String>, Json)>>,
     pub(crate) run_epoch: u64,
@@ -271,6 +274,7 @@ impl<'a> SimWorld<'a> {
             lease_spent: false,
             current: None,
             clock: 0,
+            idle_log: Vec::new(),
             model_calls: BTreeMap::new(),
             model_modes: BTreeMap::new(),
             run_epoch: 0,
@@ -384,7 +388,9 @@ impl<'a> SimWorld<'a> {
         self.parking.pending = None;
         self.parking.suspensions = 0;
         self.parking.unmatched = 0;
-        self.inbox.schedule(program, self.seed, request.turn);
+        if !program.idles(&request.handler) {
+            self.inbox.schedule(program, self.seed, request.turn);
+        }
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
         self.armed = faults;
@@ -524,7 +530,7 @@ impl<'a> SimWorld<'a> {
             trace.exit(&ran);
         }
         match ran {
-            Ok(Ran::Finished(_) | Ran::Suspended(_)) => {}
+            Ok(Ran::Finished(_) | Ran::Suspended(_) | Ran::NotDue(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => self.acknowledge(&finish),
             Err(exit) => self
                 .owner_faults
@@ -1409,6 +1415,8 @@ impl SimWorld<'_> {
             };
             fields.push(Json::Number(used));
         }
+        let cache = fields.len() - 2;
+        self.warm_usage(rng, &mut fields[cache..]);
         Self::variant_json(name(ir::ATTEMPT_OK), fields)
     }
 

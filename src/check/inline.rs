@@ -309,6 +309,7 @@ impl<'a> Inliner<'a> {
             body,
             ends_session: handler.ends_session,
             side: handler.side,
+            idle: handler.idle.clone(),
         })
     }
 

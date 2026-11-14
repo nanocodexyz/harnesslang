@@ -136,6 +136,7 @@ impl Driver {
             Ok(Ran::Finished(_)) => "finished",
             Ok(Ran::AlreadyFinished(_)) => "already_finished",
             Ok(Ran::Suspended(_)) => "suspended",
+            Ok(Ran::NotDue(_)) => "not_due",
             Err(Exit::Stop(Stop::Crash)) => "crash",
             Err(Exit::Stop(Stop::Fenced)) => "fenced",
             Err(Exit::Corrupt(_)) => "corrupt",

@@ -335,9 +335,14 @@ class HarnessObject {
         await this.settle();
         return { ran: ran.ran, suspension: ran.suspension };
       }
+      if (ran.ran === "not_due") {
+        await this.settle();
+        return { ran: ran.ran };
+      }
       if (ran.ran === "already_finished") await world.acknowledge(ran.finish);
       await this.settle();
       assert(world.finish !== null, "a driven turn is acknowledged");
+      await this.armIdle();
       return { ran: ran.ran, finish: world.finish };
     } catch (error) {
       this.armed = false;
@@ -374,8 +379,27 @@ class HarnessObject {
     }
   }
 
+  async armIdle() {
+    const due = await idleDue({ target: CLOUDFLARE_TARGET, mutation: this.mutation }, this.load());
+    if (due === null) return;
+    this.storageWrites.push(this.storage.setAlarm(Number(due)));
+    await this.settle();
+  }
+
+  async woken() {
+    const resumed = await this.resume();
+    if (resumed.ran !== "idle" || PROGRAM.idle === null) return resumed;
+    try {
+      const session = fold(this.load());
+      return await this.drive({ turn: session.lastTurn + 1, handler: PROGRAM.idle.handler, arguments: [] });
+    } catch (error) {
+      if (error instanceof Corrupt) return { ran: "corrupt", message: error.message };
+      throw error;
+    }
+  }
+
   async alarm() {
-    const resumed = await this.serialized(() => this.resume());
+    const resumed = await this.serialized(() => this.woken());
     if (resumed !== null) return resumed;
     await this.storage.setAlarm(Date.now() + ALARM_RESUME_DELAY_MS);
     return { ran: "busy" };

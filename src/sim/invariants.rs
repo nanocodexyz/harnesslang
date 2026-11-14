@@ -53,10 +53,11 @@ pub enum Invariant {
     ChildScoped,
     FamilyBounded,
     SideIsolated,
+    IdleDue,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -95,6 +96,7 @@ impl Invariant {
         Self::ChildScoped,
         Self::FamilyBounded,
         Self::SideIsolated,
+        Self::IdleDue,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -137,6 +139,7 @@ impl Invariant {
             Self::ChildScoped => "child_scoped",
             Self::FamilyBounded => "family_bounded",
             Self::SideIsolated => "side_isolated",
+            Self::IdleDue => "idle_due",
         }
     }
 }
@@ -301,6 +304,7 @@ pub fn check(
     checkpoint_compacted(program, world, records)?;
     liveness_and_replay(program, world, turns, records)?;
     world.inbox.kept(records)?;
+    crate::sim::idle::check(program, world, records)?;
     let session = session::fold(records).expect("liveness folded this journal");
     cells(program, &calls, &session)
 }
