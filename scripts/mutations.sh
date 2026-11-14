@@ -50,6 +50,7 @@ nested_idempotent_reported_unknown examples/code_agent.hl --twice nested_known 0
 nested_enum_unchecked examples/code_tasks.hl --twice nested_enum_valid 0..300
 default_unfilled docs/snippets/defaults.hl --twice tool_admitted
 mode_dropped docs/snippets/modes.hl --twice mode_sent
+settings_dropped docs/snippets/settings.hl --twice settings_sent
 resume_replays_suspend examples/hooks.hl --twice seq_unique
 suspend_before_flush examples/hooks.hl --twice suspend_durable
 resume_unmatched examples/hooks.hl --twice resume_matched
@@ -92,9 +93,11 @@ js bound_message examples/agent.hl cloudflare,vercel backend_equal
 js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic|liveness
 rust default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
+rust settings_dropped docs/snippets/settings.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
 rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
 js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
+js settings_dropped docs/snippets/settings.hl cloudflare,vercel backend_equal|panic
 js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal
 rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal

@@ -577,7 +577,15 @@ pub struct Model {
     pub reply: Reply,
     pub window: Option<Window>,
     pub modes: Vec<String>,
+    pub settings: Vec<Setting>,
     pub interrupts: Interrupts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Setting {
+    pub name: String,
+    pub ty: Type,
+    pub default: Literal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

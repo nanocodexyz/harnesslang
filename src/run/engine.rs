@@ -166,6 +166,7 @@ pub struct ModelRequest<'a> {
     pub seq: u64,
     pub calls_max: u64,
     pub mode: Option<&'a str>,
+    pub settings: Option<&'a Json>,
     pub context: &'a Value,
     pub blobs: &'a Blobs,
 }
@@ -1604,7 +1605,7 @@ impl<'a> Engine<'a> {
                 let site = site.clone();
                 self.settle(&site, &call, &output)
             }
-            Some(SiteLog::Reply(response, recorded)) => {
+            Some(SiteLog::Reply(response, recorded, sent)) => {
                 if site.kind != SiteKind::Model {
                     return Err(self.diverged(seq, "a model reply", &call.tool));
                 }
@@ -1614,6 +1615,14 @@ impl<'a> Engine<'a> {
                         seq,
                         &format!("a model reply in {}", mode_text(recorded.as_deref())),
                         &format!("{} in {}", call.tool, mode_text(mode)),
+                    ));
+                }
+                let settings = self.settings(&args);
+                if sent != settings {
+                    return Err(self.diverged(
+                        seq,
+                        &format!("a model reply with {}", settings_text(sent.as_ref())),
+                        &format!("{} with {}", call.tool, settings_text(settings.as_ref())),
                     ));
                 }
                 self.reply(&response)
@@ -2245,6 +2254,10 @@ impl<'a> Engine<'a> {
         let sent = mode
             .as_deref()
             .filter(|_| self.mutation != Mutation::ModeDropped);
+        let settings = self.settings(args);
+        let sent_settings = settings
+            .as_ref()
+            .filter(|_| self.mutation != Mutation::SettingsDropped);
         let response = if preempted {
             interrupted_response()
         } else {
@@ -2256,6 +2269,7 @@ impl<'a> Engine<'a> {
                 seq,
                 calls_max,
                 mode: sent,
+                settings: sent_settings,
                 context: &args[0],
                 blobs: &self.blobs,
             })
@@ -2282,9 +2296,39 @@ impl<'a> Engine<'a> {
             seq,
             response: recorded.clone(),
             mode: mode.clone(),
+            settings: settings.clone(),
         });
-        self.sites.insert(seq, SiteLog::Reply(recorded, mode));
+        self.sites
+            .insert(seq, SiteLog::Reply(recorded, mode, settings));
         self.reply(&response)
+    }
+
+    fn settings(&self, args: &[Value]) -> Option<Json> {
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        if model.settings.is_empty() {
+            return None;
+        }
+        assert_eq!(
+            args.len(),
+            1 + model.settings.len(),
+            "a model site passes the context and every setting"
+        );
+        let fields = model
+            .settings
+            .iter()
+            .zip(&args[1..])
+            .map(|(setting, value)| {
+                (
+                    setting.name.clone(),
+                    value::to_json(self.program, &setting.ty, value),
+                )
+            })
+            .collect();
+        Some(Json::Object(fields))
     }
 
     fn run_site(
@@ -2634,6 +2678,13 @@ impl<'a> Engine<'a> {
             call_id(self.turn, seq)
         )))
     }
+}
+
+fn settings_text(settings: Option<&Json>) -> String {
+    settings.map_or_else(
+        || "no settings".to_owned(),
+        |settings| format!("settings {}", settings.encode()),
+    )
 }
 
 fn mode_text(mode: Option<&str>) -> String {

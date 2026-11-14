@@ -34,6 +34,7 @@ const job_hold_ms: u64 = 600000
 type outcome = completed(text) | failed(text) | exhausted
 type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
 type kept = refreshed(u64) | lapsed(text)
+type effort_level = "high" | "medium" | "low"
 
 tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external recoverable jobs at most bash_jobs_max
 tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text or blob<image_bytes_max> effect none
@@ -45,7 +46,7 @@ tool list_agents(include_completed: bool = false) -> text effect none
 tool wait_agent(agent_id: text) -> text effect none
 spawn spawn_agent runs delegated from "claude_code_child.hl"
 
-model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only, refresh
+model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only, refresh settings(effort: effort_level = "high")
 
 on resume
 on job(notice: text) bound job_notices_max
@@ -71,6 +72,8 @@ state {
   requested_ms: u64
   refresh_due: u64
   joins_requested: bool
+  effort: effort_level
+  pinned: effort_level
 }
 
 invariant turns_bounded: turns <= turns_max
@@ -306,6 +309,7 @@ on prompt(input: text, rounds: u64) -> outcome
   }
   push context user(input)
   turns = turns + 1
+  pinned = effort
   output_continuations = 0
   attempts = 0
   waited_ms = 0
@@ -334,7 +338,7 @@ on prompt(input: text, rounds: u64) -> outcome
         failed(_) => {}
       }
       let started = now()
-      match messages(context) {
+      match messages(context) with {effort: pinned} {
         throttled(error, after_ms) => { back_off(error, after_ms, throttled_attempts_max, true) }
         transient(error, after_ms) => { back_off(error, after_ms, attempts_max, false) }
         rejected(error) => { return failed("provider rejected the request: " ++ error) }
@@ -394,6 +398,11 @@ on prompt(input: text, rounds: u64) -> outcome
   return exhausted
 }
 
+on set_effort(level: effort_level) -> u64 {
+  effort = level
+  return turns
+}
+
 on idle refresh() at refresh_due bound cache_refreshes -> kept {
   let started = now()
   if started > clock_ms_max or requested_ms > clock_ms_max {
@@ -402,7 +411,7 @@ on idle refresh() at refresh_due bound cache_refreshes -> kept {
   if started >= requested_ms + cache_lifetime_ms {
     return lapsed("the prompt cache outlived its lifetime")
   }
-  match messages(context) mode refresh {
+  match messages(context) mode refresh with {effort: pinned} {
     ok(_, _, _, _, cache_read, cache_write) => {
       let opened = now()
       if cache_read == 0 or cache_write > 0 {

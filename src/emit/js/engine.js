@@ -377,6 +377,9 @@ class Engine {
         if (logged.mode !== site.mode) {
           throw this.diverged(seq, `a model reply in ${modeText(logged.mode)}`, `${call.tool} in ${modeText(site.mode)}`);
         }
+        if (!jsonEqual(logged.settings, settingsOf(args))) {
+          throw this.diverged(seq, `a model reply with ${settingsText(logged.settings)}`, `${call.tool} with ${settingsText(settingsOf(args))}`);
+        }
         return this.reply(logged.response);
       case "unknown":
         this.same(seq, logged.call, call);
@@ -769,8 +772,9 @@ class Engine {
     const interrupted = !ran.preempted[0] && this.events.slice(ran.events).some((event) => interruptedBy(event.delivery, by));
     if (site.kind === "model") {
       const response = interrupted ? interruptedResponse() : output;
-      this.append({ kind: "model", turn: this.turn, seq, response, mode: site.mode });
-      this.sites.set(seq, { kind: "reply", response, mode: site.mode });
+      const settings = settingsOf(args);
+      this.append({ kind: "model", turn: this.turn, seq, response, mode: site.mode, settings });
+      this.sites.set(seq, { kind: "reply", response, mode: site.mode, settings });
       return this.reply(response);
     }
     if (interrupted) {
@@ -789,7 +793,7 @@ class Engine {
     if (site.kind === "model") {
       if (preempted) return interruptedResponse();
       const callsMax = PROGRAM.model === null ? 0n : PROGRAM.model.calls;
-      return world.model({ turn: this.turn, seq, callsMax, mode: site.mode, context: args[0], blobs: this.blobs, interrupts: by });
+      return world.model({ turn: this.turn, seq, callsMax, mode: site.mode, settings: settingsOf(args), context: args[0], blobs: this.blobs, interrupts: by });
     }
     let output;
     if (site.kind === "wait") {
@@ -1466,10 +1470,23 @@ function modelRequestJson(request) {
     ["turn", BigInt(request.turn)],
   ];
   if (request.mode !== null) entries.push([MODEL_MODE, request.mode]);
+  if (request.settings !== null) entries.push([MODEL_SETTINGS, request.settings]);
   const by = request.interrupts ?? NO_INTERRUPTS;
   if (anyInterrupt(by)) entries.push([INTERRUPTED_BY, interruptNames(by)]);
   if (PROGRAM.blobs !== undefined) entries.push([MODEL_BLOBS, request.blobs.json()]);
   return object(entries);
+}
+
+function settingsOf(args) {
+  if (PROGRAM.model === null || PROGRAM.model.settings.length === 0) return null;
+  assert(args.length === 1 + PROGRAM.model.settings.length, "a model site passes the context and every setting");
+  const entries = PROGRAM.model.settings.map((setting, index) => [setting.name, toJson(setting.type, args[index + 1])]);
+  entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return object(entries);
+}
+
+function settingsText(settings) {
+  return settings === null ? "no settings" : `settings ${encodeJson(settings)}`;
 }
 
 function modeText(mode) {

@@ -1081,6 +1081,80 @@ impl Checker<'_> {
         Ok(read)
     }
 
+    fn settings(
+        &mut self,
+        callee: &ast::Name,
+        given: Option<&ast::Settings>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<Vec<Expr>> {
+        let declared = self
+            .program
+            .model
+            .as_ref()
+            .expect("a model name is bound only with a model")
+            .settings
+            .clone();
+        let fields = given.map_or(&[][..], |given| given.fields.as_slice());
+        if let (Some(given), true) = (given, declared.is_empty()) {
+            return error(
+                given.at,
+                format!("model '{}' declares no settings", callee.text),
+            );
+        }
+        for (index, (name, _)) in fields.iter().enumerate() {
+            if !declared.iter().any(|setting| setting.name == name.text) {
+                return error(
+                    name.at,
+                    format!(
+                        "model '{}' declares no setting '{}'",
+                        callee.text, name.text
+                    ),
+                );
+            }
+            if fields[..index]
+                .iter()
+                .any(|(earlier, _)| earlier.text == name.text)
+            {
+                return error(name.at, format!("setting '{}' is given twice", name.text));
+            }
+        }
+        let mut values = Vec::with_capacity(declared.len());
+        for setting in &declared {
+            let Some((_, value)) = fields.iter().find(|(name, _)| name.text == setting.name) else {
+                values.push(self.setting_default(setting));
+                continue;
+            };
+            let at = value.at();
+            let (value, ty) = self.expr(value, Some(&setting.ty), out)?;
+            self.expect(at, &setting.ty, &ty)?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    fn setting_default(&self, setting: &ir::Setting) -> Expr {
+        match &setting.default {
+            ir::Literal::Bool(value) => Expr::Bool(*value),
+            ir::Literal::Text(value) => {
+                let sum = self
+                    .program
+                    .text_enum(&setting.ty)
+                    .expect("a text setting is a text enum");
+                let variant = sum
+                    .variants
+                    .iter()
+                    .position(|candidate| candidate.name == *value)
+                    .expect("the checker took the default from the enum's values");
+                Expr::Construct {
+                    ty: setting.ty.clone(),
+                    variant,
+                    fields: Vec::new(),
+                }
+            }
+            ir::Literal::U64(_) => panic!("a model setting is a bool or a text enum"),
+        }
+    }
+
     fn mode(&self, callee: &ast::Name, mode: &ast::Name) -> Checked<ir::ModeId> {
         let model = self
             .program
@@ -1256,6 +1330,7 @@ impl Checker<'_> {
         callee: &ast::Name,
         args: &[ast::Expr],
         mode: Option<&ast::Name>,
+        settings: Option<&ast::Settings>,
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
@@ -1268,6 +1343,15 @@ impl Checker<'_> {
                 format!(
                     "'mode {}' follows a call of '{}': only a model call takes a mode",
                     mode.text, callee.text
+                ),
+            );
+        }
+        if let Some(settings) = settings.filter(|_| !is_model) {
+            return error(
+                settings.at,
+                format!(
+                    "'with {{...}}' follows a call of '{}': only a model call takes settings",
+                    callee.text
                 ),
             );
         }
@@ -1351,11 +1435,13 @@ impl Checker<'_> {
                 .expect("a model name is bound only with a model")
                 .result();
             let mode = mode.map(|mode| self.mode(callee, mode)).transpose()?;
+            let mut args = vec![value];
+            args.extend(self.settings(callee, settings, out)?);
             let called = self.site(
                 SiteKind::Model,
                 SiteClass::Fixed(EffectClass::Idempotent),
                 result,
-                vec![value],
+                args,
                 out,
             );
             self.sites
@@ -1560,9 +1646,19 @@ impl Checker<'_> {
                     ),
                 }
             }
-            ast::Expr::Call { callee, args, mode } => {
-                self.call(callee, args, mode.as_ref(), expected, out)
-            }
+            ast::Expr::Call {
+                callee,
+                args,
+                mode,
+                settings,
+            } => self.call(
+                callee,
+                args,
+                mode.as_ref(),
+                settings.as_ref(),
+                expected,
+                out,
+            ),
             ast::Expr::Binary {
                 at,
                 op,
@@ -1710,7 +1806,7 @@ fn parallel_body<'b>(
     };
     let dispatches_item = matches!(
         subject,
-        ast::Expr::Call { callee, args, mode: None }
+        ast::Expr::Call { callee, args, mode: None, settings: None }
             if callee.text == "dispatch"
                 && matches!(args.as_slice(), [ast::Expr::Name(item)] if item.text == name.text)
     );

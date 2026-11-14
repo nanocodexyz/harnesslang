@@ -464,6 +464,7 @@ pub struct ModelRequest<'a> {
     pub seq: u64,
     pub calls_max: u64,
     pub mode: Option<&'a str>,
+    pub settings: Option<&'a Json>,
     pub context: &'a dyn Fn() -> Json,
     pub blobs: &'a Blobs,
     pub interrupts: Interrupts,
@@ -796,6 +797,7 @@ pub enum Run<'a> {
     Model {
         calls_max: u64,
         context: &'a dyn Fn() -> Json,
+        settings: Option<Json>,
     },
     Now,
     Random,
@@ -1500,7 +1502,7 @@ impl<'a> Engine<'a> {
                 self.discover(&call.tool, &output);
                 self.job_answer(&call.tool, output)
             }
-            Some(SiteLog::Reply(response, recorded)) => {
+            Some(SiteLog::Reply(response, recorded, sent)) => {
                 if site.kind != Kind::Model {
                     return Err(self.diverged(seq, "a model reply", &call.tool));
                 }
@@ -1509,6 +1511,17 @@ impl<'a> Engine<'a> {
                         seq,
                         &format!("a model reply in {}", mode_text(recorded.as_deref())),
                         &format!("{} in {}", call.tool, mode_text(site.mode)),
+                    ));
+                }
+                let asked = match &run {
+                    Run::Model { settings, .. } => settings.as_ref(),
+                    _ => None,
+                };
+                if sent.as_ref() != asked {
+                    return Err(self.diverged(
+                        seq,
+                        &format!("a model reply with {}", settings_text(sent.as_ref())),
+                        &format!("{} with {}", call.tool, settings_text(asked)),
                     ));
                 }
                 Ok(Answer::Reply(response))
@@ -1588,7 +1601,7 @@ impl<'a> Engine<'a> {
             unreachable!("replay never runs an effect");
         };
         let output = match run {
-            Run::Model { calls_max, context } => {
+            Run::Model { calls_max, context, settings } => {
                 let response = if preempted {
                     interrupted_response()
                 } else {
@@ -1597,6 +1610,7 @@ impl<'a> Engine<'a> {
                         seq,
                         calls_max,
                         mode: site.mode,
+                        settings: settings.as_ref(),
                         context,
                         blobs: &self.blobs,
                         interrupts,
@@ -1611,8 +1625,9 @@ impl<'a> Engine<'a> {
                     seq,
                     response: response.clone(),
                     mode: mode.clone(),
+                    settings: settings.clone(),
                 });
-                self.sites.insert(seq, SiteLog::Reply(response.clone(), mode));
+                self.sites.insert(seq, SiteLog::Reply(response.clone(), mode, settings));
                 return Ok(Answer::Reply(response));
             }
             Run::Now => Output::Ok(Json::Number(world.now())),
@@ -2091,6 +2106,13 @@ pub fn text_after(subject: String, separator: String) -> String {
 pub fn text_trim(subject: String) -> String {
     const WHITESPACE: [char; 5] = [' ', '\t', '\n', '\x0c', '\r'];
     subject.trim_matches(WHITESPACE.as_slice()).to_owned()
+}
+
+pub fn settings_text(settings: Option<&Json>) -> String {
+    match settings {
+        Some(settings) => format!("settings {}", settings.encode()),
+        None => "no settings".to_owned(),
+    }
 }
 
 pub fn mode_text(mode: Option<&str>) -> String {

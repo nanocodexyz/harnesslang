@@ -312,6 +312,26 @@ impl<'a, 'p> Body<'a, 'p> {
         self.line("};");
     }
 
+    fn settings(&mut self, model: &ir::Model) -> String {
+        if model.settings.is_empty() {
+            return "None".to_owned();
+        }
+        let fields: Vec<String> = model
+            .settings
+            .iter()
+            .enumerate()
+            .map(|(index, setting)| {
+                format!(
+                    "({:?}, {}(&argument{}))",
+                    setting.name,
+                    self.types.to_json(&setting.ty),
+                    index + 1
+                )
+            })
+            .collect();
+        format!("Some(Json::object([{}]))", fields.join(", "))
+    }
+
     fn cell_site(&mut self, code: ir::CodeId, result: &Type) {
         assert_eq!(
             result,
@@ -406,8 +426,9 @@ impl<'a, 'p> Body<'a, 'p> {
                     EffectClass::Idempotent
                 ));
                 self.line(&format!("let context = || {context}(&argument0);"));
+                let settings = self.settings(model);
                 let run = format!(
-                    "Run::Model {{ calls_max: {}, context: &context }}",
+                    "Run::Model {{ calls_max: {}, context: &context, settings: {settings} }}",
                     constant(&model.calls.name)
                 );
                 let decode = match (result, &model.window) {

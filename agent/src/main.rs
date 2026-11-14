@@ -274,11 +274,12 @@ impl Agent {
         turn: u64,
         seq: u64,
         mode: Option<&str>,
+        effort: Option<&str>,
         context: &Value,
         attached: &anthropic::Attached<'_>,
     ) -> Value {
         let call = harness::call_id(turn, seq);
-        let body = match self.client.body(context, mode, attached) {
+        let body = match self.client.body(context, mode, effort, attached) {
             Ok(body) => body,
             Err(error) => {
                 return anthropic::transient(&format!("context does not render: {error}"), 0);
@@ -466,8 +467,18 @@ macro_rules! host_for {
                         )
                     })
                 };
-                let reply =
-                    self.run_model(request.turn, request.seq, request.mode, &context, &attached);
+                let effort = request
+                    .settings
+                    .and_then(|settings| settings.get(anthropic::EFFORT_SETTING))
+                    .and_then(|effort| effort.as_str());
+                let reply = self.run_model(
+                    request.turn,
+                    request.seq,
+                    request.mode,
+                    effort,
+                    &context,
+                    &attached,
+                );
                 $module::Json::decode(&reply.encode())
                     .expect("a reply the host built decodes as harness JSON")
             }

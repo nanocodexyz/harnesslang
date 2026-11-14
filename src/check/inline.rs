@@ -564,7 +564,12 @@ impl<'a> Inliner<'a> {
                 Expr::Number(..) | Expr::Text(..) | Expr::Bool(..) => {}
                 Expr::Name(name) => walk.reference(&self.declared, name)?,
                 Expr::Member { base, .. } => pending.push(base),
-                Expr::Call { callee, args, .. } => {
+                Expr::Call {
+                    callee,
+                    args,
+                    settings,
+                    ..
+                } => {
                     if self.functions.contains_key(callee.text.as_str()) {
                         return error(
                             callee.at,
@@ -576,6 +581,9 @@ impl<'a> Inliner<'a> {
                     }
                     walk.reference(&self.declared, callee)?;
                     pending.extend(args.iter().rev());
+                    if let Some(settings) = settings {
+                        pending.extend(settings.fields.iter().rev().map(|(_, value)| value));
+                    }
                 }
                 Expr::Binary { left, right, .. }
                 | Expr::With {

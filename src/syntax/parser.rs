@@ -1,8 +1,8 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
     Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
-    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
-    TypeBody, TypeDef, TypeExpr, VariantDef,
+    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Settings, Spawn, State,
+    Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -428,12 +428,20 @@ impl<'a> Parser<'a> {
                 modes.push(self.name("a model call mode")?);
             }
         }
+        let (settings, setting_defaults) = if self.is_word("settings") {
+            self.advance();
+            self.tool_params()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let interrupts = self.interrupts()?;
         Ok(Model {
             name,
             calls,
             reply,
             modes,
+            settings,
+            setting_defaults,
             window,
             interrupts,
         })
@@ -1116,9 +1124,38 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                Ok(Expr::Call { callee, args, mode })
+                let settings = if self.is_word("with")
+                    && matches!(self.peek_second(), Token::Symbol(Symbol::LeftBrace))
+                {
+                    Some(self.settings()?)
+                } else {
+                    None
+                };
+                Ok(Expr::Call {
+                    callee,
+                    args,
+                    mode,
+                    settings,
+                })
             }
             _ => Err(self.unexpected("an expression")),
+        }
+    }
+
+    fn settings(&mut self) -> Parsed<Settings> {
+        let at = self.word("with")?;
+        self.symbol(Symbol::LeftBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            let name = self.name("a model setting")?;
+            self.symbol(Symbol::Colon)?;
+            fields.push((name, self.expr()?));
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+                continue;
+            }
+            self.symbol(Symbol::RightBrace)?;
+            return Ok(Settings { at, fields });
         }
     }
 

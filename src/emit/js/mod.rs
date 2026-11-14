@@ -281,12 +281,24 @@ fn program_literal(program: &Program) -> String {
                 window.tokens.value, window.attempt
             )
         });
+        let settings: Vec<String> = model
+            .settings
+            .iter()
+            .map(|setting| {
+                format!(
+                    "{{ name: {}, type: {} }}",
+                    js_string(&setting.name),
+                    type_literal(&setting.ty)
+                )
+            })
+            .collect();
         format!(
-            "{{ name: {}, calls: {}n, declared: {}, window: {window}, interrupts: {} }}",
+            "{{ name: {}, calls: {}n, declared: {}, window: {window}, interrupts: {}, settings: [{}] }}",
             js_string(&model.name),
             model.calls.value,
             model.declared(),
-            interrupts_literal(model.interrupts)
+            interrupts_literal(model.interrupts),
+            settings.join(", ")
         )
     });
     let events = &program.events;

@@ -296,6 +296,7 @@ impl Checker<'_> {
             callee,
             args,
             mode: None,
+            settings: None,
         } = subject
         else {
             return Ok(None);

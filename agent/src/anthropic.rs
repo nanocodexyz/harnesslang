@@ -21,6 +21,7 @@ pub const HTTP_TOO_LARGE: u16 = 413;
 pub const HTTP_TOO_MANY: u16 = 429;
 pub const HTTP_SERVER_ERROR_MIN: u16 = 500;
 pub const EFFORT: &str = "high";
+pub const EFFORT_SETTING: &str = "effort";
 pub const PROMPT_TOO_LONG: &str = "prompt is too long";
 
 pub fn adaptive_thinking(model: &str) -> bool {
@@ -286,6 +287,7 @@ impl Client {
         &self,
         context: &Value,
         mode: Option<&str>,
+        effort: Option<&str>,
         attached: &Attached<'_>,
     ) -> Result<Value, String> {
         let mut tools = self.tools.clone();
@@ -339,7 +341,7 @@ impl Client {
             );
             body.insert(
                 "output_config",
-                Value::object([("effort", Value::text(EFFORT))]),
+                Value::object([(EFFORT_SETTING, Value::text(effort.unwrap_or(EFFORT)))]),
             );
         } else {
             body.insert(

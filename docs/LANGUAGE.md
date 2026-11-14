@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `runs` `session` `sessions` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `runs` `session` `sessions` `settings` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -552,7 +552,7 @@ tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
 listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ interrupts ] ;
+model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -597,7 +597,7 @@ product    = postfix { "*" postfix } ;
 postfix    = primary { "." name } ;
 primary    = number | text | "true" | "false" | "(" expr ")"
            | "take" name
-           | name [ "(" [ expr { "," expr } ] ")" [ "at" "most" bound ] [ "mode" name ] ] ;
+           | name [ "(" [ expr { "," expr } ] ")" [ "at" "most" bound ] [ "mode" name ] [ "with" "{" name ":" expr { "," name ":" expr } "}" ] ] ;
 ```
 
 Notes the grammar leaves out:
@@ -1174,6 +1174,132 @@ on ping() -> u64 {
   return 1
 }
 ```
+
+`settings(name: type = default, ...)` after the modes declares the model's request
+settings, typed values the host sends with every request, such as Claude's
+reasoning effort or a fast mode. A setting is a `bool` or a [text
+enum](#text-enums), and its default is a literal of that type.
+`name(context) with {setting: e, ...}` gives a call's settings, where `e` is
+any expression of the setting's type, a state field among them, so a
+harness keeps its settings as session state that ordinary handlers change
+between turns and every call follows. A setting the call leaves out takes its
+default. Settings combine with a mode: `think(context) mode text_only with
+{effort: chosen}`. Every request of a model with settings carries all of
+them, the `model` record journals them as `"settings"`, an object of every
+setting's value (a model without settings writes none, so other journals are
+unchanged), and a replay whose call computes other settings than the record
+names diverges, as a different mode does. Settings add no call site, so the
+worst case is unchanged. The simulator records the settings of every request;
+`settings_sent` requires that each journaled reply answered a request sent with
+the settings its record names, and `settings_dropped` sends the request without
+them:
+
+```hl docs/snippets/settings.hl
+harness tuned
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type effort = "low" | "medium" | "high"
+type outcome = answered(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply settings(effort: effort = "high", fast: bool = false)
+
+state {
+  context: list<entry, context_max>
+  chosen: effort
+  quick: bool
+}
+
+on configure(level: effort, fast: bool) -> u64 {
+  chosen = level
+  quick = fast
+  return 0
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 2 <= context_max
+{
+  push context user(question)
+  match think(context) with {effort: chosen, fast: quick} {
+    failed(error) => { return stopped(error) }
+    ok(reply) => {
+      match reply {
+        answer(words) => {
+          push context user(words)
+          return answered(words)
+        }
+        calls(_) => {
+          match think(context) {
+            failed(error) => { return stopped(error) }
+            ok(forced) => {
+              match forced {
+                answer(words) => { return answered(words) }
+                calls(_) => { return stopped("the model kept calling tools") }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`configure` is a turn of its own that only assigns state, and the simulator
+draws it between the turns that ask, with random arguments, so the settings
+change from turn to turn. The first call of `ask` sends the stored settings and
+the second leaves them out, so it sends the defaults; a state field of a text
+enum starts at its first value, `"low"`:
+
+```console
+$ hl run docs/snippets/settings.hl --handler ask --arg hi --seed 0 | grep -o '"settings":{[^}]*}'
+"settings":{"effort":"low","fast":false}
+"settings":{"effort":"high","fast":false}
+$ hl sim --target vercel --seeds 0..200 --twice --mutation settings_dropped docs/snippets/settings.hl | head -n 1
+FAIL invariant=settings_sent seed=0 target=vercel profile=errors mutation=settings_dropped: model call 1/1 is journaled with settings {"effort":"low","fast":false} but its reply answered a request sent with no settings
+$ hl check docs/snippets/errors/setting-type.hl
+docs/snippets/errors/setting-type.hl:5:46: error: setting 'budget' of model 'think' is u64: a model setting is a bool or a text enum, the values a host can send
+$ hl check docs/snippets/errors/undeclared-setting.hl
+docs/snippets/errors/undeclared-setting.hl:15:36: error: model 'think' declares no setting 'speed'
+```
+
+```hl docs/snippets/errors/setting-type.hl
+harness notes
+
+const calls_max: u64 = 4
+
+model think calls calls_max settings(budget: u64 = calls_max)
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/undeclared-setting.hl
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+type effort = "low" | "high"
+
+model think calls calls_max settings(effort: effort = "high")
+
+state {
+  context: list<entry, context_max>
+}
+
+on ping() -> u64 {
+  let reply = think(context) with {speed: true}
+  return 1
+}
+```
+
+`examples/claude_code.hl` keeps Claude's reasoning effort so, as nanocode's
+session settings do: `set_effort` stores it between turns, each `prompt` turn
+pins the effort in effect when it starts, and its requests and prompt cache
+refreshes send the pinned value, which hl-agent puts in the request's
+`output_config`.
 
 ### state
 
