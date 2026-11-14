@@ -1,3 +1,4 @@
+pub mod cell;
 pub mod dump;
 pub mod faults;
 pub mod invariants;
@@ -41,6 +42,17 @@ pub struct SeedRun {
 }
 
 pub fn supported(program: &Program) -> Result<(), String> {
+    for code in &program.codes {
+        for tool in &code.tools {
+            let tool = &program.tools[*tool];
+            if let Some(param) = tool.params.iter().find(|param| contains_list(&param.ty)) {
+                return Err(format!(
+                    "code '{}': the simulator cannot generate the list input '{}' of nested tool '{}'",
+                    code.name, param.name, tool.name
+                ));
+            }
+        }
+    }
     for handler in &program.handlers {
         for local in &handler.params {
             let param = &handler.locals[*local];
@@ -246,7 +258,9 @@ fn unknown_count(records: &[Record]) -> u64 {
     records
         .iter()
         .map(|record| match record {
-            Record::Recovery { unknown, .. } => unknown.len() as u64,
+            Record::Recovery {
+                unknown, nested, ..
+            } => (unknown.len() + nested.len()) as u64,
             _ => 0,
         })
         .sum()
@@ -276,6 +290,10 @@ fn add(total: &mut Stats, more: &Stats) {
     total.takeovers += more.takeovers;
     total.dispatches += more.dispatches;
     total.unknown += more.unknown;
+    total.cells += more.cells;
+    total.nested += more.nested;
+    total.divergences += more.divergences;
+    total.waits += more.waits;
 }
 
 pub fn sweep(program: &Program, options: &Options) -> Summary {
@@ -359,7 +377,7 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             )
         }
         None => format!(
-            "ok target={} mutation={} seeds={}..{} ({} seeds{}): turns={} runs={} crashes={} power_losses={} torn_writes={} takeovers={} fenced={} dispatches={} unknown={}",
+            "ok target={} mutation={} seeds={}..{} ({} seeds{}): turns={} runs={} crashes={} power_losses={} torn_writes={} takeovers={} fenced={} dispatches={} unknown={}{}",
             options.target.name(),
             options.mutation.name(),
             options.seeds.start,
@@ -374,7 +392,15 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             stats.takeovers,
             stats.fenced,
             stats.dispatches,
-            stats.unknown
+            stats.unknown,
+            if stats.cells > 0 {
+                format!(
+                    " cells={} nested={} divergences={} waits={}",
+                    stats.cells, stats.nested, stats.divergences, stats.waits
+                )
+            } else {
+                String::new()
+            }
         ),
     }
 }

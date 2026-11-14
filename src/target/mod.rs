@@ -131,7 +131,7 @@ pub struct Model {
 
 impl Model {
     pub const fn wait_flushes(&self) -> bool {
-        self.gate_before_outbound
+        self.gate_before_outbound || matches!(self.recovery, Recovery::InStep { .. })
     }
 }
 

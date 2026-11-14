@@ -1,3 +1,4 @@
+pub mod cell;
 pub mod cell_journal;
 pub mod crc;
 pub mod engine;

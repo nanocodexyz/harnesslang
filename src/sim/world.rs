@@ -1,14 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::effect::EffectClass;
 use crate::ir::{self, Program, Type};
+use crate::run::cell::{CellEngine, CellEvent, Input, Step, Wait};
+use crate::run::cell_journal::Entry;
 use crate::run::engine::{Finish, ModelRequest, Point, Stop, ToolRequest, World};
 use crate::run::journal::{self, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value;
+use crate::sim::cell::{CELL_CALL_PPM, DIVERGENCE_PPM, Plan, SimEngine};
 use crate::sim::faults::{PowerLoss, Profile, SECTOR_PERSISTED_PPM};
+use crate::sim::invariants::{Invariant, Violation};
 use crate::sim::rng::Rng;
 use crate::sim::trace::{self, Trace};
 use crate::target::medium::Medium;
@@ -20,6 +24,8 @@ pub const UNDECLARED_TOOL_PPM: u64 = 250_000;
 pub const OVER_CAPACITY_PPM: u64 = 5_000;
 pub const TOOL_FAILURE_PPM: u64 = 150_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
+pub const CLOCK_JUMP_MS_MAX: u64 = 60_000;
+pub const OWNERS: usize = 2;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const WORDS: [&str; 8] = [
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
@@ -44,6 +50,19 @@ pub struct Stats {
     pub takeovers: u64,
     pub dispatches: u64,
     pub unknown: u64,
+    pub cells: u64,
+    pub nested: u64,
+    pub divergences: u64,
+    pub waits: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DurableCell {
+    header: bool,
+    finished: bool,
+    entries: Vec<Entry>,
+    nested: BTreeSet<String>,
+    reported: BTreeSet<String>,
 }
 
 pub struct SimWorld<'a> {
@@ -59,6 +78,15 @@ pub struct SimWorld<'a> {
     pub owner_faults: Vec<String>,
     pub stats: Stats,
     pub trace: Option<Trace>,
+    pub nested_dispatched: BTreeMap<String, Dispatched>,
+    pub cell_faults: Vec<Violation>,
+    engines: [SimEngine; OWNERS],
+    injected: BTreeSet<(usize, u64)>,
+    diverged: BTreeSet<(usize, u64)>,
+    running: BTreeMap<(u64, usize, u64), BTreeSet<u64>>,
+    cell_calls: BTreeMap<u64, BTreeSet<u64>>,
+    cell_timers: BTreeMap<u64, BTreeSet<u64>>,
+    cell_codes: BTreeMap<u64, usize>,
     rng: Rng,
     faults_left: u64,
     armed: bool,
@@ -67,6 +95,7 @@ pub struct SimWorld<'a> {
     current: Option<TurnRequest>,
     clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
+    run_epoch: u64,
 }
 
 impl<'a> SimWorld<'a> {
@@ -91,6 +120,15 @@ impl<'a> SimWorld<'a> {
             owner_faults: Vec::new(),
             stats: Stats::default(),
             trace: None,
+            nested_dispatched: BTreeMap::new(),
+            cell_faults: Vec::new(),
+            engines: [SimEngine::default(), SimEngine::default()],
+            injected: BTreeSet::new(),
+            diverged: BTreeSet::new(),
+            running: BTreeMap::new(),
+            cell_calls: BTreeMap::new(),
+            cell_timers: BTreeMap::new(),
+            cell_codes: BTreeMap::new(),
             rng: Rng::derive(seed, "faults"),
             faults_left: 0,
             armed: faults,
@@ -99,6 +137,7 @@ impl<'a> SimWorld<'a> {
             current: None,
             clock: 0,
             model_calls: BTreeMap::new(),
+            run_epoch: 0,
         }
     }
 
@@ -145,6 +184,9 @@ impl<'a> SimWorld<'a> {
         if self.faults_left == 0 {
             self.armed = false;
         }
+        if !self.program.codes.is_empty() && self.fault(self.profile.crash_ppm) {
+            self.clock += self.rng.range(1, CLOCK_JUMP_MS_MAX);
+        }
         let bytes = self.traced_bytes();
         let records = match self.medium.open() {
             Ok(records) => records,
@@ -159,6 +201,7 @@ impl<'a> SimWorld<'a> {
             Medium::Jsonl(_) => 0,
         };
         self.opened("run", epoch, bytes);
+        self.run_epoch = epoch;
         Ok((records, epoch))
     }
 
@@ -322,11 +365,20 @@ impl World for SimWorld<'_> {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
-        let output = self.tool_output(request);
+        let output = match request.nested {
+            Some(_) => self.nested_output(request),
+            None => self.tool_output(request),
+        };
         self.record("tool", || {
             vec![
                 ("turn", Json::Number(request.turn)),
                 ("seq", Json::Number(request.seq)),
+                (
+                    "nested",
+                    request
+                        .nested
+                        .map_or(Json::Null, |nested| Json::Number(nested.id)),
+                ),
                 ("tool", Json::text(request.tool)),
                 ("effect", Json::text(request.effect.name())),
                 ("input", request.input.clone()),
@@ -377,6 +429,94 @@ impl World for SimWorld<'_> {
         random
     }
 
+    fn cell_start(&mut self, cell: u64, script: &str) -> Step {
+        let step = self.start_cell(cell, script);
+        self.record("cell_start", || {
+            vec![
+                ("cell", Json::Number(cell)),
+                ("script", Json::text(script)),
+                ("step", crate::run::cell::step_json(&step)),
+            ]
+        });
+        step
+    }
+
+    fn cell_resume(&mut self, cell: u64, input: Input) -> Step {
+        let owner = usize::from(self.nested);
+        let traced = self
+            .trace
+            .as_ref()
+            .map(|_| crate::run::cell::input_json(&input));
+        let step = self.engines[owner].resume(cell, input);
+        if let Some(input) = traced {
+            self.record("cell_resume", || {
+                vec![
+                    ("cell", Json::Number(cell)),
+                    ("input", input),
+                    ("step", crate::run::cell::step_json(&step)),
+                ]
+            });
+        }
+        step
+    }
+
+    fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64) -> Result<u64, Stop> {
+        let attempt = match &mut self.medium {
+            Medium::Rows(rows) => rows.nested_attempt(turn, seq, nested),
+            Medium::Jsonl(_) => panic!("only step targets count attempts"),
+        };
+        self.record("attempt", || {
+            vec![
+                ("turn", Json::Number(turn)),
+                ("seq", Json::Number(seq)),
+                ("nested", Json::Number(nested)),
+                ("answer", Json::Number(attempt)),
+            ]
+        });
+        Ok(attempt)
+    }
+
+    fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
+        self.check_wait(wait);
+        self.stats.waits += 1;
+        self.clock = self.clock.max(wait.until_ms);
+        let clock = self.clock;
+        self.record("wait", || {
+            vec![
+                ("cell", Json::Number(wait.cell)),
+                ("timer", Json::Number(wait.timer)),
+                ("until", Json::Number(wait.until_ms)),
+                ("clock", Json::Number(clock)),
+            ]
+        });
+        Ok(())
+    }
+
+    fn observe(&mut self, event: &CellEvent) {
+        let owner = usize::from(self.nested);
+        match event {
+            CellEvent::Delivered { cell, id } => {
+                if let Some(running) = self.running.get_mut(&(self.stats.runs, owner, *cell)) {
+                    running.remove(id);
+                }
+            }
+            CellEvent::Diverged { cell, reason } => {
+                self.stats.divergences += 1;
+                if !self.injected.contains(&(owner, *cell)) {
+                    self.cell_fault(
+                        Invariant::CellReplayEqual,
+                        format!("cell {cell} diverged from its journal without the divergence fault: {reason}"),
+                    );
+                }
+                self.diverged.insert((owner, *cell));
+            }
+            CellEvent::Finished { .. } => {}
+        }
+        self.record("cell", || {
+            vec![("observed", crate::run::cell::event_json(event))]
+        });
+    }
+
     fn acknowledge(&mut self, finish: &Finish) {
         self.record("ack", || {
             vec![
@@ -391,8 +531,13 @@ impl World for SimWorld<'_> {
 
 impl SimWorld<'_> {
     fn flush_medium(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
+        let cell_unfenced = self.mutation == Mutation::PostgresCellUnfenced
+            && records
+                .iter()
+                .any(|record| matches!(record, Record::NestedCall { .. }));
         let fence = self.mutation != Mutation::PostgresNoFence
-            && self.target.target == Target::ServerPostgres;
+            && self.target.target == Target::ServerPostgres
+            && !cell_unfenced;
         if let Medium::Rows(rows) = &mut self.medium {
             if fence && rows.fenced(epoch) {
                 self.stats.fenced += 1;
@@ -477,12 +622,18 @@ impl SimWorld<'_> {
         };
         let mut calls = Vec::new();
         for index in 0..count {
-            let tool = if self.program.tools.is_empty() || rng.chance(UNDECLARED_TOOL_PPM) {
-                UNDECLARED_TOOLS[rng.pick(UNDECLARED_TOOLS.len())].to_owned()
+            let cell = !self.program.codes.is_empty() && rng.chance(CELL_CALL_PPM);
+            let (tool, input) = if cell {
+                let code = &self.program.codes[rng.pick(self.program.codes.len())];
+                let plan = Plan {
+                    program: self.program,
+                    code,
+                };
+                let ops = plan.ops(&mut rng);
+                (code.name.clone(), crate::sim::cell::script(&ops))
             } else {
-                self.program.tools[rng.pick(self.program.tools.len())]
-                    .name
-                    .clone()
+                let tool = self.tool_name(&mut rng);
+                (tool, Self::generated_text(&mut rng))
             };
             let mut fields = BTreeMap::new();
             fields.insert(
@@ -495,11 +646,240 @@ impl SimWorld<'_> {
             );
             fields.insert(
                 ir::CALL_FIELDS[ir::CALL_INPUT].to_owned(),
-                Json::String(Self::generated_text(&mut rng)),
+                Json::String(input),
             );
             calls.push(Json::Object(fields));
         }
         Json::object([("calls", Json::Array(calls))])
+    }
+
+    pub fn cell_fault(&mut self, invariant: Invariant, detail: String) {
+        self.cell_faults.push(Violation { invariant, detail });
+    }
+
+    fn durable_cell(&self, cell: u64) -> DurableCell {
+        let mut found = DurableCell::default();
+        let Ok(records) = self.medium.durable() else {
+            return found;
+        };
+        for record in records {
+            match record {
+                Record::Cell {
+                    cell: durable,
+                    fresh,
+                    update,
+                    ..
+                } if durable == cell => {
+                    found.header |= fresh;
+                    found.finished |= update.finished;
+                    found.entries.extend(update.entries);
+                }
+                Record::NestedCall {
+                    turn, seq, nested, ..
+                } => {
+                    found.nested.insert(journal::nested_id(turn, seq, nested));
+                }
+                Record::Recovery { turn, nested, .. } => {
+                    for (seq, inner) in nested {
+                        found.reported.insert(journal::nested_id(turn, seq, inner));
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    fn start_cell(&mut self, cell: u64, script: &str) -> Step {
+        let owner = usize::from(self.nested);
+        let durable = self.durable_cell(cell);
+        let fenced = !self.nested
+            && matches!(&self.medium, Medium::Rows(rows) if rows.fenced(self.run_epoch))
+            && self.target.target == Target::ServerPostgres;
+        if durable.finished && !fenced {
+            self.cell_fault(
+                Invariant::CellFinishesOnce,
+                format!("the engine started on cell {cell}, whose finished update is durable"),
+            );
+        }
+        self.injected.remove(&(owner, cell));
+        self.diverged.remove(&(owner, cell));
+        self.stats.cells += u64::from(!durable.header);
+        let outputs: Vec<(u64, bool)> = durable
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_input())
+            .enumerate()
+            .map(|(index, entry)| (index as u64, matches!(entry, Entry::Call { .. })))
+            .collect();
+        let mut diverge_at = None;
+        if durable.header && !outputs.is_empty() && self.fault(DIVERGENCE_PPM) {
+            let calls: Vec<u64> = outputs
+                .iter()
+                .filter(|(_, call)| *call)
+                .map(|(index, _)| *index)
+                .collect();
+            let choices: Vec<u64> = if calls.is_empty() {
+                outputs.iter().map(|(index, _)| *index).collect()
+            } else {
+                calls
+            };
+            diverge_at = Some(choices[self.rng.pick(choices.len())]);
+            self.injected.insert((owner, cell));
+        }
+        self.engines[owner].start_diverging(cell, script, diverge_at)
+    }
+
+    fn check_wait(&mut self, wait: &Wait) {
+        let durable = self.durable_cell(wait.cell);
+        if !durable.header {
+            self.cell_fault(
+                Invariant::HeaderBeforeWait,
+                format!(
+                    "cell {} waits on timer {} before its header is durable",
+                    wait.cell, wait.timer
+                ),
+            );
+        }
+        let code = &self.program.codes[wait.code];
+        let (timers, timer_ms) = (code.timers.clone(), code.timer_ms.clone());
+        let armed = self.cell_timers.entry(wait.cell).or_default();
+        armed.insert(wait.timer);
+        let count = armed.len() as u64;
+        if count > timers.value {
+            self.cell_fault(
+                Invariant::CellBounded,
+                format!(
+                    "cell {} waits on {count} timers, past timers ({} = {})",
+                    wait.cell, timers.name, timers.value
+                ),
+            );
+        }
+        if wait.delay_ms > timer_ms.value {
+            self.cell_fault(
+                Invariant::CellBounded,
+                format!(
+                    "cell {} waits {} ms, past timer_ms ({} = {})",
+                    wait.cell, wait.delay_ms, timer_ms.name, timer_ms.value
+                ),
+            );
+        }
+    }
+
+    fn check_nested(&mut self, request: &ToolRequest<'_>, id: &str) {
+        let nested = request.nested.expect("a nested request names its call");
+        let owner = usize::from(self.nested);
+        self.cell_codes.insert(nested.cell, nested.code);
+        if self.diverged.contains(&(owner, nested.cell)) {
+            self.cell_fault(
+                Invariant::CellReplayEqual,
+                format!(
+                    "nested call {id} was dispatched after cell {} diverged",
+                    nested.cell
+                ),
+            );
+        }
+        if request.effect == EffectClass::External {
+            let durable = self.durable_cell(nested.cell);
+            let recorded = journal::nested_id(request.turn, request.seq, nested.record);
+            let fenced = !self.nested
+                && matches!(&self.medium, Medium::Rows(rows) if rows.fenced(self.run_epoch))
+                && self.target.target == Target::ServerPostgres;
+            if durable.reported.contains(&recorded) && !fenced {
+                self.cell_fault(
+                    Invariant::NestedExternalOnce,
+                    format!("nested external call {recorded} was dispatched after a recovery reported it unknown"),
+                );
+            }
+            let id = &recorded;
+            if !durable.header || !durable.nested.contains(id) {
+                self.cell_fault(
+                    Invariant::NestedExternalOnce,
+                    format!(
+                        "nested external call {id} was dispatched before C1 made durable its cell header ({}) and call record ({})",
+                        durable.header,
+                        durable.nested.contains(id)
+                    ),
+                );
+            }
+        }
+        let code = &self.program.codes[nested.code];
+        let (calls, parallel) = (code.calls.clone(), code.parallel.clone());
+        let issued = self.cell_calls.entry(nested.cell).or_default();
+        issued.insert(nested.id);
+        let issued = issued.len() as u64;
+        if issued > calls.value {
+            self.cell_fault(
+                Invariant::CellBounded,
+                format!(
+                    "cell {} dispatched {issued} nested calls, past calls ({} = {})",
+                    nested.cell, calls.name, calls.value
+                ),
+            );
+        }
+        let running = self
+            .running
+            .entry((self.stats.runs, owner, nested.cell))
+            .or_default();
+        running.insert(nested.id);
+        let running = running.len() as u64;
+        if running > parallel.value {
+            self.cell_fault(
+                Invariant::CellBounded,
+                format!(
+                    "cell {} runs {running} nested calls at once, past parallel ({} = {})",
+                    nested.cell, parallel.name, parallel.value
+                ),
+            );
+        }
+    }
+
+    fn nested_output(&mut self, request: &ToolRequest<'_>) -> Output {
+        let nested = request.nested.expect("a nested request names its call");
+        let id = journal::nested_id(request.turn, request.seq, nested.id);
+        self.check_nested(request, &id);
+        let entry = self.nested_dispatched.entry(id.clone()).or_default();
+        entry.tool = request.tool.to_owned();
+        if request.effect == EffectClass::External {
+            entry.external += 1;
+        } else {
+            entry.other += 1;
+        }
+        let count = entry.external + entry.other;
+        self.stats.dispatches += 1;
+        self.stats.nested += 1;
+        let mut rng = Rng::derive_keyed(
+            self.seed,
+            "nested",
+            &[request.turn, request.seq, nested.id, count],
+        );
+        let output = if rng.chance(TOOL_FAILURE_PPM) {
+            Output::Failed(format!(
+                "{} failed: {}",
+                request.tool,
+                Self::generated_text(&mut rng)
+            ))
+        } else {
+            Output::Ok(Self::tool_value(&mut rng, request.returns))
+        };
+        if request.effect == EffectClass::External {
+            self.nested_dispatched
+                .get_mut(&id)
+                .expect("inserted above")
+                .outputs
+                .push(output.clone());
+        }
+        output
+    }
+
+    fn tool_name(&self, rng: &mut Rng) -> String {
+        if self.program.tools.is_empty() || rng.chance(UNDECLARED_TOOL_PPM) {
+            UNDECLARED_TOOLS[rng.pick(UNDECLARED_TOOLS.len())].to_owned()
+        } else {
+            self.program.tools[rng.pick(self.program.tools.len())]
+                .name
+                .clone()
+        }
     }
 
     fn check_acknowledge(&mut self, finish: &Finish) {

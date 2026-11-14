@@ -84,5 +84,13 @@ pub fn point_fields(point: Point) -> Vec<(&'static str, Json)> {
         Point::BeforeRun(kind, effect) => run("before_run", kind, effect),
         Point::AfterRun(kind, effect) => run("after_run", kind, effect),
         Point::BeforeAcknowledge => vec![("point", Json::text("before_acknowledge"))],
+        Point::Cell(cell) => match cell {
+            crate::run::cell::CellPoint::BeforeNested(effect)
+            | crate::run::cell::CellPoint::AfterNested(effect) => vec![
+                ("point", Json::text(cell.name())),
+                ("effect", Json::text(effect.name())),
+            ],
+            other => vec![("point", Json::text(other.name()))],
+        },
     }
 }

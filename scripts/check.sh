@@ -23,10 +23,18 @@ fi
 for file in examples/*.hl; do
   "$hl" check "$file" > /dev/null
   for target in $targets; do
-    "$hl" check --target "$target" "$file" > /dev/null
+    if ! "$hl" check --target "$target" "$file" > /dev/null 2> "$scratch/stderr"; then
+      if grep -q 'cells: unsupported' "$scratch/stderr"; then
+        touch "$scratch/unsupported-$(basename "$file" .hl)-$target"
+        continue
+      fi
+      cat "$scratch/stderr" >&2
+      exit 1
+    fi
+    rm -f "$scratch/unsupported-$(basename "$file" .hl)-$target"
   done
 done
-echo "check: every example passes on every target"
+echo "check: every example passes on every target, or is refused with cells: unsupported"
 
 expect_error() {
   local file=$1 target=$2 expected=$3
@@ -48,6 +56,14 @@ expect_error examples/invalid/unchecked_external.hl any "unchecked_external.hl:1
 expect_error examples/invalid/unbounded_list.hl any "unbounded_list.hl:8:22: error: a list needs a capacity"
 expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: error: the bound of loop 'step' must be a named constant, found number 64"
 expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
+expect_error examples/invalid/code_no_model.hl any "code_no_model.hl:14:6: error: code 'exec' needs a model declaration"
+expect_error examples/invalid/code_unknown_tool.hl any "code_unknown_tool.hl:17:15: error: code 'exec' lists 'bash', which is not a declared tool"
+expect_error examples/invalid/code_nested_code.hl any "code_nested_code.hl:27:15: error: code 'outer' lists code tool 'exec'"
+expect_error examples/invalid/code_literal_bound.hl any "code_literal_bound.hl:18:9: error: field 'calls' of code 'exec' must be a named constant, found number 8"
+expect_error examples/invalid/code_parallel_over_calls.hl any "code_parallel_over_calls.hl:18:6: error: code 'exec': parallel (cell_wide = 16) exceeds calls (cell_calls_max = 8)"
+expect_error examples/invalid/code_missing_field.hl any "code_missing_field.hl:16:6: error: code 'exec' lacks 'timers'"
+expect_error examples/invalid/code_no_tools.hl any "code_no_tools.hl:16:6: error: code 'exec' lists no tools"
+expect_error examples/invalid/code_unknown_field.hl any "code_unknown_field.hl:24:3: error: code 'exec' has no field 'memory'"
 expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': worst case 17408 outbound requests exceeds cloudflare's limit of 10000 outbound requests per invocation; loops: step below turn_steps_max (1024) x call below calls_per_step_max (16)"
 for target in native-jsonl native-sqlite server-postgres vercel; do
   "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
@@ -58,6 +74,10 @@ pids=()
 for target in $targets; do
   (
     for file in examples/*.hl; do
+      if [ -e "$scratch/unsupported-$(basename "$file" .hl)-$target" ]; then
+        echo "skip $file on $target: cells: unsupported"
+        continue
+      fi
       "$hl" sim --target "$target" --seeds "$seeds" "$file"
     done
     "$hl" sim --target "$target" --seeds "$twice_seeds" --twice examples/agent.hl

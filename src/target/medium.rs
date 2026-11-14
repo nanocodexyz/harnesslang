@@ -81,6 +81,7 @@ pub struct Rows {
     pub committed: Vec<String>,
     pub epoch: u64,
     pub attempts: BTreeMap<(u64, u64), u64>,
+    pub nested_attempts: BTreeMap<(u64, u64, u64), u64>,
 }
 
 impl Rows {
@@ -101,6 +102,12 @@ impl Rows {
 
     pub fn attempt(&mut self, turn: u64, seq: u64) -> u64 {
         let attempts = self.attempts.entry((turn, seq)).or_insert(0);
+        *attempts += 1;
+        *attempts
+    }
+
+    pub fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64) -> u64 {
+        let attempts = self.nested_attempts.entry((turn, seq, nested)).or_insert(0);
         *attempts += 1;
         *attempts
     }

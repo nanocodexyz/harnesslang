@@ -172,7 +172,6 @@ impl Mutation {
                 Target::NativeJsonl,
                 Target::NativeSqlite,
                 Target::ServerPostgres,
-                Target::Vercel,
             ],
             Self::DivergenceDispatches => all,
             Self::NestedIdsRestart => all,
