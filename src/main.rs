@@ -25,6 +25,20 @@ fn usage() -> ExitCode {
     ExitCode::from(USAGE_EXIT)
 }
 
+fn print_report(report: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(
+        format!(
+            "{report}
+"
+        )
+        .as_bytes(),
+    ) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        written => written,
+    }
+}
+
 fn load(file: &str) -> Result<Program, String> {
     let source = std::fs::read_to_string(file)
         .map_err(|error| format!("{file}: error: cannot read: {error}"))?;
@@ -410,7 +424,10 @@ fn sim_command(args: &[String]) -> ExitCode {
             }
         },
     };
-    println!("{}", sim::report(&summary, &options, &file));
+    if let Err(error) = print_report(&sim::report(&summary, &options, &file)) {
+        eprintln!("stdout: error: {error}");
+        return ExitCode::from(FAILURE_EXIT);
+    }
     if summary.failure.is_some() {
         ExitCode::from(FAILURE_EXIT)
     } else {
@@ -428,7 +445,10 @@ fn exhaustive_command(
         return ExitCode::from(USAGE_EXIT);
     }
     let summary = sim::exhaustive::explore(program, options);
-    println!("{}", sim::exhaustive::report(&summary, options, file));
+    if let Err(error) = print_report(&sim::exhaustive::report(&summary, options, file)) {
+        eprintln!("stdout: error: {error}");
+        return ExitCode::from(FAILURE_EXIT);
+    }
     if summary.stopped.is_some() {
         ExitCode::from(FAILURE_EXIT)
     } else {

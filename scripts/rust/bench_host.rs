@@ -80,6 +80,10 @@ pub struct Bench {
 }
 
 impl Host for Bench {
+    fn listing(&mut self, _request: &harness::ListingRequest<'_>) -> Output {
+        Output::Ok(Json::Object(std::collections::BTreeMap::new()))
+    }
+
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
         self.tools += 1;
         let id = harness::call_id(request.turn, request.seq);
@@ -116,7 +120,7 @@ impl Host for Bench {
                         Json::String(format!("c{}-{}-{index}", request.turn, request.seq)),
                     ),
                     ("tool", Json::text(tool)),
-                    ("input", Json::String(format!("src/file_{index}.rs"))),
+                    ("input", Json::String(bench_input(tool, index))),
                 ])
             })
             .collect();
@@ -237,4 +241,14 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn bench_input(tool: &str, index: usize) -> String {
+    let path = ("path", Json::String(format!("src/file_{index}.rs")));
+    let fields = match tool {
+        "edit" => vec![path, ("body", Json::String(format!("body {index}")))],
+        "bash" => vec![("command", Json::String(format!("cargo check src/file_{index}.rs")))],
+        _ => vec![path],
+    };
+    Json::object(fields).encode()
 }

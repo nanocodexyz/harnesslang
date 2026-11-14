@@ -433,7 +433,7 @@ finished once, unknown reported exactly when a dispatch may have happened):
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 examples/agent.hl
-ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=2776 crashes=2272 power_losses=191 torn_writes=323 takeovers=0 fenced=0 dispatches=7785 unknown=746
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=2764 crashes=2260 power_losses=159 torn_writes=291 takeovers=0 fenced=0 dispatches=7032 unknown=800
 ```
 
 Each invariant has a planted bug the simulator must catch. Here recovery sends
@@ -441,7 +441,7 @@ open external calls again instead of reporting them unknown:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation recovery_redispatches_external examples/agent.hl
-FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=recovery_redispatches_external: external call 1/2 (spawn_agent) was dispatched 5 times
+FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=recovery_redispatches_external: external call 1/16 (web_fetch) was dispatched 3 times
 replay: hl sim --target native-jsonl --seeds 0..1 --mutation recovery_redispatches_external examples/agent.hl
 ```
 
@@ -493,7 +493,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `fn` `in` `known` `maybe` `parallel` `reply`
+Contextual words: `below` `calls` `fn` `from` `in` `known` `listing` `maybe` `parallel` `reply` `tools`
 
 Builtin functions, whose names declarations may not take:
 
@@ -539,12 +539,13 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | code | model | state | invariant | function | handler ;
+item       = const | type | tool | listing | code | model | state | invariant | function | handler ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
+listing    = "tools" "from" "listing" "(" name "," bound ")" params "effect" effect_class ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
 model      = "model" name "calls" bound [ "reply" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
@@ -667,6 +668,16 @@ result that does not fit the declared type is recorded as the call's failure
 ([Text enums](#text-enums)). The class is `none`, `idempotent` or `external`
 ([Effects](#effects)).
 
+The parameters are the tool's input type, checked at the boundary. A call the
+program makes passes typed arguments. A call the model makes reaches the tool
+through `dispatch`, whose input is the call's `input` text: it must be a
+JSON object holding exactly the parameters, each of its type. Then the
+`call` record holds that object and the host receives it. Otherwise the
+`call` record holds the text, the tool does not run, and the call is
+recorded as failed with what was wrong (`input of read: missing 'path'`),
+never run with a guess. A tool the program does not declare has no input
+type and receives the text.
+
 ```console
 $ hl check docs/snippets/errors/tool-returns.hl
 docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text or a text enum
@@ -680,6 +691,173 @@ const calls_max: u64 = 4
 model think calls calls_max
 
 tool plan(goal: text) -> reply effect none
+
+on ping() -> u64 { return 1 }
+```
+
+### tools from listing
+
+`tools from listing(name, bound) (param: type, ...) effect class` declares a
+family of tools whose names are known only at run time, such as an MCP
+server's: the listing `name` names them `name__TOOL`, as nanocode names MCP
+tools `mcp__SERVER__TOOL`. The declaration fixes what the program relies on,
+so the effect rule stays a compile-time fact:
+
+- Every tool of the family has the declared class. `dispatch` of
+  `docs__search` journals its call as that class, flushes it first when it is
+  `external`, and reports `unknown` after a crash exactly as for a declared
+  tool.
+- Every tool of the family takes the declared input, checked as a declared
+  tool's is ([tool](#tool)), and returns `text`.
+- `name()` reads the listing: an effect of class `none` that returns
+  `known<u64>`, the number of tools it admitted. Its `result` record holds
+  the listing, an object of tool name to fingerprint text (what the host
+  hashes a tool's definition to), so a rerun admits the same tools. A listing
+  that holds more than `bound` tools, or that is not such an object, is
+  recorded as the read's failure.
+- `dispatch` admits a listed tool by name against the latest read of its
+  listing in the turn. A tool that read did not list is refused, and the host
+  receives the admitted fingerprint with the call and refuses a tool whose
+  current definition differs (`TOOL changed since admission; rediscover
+  before executing`, nanocode's words). Both refusals are recorded as the
+  call's failure, so the program meets them in its `failed` arm, and a
+  rerun replays them.
+
+Reading the listing at the start of every round admits what the model is
+offered in that round, as nanocode admits dynamic tools per model request:
+
+```hl docs/snippets/listing.hl
+harness lookup
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const docs_max: u64 = 6
+
+type outcome = done(text) | stopped(text) | exhausted
+
+tool read(path: text, line: u64) -> text effect none
+tools from listing(docs, docs_max) (query: text) effect idempotent
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    match docs() {
+      ok(listed) => {
+        if listed == 0 { return stopped("no docs tools") }
+      }
+      failed(error) => { return stopped(error) }
+    }
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+```console
+$ hl check docs/snippets/listing.hl | grep -E 'worst case'
+  handler ask: worst case 48 effects, 91 journal records, 48 outbound requests
+$ hl run docs/snippets/listing.hl --handler ask --arg hi --seed 10 | sed -n 3p
+{"crc":3538033750,"record":{"result":{"call_id":"1/1","output":{"ok":{"delta":"delta-v1","epsilon":"epsilon-v1","theta":"theta-v1"}},"seq":1}}}
+$ hl run docs/snippets/listing.hl --handler ask --arg hi --seed 10 | grep -o '"failed":"[^"]*"'
+"failed":"input of read: missing 'path'"
+"failed":"docs__epsilon was not admitted: listing docs did not list epsilon in this turn"
+"failed":"input of docs__theta: 'beta-1' is not a parameter"
+$ hl run docs/snippets/listing.hl --handler ask --arg hi --seed 4 | grep -o '"failed":"docs__epsilon[^"]*"'
+"failed":"docs__epsilon changed since admission; rediscover before executing"
+```
+
+Each round's listing read costs one effect, two records and one outbound
+request. `hl sim` keeps a listing per declaration that starts with each of
+eight names listed in `LISTED_PRESENT_PPM` = 500000 cases per million and
+changes between turns, at every crash and at every model call: each name is
+added, removed or given a new fingerprint in `LISTING_CHANGE_PPM` = 100000
+cases per million. `LISTED_TOOL_PPM` = 250000 of the model's calls name a
+listed tool, `UNLISTED_TOOL_PPM` = 250000 of those a name its listing may
+not hold, and `INPUT_INVALID_PPM` = 100000 of the calls to a declared or
+listed tool carry input that does not fit (not JSON, a parameter missing or
+one too many). The `tool_admitted` invariant requires that every listed
+tool that ran had the fingerprint its turn's listing admitted, and that every
+tool with a declared input ran only with input that fits it. Three planted
+bugs break it: `listing_unchecked` sends listed tools without their
+admission, `input_unchecked` sends input that does not fit, and
+`listed_class_dropped` journals an external listed tool as `none`, so a
+rerun sends it again:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
+FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=listing_unchecked: listed call 2/54 (mcp__beta) ran as Some("beta-v37") while listing mcp admitted None in turn 2: a tool that changed since admission must be refused
+$ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
+FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=input_unchecked: call 1/7 (steer_waiting) ran with input "{\"eta-51\":true}", which does not fit its declared input: not a JSON object
+$ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
+FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 1/18 (mcp__beta) was dispatched 4 times
+```
+
+The checker's listing errors:
+
+```console
+$ hl check examples/invalid/listing_tool_name.hl
+examples/invalid/listing_tool_name.hl:5:6: error: tool 'docs__search' is named like a tool of listing 'docs'
+$ hl check examples/invalid/listing_unknown.hl
+examples/invalid/listing_unknown.hl:11:5: error: 'unknown' is not a variant of known<u64>
+$ hl check docs/snippets/errors/listing-name.hl
+docs/snippets/errors/listing-name.hl:5:20: error: listing 'team__docs' names its tools 'team__docs__NAME', so its name holds no '__' and does not end with '_'
+$ hl check docs/snippets/errors/listing-arguments.hl
+docs/snippets/errors/listing-arguments.hl:8:9: error: listing 'docs' takes 0 argument(s), found 1
+$ hl check docs/snippets/errors/listing-bound.hl
+docs/snippets/errors/listing-bound.hl:3:26: error: the tools one listing may hold must be a named constant, found number 16
+```
+
+```hl docs/snippets/errors/listing-name.hl
+harness notes
+
+const docs_max: u64 = 16
+
+tools from listing(team__docs, docs_max) (query: text) effect none
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/listing-arguments.hl
+harness notes
+
+const docs_max: u64 = 16
+
+tools from listing(docs, docs_max) (query: text) effect none
+
+on admit(query: text) -> u64 {
+  match docs(query) {
+    ok(listed) => { return listed }
+    failed(error) => { return 0 }
+  }
+}
+```
+
+```hl docs/snippets/errors/listing-bound.hl
+harness notes
+
+tools from listing(docs, 16) (query: text) effect none
 
 on ping() -> u64 { return 1 }
 ```
@@ -1325,8 +1503,8 @@ decision:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation enum_unchecked examples/hooks.hl
-FAIL invariant=enum_valid seed=0 target=native-jsonl profile=errors mutation=enum_unchecked: call 2/28 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("eta-1"))]: a result outside its text enum must be recorded as failed
-replay: hl sim --target native-jsonl --seeds 0..1 --mutation enum_unchecked examples/hooks.hl
+FAIL invariant=enum_valid seed=6 target=native-jsonl profile=clean mutation=enum_unchecked: call 2/10 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("beta-1"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 6..7 --mutation enum_unchecked examples/hooks.hl
 ```
 
 The checker's text enum errors:
@@ -1492,7 +1670,13 @@ tool results are, values outside a text enum included.
 continues at most `continuations_max` times, `pause_turn` sends the context
 again, `model_context_window_exceeded` is handled once, `refusal` stops the
 turn, and a failed call is asked again up to `throttled_attempts_max` times
-in a row.
+in a row. `examples/codex_agent.hl` ports the Codex turn's `end_turn`
+(`crates/backends/codex/src/model/run/turn.rs`): its reply is
+`message(text, bool) | calls(list<call, calls_per_round_max>)`, and a message
+whose `end_turn` is false sends the context again instead of finishing; its
+calls run with `parallel`, listed MCP tools included. Each
+continuation spends one of `rounds_max` rounds, so the prover bounds it like
+any other round and the worst case counts it.
 
 The planted bug `model_failure_unrecorded` writes no record for a failed
 call, as a harness that treats provider errors as transient might. A rerun
@@ -1501,8 +1685,8 @@ reply where the program runs a tool:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
-FAIL invariant=liveness seed=2 target=native-jsonl profile=lying mutation=model_failure_unrecorded: turn 1: replay of turn 1 diverged at seq 2: the journal records a model reply, the program runs 'Bash' (1/2)
-replay: hl sim --target native-jsonl --seeds 2..3 --mutation model_failure_unrecorded examples/claude_agent.hl
+FAIL invariant=liveness seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: turn 3: replay of turn 3 diverged at seq 2: the journal records a model reply, the program runs 'steer_waiting' (3/2)
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation model_failure_unrecorded examples/claude_agent.hl
 ```
 
 The checker's reply errors:
@@ -1617,8 +1801,9 @@ Effects inside an expression run before the expression, left to right.
 | `external` | `effect external`, a tool the program does not declare | `maybe<T>` | never runs again: the result is `unknown` |
 
 These are nanocode's `EffectClass`. `dispatch(call)` looks `call.tool` up among
-the declared tools at run time, defaults an undeclared tool to `external`, and
-always has type `maybe<text>`; a none or idempotent tool reached through it
+the declared tools and the listed families ([tools from
+listing](#tools-from-listing)) at run time, defaults an undeclared tool to
+`external`, and always has type `maybe<text>`; a none or idempotent tool reached through it
 never yields `unknown`. Calling a tool by name gives its own class's result
 type, so only an external tool needs an `unknown` arm:
 
@@ -1794,7 +1979,7 @@ $ hl check docs/snippets/parallel.hl | grep -E 'handler ask: worst|proved for'
   handler ask: worst case 9 effects, 20 journal records, 9 outbound requests
 docs/snippets/parallel.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
 $ hl sim --target cloudflare --seeds 0..200 docs/snippets/parallel.hl
-ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1462 crashes=958 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=1799 unknown=362
+ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1444 crashes=940 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=1633 unknown=383
 ```
 
 Anything else in the body is an error: a statement before the match, a match

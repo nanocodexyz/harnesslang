@@ -7,6 +7,7 @@ pub use crate::syntax::ast::BinaryOp;
 pub type ConstId = usize;
 pub type SumId = usize;
 pub type ToolId = usize;
+pub type ListingId = usize;
 pub type FieldId = usize;
 pub type LocalId = usize;
 pub type SiteId = usize;
@@ -36,6 +37,8 @@ pub const OK: VariantId = 0;
 pub const FAILED: VariantId = 1;
 pub const UNKNOWN: VariantId = 2;
 pub const OUTCOME_VARIANTS: [&str; 3] = ["ok", "failed", "unknown"];
+
+pub const LISTED_TOOL_SEPARATOR: &str = "__";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bound {
@@ -125,6 +128,7 @@ pub struct Program {
     pub sums: Vec<Sum>,
     pub tools: Vec<Tool>,
     pub codes: Vec<Code>,
+    pub listings: Vec<Listing>,
     pub model: Option<Model>,
     pub state: Vec<Field>,
     pub invariants: Vec<Invariant>,
@@ -166,9 +170,34 @@ impl Program {
         }
     }
 
+    pub fn listed<'t>(&self, tool: &'t str) -> Option<(ListingId, &'t str)> {
+        let (prefix, name) = tool.split_once(LISTED_TOOL_SEPARATOR)?;
+        if name.is_empty() {
+            return None;
+        }
+        let id = self
+            .listings
+            .iter()
+            .position(|listing| listing.name == prefix)?;
+        Some((id, name))
+    }
+
     pub fn dispatch_class(&self, tool: &str) -> EffectClass {
-        self.tool(tool)
-            .map_or(EffectClass::undeclared(), |(_, tool)| tool.effect)
+        if let Some((_, declared)) = self.tool(tool) {
+            return declared.effect;
+        }
+        self.listed(tool)
+            .map_or(EffectClass::undeclared(), |(id, _)| {
+                self.listings[id].effect
+            })
+    }
+
+    pub fn input_params(&self, tool: &str) -> Option<&[Field]> {
+        if let Some((_, declared)) = self.tool(tool) {
+            return Some(&declared.params);
+        }
+        self.listed(tool)
+            .map(|(id, _)| self.listings[id].params.as_slice())
     }
 
     pub fn code(&self, name: &str) -> Option<(CodeId, &Code)> {
@@ -225,6 +254,14 @@ pub struct Tool {
     pub name: String,
     pub params: Vec<Field>,
     pub returns: Type,
+    pub effect: EffectClass,
+}
+
+#[derive(Clone, Debug)]
+pub struct Listing {
+    pub name: String,
+    pub bound: Bound,
+    pub params: Vec<Field>,
     pub effect: EffectClass,
 }
 
@@ -298,6 +335,7 @@ impl Site {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteKind {
     Tool(ToolId),
+    Listing(ListingId),
     Dispatch,
     Model,
     Now,
@@ -307,12 +345,16 @@ pub enum SiteKind {
 
 impl SiteKind {
     pub const fn outbound(self) -> bool {
-        matches!(self, Self::Tool(_) | Self::Dispatch | Self::Model)
+        matches!(
+            self,
+            Self::Tool(_) | Self::Listing(_) | Self::Dispatch | Self::Model
+        )
     }
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Tool(_) => "tool",
+            Self::Listing(_) => "listing",
             Self::Dispatch => "dispatch",
             Self::Model => "model",
             Self::Now => "now",

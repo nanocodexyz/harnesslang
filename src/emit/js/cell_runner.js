@@ -470,6 +470,7 @@ class CellRunner {
       effect,
       input: call.input,
       returns: tool.returns,
+      admitted: null,
       nested: { id, record: this.recordId(id), cell: this.cell, code: this.site.code },
     });
     await this.host.hook(nestedPoint("cell_after_nested", effect));

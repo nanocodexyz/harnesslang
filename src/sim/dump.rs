@@ -82,6 +82,13 @@ fn tools_json(program: &Program) -> Json {
             "the checker refuses a code tool named like a tool"
         );
     }
+    for listing in &program.listings {
+        tools.insert(listing.name.clone(), Json::text(EffectClass::None.name()));
+        for word in crate::sim::world::WORDS {
+            let name = format!("{}{}{word}", listing.name, crate::ir::LISTED_TOOL_SEPARATOR);
+            tools.insert(name, Json::text(listing.effect.name()));
+        }
+    }
     Json::Object(tools)
 }
 

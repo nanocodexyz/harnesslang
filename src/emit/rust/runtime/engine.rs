@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Tool,
+    Listing,
     Dispatch,
     Model,
     Now,
@@ -11,6 +12,7 @@ impl Kind {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Tool => "tool",
+            Self::Listing => "listing",
             Self::Dispatch => "dispatch",
             Self::Model => "model",
             Self::Now => "now",
@@ -123,6 +125,98 @@ pub fn checked_output(tool: &str, returns: Returns, output: Output) -> Output {
     ))
 }
 
+pub const LISTED_TOOL_SEPARATOR: &str = "__";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolInput {
+    Untyped,
+    Typed(Json),
+    Invalid(String),
+}
+
+pub fn listed(tool: &str) -> Option<(usize, &str)> {
+    let (prefix, name) = tool.split_once(LISTED_TOOL_SEPARATOR)?;
+    if name.is_empty() {
+        return None;
+    }
+    let id = program::LISTINGS.iter().position(|listing| listing.0 == prefix)?;
+    Some((id, name))
+}
+
+pub fn typed_input(tool: &str, raw: &str, check: fn(&Json) -> Result<(), String>) -> ToolInput {
+    let input = match Json::decode(raw) {
+        Ok(input @ Json::Object(_)) => input,
+        _ => return ToolInput::Invalid(format!("input of {tool}: not a JSON object")),
+    };
+    match check(&input) {
+        Ok(()) => ToolInput::Typed(input),
+        Err(error) => ToolInput::Invalid(format!("input of {tool}: {error}")),
+    }
+}
+
+pub fn input_fields(input: &Json) -> Result<&BTreeMap<String, Json>, String> {
+    match input {
+        Json::Object(fields) => Ok(fields),
+        _ => Err("not a JSON object".to_owned()),
+    }
+}
+
+pub fn input_param<T>(fields: &BTreeMap<String, Json>, name: &str, parse: fn(&Json) -> Result<T, String>) -> Result<(), String> {
+    let field = fields.get(name).ok_or_else(|| format!("missing '{name}'"))?;
+    parse(field).map(drop).map_err(|error| format!("'{name}': {error}"))
+}
+
+pub fn input_extra(fields: &BTreeMap<String, Json>, params: &[&str]) -> Result<(), String> {
+    match fields.keys().find(|key| !params.contains(&key.as_str())) {
+        Some(extra) => Err(format!("'{extra}' is not a parameter")),
+        None => Ok(()),
+    }
+}
+
+pub fn not_admitted(tool: &str, listing: &str, name: &str) -> String {
+    format!("{tool} was not admitted: listing {listing} did not list {name} in this turn")
+}
+
+pub fn admitted_tools(json: &Json) -> Result<BTreeMap<String, String>, String> {
+    let Json::Object(map) = json else {
+        return Err(format!("a listing is an object, found {}", json.encode()));
+    };
+    let mut tools = BTreeMap::new();
+    for (name, fingerprint) in map {
+        let fingerprint = fingerprint
+            .as_str()
+            .ok_or_else(|| format!("listed tool '{name}' has fingerprint {}, not text", fingerprint.encode()))?;
+        tools.insert(name.clone(), fingerprint.to_owned());
+    }
+    Ok(tools)
+}
+
+pub fn listing_count(json: &Json) -> Result<u64, String> {
+    admitted_tools(json).map(|tools| tools.len() as u64)
+}
+
+pub fn checked_listing(listing: usize, output: Output) -> Output {
+    let (name, bound_name, bound) = program::LISTINGS[listing];
+    let Output::Ok(json) = &output else {
+        return output;
+    };
+    let fingerprints = match json {
+        Json::Object(map) if map.iter().all(|(tool, fingerprint)| !tool.is_empty() && fingerprint.as_str().is_some()) => map.len() as u64,
+        other => {
+            return Output::Failed(format!(
+                "listing {name} returned {}, which is not an object of fingerprints",
+                other.encode()
+            ));
+        }
+    };
+    if fingerprints > bound {
+        return Output::Failed(format!(
+            "listing {name} returned {fingerprints} tools, over its bound {bound_name} ({bound})"
+        ));
+    }
+    output
+}
+
 pub struct ToolRequest<'a> {
     pub turn: u64,
     pub seq: u64,
@@ -131,6 +225,13 @@ pub struct ToolRequest<'a> {
     pub input: &'a Json,
     pub returns: Returns,
     pub nested: Option<NestedRef>,
+    pub admitted: Option<&'a str>,
+}
+
+pub struct ListingRequest<'a> {
+    pub turn: u64,
+    pub seq: u64,
+    pub listing: &'a str,
 }
 
 pub struct ModelRequest<'a> {
@@ -144,6 +245,7 @@ pub trait World {
     fn hook(&mut self, point: Point) -> Result<(), Stop>;
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop>;
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output;
     fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop>;
     fn model(&mut self, request: &ModelRequest<'_>) -> Json;
     fn now(&mut self) -> u64;
@@ -160,6 +262,7 @@ pub trait Host {
         Ok(())
     }
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output;
     fn concurrent(&self) -> Option<&dyn ConcurrentTools> {
         None
     }
@@ -262,6 +365,7 @@ pub fn host_tools<H: Host>(host: &mut H, requests: &[ToolRequest<'_>], limit: Op
 
 pub enum Run<'a> {
     Tool(Returns),
+    Listing(usize),
     Model {
         calls_max: u64,
         context: &'a dyn Fn() -> Json,
@@ -308,6 +412,7 @@ pub struct Engine<'a> {
     cells: BTreeMap<u64, CellLog>,
     nested: BTreeMap<(u64, u64), SiteLog>,
     next_cell: u64,
+    admitted: BTreeMap<usize, BTreeMap<String, String>>,
 }
 
 impl<'a> Engine<'a> {
@@ -323,6 +428,7 @@ impl<'a> Engine<'a> {
             cells: log.cells.clone(),
             nested: log.nested.clone(),
             next_cell: 0,
+            admitted: BTreeMap::new(),
         }
     }
 
@@ -521,6 +627,9 @@ impl<'a> Engine<'a> {
                 if site.kind == Kind::Model {
                     return Err(self.corrupt(format!("{output:?} does not fit a reply")));
                 }
+                if let Run::Listing(listing) = run {
+                    self.admit_listing(listing, &output)?;
+                }
                 Ok(Answer::Output(output))
             }
             Some(SiteLog::Reply(response)) => {
@@ -586,6 +695,11 @@ impl<'a> Engine<'a> {
         }
         self.hook(Point::BeforeRun(site.kind, call.effect))?;
         let turn = self.turn;
+        let gate = if site.kind == Kind::Dispatch { self.gate(&call) } else { Ok(None) };
+        let listing = match run {
+            Run::Listing(listing) => Some(listing),
+            _ => None,
+        };
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
@@ -608,18 +722,30 @@ impl<'a> Engine<'a> {
             }
             Run::Now => Output::Ok(Json::Number(world.now())),
             Run::Random => Output::Ok(Json::Number(world.random())),
-            Run::Tool(returns) => {
-                let output = world.tool(&ToolRequest {
+            Run::Listing(listing) => {
+                let output = world.listing(&ListingRequest {
                     turn,
                     seq,
-                    tool: &call.tool,
-                    effect: call.effect,
-                    input: &call.input,
-                    returns,
-                    nested: None,
+                    listing: program::LISTINGS[listing].0,
                 });
-                checked_output(&call.tool, returns, output)
+                checked_listing(listing, output)
             }
+            Run::Tool(returns) => match gate {
+                Err(refused) => Output::Failed(refused),
+                Ok(admitted) => {
+                    let output = world.tool(&ToolRequest {
+                        turn,
+                        seq,
+                        tool: &call.tool,
+                        effect: call.effect,
+                        input: &call.input,
+                        returns,
+                        admitted: admitted.as_deref(),
+                        nested: None,
+                    });
+                    checked_output(&call.tool, returns, output)
+                }
+            },
         };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
         self.append(Record::Result {
@@ -628,7 +754,38 @@ impl<'a> Engine<'a> {
             output: output.clone(),
         });
         self.sites.insert(seq, SiteLog::Done(call, output.clone()));
+        if let Some(listing) = listing {
+            self.admit_listing(listing, &output)?;
+        }
         Ok(Answer::Output(output))
+    }
+
+    fn gate(&self, call: &Call) -> Result<Option<String>, String> {
+        if let Json::String(raw) = &call.input
+            && let ToolInput::Invalid(error) = program::tool_input(&call.tool, raw)
+        {
+            return Err(error);
+        }
+        let Some((listing, name)) = listed(&call.tool) else {
+            return Ok(None);
+        };
+        match self.admitted.get(&listing).and_then(|tools| tools.get(name)) {
+            Some(fingerprint) => Ok(Some(fingerprint.clone())),
+            None => Err(not_admitted(&call.tool, program::LISTINGS[listing].0, name)),
+        }
+    }
+
+    fn admit_listing(&mut self, listing: usize, output: &Output) -> Result<(), Halt> {
+        match output {
+            Output::Ok(json) => {
+                let tools = admitted_tools(json).map_err(|error| self.corrupt(error))?;
+                self.admitted.insert(listing, tools);
+            }
+            Output::Failed(_) => {
+                self.admitted.remove(&listing);
+            }
+        }
+        Ok(())
     }
 
     pub fn parallel(&mut self, calls: Vec<Call>, returns: Returns, limit: Option<u64>) -> Result<Vec<Answer>, Halt> {
@@ -697,22 +854,37 @@ impl<'a> Engine<'a> {
             );
         }
         let turn = self.turn;
-        let requests: Vec<ToolRequest<'_>> = group
+        let gates: Vec<Result<Option<String>, String>> = group.iter().map(|(index, _)| self.gate(&calls[*index])).collect();
+        let sent: Vec<usize> = (0..group.len()).filter(|position| gates[*position].is_ok()).collect();
+        let requests: Vec<ToolRequest<'_>> = sent
             .iter()
-            .map(|(index, seq)| ToolRequest {
-                turn,
-                seq: *seq,
-                tool: &calls[*index].tool,
-                effect: calls[*index].effect,
-                input: &calls[*index].input,
-                returns,
+            .map(|position| {
+                let (index, seq) = group[*position];
+                ToolRequest {
+                    turn,
+                    seq,
+                    tool: &calls[index].tool,
+                    effect: calls[index].effect,
+                    input: &calls[index].input,
+                    returns,
+                    admitted: gates[*position].as_ref().ok().and_then(Option::as_deref),
+                    nested: None,
+                }
             })
             .collect();
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
-        let mut completed = world.tools(&requests, limit)?;
-        assert_eq!(completed.len(), group.len(), "a batch returns one output per request");
+        let mut completed = if requests.is_empty() { Vec::new() } else { world.tools(&requests, limit)? };
+        assert_eq!(completed.len(), sent.len(), "a batch returns one output per request");
+        for (position, _) in &mut completed {
+            *position = sent[*position];
+        }
+        for (position, gate) in gates.into_iter().enumerate() {
+            if let Err(refused) = gate {
+                completed.push((position, Output::Failed(refused)));
+            }
+        }
         completed.sort_by_key(|(position, _)| *position);
         for (position, output) in completed {
             let (index, seq) = group[position];

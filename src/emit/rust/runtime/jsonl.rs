@@ -339,6 +339,10 @@ impl<H: Host> World for JsonlWorld<'_, H> {
         self.host.tool(request)
     }
 
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output {
+        self.host.listing(request)
+    }
+
     fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
         host_tools(self.host, requests, limit)
     }

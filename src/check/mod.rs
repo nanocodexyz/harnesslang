@@ -19,8 +19,18 @@ pub struct Globals {
     types: BTreeMap<String, ir::SumId>,
     tools: BTreeMap<String, ir::ToolId>,
     codes: BTreeMap<String, ir::CodeId>,
+    listings: BTreeMap<String, ir::ListingId>,
     fields: BTreeMap<String, ir::FieldId>,
     model: Option<String>,
+}
+
+impl Globals {
+    fn effect(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+            || self.listings.contains_key(name)
+            || self.codes.contains_key(name)
+            || self.model.as_deref() == Some(name)
+    }
 }
 
 type Checked<T> = Result<T, Diagnostic>;
@@ -36,6 +46,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         sums: Vec::new(),
         tools: Vec::new(),
         codes: Vec::new(),
+        listings: Vec::new(),
         model: None,
         state: Vec::new(),
         invariants: Vec::new(),
@@ -46,6 +57,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         types: BTreeMap::new(),
         tools: BTreeMap::new(),
         codes: BTreeMap::new(),
+        listings: BTreeMap::new(),
         fields: BTreeMap::new(),
         model: None,
     };
@@ -55,6 +67,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
     sums(source, &mut program, &mut globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
     codes(source, &mut program, &mut globals, &mut values)?;
+    listings(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
     invariants(&expanded, &mut program, &globals)?;
@@ -597,20 +610,7 @@ fn tools(
                 format!("tool '{}' has the name of a variant", tool.name.text),
             );
         }
-        let mut params = Vec::new();
-        let mut seen = BTreeSet::new();
-        for param in &tool.params {
-            if !seen.insert(param.name.text.clone()) {
-                return error(
-                    param.name.at,
-                    format!("parameter '{}' appears twice", param.name.text),
-                );
-            }
-            params.push(ir::Field {
-                name: param.name.text.clone(),
-                ty: resolve(program, globals, &param.ty)?,
-            });
-        }
+        let params = params(program, globals, &tool.params)?;
         let returns = resolve(program, globals, &tool.returns)?;
         if !matches!(returns, Type::U64 | Type::Bool | Type::Text)
             && program.text_enum(&returns).is_none()
@@ -629,6 +629,86 @@ fn tools(
             returns,
             effect: tool.effect,
         });
+    }
+    Ok(())
+}
+
+fn params(
+    program: &ir::Program,
+    globals: &Globals,
+    declared: &[ast::Param],
+) -> Checked<Vec<ir::Field>> {
+    let mut params = Vec::new();
+    let mut seen = BTreeSet::new();
+    for param in declared {
+        if !seen.insert(param.name.text.clone()) {
+            return error(
+                param.name.at,
+                format!("parameter '{}' appears twice", param.name.text),
+            );
+        }
+        params.push(ir::Field {
+            name: param.name.text.clone(),
+            ty: resolve(program, globals, &param.ty)?,
+        });
+    }
+    Ok(params)
+}
+
+fn listings(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &mut Globals,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    let variants = variant_names(program);
+    for item in &source.items {
+        let Item::Listing(listing) = item else {
+            continue;
+        };
+        let name = &listing.name;
+        claim(values, name, "listing")?;
+        if variants.contains(&name.text) {
+            return error(
+                name.at,
+                format!("listing '{}' has the name of a variant", name.text),
+            );
+        }
+        if name.text.contains(ir::LISTED_TOOL_SEPARATOR) || name.text.ends_with(WILDCARD) {
+            return error(
+                name.at,
+                format!(
+                    "listing '{}' names its tools '{}{}NAME', so its name holds no '{}' and does not end with '_'",
+                    name.text,
+                    name.text,
+                    ir::LISTED_TOOL_SEPARATOR,
+                    ir::LISTED_TOOL_SEPARATOR
+                ),
+            );
+        }
+        let bound = bound(program, globals, &listing.bound, "a listing's bound")?;
+        let params = params(program, globals, &listing.params)?;
+        globals
+            .listings
+            .insert(name.text.clone(), program.listings.len());
+        program.listings.push(ir::Listing {
+            name: name.text.clone(),
+            bound,
+            params,
+            effect: listing.effect,
+        });
+    }
+    for item in &source.items {
+        let Item::Tool(tool) = item else { continue };
+        if let Some((id, _)) = program.listed(&tool.name.text) {
+            return error(
+                tool.name.at,
+                format!(
+                    "tool '{}' is named like a tool of listing '{}'",
+                    tool.name.text, program.listings[id].name
+                ),
+            );
+        }
     }
     Ok(())
 }

@@ -283,6 +283,15 @@ impl World for Driver {
         expect(&event, "tool", &Json::text(request.tool));
         expect(&event, "effect", &Json::text(request.effect.name()));
         expect(&event, "input", request.input);
+        expect(&event, "admitted", &request.admitted.map_or(Json::Null, Json::text));
+        harness::output_from(field(&event, "output")).unwrap_or_else(|error| fail(&error))
+    }
+
+    fn listing(&mut self, request: &harness::ListingRequest<'_>) -> Output {
+        let event = self.events.next("listing");
+        expect(&event, "turn", &Json::Number(request.turn));
+        expect(&event, "seq", &Json::Number(request.seq));
+        expect(&event, "listing", &Json::text(request.listing));
         harness::output_from(field(&event, "output")).unwrap_or_else(|error| fail(&error))
     }
 

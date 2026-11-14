@@ -251,7 +251,9 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
             }
             Ok(widest_cost)
         }
-        SiteKind::Tool(_) | SiteKind::Now | SiteKind::Random => Ok(plain(EFFECT_RECORDS)),
+        SiteKind::Tool(_) | SiteKind::Listing(_) | SiteKind::Now | SiteKind::Random => {
+            Ok(plain(EFFECT_RECORDS))
+        }
     }
 }
 

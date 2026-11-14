@@ -32,13 +32,16 @@ pub enum Mutation {
     EnumUnchecked,
     NestedEnumUnchecked,
     ModelFailureUnrecorded,
+    ListingUnchecked,
+    ListedClassDropped,
+    InputUnchecked,
     BatchFlushAfterDispatch,
     ResultsInCompletionOrder,
     BatchPushesReversed,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 36] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -69,6 +72,9 @@ impl Mutation {
         Self::EnumUnchecked,
         Self::NestedEnumUnchecked,
         Self::ModelFailureUnrecorded,
+        Self::ListingUnchecked,
+        Self::ListedClassDropped,
+        Self::InputUnchecked,
         Self::BatchFlushAfterDispatch,
         Self::ResultsInCompletionOrder,
         Self::BatchPushesReversed,
@@ -106,6 +112,9 @@ impl Mutation {
             Self::EnumUnchecked => "enum_unchecked",
             Self::NestedEnumUnchecked => "nested_enum_unchecked",
             Self::ModelFailureUnrecorded => "model_failure_unrecorded",
+            Self::ListingUnchecked => "listing_unchecked",
+            Self::ListedClassDropped => "listed_class_dropped",
+            Self::InputUnchecked => "input_unchecked",
             Self::BatchFlushAfterDispatch => "batch_flush_after_dispatch",
             Self::ResultsInCompletionOrder => "results_in_completion_order",
             Self::BatchPushesReversed => "batch_pushes_reversed",
@@ -159,7 +168,10 @@ impl Mutation {
             | Self::EnumUnchecked
             | Self::ModelFailureUnrecorded
             | Self::ResultsInCompletionOrder
-            | Self::BatchPushesReversed => all,
+            | Self::BatchPushesReversed
+            | Self::ListingUnchecked
+            | Self::ListedClassDropped
+            | Self::InputUnchecked => all,
             Self::BatchFlushAfterDispatch => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

@@ -5,7 +5,9 @@ use std::ops::Range;
 use crate::effect::EffectClass;
 use crate::ir::Program;
 use crate::run::cell::{CellEvent, Input, Step, Wait};
-use crate::run::engine::{Exit, Finish, ModelRequest, Point, Stop, ToolRequest, World};
+use crate::run::engine::{
+    Exit, Finish, ListingRequest, ModelRequest, Point, Stop, ToolRequest, World,
+};
 use crate::run::journal::{self, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
@@ -466,12 +468,20 @@ impl World for Run<'_, '_> {
         }
         let id = journal::call_id(request.turn, request.seq);
         let flipped = self.outcome_flipped(request, &id);
+        let external = self.state.sim.program.dispatch_class(request.tool) == EffectClass::External;
+        let refused = self.state.sim.host_refusal(request);
         let entry = self.state.sim.dispatched.entry(id.clone()).or_default();
         entry.tool = request.tool.to_owned();
-        if request.effect == EffectClass::External {
+        if external {
             entry.external += 1;
         } else {
             entry.other += 1;
+        }
+        if let Some(refused) = refused {
+            if external {
+                entry.outputs.push(refused.clone());
+            }
+            return refused;
         }
         let count = entry.external + entry.other;
         let seed = self.session.seed;
@@ -499,6 +509,10 @@ impl World for Run<'_, '_> {
             .expect("inserted above")
             .returned(program, request, &output);
         output
+    }
+
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output {
+        World::listing(&mut self.state.sim, request)
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {

@@ -1036,13 +1036,94 @@ function handlerNamed(name) {
   return PROGRAM.handlers.find((handler) => handler.name === name) ?? null;
 }
 
+const LISTED_TOOL_SEPARATOR = "__";
+
+function listed(tool) {
+  const at = tool.indexOf(LISTED_TOOL_SEPARATOR);
+  if (at < 0) return null;
+  const prefix = tool.slice(0, at);
+  const name = tool.slice(at + LISTED_TOOL_SEPARATOR.length);
+  if (name === "") return null;
+  const listing = PROGRAM.listings.findIndex((candidate) => candidate.name === prefix);
+  return listing < 0 ? null : { listing, name };
+}
+
 function dispatchClass(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
-  return declared === undefined ? "external" : declared.effect;
+  if (declared !== undefined) return declared.effect;
+  const found = listed(tool);
+  return found === null ? "external" : PROGRAM.listings[found.listing].effect;
+}
+
+function inputParams(tool) {
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  if (declared !== undefined) return declared.params;
+  const found = listed(tool);
+  return found === null ? null : PROGRAM.listings[found.listing].params;
+}
+
+function inputFits(params, input) {
+  if (!isObject(input)) return "not a JSON object";
+  for (const param of params) {
+    if (!Object.hasOwn(input, param.name)) return `missing '${param.name}'`;
+    try {
+      fromJson(param.ty, input[param.name]);
+    } catch (error) {
+      if (!(error instanceof DecodeError)) throw error;
+      return `'${param.name}': ${error.message}`;
+    }
+  }
+  const extra = Object.keys(input).sort(compareKeys).find((key) => !params.some((param) => param.name === key));
+  return extra === undefined ? null : `'${extra}' is not a parameter`;
+}
+
+function toolInput(tool, raw) {
+  const params = inputParams(tool);
+  if (params === null) return { kind: "untyped" };
+  let input = null;
+  try {
+    input = decodeJson(raw);
+  } catch (error) {
+    if (!(error instanceof DecodeError)) throw error;
+  }
+  const error = isObject(input) ? inputFits(params, input) : "not a JSON object";
+  if (error !== null) return { kind: "invalid", error: `input of ${tool}: ${error}` };
+  return { kind: "typed", input };
+}
+
+function notAdmitted(tool, listing, name) {
+  return `${tool} was not admitted: listing ${listing} did not list ${name} in this turn`;
+}
+
+function admittedTools(json) {
+  if (!isObject(json)) throw new DecodeError(`a listing is an object, found ${encodeJson(json)}`);
+  const tools = new Map();
+  for (const name of Object.keys(json).sort(compareKeys)) {
+    const fingerprint = json[name];
+    if (typeof fingerprint !== "string") {
+      throw new DecodeError(`listed tool '${name}' has fingerprint ${encodeJson(fingerprint)}, not text`);
+    }
+    tools.set(name, fingerprint);
+  }
+  return tools;
+}
+
+function checkedListing(listing, output) {
+  if (output.tag !== "ok") return output;
+  const json = output.value;
+  const fits = isObject(json) && Object.keys(json).every((name) => name !== "" && typeof json[name] === "string");
+  if (!fits) {
+    return { tag: "failed", error: `listing ${listing.name} returned ${encodeJson(json)}, which is not an object of fingerprints` };
+  }
+  const count = BigInt(Object.keys(json).length);
+  if (count > listing.bound) {
+    return { tag: "failed", error: `listing ${listing.name} returned ${count} tools, over its bound ${listing.boundName} (${listing.bound})` };
+  }
+  return output;
 }
 
 function outbound(kind) {
-  return kind === "tool" || kind === "dispatch" || kind === "model";
+  return kind === "tool" || kind === "listing" || kind === "dispatch" || kind === "model";
 }
 
 function flushes(durability, resolved) {

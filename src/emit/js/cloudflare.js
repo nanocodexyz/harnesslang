@@ -82,6 +82,12 @@ class CloudflareWorld {
     return output;
   }
 
+  async listing(request) {
+    const output = await this.object.host.listing(request);
+    for (const record of this.deferred.splice(0)) this.object.insert(record);
+    return output;
+  }
+
   async tools(requests, limit) {
     const simulated = this.object.simulation.tools;
     if (simulated !== undefined) return simulated(this, requests, limit);
@@ -114,6 +120,7 @@ class HarnessObject {
     this.host = env.HL_HOST ?? defaultHost({
       fetch: (url, init) => fetch(url, init),
       toolsUrl: env.HL_TOOLS_URL,
+      listingsUrl: env.HL_LISTINGS_URL,
       modelUrl: env.HL_MODEL_URL,
       now: () => Date.now(),
       random: platformRandom,

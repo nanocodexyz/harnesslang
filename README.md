@@ -72,7 +72,7 @@ $ hl check --target cloudflare docs/snippets/readme.hl | grep -E 'worst|ok for'
   proved handler ask on cloudflare: worst_case: 40 outbound requests <= 10000 outbound requests per invocation (step below steps_max (8) x call below calls_max (4))
 docs/snippets/readme.hl: ok for cloudflare
 $ hl sim --target server-postgres --seeds 0..100 docs/snippets/readme.hl
-ok target=server-postgres mutation=none seeds=0..100 (100 seeds): turns=244 runs=665 crashes=382 power_losses=0 torn_writes=0 takeovers=57 fenced=39 dispatches=968 unknown=139
+ok target=server-postgres mutation=none seeds=0..100 (100 seeds): turns=244 runs=655 crashes=375 power_losses=0 torn_writes=0 takeovers=55 fenced=36 dispatches=927 unknown=136
 ```
 
 ## What it proves
