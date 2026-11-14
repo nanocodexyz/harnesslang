@@ -1,4 +1,4 @@
-const CLOUDFLARE_TARGET = { recovery: "at_load", gateBeforeOutbound: true };
+const CLOUDFLARE_TARGET = TARGET_MODEL;
 const CLOUDFLARE_EPOCH = 0;
 const JOURNAL_SCHEMA = "CREATE TABLE IF NOT EXISTS hl_journal (position INTEGER PRIMARY KEY, record TEXT NOT NULL)";
 const JOURNAL_INSERT = "INSERT INTO hl_journal (position, record) VALUES (?, ?)";
@@ -48,6 +48,30 @@ class CloudflareWorld {
     throw new Panic("cloudflare recovers at load and counts no step attempts");
   }
 
+  async nestedAttempt() {
+    throw new Panic("cloudflare recovers nested calls at load and counts no step attempts");
+  }
+
+  cellStart(cell, script) {
+    return this.object.cells.start(cell, script);
+  }
+
+  cellResume(cell, input) {
+    return this.object.cells.resume(cell, input);
+  }
+
+  async waited() {
+    return false;
+  }
+
+  async wait(wait) {
+    await this.object.host.wait(wait);
+  }
+
+  async observe(event) {
+    await this.object.host.observe(event);
+  }
+
   async tool(request) {
     const output = await this.object.host.tool(request);
     for (const record of this.deferred.splice(0)) this.object.insert(record);
@@ -84,6 +108,7 @@ class HarnessObject {
       now: () => Date.now(),
       random: platformRandom,
     });
+    this.cells = env.HL_CELLS ?? new IsolateCells(env[LOADER_BINDING], this);
     this.storage.sql.exec(JOURNAL_SCHEMA);
     this.position = 0;
     this.armed = false;

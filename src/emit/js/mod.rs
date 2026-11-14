@@ -7,6 +7,8 @@ use crate::target::{self, Target};
 
 const RUNTIME: &str = include_str!("runtime.js");
 const CELL_JOURNAL: &str = include_str!("cell_journal.js");
+const CELL_RUNNER: &str = include_str!("cell_runner.js");
+const CELL_ENGINE: &str = include_str!("cell_engine.js");
 const ENGINE: &str = include_str!("engine.js");
 const CLOUDFLARE: &str = include_str!("cloudflare.js");
 const VERCEL: &str = include_str!("vercel.js");
@@ -26,11 +28,12 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
             ));
         }
     };
-    let errors = target::check_limits(program, &target::model(target));
+    let model = target::model(target);
+    let errors = target::check_limits(program, &model);
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
-    let mut out = String::new();
+    let mut out = target_literal(&model);
     for constant in &program.constants {
         writeln!(
             out,
@@ -42,12 +45,28 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     out.push_str(&program_literal(program));
     out.push_str(RUNTIME);
     out.push_str(CELL_JOURNAL);
+    out.push_str(CELL_RUNNER);
+    out.push_str(CELL_ENGINE);
+    writeln!(out, "const CELL_ENGINE_SOURCE = {};", js_string(CELL_ENGINE))
+        .expect("writing to a string succeeds");
     out.push_str(ENGINE);
     for (index, handler) in program.handlers.iter().enumerate() {
         out.push_str(&handler_function(program, index, handler));
     }
     out.push_str(adapter);
     Ok(out)
+}
+
+fn target_literal(model: &target::Model) -> String {
+    let recovery = match model.recovery {
+        target::Recovery::AtLoad => "at_load",
+        target::Recovery::InStep { .. } => "in_step",
+    };
+    format!(
+        "const TARGET_MODEL = {{ recovery: \"{recovery}\", gateBeforeOutbound: {}, waitFlushes: {} }};\n",
+        model.gate_before_outbound,
+        model.wait_flushes()
+    )
 }
 
 pub fn js_string(text: &str) -> String {
@@ -110,6 +129,10 @@ fn site_literal(site: &Site) -> String {
         | SiteKind::Random
         | SiteKind::Cell(_) => "null".to_owned(),
     };
+    let code = match site.kind {
+        SiteKind::Cell(code) => code.to_string(),
+        _ => "null".to_owned(),
+    };
     let class = match site.class {
         SiteClass::Fixed(effect) => effect.name(),
         SiteClass::Dispatched => "dispatched",
@@ -122,7 +145,7 @@ fn site_literal(site: &Site) -> String {
         Durability::Cell => "cell",
     };
     format!(
-        "{{ kind: \"{}\", tool: {tool}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",
+        "{{ kind: \"{}\", tool: {tool}, code: {code}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",
         site.kind.name(),
         type_literal(&site.result)
     )
@@ -166,6 +189,10 @@ fn program_literal(program: &Program) -> String {
         )
         .expect("writing to a string succeeds");
     }
+    out.push_str("  ],\n  codes: [\n");
+    for code in &program.codes {
+        out.push_str(&code_literal(code));
+    }
     let model = program.model.as_ref().map_or("null".to_owned(), |model| {
         format!(
             "{{ name: {}, calls: {}n }}",
@@ -184,6 +211,29 @@ fn program_literal(program: &Program) -> String {
     }
     out.push_str("  ],\n};\n");
     out
+}
+
+fn bound_literal(bound: &crate::ir::Bound) -> String {
+    format!(
+        "{{ name: {}, value: {}n }}",
+        js_string(&bound.name),
+        bound.value
+    )
+}
+
+fn code_literal(code: &crate::ir::Code) -> String {
+    let tools: Vec<String> = code.tools.iter().map(ToString::to_string).collect();
+    format!(
+        "    {{ name: {}, tools: [{}], calls: {}, parallel: {}, timers: {}, timerMs: {}, journalBytes: {}, yieldMs: {} }},\n",
+        js_string(&code.name),
+        tools.join(", "),
+        bound_literal(&code.calls),
+        bound_literal(&code.parallel),
+        bound_literal(&code.timers),
+        bound_literal(&code.timer_ms),
+        bound_literal(&code.journal_bytes),
+        bound_literal(&code.yield_ms)
+    )
 }
 
 fn handler_literal(index: usize, handler: &Handler) -> String {

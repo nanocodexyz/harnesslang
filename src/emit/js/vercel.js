@@ -1,11 +1,37 @@
-const VERCEL_TARGET = { recovery: "in_step", gateBeforeOutbound: false };
+const VERCEL_TARGET = TARGET_MODEL;
 const VERCEL_EPOCH = 0;
 const STEPS_PER_EFFECT_MAX = 2;
 const STEPS_PER_TURN_FIXED = 2;
 
+assert(VERCEL_TARGET.recovery === "in_step", "the Vercel adapter recovers external effects in their step");
+assert(!VERCEL_TARGET.gateBeforeOutbound, "a Vercel step has no output gate");
+
+class StepWait {
+  constructor(wait) {
+    this.wait = wait;
+  }
+}
+
+function waitJson(wait) {
+  return object([["cell", BigInt(wait.cell)], ["delay_ms", wait.delayMs], ["timer", BigInt(wait.timer)], ["until_ms", wait.untilMs]]);
+}
+
+function waitFrom(json) {
+  if (!isObject(json)) throw new DecodeError("a wait is an object");
+  const fields = new Fields("wait", json);
+  fields.exact(["cell", "delay_ms", "timer", "until_ms"]);
+  const big = (key) => {
+    const value = fields.get(key);
+    if (typeof value !== "bigint") throw new DecodeError(`a wait's '${key}' is not a number`);
+    return value;
+  };
+  return { cell: fields.number("cell"), timer: fields.number("timer"), delayMs: big("delay_ms"), untilMs: big("until_ms") };
+}
+
 class StepWorld {
-  constructor(context) {
+  constructor(context, waited) {
     this.context = context;
+    this.waitedTimers = waited;
   }
 
   append() {}
@@ -25,6 +51,32 @@ class StepWorld {
     const attempt = this.context.attempt;
     assert(Number.isSafeInteger(attempt) && attempt >= 1, "a step's attempt counts from 1");
     return attempt;
+  }
+
+  async nestedAttempt(turn, seq, nested) {
+    const attempt = await this.context.nestedAttempt(turn, seq, nested);
+    assert(Number.isSafeInteger(attempt) && attempt >= 1, "a step's attempt counts from 1");
+    return attempt;
+  }
+
+  cellStart(cell, script) {
+    return this.context.cells.start(cell, script);
+  }
+
+  cellResume(cell, input) {
+    return this.context.cells.resume(cell, input);
+  }
+
+  async waited(wait) {
+    return this.waitedTimers.some((done) => done.cell === wait.cell && done.timer === wait.timer);
+  }
+
+  async wait(wait) {
+    throw new StepWait(wait);
+  }
+
+  async observe(event) {
+    await this.context.host.observe(event);
   }
 
   tool(request) {
@@ -57,11 +109,13 @@ async function runStep(input, context) {
   const records = input.lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false)));
   const request = decodeOrCorrupt(() => turnRequestFromJson(decodeJson(input.request)));
   const setup = { target: VERCEL_TARGET, mutation: context.mutation ?? "none" };
+  const waited = (input.waited ?? []).map((text) => decodeOrCorrupt(() => waitFrom(decodeJson(text))));
   try {
-    const ran = await runTurn(setup, new StepWorld(context), VERCEL_EPOCH, records, request);
+    const ran = await runTurn(setup, new StepWorld(context, waited), VERCEL_EPOCH, records, request);
     throw new Panic(`a step ends at a flush, found the turn ${ran.ran}`);
   } catch (error) {
     if (error instanceof StepEnd) return { lines: error.records.map((record) => encodeLine(record, false)) };
+    if (error instanceof StepWait) return { lines: [], wait: encodeJson(waitJson(error.wait)) };
     throw error;
   }
 }
@@ -80,6 +134,7 @@ async function driveTurn(platform, lines, folded, requestText) {
   const handler = handlerNamed(request.handler);
   const stepsMax = STEPS_PER_EFFECT_MAX * handler.effectsMax + STEPS_PER_TURN_FIXED;
   let live = false;
+  const waited = [];
   for (let step = 0; step < stepsMax; step++) {
     const log = folded.turns.get(request.turn);
     if (log !== undefined && log.finished !== null) {
@@ -88,7 +143,13 @@ async function driveTurn(platform, lines, folded, requestText) {
       await platform.step(`acknowledge ${request.turn}`, { kind: "acknowledge", finish: encodeJson(finishJson(finish)) });
       return;
     }
-    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText });
+    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice() });
+    if (done.output.wait !== undefined) {
+      assert(done.output.lines.length === 0, "a step that waits flushed before it waited");
+      await platform.sleep(`turn ${request.turn} sleep ${step}`, decodeOrCorrupt(() => waitFrom(decodeJson(done.output.wait))));
+      waited.push(done.output.wait);
+      continue;
+    }
     assert(done.output.lines.length > 0, "a run step ends at a flush of at least one record");
     for (const line of done.output.lines) {
       lines.push(line);
