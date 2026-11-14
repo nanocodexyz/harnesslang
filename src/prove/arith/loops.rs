@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::Stmt;
-use crate::prove::arith::{LoopKind, Prover, Quantity, State, U64_MAX, capacity, modified, quantity_name};
+use crate::prove::arith::{
+    LoopKind, Prover, Quantity, State, U64_MAX, capacity, modified, quantity_name,
+};
 use crate::prove::linear::{self, Extent, Linear, Var};
 
 type Spread = (Option<i128>, Option<i128>);
@@ -23,8 +25,12 @@ impl Prover<'_> {
         let handler = self.handler.expect("a loop belongs to a handler");
         match quantity {
             Quantity::Field(_) | Quantity::Local(_) => U64_MAX,
-            Quantity::FieldLen(field) => capacity(&self.program.state[field].ty).expect("a list has a capacity"),
-            Quantity::LocalLen(local) => capacity(&handler.locals[local].ty).expect("a list has a capacity"),
+            Quantity::FieldLen(field) => {
+                capacity(&self.program.state[field].ty).expect("a list has a capacity")
+            }
+            Quantity::LocalLen(local) => {
+                capacity(&handler.locals[local].ty).expect("a list has a capacity")
+            }
         }
     }
 
@@ -76,11 +82,20 @@ impl Prover<'_> {
         }
     }
 
-    fn summarize_body(&mut self, state: &State, kind: LoopKind<'_>, body: &[Stmt], quantities: &BTreeSet<Quantity>) -> Option<Summary> {
+    fn summarize_body(
+        &mut self,
+        state: &State,
+        kind: LoopKind<'_>,
+        body: &[Stmt],
+        quantities: &BTreeSet<Quantity>,
+    ) -> Option<Summary> {
         let mut start = state.clone();
         let mut anchors = BTreeMap::new();
         for quantity in quantities {
-            let name = format!("{} at an iteration's start", quantity_name(self.program, self.handler, *quantity));
+            let name = format!(
+                "{} at an iteration's start",
+                quantity_name(self.program, self.handler, *quantity)
+            );
             let max = self.quantity_max(*quantity);
             let var = self.fresh(&mut start, &name, max);
             start.env.insert(*quantity, var);
@@ -98,16 +113,31 @@ impl Prover<'_> {
         };
         for quantity in quantities {
             let now = Linear::var(end.env[quantity]);
-            let delta = now.subtract(&Linear::var(anchors[quantity])).expect("a difference of two variables fits");
-            let spread = (finite(self.extent(&end, &delta, false)), finite(self.extent(&end, &delta, true)));
-            let absolute = (finite(self.extent(&end, &now, false)), finite(self.extent(&end, &now, true)));
+            let delta = now
+                .subtract(&Linear::var(anchors[quantity]))
+                .expect("a difference of two variables fits");
+            let spread = (
+                finite(self.extent(&end, &delta, false)),
+                finite(self.extent(&end, &delta, true)),
+            );
+            let absolute = (
+                finite(self.extent(&end, &now, false)),
+                finite(self.extent(&end, &now, true)),
+            );
             summary.delta.insert(*quantity, spread);
             summary.absolute.insert(*quantity, absolute);
         }
         Some(summary)
     }
 
-    fn advance(&mut self, state: &mut State, quantity: Quantity, start: Var, steps: &Linear, spread: Spread) {
+    fn advance(
+        &mut self,
+        state: &mut State,
+        quantity: Quantity,
+        start: Var,
+        steps: &Linear,
+        spread: Spread,
+    ) {
         let name = quantity_name(self.program, self.handler, quantity);
         let max = self.quantity_max(quantity);
         let var = self.fresh(state, &name, max);
@@ -129,7 +159,12 @@ impl Prover<'_> {
         state.env.insert(quantity, var);
     }
 
-    pub(super) fn repeat(&mut self, state: State, kind: LoopKind<'_>, body: &[Stmt]) -> Option<State> {
+    pub(super) fn repeat(
+        &mut self,
+        state: State,
+        kind: LoopKind<'_>,
+        body: &[Stmt],
+    ) -> Option<State> {
         let mut state = state;
         let count = self.iterations(&mut state, kind);
         if count.as_constant() == Some(0) {
@@ -142,13 +177,26 @@ impl Prover<'_> {
         let mut iteration = state.clone();
         let counter = self.fresh(&mut iteration, &format!("iteration of {label}"), U64_MAX);
         let counter_value = Linear::var(counter);
-        iteration.facts.push(counter_value.plus(1).and_then(|next| next.subtract(&count)).expect("an iteration bound fits"));
+        iteration.facts.push(
+            counter_value
+                .plus(1)
+                .and_then(|next| next.subtract(&count))
+                .expect("an iteration bound fits"),
+        );
         if summary.is_none() {
             iteration.facts.push(counter_value.clone());
         }
         for quantity in &quantities {
-            let spread = summary.as_ref().map_or((Some(0), Some(0)), |summary| summary.delta[quantity]);
-            self.advance(&mut iteration, *quantity, state.env[quantity], &counter_value, spread);
+            let spread = summary
+                .as_ref()
+                .map_or((Some(0), Some(0)), |summary| summary.delta[quantity]);
+            self.advance(
+                &mut iteration,
+                *quantity,
+                state.env[quantity],
+                &counter_value,
+                spread,
+            );
         }
         self.bind_iteration(&mut iteration, kind, Some(counter));
         self.path.push(label);
@@ -158,7 +206,14 @@ impl Prover<'_> {
         Some(self.compact(exit))
     }
 
-    fn exit(&mut self, state: State, kind: LoopKind<'_>, count: &Linear, quantities: &BTreeSet<Quantity>, summary: Option<&Summary>) -> Option<State> {
+    fn exit(
+        &mut self,
+        state: State,
+        kind: LoopKind<'_>,
+        count: &Linear,
+        quantities: &BTreeSet<Quantity>,
+        summary: Option<&Summary>,
+    ) -> Option<State> {
         let mut exit = state.clone();
         let Some(summary) = summary else {
             if matches!(kind, LoopKind::Below { .. }) {
@@ -168,7 +223,13 @@ impl Prover<'_> {
             return Some(exit);
         };
         for quantity in quantities {
-            self.advance(&mut exit, *quantity, state.env[quantity], count, summary.delta[quantity]);
+            self.advance(
+                &mut exit,
+                *quantity,
+                state.env[quantity],
+                count,
+                summary.delta[quantity],
+            );
             if matches!(kind, LoopKind::Below { .. }) {
                 let now = Linear::var(exit.env[quantity]);
                 let (low, high) = summary.absolute[quantity];
@@ -211,15 +272,22 @@ impl Prover<'_> {
             }
             let name = quantity_name(self.program, self.handler, quantity);
             let var = self.fresh_raw(&name);
-            left.facts.extend(linear::equal(&Linear::var(var), &Linear::var(left_var)).expect("an equality of variables fits"));
-            right.facts.extend(linear::equal(&Linear::var(var), &Linear::var(right_var)).expect("an equality of variables fits"));
+            left.facts.extend(
+                linear::equal(&Linear::var(var), &Linear::var(left_var))
+                    .expect("an equality of variables fits"),
+            );
+            right.facts.extend(
+                linear::equal(&Linear::var(var), &Linear::var(right_var))
+                    .expect("an equality of variables fits"),
+            );
             env.insert(quantity, var);
             keep.insert(var);
             joined.push(var);
         }
         let anchors = left.anchors.intersection(&right.anchors).copied().collect();
         let left_facts = linear::project(&left.facts, &keep, &mut self.budget).unwrap_or_default();
-        let right_facts = linear::project(&right.facts, &keep, &mut self.budget).unwrap_or_default();
+        let right_facts =
+            linear::project(&right.facts, &keep, &mut self.budget).unwrap_or_default();
         let mut facts = BTreeSet::new();
         for fact in &left_facts {
             if self.proves(&right_facts, fact) {
@@ -232,21 +300,37 @@ impl Prover<'_> {
             }
         }
         let sides = [
-            State { facts: left_facts, env: BTreeMap::new(), anchors: BTreeSet::new() },
-            State { facts: right_facts, env: BTreeMap::new(), anchors: BTreeSet::new() },
+            State {
+                facts: left_facts,
+                env: BTreeMap::new(),
+                anchors: BTreeSet::new(),
+            },
+            State {
+                facts: right_facts,
+                env: BTreeMap::new(),
+                anchors: BTreeSet::new(),
+            },
         ];
         for var in &joined {
             let mut measures = vec![Linear::var(*var)];
             for other in &keep {
                 if other != var {
-                    measures.push(Linear::var(*var).subtract(&Linear::var(*other)).expect("a difference of variables fits"));
+                    measures.push(
+                        Linear::var(*var)
+                            .subtract(&Linear::var(*other))
+                            .expect("a difference of variables fits"),
+                    );
                 }
             }
             for measure in measures {
                 facts.extend(self.hull(&sides, &measure));
             }
         }
-        State { facts: facts.into_iter().collect(), env, anchors }
+        State {
+            facts: facts.into_iter().collect(),
+            env,
+            anchors,
+        }
     }
 
     fn hull(&mut self, sides: &[State; 2], measure: &Linear) -> Vec<Linear> {
@@ -272,4 +356,3 @@ impl Prover<'_> {
         facts
     }
 }
-

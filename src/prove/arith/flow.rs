@@ -59,15 +59,28 @@ impl Prover<'_> {
                 }
                 end
             }
-            Stmt::Loop { index, bound, body } => {
-                self.repeat(state, LoopKind::Below { index: *index, bound }, body)
-            }
+            Stmt::Loop { index, bound, body } => self.repeat(
+                state,
+                LoopKind::Below {
+                    index: *index,
+                    bound,
+                },
+                body,
+            ),
             Stmt::For {
                 item,
                 list,
                 bound,
                 body,
-            } => self.repeat(state, LoopKind::Each { item: *item, list, bound }, body),
+            } => self.repeat(
+                state,
+                LoopKind::Each {
+                    item: *item,
+                    list,
+                    bound,
+                },
+                body,
+            ),
             Stmt::Effect { site, args, result } => {
                 for arg in args {
                     self.value(&mut state, arg);
@@ -76,7 +89,11 @@ impl Prover<'_> {
                 let handler = self.handler.expect("an effect belongs to a handler");
                 if handler.sites[*site].kind == SiteKind::Model {
                     let what = self.names.site(*site, args);
-                    self.invariants_hold(&state, &format!("when the reply of {what} fails to decode and the turn traps"), "invariant_preserved");
+                    self.invariants_hold(
+                        &state,
+                        &format!("when the reply of {what} fails to decode and the turn traps"),
+                        "invariant_preserved",
+                    );
                 }
                 Some(state)
             }
@@ -117,7 +134,11 @@ impl Prover<'_> {
             Type::List { .. } => {
                 self.value(state, value);
                 let length = self.list_len(state, value);
-                (Quantity::FieldLen(field), capacity(ty).expect("a list has a capacity"), length)
+                (
+                    Quantity::FieldLen(field),
+                    capacity(ty).expect("a list has a capacity"),
+                    length,
+                )
             }
             _ => {
                 self.value(state, value);
@@ -151,7 +172,11 @@ impl Prover<'_> {
             );
             let mut trapped = state.clone();
             trapped.facts.extend(linear::negation(&goal));
-            self.invariants_hold(&trapped, &format!("when push onto {name} traps"), "invariant_preserved");
+            self.invariants_hold(
+                &trapped,
+                &format!("when push onto {name} traps"),
+                "invariant_preserved",
+            );
         }
         state.facts.push(goal);
         let grown = length.plus(1);

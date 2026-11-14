@@ -104,16 +104,27 @@ impl Walk<'_> {
                 falls
             }
             Stmt::Loop { index, bound, body } => {
-                let label = format!("loop {} below {}", self.handler.locals[*index].name, bound.name);
+                let label = format!(
+                    "loop {} below {}",
+                    self.handler.locals[*index].name, bound.name
+                );
                 self.branch(label, body);
                 true
             }
-            Stmt::For { item, list, body, .. } => {
-                let label = format!("for {} in {}", self.handler.locals[*item].name, self.names.expr(list));
+            Stmt::For {
+                item, list, body, ..
+            } => {
+                let label = format!(
+                    "for {} in {}",
+                    self.handler.locals[*item].name,
+                    self.names.expr(list)
+                );
                 self.branch(label, body);
                 true
             }
-            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Effect { .. } => true,
+            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Effect { .. } => {
+                true
+            }
         }
     }
 }

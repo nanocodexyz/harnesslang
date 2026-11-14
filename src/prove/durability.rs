@@ -155,7 +155,8 @@ impl Prover<'_> {
         if !self.plan.checkpoint_sorted {
             self.finding(
                 "replay_equal",
-                "the checkpoint encodes state in hash order, so two runs write different bytes".to_owned(),
+                "the checkpoint encodes state in hash order, so two runs write different bytes"
+                    .to_owned(),
                 None,
             );
         }
@@ -281,7 +282,11 @@ impl Prover<'_> {
             }
             Record::Status => {
                 if state.phase != Phase::Running {
-                    self.finding("finish_once", "a path appends a second status record".to_owned(), None);
+                    self.finding(
+                        "finish_once",
+                        "a path appends a second status record".to_owned(),
+                        None,
+                    );
                 }
                 state.phase = Phase::StatusBuffered;
             }
@@ -290,7 +295,14 @@ impl Prover<'_> {
         state.pending.insert(record);
     }
 
-    fn run(&mut self, site: SiteId, class: EffectClass, outbound: bool, what: &str, state: &mut State) {
+    fn run(
+        &mut self,
+        site: SiteId,
+        class: EffectClass,
+        outbound: bool,
+        what: &str,
+        state: &mut State,
+    ) {
         let pending = describe(&state.pending, self.handler);
         if outbound && self.plan.model.gate_before_outbound && !state.pending.is_empty() {
             self.finding(

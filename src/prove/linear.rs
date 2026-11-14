@@ -167,7 +167,9 @@ fn contradiction(constraints: &BTreeSet<Linear>) -> bool {
 fn subsume(constraints: BTreeSet<Linear>) -> BTreeSet<Linear> {
     let mut strongest: BTreeMap<BTreeMap<Var, i128>, i128> = BTreeMap::new();
     for constraint in constraints {
-        let entry = strongest.entry(constraint.terms).or_insert(constraint.constant);
+        let entry = strongest
+            .entry(constraint.terms)
+            .or_insert(constraint.constant);
         *entry = (*entry).max(constraint.constant);
     }
     let set: BTreeSet<Linear> = strongest

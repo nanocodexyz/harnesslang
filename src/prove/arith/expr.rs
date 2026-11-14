@@ -48,26 +48,58 @@ impl Prover<'_> {
                 self.value(state, list);
                 self.linear_of(state, value)
             }
-            Expr::U64(_) | Expr::Constant(_) | Expr::Local(_) | Expr::Field(_) => self.linear_of(state, value),
+            Expr::U64(_) | Expr::Constant(_) | Expr::Local(_) | Expr::Field(_) => {
+                self.linear_of(state, value)
+            }
             Expr::Bool(_) | Expr::Text(_) => None,
         }
     }
 
-    fn add(&mut self, state: &mut State, left: &Linear, right: &Linear, text: String) -> Option<Linear> {
+    fn add(
+        &mut self,
+        state: &mut State,
+        left: &Linear,
+        right: &Linear,
+        text: String,
+    ) -> Option<Linear> {
         let sum = left.add(right)?;
         let goal = sum.plus(-U64_MAX)?;
-        self.obligation(state, goal, Severity::Error, "no_overflow", format!("u64 overflow in '{text}' is possible"));
+        self.obligation(
+            state,
+            goal,
+            Severity::Error,
+            "no_overflow",
+            format!("u64 overflow in '{text}' is possible"),
+        );
         Some(sum)
     }
 
-    fn subtract(&mut self, state: &mut State, left: &Linear, right: &Linear, text: String) -> Option<Linear> {
+    fn subtract(
+        &mut self,
+        state: &mut State,
+        left: &Linear,
+        right: &Linear,
+        text: String,
+    ) -> Option<Linear> {
         let difference = left.subtract(right)?;
         let goal = right.subtract(left)?;
-        self.obligation(state, goal, Severity::Error, "no_overflow", format!("u64 underflow in '{text}' is possible"));
+        self.obligation(
+            state,
+            goal,
+            Severity::Error,
+            "no_overflow",
+            format!("u64 underflow in '{text}' is possible"),
+        );
         Some(difference)
     }
 
-    fn multiply(&mut self, state: &mut State, left: &Linear, right: &Linear, text: String) -> Linear {
+    fn multiply(
+        &mut self,
+        state: &mut State,
+        left: &Linear,
+        right: &Linear,
+        text: String,
+    ) -> Linear {
         let message = format!("u64 overflow in '{text}' is possible");
         let scaled = match (left.as_constant(), right.as_constant()) {
             (Some(factor), _) => right.scale(factor),
@@ -105,22 +137,42 @@ impl Prover<'_> {
                     describe(high_left),
                     describe(high_right)
                 );
-                self.report(Severity::Error, "no_overflow", message, Some(counterexample));
+                self.report(
+                    Severity::Error,
+                    "no_overflow",
+                    message,
+                    Some(counterexample),
+                );
                 Linear::var(self.fresh(state, &product_name, U64_MAX))
             }
         }
     }
 
-    fn comparison(&self, state: &State, op: BinaryOp, left: &Expr, right: &Expr, truth: bool) -> Option<Alternatives> {
+    fn comparison(
+        &self,
+        state: &State,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        truth: bool,
+    ) -> Option<Alternatives> {
         let left = self.linear_of(state, left)?;
         let right = self.linear_of(state, right)?;
         let below = |low: &Linear, high: &Linear| low.subtract(high)?.plus(1);
         let at_most = |low: &Linear, high: &Linear| low.subtract(high);
         let alternatives = match (op, truth) {
-            (BinaryOp::Less, true) | (BinaryOp::GreaterEqual, false) => vec![vec![below(&left, &right)?]],
-            (BinaryOp::Less, false) | (BinaryOp::GreaterEqual, true) => vec![vec![at_most(&right, &left)?]],
-            (BinaryOp::LessEqual, true) | (BinaryOp::Greater, false) => vec![vec![at_most(&left, &right)?]],
-            (BinaryOp::LessEqual, false) | (BinaryOp::Greater, true) => vec![vec![below(&right, &left)?]],
+            (BinaryOp::Less, true) | (BinaryOp::GreaterEqual, false) => {
+                vec![vec![below(&left, &right)?]]
+            }
+            (BinaryOp::Less, false) | (BinaryOp::GreaterEqual, true) => {
+                vec![vec![at_most(&right, &left)?]]
+            }
+            (BinaryOp::LessEqual, true) | (BinaryOp::Greater, false) => {
+                vec![vec![at_most(&left, &right)?]]
+            }
+            (BinaryOp::LessEqual, false) | (BinaryOp::Greater, true) => {
+                vec![vec![below(&right, &left)?]]
+            }
             (BinaryOp::Equal, true) | (BinaryOp::NotEqual, false) => {
                 vec![linear::equal(&left, &right)?.to_vec()]
             }
@@ -132,9 +184,18 @@ impl Prover<'_> {
         Some(alternatives)
     }
 
-    pub(super) fn goals(&self, state: &State, condition: &Expr, truth: bool) -> Option<Alternatives> {
+    pub(super) fn goals(
+        &self,
+        state: &State,
+        condition: &Expr,
+        truth: bool,
+    ) -> Option<Alternatives> {
         match condition {
-            Expr::Bool(value) => Some(if *value == truth { vec![Vec::new()] } else { Vec::new() }),
+            Expr::Bool(value) => Some(if *value == truth {
+                vec![Vec::new()]
+            } else {
+                Vec::new()
+            }),
             Expr::Not(operand) => self.goals(state, operand, !truth),
             Expr::Binary {
                 op: op @ (BinaryOp::And | BinaryOp::Or),
@@ -175,7 +236,10 @@ impl Prover<'_> {
 
     pub(super) fn holds(&mut self, state: &State, condition: &Expr) -> Result<(), Option<String>> {
         let Some(alternatives) = self.goals(state, condition, true) else {
-            return Err(Some("the prover reasons only about u64 comparisons joined by and, or and not".to_owned()));
+            return Err(Some(
+                "the prover reasons only about u64 comparisons joined by and, or and not"
+                    .to_owned(),
+            ));
         };
         let mut first_failure = None;
         for alternative in &alternatives {
@@ -209,7 +273,10 @@ impl Prover<'_> {
                     self.report(
                         Severity::Error,
                         property,
-                        format!("invariant '{}' ({text}) may not hold {when}", invariant.name),
+                        format!(
+                            "invariant '{}' ({text}) may not hold {when}",
+                            invariant.name
+                        ),
                         counterexample,
                     );
                 }

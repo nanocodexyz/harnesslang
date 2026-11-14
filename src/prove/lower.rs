@@ -132,10 +132,8 @@ fn arithmetic(value: &Expr) -> bool {
         Expr::Binary {
             op, left, right, ..
         } => {
-            matches!(
-                op,
-                BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply
-            ) || arithmetic(left)
+            matches!(op, BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply)
+                || arithmetic(left)
                 || arithmetic(right)
         }
         Expr::Not(operand) | Expr::Len(operand) => arithmetic(operand),
@@ -189,7 +187,10 @@ impl Lowering<'_> {
                 Stmt::Loop { body, .. } | Stmt::For { body, .. } => {
                     self.collect_names(body, names);
                 }
-                Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Finish { .. } => {}
+                Stmt::Let { .. }
+                | Stmt::Assign { .. }
+                | Stmt::Push { .. }
+                | Stmt::Finish { .. } => {}
             }
         }
     }
@@ -212,7 +213,11 @@ impl Lowering<'_> {
             let text = self.names.expr(requires);
             ops.push(Op::Choice(vec![
                 arm(format!("requires {text} holds"), Entry::Plain, Vec::new()),
-                arm(format!("requires {text} fails"), Entry::Plain, self.finish()),
+                arm(
+                    format!("requires {text} fails"),
+                    Entry::Plain,
+                    self.finish(),
+                ),
             ]));
         }
         ops.extend(self.block(&self.handler.body));
@@ -227,10 +232,7 @@ impl Lowering<'_> {
     }
 
     fn finish(&self) -> Vec<Op> {
-        let mut ops = vec![
-            Op::Append(Record::Status),
-            Op::Append(Record::Checkpoint),
-        ];
+        let mut ops = vec![Op::Append(Record::Status), Op::Append(Record::Checkpoint)];
         if self.run_mutation() == RunMutation::FinishBeforeFlush {
             self.acknowledge(&mut ops);
             ops.push(Op::Flush(Point::Finish));
@@ -282,7 +284,11 @@ impl Lowering<'_> {
                 let text = self.names.expr(condition);
                 ops.push(Op::Choice(vec![
                     arm(format!("if {text}"), Entry::Plain, self.block(then)),
-                    arm(format!("else of if {text}"), Entry::Plain, self.block(otherwise)),
+                    arm(
+                        format!("else of if {text}"),
+                        Entry::Plain,
+                        self.block(otherwise),
+                    ),
                 ]));
             }
             Stmt::Match { subject, ty, arms } => {
@@ -329,7 +335,10 @@ impl Lowering<'_> {
                 args.iter().for_each(|arg| self.arithmetic_trap(arg, ops));
                 ops.extend(self.effect(*site, args));
                 if self.handler.sites[*site].kind == SiteKind::Model {
-                    ops.push(self.trap(format!("decoding the reply of {}", self.names.site(*site, args))));
+                    ops.push(self.trap(format!(
+                        "decoding the reply of {}",
+                        self.names.site(*site, args)
+                    )));
                 }
             }
             Stmt::Finish { value } => {

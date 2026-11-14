@@ -44,8 +44,14 @@ pub fn run(args: &[String], load: fn(&str) -> Result<Program, String>) -> u8 {
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
         let parsed = match flag.as_str() {
-            "--target" => rest.next().and_then(|name| Target::parse(name)).map(|parsed| target = Some(parsed)),
-            "--mutation" => rest.next().and_then(|name| Mutation::parse(name)).map(|parsed| mutation = parsed),
+            "--target" => rest
+                .next()
+                .and_then(|name| Target::parse(name))
+                .map(|parsed| target = Some(parsed)),
+            "--mutation" => rest
+                .next()
+                .and_then(|name| Mutation::parse(name))
+                .map(|parsed| mutation = parsed),
             name if !name.starts_with("--") && file.is_none() => {
                 file = Some(name.to_owned());
                 Some(())

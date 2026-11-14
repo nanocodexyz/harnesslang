@@ -103,7 +103,11 @@ fn zero_state(program: &Program, report: &mut Report) {
 }
 
 fn quantity_name(program: &Program, handler: Option<&Handler>, quantity: Quantity) -> String {
-    let local = |local: LocalId| handler.expect("a local belongs to a handler").locals[local].name.clone();
+    let local = |local: LocalId| {
+        handler.expect("a local belongs to a handler").locals[local]
+            .name
+            .clone()
+    };
     match quantity {
         Quantity::Field(field) => program.state[field].name.clone(),
         Quantity::FieldLen(field) => format!("len({})", program.state[field].name),
@@ -232,12 +236,22 @@ impl<'a> Prover<'a> {
     fn fresh(&mut self, state: &mut State, name: &str, max: i128) -> Var {
         let var = self.fresh_raw(name);
         let value = Linear::var(var);
-        state.facts.push(value.scale(-1).expect("negating one variable fits"));
-        state.facts.push(value.plus(-max).expect("a u64 bound fits i128"));
+        state
+            .facts
+            .push(value.scale(-1).expect("negating one variable fits"));
+        state
+            .facts
+            .push(value.plus(-max).expect("a u64 bound fits i128"));
         var
     }
 
-    fn fresh_equal(&mut self, state: &mut State, name: &str, max: i128, value: Option<Linear>) -> Var {
+    fn fresh_equal(
+        &mut self,
+        state: &mut State,
+        name: &str,
+        max: i128,
+        value: Option<Linear>,
+    ) -> Var {
         let var = self.fresh(state, name, max);
         if let Some(value) = value
             && let Some(pair) = linear::equal(&Linear::var(var), &value)
@@ -257,7 +271,10 @@ impl<'a> Prover<'a> {
         for (field, declared) in program.state.iter().enumerate() {
             let (quantity, max) = match &declared.ty {
                 Type::U64 => (Quantity::Field(field), U64_MAX),
-                ty @ Type::List { .. } => (Quantity::FieldLen(field), capacity(ty).expect("a list has a capacity")),
+                ty @ Type::List { .. } => (
+                    Quantity::FieldLen(field),
+                    capacity(ty).expect("a list has a capacity"),
+                ),
                 _ => continue,
             };
             let var = self.fresh(&mut state, &quantity_name(program, None, quantity), max);
@@ -307,9 +324,17 @@ impl<'a> Prover<'a> {
     fn linear_of(&self, state: &State, value: &Expr) -> Option<Linear> {
         match value {
             Expr::U64(number) => Some(Linear::constant(i128::from(*number))),
-            Expr::Constant(constant) => Some(Linear::constant(i128::from(self.program.constants[*constant].value))),
-            Expr::Local(local) => state.env.get(&Quantity::Local(*local)).map(|var| Linear::var(*var)),
-            Expr::Field(field) => state.env.get(&Quantity::Field(*field)).map(|var| Linear::var(*var)),
+            Expr::Constant(constant) => Some(Linear::constant(i128::from(
+                self.program.constants[*constant].value,
+            ))),
+            Expr::Local(local) => state
+                .env
+                .get(&Quantity::Local(*local))
+                .map(|var| Linear::var(*var)),
+            Expr::Field(field) => state
+                .env
+                .get(&Quantity::Field(*field))
+                .map(|var| Linear::var(*var)),
             Expr::Len(list) => self.list_len(state, list),
             Expr::Binary {
                 op, left, right, ..
@@ -331,7 +356,13 @@ impl<'a> Prover<'a> {
         }
     }
 
-    fn report(&mut self, severity: Severity, property: &'static str, message: String, counterexample: Option<String>) {
+    fn report(
+        &mut self,
+        severity: Severity,
+        property: &'static str,
+        message: String,
+        counterexample: Option<String>,
+    ) {
         if self.quiet > 0 {
             return;
         }
@@ -380,7 +411,14 @@ impl<'a> Prover<'a> {
         Some(shown.join(", "))
     }
 
-    fn obligation(&mut self, state: &mut State, goal: Linear, severity: Severity, property: &'static str, message: String) -> bool {
+    fn obligation(
+        &mut self,
+        state: &mut State,
+        goal: Linear,
+        severity: Severity,
+        property: &'static str,
+        message: String,
+    ) -> bool {
         let proven = self.proves(&state.facts, &goal);
         if proven {
             if self.quiet == 0 {
@@ -389,7 +427,9 @@ impl<'a> Prover<'a> {
         } else if self.quiet == 0 {
             let counterexample = self.counterexample(state, &goal);
             let hint = if self.budget.steps_left == 0 {
-                format!("{message} (the proof budget of {PROOF_STEPS_PER_HANDLER_MAX} steps ran out)")
+                format!(
+                    "{message} (the proof budget of {PROOF_STEPS_PER_HANDLER_MAX} steps ran out)"
+                )
             } else {
                 message
             };
