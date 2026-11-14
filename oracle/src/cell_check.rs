@@ -12,6 +12,7 @@ use crate::golden::Follow;
 use crate::summary::CellSummary;
 
 const NESTED_ID_INFIX: &str = "/code-";
+const TOOL_NAME_KEY: &str = "name";
 const DIFFERENTIAL_SEED: u64 = 0;
 const DIFFERENTIAL_WALL_MS: u64 = 0;
 
@@ -237,12 +238,15 @@ fn tool_names(journal: &CellJournal) -> Result<Vec<String>, String> {
         .tools
         .iter()
         .map(|tool| {
-            tool.as_str().map(str::to_owned).ok_or_else(|| {
-                format!(
-                    "cell {} header lists a tool that is not a name: {tool}",
-                    journal.cell_id
-                )
-            })
+            tool.as_str()
+                .or_else(|| tool.get(TOOL_NAME_KEY).and_then(Value::as_str))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "cell {} header lists a tool that is not a name: {tool}",
+                        journal.cell_id
+                    )
+                })
         })
         .collect()
 }
