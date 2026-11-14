@@ -12,5 +12,9 @@
     "cache_control": {
       "type": "ephemeral"
     }
+  },
+  {
+    "type": "text",
+    "text": "# Tool calls\nEach tool call costs a model turn, so do the work in as few as it allows. Put steps whose order is already known into one Bash command (`&&`, a loop, a here-doc script) instead of one call per step, and check their result in that same command. Make calls that do not depend on each other, such as reads of different files, together in one response. Read only the part of a file you need: search a large file with `grep -n` first, then Read with offset and limit. Return only the output the next decision needs: cut long output with grep, head or tail. Start a server in the background with its output redirected to a file, and check it in the command that starts it. Use separate calls only when an intermediate result needs your judgment."
   }
 ]
