@@ -51,10 +51,11 @@ pub enum Invariant {
     SearchListed,
     DeniedUnrun,
     ChildScoped,
+    IdleDue,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -91,6 +92,7 @@ impl Invariant {
         Self::SearchListed,
         Self::DeniedUnrun,
         Self::ChildScoped,
+        Self::IdleDue,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -131,6 +133,7 @@ impl Invariant {
             Self::SearchListed => "search_listed",
             Self::DeniedUnrun => "denied_unrun",
             Self::ChildScoped => "child_scoped",
+            Self::IdleDue => "idle_due",
         }
     }
 }
@@ -295,6 +298,7 @@ pub fn check(
     checkpoint_compacted(program, world, records)?;
     liveness_and_replay(program, world, turns, records)?;
     world.inbox.kept(records)?;
+    crate::sim::idle::check(program, world, records)?;
     let session = session::fold(records).expect("liveness folded this journal");
     cells(program, &calls, &session)
 }

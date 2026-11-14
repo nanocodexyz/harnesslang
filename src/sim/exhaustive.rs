@@ -266,7 +266,7 @@ impl Run<'_, '_> {
         self.state.sim.second_owner_runs(false);
         self.nested = false;
         match ran {
-            Ok(Ran::Finished(_) | Ran::Suspended(_)) => {}
+            Ok(Ran::Finished(_) | Ran::Suspended(_) | Ran::NotDue(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => World::acknowledge(&mut self.state.sim, &finish),
             Err(exit) => self
                 .state
@@ -635,7 +635,8 @@ fn workload(program: &Program, seed: u64) -> Vec<TurnRequest> {
     let turns = workload.range(1, TURNS_PER_SESSION_MAX);
     (1..=turns)
         .map(|turn| {
-            let handler = &program.handlers[workload.pick(program.handlers.len())];
+            let prompted = program.prompted();
+            let handler = prompted[workload.pick(prompted.len())];
             let arguments = handler
                 .params
                 .iter()
@@ -754,6 +755,7 @@ impl<'a> Search<'_, 'a> {
     fn after_run(&mut self, mut state: State<'a>, ran: Result<Ran, Exit>) -> Result<(), Stopped> {
         match ran {
             Ok(Ran::Finished(_)) => self.next_turn(state),
+            Ok(Ran::NotDue(_)) => panic!("the exhaustive sim requests no idle turns"),
             Ok(Ran::Suspended(suspension)) => {
                 if let Err(violation) = state.sim.suspended(&suspension) {
                     return Err(self.fail(&state, violation));

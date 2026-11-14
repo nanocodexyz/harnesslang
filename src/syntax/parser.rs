@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
     Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
-    Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
+    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
     TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
@@ -480,6 +480,18 @@ impl<'a> Parser<'a> {
             handler.ends_session = true;
             return Ok(Some(Item::Handler(handler)));
         }
+        if first == "idle" && second.is_some() {
+            self.word("idle")?;
+            let name = self.name("an idle handler name")?;
+            let params = self.params()?;
+            self.word("at")?;
+            let due = self.name("the state field that holds the idle turn's due time")?;
+            self.word("bound")?;
+            let bound = self.bound("the idle turns after each other turn")?;
+            let mut handler = self.handler(name, params)?;
+            handler.idle = Some(Idle { due, bound });
+            return Ok(Some(Item::Handler(handler)));
+        }
         let Some(kind) = HookKind::ALL.into_iter().find(|kind| {
             let (one, two) = kind.words();
             !kind.denies() && one == first && second.as_deref() == (!two.is_empty()).then_some(two)
@@ -580,6 +592,7 @@ impl<'a> Parser<'a> {
             requires,
             body,
             ends_session: false,
+            idle: None,
         })
     }
 

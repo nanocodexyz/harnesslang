@@ -65,7 +65,8 @@ notice_dropped docs/snippets/catalog.hl --twice checkpoint_compacted
 search_unchecked docs/snippets/catalog.hl --twice search_listed
 discovery_unchecked docs/snippets/catalog.hl --twice tool_admitted
 blob_unjournaled docs/snippets/images.hl --twice blob_journaled
-blobs_unevicted docs/snippets/images.hl --twice checkpoint_compacted"
+blobs_unevicted docs/snippets/images.hl --twice checkpoint_compacted
+idle_early docs/snippets/keep.hl --twice idle_due"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
@@ -87,7 +88,9 @@ js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
 js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
 js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal
 rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal"
+js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal
+rust idle_early docs/snippets/keep.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js idle_early docs/snippets/keep.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 

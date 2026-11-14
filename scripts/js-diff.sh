@@ -22,6 +22,7 @@ plant_expression() {
     mode_dropped) echo 's/world.model({ turn: this.turn, seq, callsMax, mode: site.mode,/world.model({ turn: this.turn, seq, callsMax, mode: null,/' ;;
     blob_unjournaled) echo 's/this.blobs.journaled(data, true)/this.blobs.journaled(data, false)/' ;;
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
+    idle_early) echo 's/if (clock < due) return { ran: "not_due"/if (false \&\& clock < due) return { ran: "not_due"/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

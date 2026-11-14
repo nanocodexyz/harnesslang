@@ -453,8 +453,13 @@ impl<'d> JsonlJournal<'d> {
             Ran::AlreadyFinished(finish) => host.acknowledge(finish),
             Ran::Finished(finish) => self.advance(finish.turn, flushed),
             Ran::Suspended(_) => self.records.extend(flushed),
+            Ran::NotDue(_) => assert!(flushed.is_empty(), "an idle turn that is not due writes nothing"),
         }
         Ok((self, ran))
+    }
+
+    pub fn idle_due(&self) -> Result<Option<u64>, Exit> {
+        idle_due(self.start, &self.records)
     }
 
     fn advance(&mut self, turn: u64, mut flushed: Vec<Record>) {

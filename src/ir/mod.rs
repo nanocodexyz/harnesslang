@@ -179,6 +179,7 @@ pub struct Program {
     pub cuts: Vec<u64>,
     pub notice: Option<VariantId>,
     pub blobs: Option<Blobs>,
+    pub idle: Option<Idle>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -221,6 +222,19 @@ impl Program {
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
         self.handlers.iter().find(|handler| handler.name == name)
+    }
+
+    pub fn idles(&self, handler: &str) -> bool {
+        self.idle
+            .as_ref()
+            .is_some_and(|idle| idle.handler == handler)
+    }
+
+    pub fn prompted(&self) -> Vec<&Handler> {
+        self.handlers
+            .iter()
+            .filter(|handler| !self.idles(&handler.name))
+            .collect()
     }
 
     pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
@@ -620,6 +634,20 @@ pub const HOOK_DECIDED_FIELD: &str = "_hook_decided";
 pub const HOOK_DENIED_FIELD: &str = "_hook_denied";
 pub const HOOK_REASON_FIELD: &str = "_hook_reason";
 pub const HOOK_INPUT_FIELD: &str = "_hook_input";
+pub const IDLE_RUNS_FIELD: &str = "_idle_runs";
+pub const IDLE_RAN_FIELD: &str = "_idle_ran";
+pub const IDLE_BOUNDED_INVARIANT: &str = "_idle_bounded";
+pub const IDLE_AT: &str = "at";
+pub const IDLE_DUE: &str = "due";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Idle {
+    pub handler: String,
+    pub due: FieldId,
+    pub bound: Bound,
+    pub runs: FieldId,
+    pub ran: FieldId,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteClass {
