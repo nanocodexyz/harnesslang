@@ -59,6 +59,7 @@ struct Open {
     medium: Medium,
     buffered: Vec<Record>,
     durable: Vec<Record>,
+    turn: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -217,6 +218,7 @@ impl SimWorld<'_> {
             medium: self.medium.clone(),
             buffered: buffered.to_vec(),
             durable,
+            turn: point.map(|(turn, _)| turn),
         });
         self.record("side", || {
             let number = |value: Option<u64>| value.map_or(Json::Null, Json::Number);
@@ -279,7 +281,7 @@ impl SimWorld<'_> {
                 return;
             }
         };
-        if let Some(detail) = self.side_oracle(request, &open.durable, answer) {
+        if let Some(detail) = self.side_oracle(request, &open.durable, open.turn, answer) {
             self.sides
                 .faults
                 .push(isolated(format!("{question}: {detail}")));
@@ -290,10 +292,14 @@ impl SimWorld<'_> {
         &self,
         request: &SideRequest,
         durable: &[Record],
+        running: Option<u64>,
         answer: &SideAnswer,
     ) -> Option<String> {
         let program = self.program;
-        let session = session::fold(durable).ok()?;
+        let mut session = session::fold(durable).ok()?;
+        if let Some(running) = running {
+            session.turns.retain(|turn, _| *turn < running);
+        }
         let state = turn::replay_all(program, &self.target, &session).ok()?;
         let blobs = Blobs::of_session(program, &session).ok()?;
         let mut replay = Replay {
