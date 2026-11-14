@@ -177,11 +177,16 @@ impl Module {
         for global in &self.globals {
             body.push(global.ty.code());
             body.push(if global.mutable { GLOBAL_MUT } else { GLOBAL_CONST });
-            body.push(match global.ty {
-                ValType::I32 => OP_I32_CONST,
-                ValType::I64 => OP_I64_CONST,
-            });
-            signed(&mut body, global.init);
+            match global.ty {
+                ValType::I32 => {
+                    body.push(OP_I32_CONST);
+                    signed(&mut body, i64::from(global.init as i32));
+                }
+                ValType::I64 => {
+                    body.push(OP_I64_CONST);
+                    signed(&mut body, global.init);
+                }
+            }
             body.push(OP_END);
         }
         body

@@ -690,6 +690,10 @@ fn assemble_command(args: &[String]) -> ExitCode {
     }
 }
 
+fn return_bytes(bytes: &[u8]) -> ExitCode {
+    write_bytes(bytes)
+}
+
 fn write_bytes(bytes: &[u8]) -> ExitCode {
     use std::io::Write;
     match std::io::stdout().lock().write_all(bytes) {
@@ -705,7 +709,10 @@ fn emit_command(args: &[String]) -> ExitCode {
     if args.iter().any(|arg| arg == "--sql") {
         return harnesslang::emit::sql::command::emit_listing(args);
     }
-    let Some(flags) = flags(args) else {
+    let wasm = args.iter().any(|arg| arg == "--wasm");
+    let wat = args.iter().any(|arg| arg == "--wat");
+    let rest: Vec<String> = args.iter().filter(|arg| *arg != "--wasm" && *arg != "--wat").cloned().collect();
+    let Some(flags) = flags(&rest) else {
         return usage();
     };
     let (Some(file), Some(target)) = (flags.file, flags.target) else {
@@ -718,11 +725,21 @@ fn emit_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
-    match emit::emit(&program, target) {
-        Ok(code) => {
+    let emitted = if wasm {
+        emit::wasm::emit(&program, target).map(|bytes| return_bytes(&bytes))
+    } else if wat {
+        emit::wasm::emit_text(&program, target).map(|text| {
+            print!("{text}");
+            ExitCode::SUCCESS
+        })
+    } else {
+        emit::emit(&program, target).map(|code| {
             print!("{code}");
             ExitCode::SUCCESS
-        }
+        })
+    };
+    match emitted {
+        Ok(code) => code,
         Err(error) => {
             eprintln!("{file}: error: {error}");
             ExitCode::from(FAILURE_EXIT)
