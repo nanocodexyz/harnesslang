@@ -1,0 +1,22 @@
+harness full_loop
+
+const rounds_max: u64 = 3
+const calls_max: u64 = 1
+const history_max: u64 = 64
+
+model think calls calls_max
+
+state {
+  history: list<entry, history_max>
+}
+
+on ask(question: text) -> text
+  requires len(history) + 1 + rounds_max <= history_max
+{
+  push history user(question)
+  loop round below rounds_max {
+    let reply = think(history)
+    push history assistant(reply)
+  }
+  return question
+}

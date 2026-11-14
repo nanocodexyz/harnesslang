@@ -726,7 +726,12 @@ impl<'a> Engine<'a> {
                 return self.block(&arm.body);
             }
             Stmt::Loop { index, bound, body } => {
-                for iteration in 0..bound.value {
+                let iterations = if self.mutation == Mutation::LoopPastBound {
+                    bound.value + 1
+                } else {
+                    bound.value
+                };
+                for iteration in 0..iterations {
                     self.locals[*index] = Some(Value::U64(iteration));
                     if let Flow::Return(value) = self.block(body)? {
                         return Ok(Flow::Return(value));

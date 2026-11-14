@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 
 seeds="${RUST_DIFF_SEEDS:-0..2000}"
 targets="${RUST_DIFF_TARGETS:-native-jsonl native-sqlite server-postgres}"
-files="${RUST_DIFF_FILES:-examples/agent.hl examples/minimal.hl examples/reviewer.hl examples/code_agent.hl examples/code_tasks.hl}"
+files="${RUST_DIFF_FILES:-$(echo examples/*.hl)}"
 opt="${RUST_DIFF_OPT:-2}"
 plant="${RUST_DIFF_PLANT:-none}"
 hl=target/release/hl
@@ -95,7 +95,7 @@ for target in $targets; do
     for file in $files; do
       diff_one "$file" "$target"
     done
-  ) > "$out/$target.log" 2>&1 &
+  ) > "$out/$target.$$.log" 2>&1 &
   pids+=($!)
 done
 failed=0
@@ -103,10 +103,11 @@ for pid in "${pids[@]}"; do
   wait "$pid" || failed=1
 done
 for target in $targets; do
-  cat "$out/$target.log"
+  cat "$out/$target.$$.log"
+  rm -f "$out/$target.$$.log"
 done
 if [ "$failed" -ne 0 ]; then
   echo "rust-diff: a differential run failed" >&2
   exit 1
 fi
-echo "rust-diff: generated Rust matches the interpreter on seeds $seeds of every example and target"
+echo "rust-diff: generated Rust matches the interpreter on seeds $seeds of $files on $targets"

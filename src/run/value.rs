@@ -364,11 +364,21 @@ pub fn state_json(program: &Program, state: &[Value]) -> Json {
     Json::Object(map)
 }
 
+static HASHED_CHECKPOINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn state_text_hashed(program: &Program, state: &[Value]) -> String {
-    let mut fields: std::collections::HashMap<&str, Json> = std::collections::HashMap::new();
-    for (field, value) in program.state.iter().zip(state) {
-        fields.insert(&field.name, to_json(program, &field.ty, value));
-    }
+    let mut fields: Vec<(&str, Json)> = program
+        .state
+        .iter()
+        .zip(state)
+        .map(|(field, value)| (field.name.as_str(), to_json(program, &field.ty, value)))
+        .collect();
+    let call = HASHED_CHECKPOINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fields.sort_by_key(|(name, _)| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&(call, name), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    });
     let entries: Vec<String> = fields
         .iter()
         .map(|(name, value)| format!("{}:{}", Json::text(name).encode(), value.encode()))

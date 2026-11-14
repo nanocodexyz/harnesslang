@@ -374,7 +374,7 @@ them with the property each must fail with.
 | `cell_limit_unchecked` | all | `cell_bounded` |
 | `vercel_nested_retry_redispatches` | vercel | `nested_external_once` |
 | `cell_gate_releases_early` | cloudflare | `nested_external_once` |
-| `postgres_cell_unfenced` | postgres | `nested_external_once` or `seq_unique`, whichever a seed reaches first |
+| `postgres_cell_unfenced` | postgres | `seq_unique` (an unfenced owner's rows lose a call its result follows) |
 
 ## Oracle
 
