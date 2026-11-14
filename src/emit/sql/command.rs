@@ -10,7 +10,7 @@ const FAILURE_EXIT: u8 = 1;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl sql render --target T [--mutation M] [--bare] GROUP [NAME=VALUE]...\n       hl sql batch --head H --turn T --turns K\n       hl sql replay --target T --seeds A..B [--mutation M] FILE\n       hl sql verify --target T --seeds A..B FILE DUMP\n  GROUP: connect|schema|acquire|load|commit; M: none|no_fence_predicate|seq_not_unique; --bare leaves out commit's BEGIN and COMMIT"
+        "usage: hl sql render --target T [--mutation M] [--bare] GROUP [NAME=VALUE]...\n       hl sql batch --head H --turn T --turns K\n       hl sql replay --target T --seeds A..B [--mutation M] FILE\n       hl sql verify --target T --seeds A..B FILE DUMP\n  GROUP: connect|schema|acquire|load|commit; M: none|no_fence_predicate|seq_not_unique; --bare leaves out commit's BEGIN and COMMIT; VALUE @PATH reads the value from a file"
     );
     ExitCode::from(USAGE_EXIT)
 }
@@ -89,6 +89,9 @@ pub fn run(args: &[String]) -> ExitCode {
         ("replay", Some(target), Some(seeds)) if flags.positional.len() == 1 => {
             finish(replay(target, mutation, seeds, &flags.positional[0]))
         }
+        ("decode", None, None) if flags.positional.len() == 1 => {
+            finish(decode(&flags.positional[0]))
+        }
         ("verify", Some(target), Some(seeds)) if flags.positional.len() == 2 => finish(verify(
             target,
             seeds,
@@ -124,22 +127,47 @@ fn render(target: Target, mutation: sql::Mutation, flags: &Flags) -> Result<Stri
         let (name, value) = assignment
             .split_once('=')
             .ok_or_else(|| format!("'{assignment}' is not NAME=VALUE"))?;
-        let param = statements
+        let value = match value.strip_prefix('@') {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|error| format!("parameter {name}: cannot read {path}: {error}"))?
+                .trim_end_matches('\n')
+                .to_owned(),
+            None => value.to_owned(),
+        };
+        let Some(param) = statements
             .iter()
             .flat_map(|statement| statement.params.iter())
             .find(|param| param.name == name)
-            .ok_or_else(|| format!("group {group} has no parameter '{name}'"))?;
+        else {
+            if unmutated_has(target, group, name)? {
+                continue;
+            }
+            return Err(format!("group {group} has no parameter '{name}'"));
+        };
         let literal = match param.ty {
             ParamType::Integer => Literal::Integer(
                 value
                     .parse()
                     .map_err(|_| format!("parameter {name}: '{value}' is not an integer"))?,
             ),
-            ParamType::Text | ParamType::Json => Literal::Text(value.to_owned()),
+            ParamType::Text | ParamType::Json => Literal::Text(value),
         };
         named.push((param.name, literal));
     }
     sql::render_all(&statements, &named)
+}
+
+fn unmutated_has(target: Target, group: &str, name: &str) -> Result<bool, String> {
+    let catalogue = sql::catalogue(target, sql::Mutation::None)?;
+    let statements: Vec<&sql::Statement> = match group {
+        "acquire" => vec![&catalogue.acquire],
+        "load" => vec![&catalogue.load],
+        "commit" => catalogue.commit.iter().collect(),
+        _ => Vec::new(),
+    };
+    Ok(statements
+        .iter()
+        .any(|statement| statement.params.iter().any(|param| param.name == name)))
 }
 
 fn batch(head: u64, turn: u64, turns: u64) -> Result<String, String> {
@@ -259,4 +287,13 @@ pub fn emit_listing(args: &[String]) -> ExitCode {
     finish(
         load(file).and_then(|program| crate::emit::sql::listing::emit(&program, target, mutation)),
     )
+}
+
+fn decode(dump: &str) -> Result<String, String> {
+    let text =
+        std::fs::read_to_string(dump).map_err(|error| format!("{dump}: cannot read: {error}"))?;
+    let (rows, sessions) = drill::check_dump(&text).map_err(|error| format!("{dump}: {error}"))?;
+    Ok(format!(
+        "decode: {rows} rows in {sessions} sessions decode, with contiguous seqs and matching session rows\n"
+    ))
 }

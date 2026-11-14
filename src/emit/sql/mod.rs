@@ -421,17 +421,17 @@ fn commit(dialect: Dialect, mutation: Mutation) -> Vec<Statement> {
     let rows = "json_each(@batch) AS b";
     let field = |name: &str| format!("json_extract(b.value, '$.{name}')");
     let (turn, kind, seq, record) = (field("turn"), field("kind"), field("seq"), field("record"));
-    let owner = owner_predicate("hl_sessions", mutation);
-    let fence = format!(
-        "UPDATE hl_sessions SET head = @head + json_array_length(@batch), lease_expires = {now} + @lease_ms, finished = COALESCE((SELECT max({turn}) FROM {rows} WHERE {kind} = 'status'), hl_sessions.finished), checkpoint = COALESCE((SELECT max({seq}) FROM {rows} WHERE {kind} = 'checkpoint'), hl_sessions.checkpoint) WHERE {owner} AND hl_sessions.head = @head AND (SELECT min({seq}) FROM {rows}) = @head + {FIRST_ROW_SEQ} AND (SELECT max({seq}) FROM {rows}) = @head + json_array_length(@batch)"
-    );
     let conflict = match dialect {
         Dialect::Sqlite => "INSERT OR ROLLBACK INTO",
         Dialect::DurableObject | Dialect::Postgres => "INSERT INTO",
     };
     let fenced_owner = owner_predicate("s", mutation);
     let insert = format!(
-        "{conflict} hl_journal (session, seq, epoch, turn, kind, record) SELECT @session, {seq}, (SELECT s.epoch FROM hl_sessions AS s WHERE {fenced_owner} AND s.head = @head + json_array_length(@batch)), {turn}, {kind}, {record} FROM {rows} ORDER BY b.key"
+        "{conflict} hl_journal (session, seq, epoch, turn, kind, record) SELECT @session, {seq}, (SELECT s.epoch FROM hl_sessions AS s WHERE {fenced_owner} AND s.head = @head AND (SELECT min({seq}) FROM {rows}) = @head + {FIRST_ROW_SEQ} AND (SELECT max({seq}) FROM {rows}) = @head + json_array_length(@batch)), {turn}, {kind}, {record} FROM {rows} ORDER BY b.key"
+    );
+    let owner = owner_predicate("hl_sessions", mutation);
+    let advance = format!(
+        "UPDATE hl_sessions SET head = @head + json_array_length(@batch), lease_expires = {now} + @lease_ms, finished = COALESCE((SELECT max({turn}) FROM {rows} WHERE {kind} = 'status'), hl_sessions.finished), checkpoint = COALESCE((SELECT max({seq}) FROM {rows} WHERE {kind} = 'checkpoint'), hl_sessions.checkpoint) WHERE {owner} AND hl_sessions.head = @head AND (SELECT count(*) FROM hl_journal AS j WHERE j.session = @session AND j.seq > @head) = json_array_length(@batch)"
     );
     let unfenced: &[&str] = if mutation == Mutation::NoFencePredicate {
         &[EPOCH.name]
@@ -451,17 +451,17 @@ fn commit(dialect: Dialect, mutation: Mutation) -> Vec<Statement> {
         ));
     }
     statements.push(Statement::new(
-        "fence",
-        dialect,
-        fence,
-        &without(&params, unfenced),
-        &[],
-    ));
-    statements.push(Statement::new(
         "insert",
         dialect,
         insert,
         &without(&params, &insert_dropped),
+        &[],
+    ));
+    statements.push(Statement::new(
+        "advance",
+        dialect,
+        advance,
+        &without(&params, unfenced),
         &[],
     ));
     if dialect == Dialect::Sqlite {

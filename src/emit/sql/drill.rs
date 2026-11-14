@@ -340,3 +340,63 @@ pub fn check_dump_line(line: &str) -> Result<(), String> {
         )),
     }
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionRows {
+    seqs: Vec<u64>,
+    finished: u64,
+    checkpoint: u64,
+    session: Option<[u64; 3]>,
+}
+
+fn dump_number(field: &str, what: &str) -> Result<u64, String> {
+    field
+        .parse()
+        .map_err(|_| format!("{what} '{field}' is not a number"))
+}
+
+pub fn check_dump(text: &str) -> Result<(u64, u64), String> {
+    let mut sessions: BTreeMap<String, SessionRows> = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        check_dump_line(line).map_err(|error| format!("line {}: {error}", index + 1))?;
+        let fields: Vec<&str> = line.split(DUMP_SEPARATOR).collect();
+        let entry = sessions.entry(fields[1].to_owned()).or_default();
+        if fields[0] == "session" {
+            let numbers = [
+                dump_number(fields[3], "head")?,
+                dump_number(fields[4], "finished")?,
+                dump_number(fields[5], "checkpoint")?,
+            ];
+            entry.session = Some(numbers);
+            continue;
+        }
+        let seq = dump_number(fields[2], "seq")?;
+        entry.seqs.push(seq);
+        match fields[5] {
+            "status" => entry.finished = entry.finished.max(dump_number(fields[4], "turn")?),
+            "checkpoint" => entry.checkpoint = entry.checkpoint.max(seq),
+            _ => {}
+        }
+    }
+    let mut rows = 0;
+    for (name, entry) in &mut sessions {
+        entry.seqs.sort_unstable();
+        for (index, seq) in entry.seqs.iter().enumerate() {
+            if *seq != index as u64 + sql::FIRST_ROW_SEQ {
+                return Err(format!(
+                    "session {name}: row {} has seq {seq}; seqs must run 1, 2, 3, ... without gaps or repeats",
+                    index + 1
+                ));
+            }
+        }
+        let found = [entry.seqs.len() as u64, entry.finished, entry.checkpoint];
+        if entry.session != Some(found) {
+            return Err(format!(
+                "session {name}: the session row says head, finished, checkpoint = {:?}, its rows say {found:?}",
+                entry.session
+            ));
+        }
+        rows += entry.seqs.len() as u64;
+    }
+    Ok((rows, sessions.len() as u64))
+}
