@@ -1,0 +1,21 @@
+harness branch_overflow
+
+const small: u64 = 5
+const large: u64 = 18446744073709551610
+const offset_max: u64 = 10
+
+state {
+  base: u64
+  offset: u64
+}
+
+on shift(wide: bool) -> u64
+  requires offset <= offset_max
+{
+  if wide {
+    base = large
+  } else {
+    base = small
+  }
+  return base + offset
+}

@@ -1,0 +1,12 @@
+harness invariant_unsupported
+
+state {
+  ready: bool
+}
+
+invariant disarmed: not ready
+
+on arm(note: text) -> bool {
+  ready = true
+  return ready
+}

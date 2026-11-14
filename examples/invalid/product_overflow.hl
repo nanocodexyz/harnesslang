@@ -1,0 +1,22 @@
+harness product_overflow
+
+tool count(path: text) -> u64 effect none
+
+state {
+  area: u64
+}
+
+on measure(width: text, height: text) -> u64 {
+  match count(width) {
+    ok(across) => {
+      match count(height) {
+        ok(down) => {
+          area = across * down
+          return area
+        }
+        failed(error) => { return 0 }
+      }
+    }
+    failed(error) => { return 0 }
+  }
+}

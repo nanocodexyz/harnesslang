@@ -1,0 +1,20 @@
+harness push_early_return
+
+const steps_max: u64 = 10
+const log_max: u64 = 5
+
+state {
+  log: list<text, log_max>
+}
+
+on run(note: text, stop: u64) -> u64
+  requires len(log) == 0
+{
+  loop step below steps_max {
+    if step == stop {
+      return step
+    }
+    push log note
+  }
+  return steps_max
+}

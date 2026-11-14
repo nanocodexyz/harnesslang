@@ -1,0 +1,17 @@
+harness push_self_iteration
+
+const history_max: u64 = 64
+
+state {
+  history: list<text, history_max>
+}
+
+on echo(note: text) -> u64
+  requires len(history) + len(history) <= history_max
+{
+  push history note
+  for item in history {
+    push history item
+  }
+  return len(history)
+}

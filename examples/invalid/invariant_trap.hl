@@ -1,0 +1,23 @@
+harness invariant_trap
+
+const calls_max: u64 = 4
+const history_max: u64 = 16
+
+model think calls calls_max
+
+state {
+  history: list<entry, history_max>
+  busy: u64
+}
+
+invariant idle: busy == 0
+
+on ask(question: text) -> text {
+  busy = busy + 1
+  let reply = think(history)
+  busy = busy - 1
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => { return "tools are not supported" }
+  }
+}

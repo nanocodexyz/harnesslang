@@ -1,0 +1,12 @@
+harness underflow_elapsed
+
+state {
+  elapsed: u64
+}
+
+on time(note: text) -> u64 {
+  let started = now()
+  let finished = now()
+  elapsed = finished - started
+  return elapsed
+}

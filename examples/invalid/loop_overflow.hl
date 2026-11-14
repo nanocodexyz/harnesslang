@@ -1,0 +1,17 @@
+harness loop_overflow
+
+const steps_max: u64 = 8
+const step_cost: u64 = 3000000000000000000
+
+state {
+  spent: u64
+}
+
+on spend(note: text) -> u64
+  requires spent == 0
+{
+  loop step below steps_max {
+    spent = spent + step_cost
+  }
+  return spent
+}

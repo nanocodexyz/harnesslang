@@ -1,0 +1,13 @@
+harness invariant_initial
+
+const turns_min: u64 = 1
+
+state {
+  turns: u64
+}
+
+invariant started: turns >= turns_min
+
+on ping(note: text) -> u64 {
+  return turns
+}

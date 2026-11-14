@@ -78,6 +78,7 @@ fi
 echo "sim: every example passes seeds $seeds on every target, and agent.hl seeds $twice_seeds twice"
 
 scripts/mutations.sh
+scripts/prove-mutations.sh
 if [ "${HL_ORACLE:-0}" = 1 ]; then
   scripts/oracle.sh
 fi

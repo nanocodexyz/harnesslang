@@ -1,0 +1,22 @@
+harness invariant_return
+
+const outer_max: u64 = 1000
+const inner_max: u64 = 1000
+const count_max: u64 = 999999
+
+state {
+  count: u64
+}
+
+invariant count_bounded: count <= count_max
+
+on tally(note: text) -> u64
+  requires count == 0
+{
+  loop row below outer_max {
+    loop column below inner_max {
+      count = count + 1
+    }
+  }
+  return count
+}

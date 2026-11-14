@@ -1,0 +1,32 @@
+harness push_unbounded
+
+const steps_max: u64 = 8
+const calls_max: u64 = 4
+const history_max: u64 = 256
+
+model think calls calls_max
+
+state {
+  history: list<entry, history_max>
+}
+
+on ask(question: text) -> text {
+  push history user(question)
+  loop step below steps_max {
+    let reply = think(history)
+    push history assistant(reply)
+    match reply {
+      answer(words) => { return words }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push history result(call, output) }
+            failed(error) => { push history error(call, error) }
+            unknown => { push history unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return "no answer within steps_max"
+}

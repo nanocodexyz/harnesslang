@@ -1,0 +1,10 @@
+harness overflow_counter
+
+state {
+  turns: u64
+}
+
+on ping(note: text) -> u64 {
+  turns = turns + 1
+  return turns
+}
