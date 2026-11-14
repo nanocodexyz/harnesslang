@@ -1,0 +1,14 @@
+harness unchecked_external
+
+const calls_max: u64 = 4
+
+tool bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+on run(command: text) -> text {
+  match bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+  }
+}

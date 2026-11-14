@@ -98,6 +98,13 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn bound(&mut self, what: &str) -> Parsed<Name> {
+        if let Token::Number(value) = self.peek().token {
+            return Err(Diagnostic::new(self.at(), format!("{what} must be a named constant, found number {value}")));
+        }
+        self.name(&format!("a named constant for {what}"))
+    }
+
     fn enter(&mut self) -> Parsed<()> {
         if self.depth >= NESTING_DEPTH_MAX {
             return Err(Diagnostic::new(
@@ -211,7 +218,7 @@ impl<'a> Parser<'a> {
         self.word("model")?;
         let name = self.name("a model name")?;
         self.word("calls")?;
-        let calls = self.name("the constant bounding the calls in one reply")?;
+        let calls = self.bound("the calls in one model reply")?;
         Ok(Model { name, calls })
     }
 
@@ -272,8 +279,11 @@ impl<'a> Parser<'a> {
             self.advance();
             self.symbol(Symbol::Less)?;
             let element = Box::new(self.type_expr()?);
+            if self.is_symbol(Symbol::Greater) {
+                return Err(Diagnostic::new(self.at(), "a list needs a capacity: write list<T, constant>"));
+            }
             self.symbol(Symbol::Comma)?;
-            let capacity = self.name("the constant bounding the list's capacity")?;
+            let capacity = self.bound("a list's capacity")?;
             self.symbol(Symbol::Greater)?;
             TypeExpr::List {
                 at,
@@ -340,7 +350,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let name = self.name("a loop name")?;
                 self.word("below")?;
-                let bound = self.name("the constant bounding the loop")?;
+                let bound = self.bound(&format!("the bound of loop '{}'", name.text))?;
                 let body = self.block()?;
                 Ok(Stmt::Loop {
                     at,
@@ -527,7 +537,12 @@ impl<'a> Parser<'a> {
         let mut expr = self.primary()?;
         while self.is_symbol(Symbol::Dot) {
             self.advance();
-            let field = self.name("a field name")?;
+            let at = self.at();
+            let Token::Name(text) = self.peek().token.clone() else {
+                return Err(self.unexpected("a field name"));
+            };
+            self.advance();
+            let field = Name { text, at };
             expr = Expr::Member {
                 base: Box::new(expr),
                 field,

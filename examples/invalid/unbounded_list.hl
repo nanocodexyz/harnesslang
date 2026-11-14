@@ -1,0 +1,14 @@
+harness unbounded_list
+
+const calls_max: u64 = 4
+
+model infer calls calls_max
+
+state {
+  context: list<entry>
+}
+
+on prompt(input: text) -> text {
+  push context user(input)
+  return input
+}

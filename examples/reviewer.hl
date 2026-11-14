@@ -1,0 +1,97 @@
+harness reviewer
+
+const rounds_max: u64 = 6
+const calls_per_round_max: u64 = 8
+const notes_max: u64 = 1024
+const links_max: u64 = 64
+const review_budget_ms: u64 = 600000
+
+type verdict = approved(text, u64) | changes(text, u64) | abandoned(text)
+
+tool diff(change: text) -> text effect none
+tool lint(change: text, strict: bool) -> u64 effect none
+tool label(change: text, name: text) -> bool effect idempotent
+tool comment(change: text, body: text) -> text effect external
+
+model review calls calls_per_round_max
+
+state {
+  notes: list<entry, notes_max>
+  links: list<text, links_max>
+  reviewed: u64
+  salt: u64
+}
+
+on review_change(change: text, strict: bool) -> verdict {
+  let started = now()
+  salt = random()
+  reviewed = reviewed + 1
+  match diff(change) {
+    ok(body) => { push notes user(body) }
+    failed(error) => { return abandoned(error) }
+  }
+  match lint(change, strict) {
+    ok(issues) => {
+      if issues > 0 and strict {
+        match label(change, "needs-work") {
+          ok(applied) => {
+            if applied { push notes user("labelled needs-work") }
+          }
+          failed(error) => { push notes user("label failed: " ++ error) }
+        }
+      } else if not strict {
+        push notes user("lint is advisory")
+      }
+    }
+    failed(error) => { push notes user("lint failed: " ++ error) }
+  }
+  loop round below rounds_max {
+    let reply = review(notes)
+    push notes assistant(reply)
+    match reply {
+      answer(words) => {
+        let finished = now()
+        if finished - started > review_budget_ms {
+          return changes("over budget: " ++ words, round)
+        }
+        if round == 0 {
+          return approved(words, round)
+        }
+        return changes(words, round + 1)
+      }
+      calls(requested) => {
+        for call in requested {
+          if call.tool == "comment" {
+            match comment(change, call.input) {
+              ok(link) => {
+                push links link
+                push notes result(call, link)
+              }
+              failed(error) => { push notes error(call, error) }
+              unknown => { push notes unknown(call) }
+            }
+          } else {
+            match dispatch(call) {
+              ok(output) => { push notes result(call, output) }
+              failed(error) => { push notes error(call, error) }
+              unknown => { push notes unknown(call) }
+            }
+          }
+        }
+      }
+    }
+  }
+  return abandoned("no verdict within rounds_max")
+}
+
+on summarize(heading: text) -> text {
+  push notes user(heading)
+  for link in links {
+    push notes user("posted " ++ link)
+  }
+  let checked = now()
+  if checked >= 0 and reviewed != 0 {
+    return heading ++ ": reviewed"
+  }
+  return heading ++ ": nothing reviewed"
+}

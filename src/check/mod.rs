@@ -324,11 +324,12 @@ fn state(
         seen_state = Some(state.at);
         for field in &state.fields {
             claim(values, &field.name, "state field")?;
+            let ty = resolve(program, globals, &field.ty)?;
+            if crate::run::value::Value::zero(&ty).is_none() {
+                return error(field.ty.at(), format!("state field '{}' has no initial value: state fields are u64, bool, text or lists", field.name.text));
+            }
             globals.fields.insert(field.name.text.clone(), program.state.len());
-            program.state.push(ir::Field {
-                name: field.name.text.clone(),
-                ty: resolve(program, globals, &field.ty)?,
-            });
+            program.state.push(ir::Field { name: field.name.text.clone(), ty });
         }
     }
     Ok(())

@@ -1,0 +1,15 @@
+harness unknown_name
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+model infer calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on prompt(input: text) -> text {
+  push context user(inpt)
+  return input
+}
