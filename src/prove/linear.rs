@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use crate::prove::linear::system::{
-    Dense, Hashing, MultiplyRotate, Row, cheapest, contradiction, dense, eliminate, project_rows,
+    Dense, Hashing, MultiplyRotate, Row, Scratch, cheapest, contradiction, dense, eliminate,
+    project_rows,
 };
 
 pub type Var = usize;
@@ -33,6 +34,7 @@ pub struct Budget {
     constraints_max: usize,
     memo: Memo,
     memo_entries_max: usize,
+    scratch: Scratch,
 }
 
 impl Budget {
@@ -42,6 +44,7 @@ impl Budget {
             constraints_max,
             memo: Memo::default(),
             memo_entries_max,
+            scratch: Scratch::default(),
         }
     }
 
@@ -56,17 +59,35 @@ impl Budget {
 
 pub fn floor_div(numerator: i128, denominator: i128) -> i128 {
     assert!(denominator > 0, "floor division by a positive number");
+    if denominator == 1 {
+        return numerator;
+    }
     numerator.div_euclid(denominator)
 }
 
 pub fn ceil_div(numerator: i128, denominator: i128) -> Option<i128> {
     assert!(denominator > 0, "ceiling division by a positive number");
+    if denominator == 1 {
+        return numerator.checked_neg().map(|_| numerator);
+    }
     Some(-(numerator.checked_neg()?.div_euclid(denominator)))
 }
 
 pub(super) fn gcd(mut left: i128, mut right: i128) -> i128 {
     left = left.abs();
     right = right.abs();
+    if let (Ok(small_left), Ok(small_right)) = (u64::try_from(left), u64::try_from(right)) {
+        return i128::from(gcd_words(small_left, small_right));
+    }
+    while right != 0 {
+        let rest = left % right;
+        left = right;
+        right = rest;
+    }
+    left
+}
+
+fn gcd_words(mut left: u64, mut right: u64) -> u64 {
     while right != 0 {
         let rest = left % right;
         left = right;
@@ -239,7 +260,8 @@ fn projected_rows(
     keep: &BTreeSet<Var>,
     budget: &mut Budget,
 ) -> Result<Vec<Row>, Unsure> {
-    budget.projected(dense(constraints)?, keep)
+    let system = dense(constraints, &mut budget.scratch)?;
+    budget.projected(system, keep)
 }
 
 pub fn project(
@@ -356,7 +378,7 @@ fn candidate(
     constraints: &[Linear],
     budget: &mut Budget,
 ) -> Result<Option<BTreeMap<Var, i128>>, Unsure> {
-    let Dense { mut rows, names } = dense(constraints)?;
+    let Dense { mut rows, names } = dense(constraints, &mut budget.scratch)?;
     let vars = names.len();
     let mut stages = Vec::with_capacity(vars);
     let mut remaining: Vec<Var> = (0..vars).collect();
@@ -364,7 +386,7 @@ fn candidate(
         if contradiction(&rows) {
             return Ok(None);
         }
-        let Some(var) = cheapest(&rows, &remaining, vars) else {
+        let Some(var) = cheapest(&rows, &remaining, vars, &mut budget.scratch) else {
             break;
         };
         remaining.retain(|candidate| *candidate != var);

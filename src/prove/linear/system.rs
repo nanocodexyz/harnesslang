@@ -88,7 +88,13 @@ impl Row {
     }
 
     pub fn normalized(mut self) -> Option<Self> {
-        let divisor = self.terms.iter().fold(0, |acc, term| gcd(acc, term.1));
+        let mut divisor = 0;
+        for term in &self.terms {
+            divisor = gcd(divisor, term.1);
+            if divisor == 1 {
+                return Some(self);
+            }
+        }
         if divisor > 1 {
             for term in &mut self.terms {
                 term.1 /= divisor;
@@ -184,29 +190,90 @@ pub fn contradiction(rows: &[Row]) -> bool {
     rows.iter().any(Row::absurd)
 }
 
-pub fn subsume(mut rows: Vec<Row>, vars: usize) -> Vec<Row> {
-    rows.sort_unstable();
-    let mut strongest: Vec<Row> = Vec::with_capacity(rows.len());
-    for row in rows {
-        match strongest.last_mut() {
-            Some(last) if last.terms == row.terms => {
-                last.constant = last.constant.max(row.constant)
-            }
-            _ => strongest.push(row),
-        }
+fn keep_strongest(strongest: &mut Vec<Row>, row: Row) {
+    match strongest.last_mut() {
+        Some(last) if last.terms == row.terms => last.constant = last.constant.max(row.constant),
+        _ => strongest.push(row),
     }
-    let bounds = boxed(&strongest, vars);
-    strongest.retain(|row| row.terms.len() < 2 || !box_implies(&bounds, row));
+}
+
+#[derive(Default)]
+pub struct Scratch {
+    bounds: Vec<Interval>,
+    touched: Vec<Var>,
+    counts: Vec<(usize, usize)>,
+}
+
+fn unboxed(mut strongest: Vec<Row>, vars: usize, scratch: &mut Scratch) -> Vec<Row> {
+    if strongest.iter().all(|row| row.terms.len() < 2) {
+        return strongest;
+    }
+    boxed(&strongest, vars, scratch);
+    let bounds = &scratch.bounds;
+    strongest.retain(|row| row.terms.len() < 2 || !box_implies(bounds, row));
+    for var in scratch.touched.drain(..) {
+        scratch.bounds[var] = (None, None);
+    }
     strongest
 }
 
-fn boxed(rows: &[Row], vars: usize) -> Vec<Interval> {
-    let mut bounds: Vec<Interval> = vec![(None, None); vars];
+pub fn subsume(mut rows: Vec<Row>, vars: usize, scratch: &mut Scratch) -> Vec<Row> {
+    rows.sort_unstable();
+    let mut strongest: Vec<Row> = Vec::with_capacity(rows.len());
+    for row in rows {
+        keep_strongest(&mut strongest, row);
+    }
+    unboxed(strongest, vars, scratch)
+}
+
+fn subsume_merged(
+    kept: Vec<Row>,
+    mut combined: Vec<Row>,
+    vars: usize,
+    scratch: &mut Scratch,
+) -> Vec<Row> {
+    assert!(
+        kept.is_sorted(),
+        "the rows an elimination keeps are already sorted"
+    );
+    combined.sort_unstable();
+    let mut strongest: Vec<Row> = Vec::with_capacity(kept.len() + combined.len());
+    let mut kept = kept.into_iter().peekable();
+    let mut combined = combined.into_iter().peekable();
+    let rows_max = kept.len() + combined.len();
+    for _ in 0..rows_max {
+        let take_kept = match (kept.peek(), combined.peek()) {
+            (Some(left), Some(right)) => left <= right,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let next = if take_kept {
+            kept.next()
+        } else {
+            combined.next()
+        };
+        keep_strongest(&mut strongest, next.expect("a row is left to merge"));
+    }
+    unboxed(strongest, vars, scratch)
+}
+
+fn boxed(rows: &[Row], vars: usize, scratch: &mut Scratch) {
+    if scratch.bounds.len() < vars {
+        scratch.bounds.resize(vars, (None, None));
+    }
+    assert!(scratch.touched.is_empty(), "the box starts empty");
     for row in rows {
         let [(var, coefficient)] = row.terms[..] else {
             continue;
         };
-        let entry = &mut bounds[var];
+        if scratch.touched.last() != Some(&var) {
+            assert!(
+                scratch.bounds[var] == (None, None),
+                "single-term rows of one variable are adjacent"
+            );
+            scratch.touched.push(var);
+        }
+        let entry = &mut scratch.bounds[var];
         if coefficient > 0 {
             let Some(negated) = row.constant.checked_neg() else {
                 continue;
@@ -217,7 +284,6 @@ fn boxed(rows: &[Row], vars: usize) -> Vec<Interval> {
             entry.0 = Some(entry.0.map_or(low, |current| current.max(low)));
         }
     }
-    bounds
 }
 
 fn box_implies(bounds: &[Interval], row: &Row) -> bool {
@@ -239,7 +305,7 @@ fn box_implies(bounds: &[Interval], row: &Row) -> bool {
     highest <= 0
 }
 
-pub fn prepare(rows: Vec<Row>, vars: usize) -> Result<Vec<Row>, Unsure> {
+pub fn prepare(rows: Vec<Row>, vars: usize, scratch: &mut Scratch) -> Result<Vec<Row>, Unsure> {
     let mut prepared = Vec::with_capacity(rows.len());
     for row in rows {
         let row = row.normalized().ok_or(Unsure::Overflow)?;
@@ -247,7 +313,7 @@ pub fn prepare(rows: Vec<Row>, vars: usize) -> Result<Vec<Row>, Unsure> {
             prepared.push(row);
         }
     }
-    Ok(subsume(prepared, vars))
+    Ok(subsume(prepared, vars, scratch))
 }
 
 pub fn eliminate(
@@ -267,6 +333,7 @@ pub fn eliminate(
         }
     }
     let pairs = above.len() * below.len();
+    let mut fresh = Vec::with_capacity(pairs);
     let mut distinct: Option<HashSet<Row, Hashing>> =
         (kept.len() + pairs > budget.constraints_max).then(|| kept.iter().cloned().collect());
     for (upper, upper_coefficient) in &above {
@@ -288,14 +355,21 @@ pub fn eliminate(
                     return Err(Unsure::Budget);
                 }
             }
-            kept.push(combined);
+            fresh.push(combined);
         }
     }
-    Ok(subsume(kept, vars))
+    Ok(subsume_merged(kept, fresh, vars, &mut budget.scratch))
 }
 
-pub fn cheapest(rows: &[Row], candidates: &[Var], vars: usize) -> Option<Var> {
-    let mut counts = vec![(0_usize, 0_usize); vars];
+pub fn cheapest(
+    rows: &[Row],
+    candidates: &[Var],
+    vars: usize,
+    scratch: &mut Scratch,
+) -> Option<Var> {
+    let counts = &mut scratch.counts;
+    counts.clear();
+    counts.resize(vars, (0, 0));
     for row in rows {
         for (var, coefficient) in &row.terms {
             if *coefficient > 0 {
@@ -322,7 +396,7 @@ pub fn project_rows(
         if contradiction(&rows) {
             break;
         }
-        let Some(var) = cheapest(&rows, &doomed, vars) else {
+        let Some(var) = cheapest(&rows, &doomed, vars, &mut budget.scratch) else {
             break;
         };
         doomed.retain(|candidate| *candidate != var);
@@ -336,11 +410,11 @@ pub struct Dense {
     pub names: Vec<Var>,
 }
 
-pub fn dense(constraints: &[Linear]) -> Result<Dense, Unsure> {
+pub fn dense(constraints: &[Linear], scratch: &mut Scratch) -> Result<Dense, Unsure> {
     let rows: Vec<Row> = constraints.iter().map(Row::of).collect();
     let names = variables(&rows);
     let renamed = rows.iter().map(|row| row.renamed(&names)).collect();
-    let prepared = prepare(renamed, names.len())?;
+    let prepared = prepare(renamed, names.len(), scratch)?;
     let present = variables(&prepared);
     if present.len() == names.len() {
         return Ok(Dense {
