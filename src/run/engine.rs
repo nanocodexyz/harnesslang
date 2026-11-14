@@ -372,6 +372,7 @@ pub struct Engine<'a> {
     discovered: BTreeMap<ir::ListingId, BTreeSet<String>>,
     blobs: Blobs,
     snapshot: Option<Vec<Value>>,
+    fork_base: Option<crate::run::session::Session>,
 }
 
 enum Flow {
@@ -436,6 +437,7 @@ impl<'a> Engine<'a> {
             discovered: BTreeMap::new(),
             blobs: Blobs::default(),
             snapshot: None,
+            fork_base: None,
         }
     }
 
@@ -445,6 +447,15 @@ impl<'a> Engine<'a> {
             "only a program with side handlers keeps the snapshot a side question reads"
         );
         self.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn with_fork_base(mut self, session: crate::run::session::Session) -> Self {
+        assert!(
+            self.program.forks(),
+            "only a program with fork tools keeps the journal a fork reads"
+        );
+        self.fork_base = Some(session);
         self
     }
 
@@ -1093,7 +1104,7 @@ impl<'a> Engine<'a> {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
                 let site = site.clone();
-                values[index] = Some(self.settle(&site, &call, &output)?);
+                values[index] = Some(self.settle(&site, &recorded, &output)?);
                 Ok(None)
             }
             Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
@@ -1123,12 +1134,13 @@ impl<'a> Engine<'a> {
                 Ok(Some(Pending {
                     index,
                     seq,
-                    call,
+                    call: recorded,
                     reopened: true,
                 }))
             }
             None => {
                 self.require_live(seq)?;
+                let call = self.fork_call(seq, call)?;
                 self.append(Record::Call {
                     turn: self.turn,
                     seq,
@@ -1602,7 +1614,7 @@ impl<'a> Engine<'a> {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
                 let site = site.clone();
-                self.settle(&site, &call, &output)
+                self.settle(&site, &recorded, &output)
             }
             Some(SiteLog::Reply(response, recorded)) => {
                 if site.kind != SiteKind::Model {
@@ -1621,13 +1633,13 @@ impl<'a> Engine<'a> {
             Some(SiteLog::Unknown(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 if !site.result.reports_unknown(self.program) {
-                    return self.reopen(site_id, seq, call, &args);
+                    return self.reopen(site_id, seq, recorded, &args);
                 }
                 Ok(Value::Variant(ir::UNKNOWN, Vec::new()))
             }
             Some(SiteLog::Open(recorded)) => {
                 self.same(seq, &recorded, &call)?;
-                self.reopen(site_id, seq, call, &args)
+                self.reopen(site_id, seq, recorded, &args)
             }
             None => {
                 self.require_live(seq)?;
@@ -1635,6 +1647,7 @@ impl<'a> Engine<'a> {
                 if site.kind == SiteKind::Model {
                     return self.execute(site_id, seq, &call, &args);
                 }
+                let call = self.fork_call(seq, call)?;
                 self.append(Record::Call {
                     turn: self.turn,
                     seq,
@@ -2464,6 +2477,9 @@ impl<'a> Engine<'a> {
     }
 
     fn gate(&self, site: &Site, call: &Call) -> Result<Option<String>, String> {
+        if let Some(refused) = self.fork_refused(call) {
+            return Err(refused);
+        }
         if site.kind != SiteKind::Dispatch {
             return Ok(None);
         }
@@ -2476,6 +2492,9 @@ impl<'a> Engine<'a> {
             && self.mutation != Mutation::InputUnchecked
         {
             return Err(error);
+        }
+        if let Some(refused) = self.fork_refused(call) {
+            return Err(refused);
         }
         let Some((listing, name)) = self.program.listed(&call.tool) else {
             return Ok(None);
@@ -2618,13 +2637,60 @@ impl<'a> Engine<'a> {
         if recorded.tool != call.tool {
             return Err(self.diverged(seq, &recorded.tool, &call.tool));
         }
-        if recorded.effect != call.effect || recorded.input != call.input {
+        let input = match self.program.fork_of(&recorded.tool) {
+            Some(at) => crate::run::fork::request_of(at, &recorded.input),
+            None => recorded.input.clone(),
+        };
+        if recorded.effect != call.effect || input != call.input {
             return Err(Halt::Exit(Exit::Corrupt(format!(
                 "replay of turn {} diverged at seq {seq}: tool '{}' was recorded with another class or input",
                 self.turn, call.tool
             ))));
         }
         Ok(())
+    }
+
+    fn fork_call(&mut self, seq: u64, call: Call) -> Result<Call, Halt> {
+        let Some(at) = self.program.fork_of(&call.tool) else {
+            return Ok(call);
+        };
+        if !matches!(call.input, Json::Object(_)) {
+            return Ok(call);
+        }
+        let base = self
+            .fork_base
+            .as_ref()
+            .expect("a live turn of a program with fork tools keeps the journal a fork reads");
+        let Ok(selected) =
+            crate::run::fork::select(base, crate::run::fork::requested(at, &call.input))
+        else {
+            return Ok(call);
+        };
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("a fork's input is filled only where its call is written");
+        };
+        let origin = ir::scoped_spawn_key(&world.scope(), self.turn, seq);
+        let setup = Setup {
+            program: self.program,
+            target: self.target,
+            mutation: self.mutation,
+        };
+        let payload =
+            crate::run::fork::entry_payload(setup, base, &selected, &origin, Some(&self.state))
+                .map_err(Halt::Exit)?;
+        Ok(Call {
+            input: crate::run::fork::input(&selected, &origin, payload),
+            ..call
+        })
+    }
+
+    fn fork_refused(&self, call: &Call) -> Option<String> {
+        let at = self.program.fork_of(&call.tool)?;
+        if !matches!(call.input, Json::Object(_)) || call.input.get(ir::FORK_STATE).is_some() {
+            return None;
+        }
+        let turn = crate::run::fork::requested(at, &call.input).unwrap_or(0);
+        Some(ir::fork_missing(turn))
     }
 
     fn diverged(&self, seq: u64, recorded: &str, running: &str) -> Halt {
@@ -2759,7 +2825,9 @@ pub fn spawn_output(
     tool: &str,
     output: Output,
 ) -> Output {
-    if !matches!(output, Output::Ok(_)) || program.spawn_of(tool).is_none() {
+    if !matches!(output, Output::Ok(_))
+        || (program.spawn_of(tool).is_none() && program.fork_of(tool).is_none())
+    {
         return output;
     }
     let key = match mutation {

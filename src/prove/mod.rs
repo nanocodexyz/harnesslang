@@ -233,8 +233,8 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
 
 fn spawning(program: &Program, kind: crate::ir::SiteKind) -> bool {
     match kind {
-        crate::ir::SiteKind::Tool(tool) => program.tools[tool].spawn.is_some(),
-        crate::ir::SiteKind::Dispatch => program.spawns().next().is_some(),
+        crate::ir::SiteKind::Tool(tool) => program.starts_sessions(&program.tools[tool]),
+        crate::ir::SiteKind::Dispatch => program.spawns().next().is_some() || program.forks(),
         _ => false,
     }
 }
@@ -296,7 +296,11 @@ fn planned_tree(
     if spawns == 0 {
         return Some(tree);
     }
-    let mut widest = PlannedTree::default();
+    let mut widest = PlannedTree {
+        records: 0,
+        requests: 0,
+        sessions: u64::from(program.forks()),
+    };
     for (tool, spawn) in program.spawns() {
         let child_program = &spawn.program;
         let child_plan = lower::lower(child_program, model, descent.mutation);

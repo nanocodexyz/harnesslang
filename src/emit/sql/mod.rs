@@ -486,7 +486,7 @@ pub fn record_kind(record: &Record) -> &'static str {
         Record::Model { .. } => 3,
         Record::Recovery { .. } => 4,
         Record::Status { .. } => 5,
-        Record::Checkpoint { .. } => 6,
+        Record::Checkpoint { .. } | Record::Host { .. } => 6,
         Record::Cell { .. } => 7,
         Record::Event { .. } => 8,
     };
@@ -496,6 +496,7 @@ pub fn record_kind(record: &Record) -> &'static str {
 pub fn record_turn(record: &Record) -> u64 {
     match record {
         Record::Checkpoint { revision, .. } => *revision,
+        Record::Host { .. } => crate::run::session::ENTRY_REVISION,
         Record::Cell { .. } => {
             panic!("emit refuses programs with code tools, so no cell record reaches sql")
         }

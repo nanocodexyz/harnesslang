@@ -217,6 +217,48 @@ pub fn run<H: SideHost + ?Sized>(
     Ok((answer, scratch.records))
 }
 
+struct NoHost;
+
+impl SideHost for NoHost {
+    fn side_tool(&mut self, _request: &ToolRequest<'_>) -> Output {
+        panic!("the checker refuses every effect in on forked: a tool")
+    }
+
+    fn side_model(&mut self, _request: &ModelRequest<'_>) -> Json {
+        panic!("the checker refuses every effect in on forked: the model")
+    }
+}
+
+pub fn run_hook(
+    setup: Setup<'_>,
+    hook: &crate::ir::Handler,
+    state: Vec<Value>,
+    arguments: &[Value],
+) -> Result<Vec<Value>, Exit> {
+    assert!(hook.sites.is_empty(), "a state hook runs no effect");
+    let log = TurnLog::new(hook.name.clone(), Json::Null);
+    let mut host = NoHost;
+    let mut scratch = Scratch {
+        host: &mut host,
+        records: Vec::new(),
+        answered: None,
+    };
+    let mode = Mode::Live {
+        world: &mut scratch,
+        epoch: 0,
+    };
+    let ran = Engine::new(setup, hook, mode, SIDE_TURN, state, &log).run(arguments)?;
+    let End::Finished(finish) = ran.end else {
+        panic!("{REFUSED}: a state hook never suspends");
+    };
+    assert_eq!(
+        finish.outcome,
+        Outcome::Completed,
+        "the prover keeps a state hook from trapping"
+    );
+    Ok(ran.state)
+}
+
 pub fn last_finished(session: &Session) -> u64 {
     session
         .turns

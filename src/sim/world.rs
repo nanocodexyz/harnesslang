@@ -148,6 +148,7 @@ pub struct Stats {
     pub events: Option<u64>,
     pub entry_states: u64,
     pub children: u64,
+    pub forks: u64,
     pub joined: u64,
     pub child_crashes: u64,
     pub side_questions: u64,
@@ -1354,6 +1355,7 @@ impl SimWorld<'_> {
             ))
         };
         let output = self.spawn_child(request, output);
+        let output = self.fork_child(request, output);
         let output = self.job_started(request, &mut rng, output);
         self.dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
@@ -1640,7 +1642,10 @@ impl SimWorld<'_> {
             } else {
                 let tool = self.drawn_tool(rng);
                 let input = match self.program.input_params(&tool) {
-                    Some(params) => self.drawn_input(rng, &tool, params),
+                    Some(params) => {
+                        let input = self.drawn_input(rng, &tool, params);
+                        self.fork_turn_input(rng, &tool, request.turn, input)
+                    }
                     None => Self::generated_text(rng),
                 };
                 (tool, input)

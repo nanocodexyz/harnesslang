@@ -1,0 +1,21 @@
+harness notes
+
+tool Bash(command: text) -> text effect external
+
+fork branch at latest
+
+state {
+  last: text
+}
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on forked(origin: text, discarded: u64) {
+  match Bash(origin) {
+    ok(output) => { last = output }
+    failed(error) => { last = error }
+    unknown => { last = "unknown" }
+  }
+}

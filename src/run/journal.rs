@@ -172,6 +172,10 @@ pub enum Record {
         at: u64,
         delivery: Delivery,
     },
+    Host {
+        key: String,
+        value: Json,
+    },
 }
 
 impl Record {
@@ -186,7 +190,7 @@ impl Record {
             | Self::NestedCall { turn, .. }
             | Self::NestedResult { turn, .. }
             | Self::Event { turn, .. } => Some(*turn),
-            Self::Checkpoint { .. } | Self::Cell { .. } => None,
+            Self::Checkpoint { .. } | Self::Cell { .. } | Self::Host { .. } => None,
         }
     }
 }
@@ -456,6 +460,10 @@ pub fn to_json(record: &Record) -> Json {
                 ("turn", turn_text(*turn)),
             ]),
         ),
+        Record::Host { key, value } => (
+            "host",
+            Json::object([("key", Json::text(key)), ("value", value.clone())]),
+        ),
     };
     Json::object([(tag, body)])
 }
@@ -696,6 +704,13 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
                 revision: fields.number("revision")?,
                 state: fields.text("state")?.to_owned(),
                 payload,
+            })
+        }
+        "host" => {
+            fields.exact(&["key", "value"])?;
+            Ok(Record::Host {
+                key: fields.text("key")?.to_owned(),
+                value: fields.get("value")?.clone(),
             })
         }
         other => Err(format!("unknown record '{other}'")),
