@@ -96,6 +96,23 @@ fn reply(program: &Program) {
                 .all(|variant| variant.name != ir::MODEL_FAILED),
         "a declared reply has no variant named like a failed model call"
     );
+    if let Some(window) = &model.window {
+        let stop = &program.sums[window.stop];
+        assert_eq!(stop.kind, SumKind::Text, "stop is a text enum");
+        assert!(
+            stop.variants
+                .iter()
+                .map(|variant| variant.name.as_str())
+                .eq(ir::STOP_VALUES),
+            "stop holds the stop reasons in order"
+        );
+        assert_eq!(
+            program.sums[window.attempt].variants,
+            ir::attempt_variants(window.stop),
+            "an attempt is ok with reply, stop and usage, or one of the model errors"
+        );
+        assert!(window.tokens.value > 0, "a context window holds tokens");
+    }
 }
 
 fn reads_local(value: &Expr) -> bool {
@@ -104,8 +121,15 @@ fn reads_local(value: &Expr) -> bool {
         Expr::Local(_) => true,
         Expr::Member { base, .. } => reads_local(base),
         Expr::Construct { fields, .. } => fields.iter().any(reads_local),
-        Expr::Binary { left, right, .. } => reads_local(left) || reads_local(right),
-        Expr::Not(operand) | Expr::Len(operand) => reads_local(operand),
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        } => reads_local(left) || reads_local(right),
+        Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand)
+        | Expr::Truncate { text: operand, .. } => reads_local(operand),
         Expr::TextBuiltin { args, .. } => args.iter().any(reads_local),
         Expr::Cancelled => false,
     }
@@ -122,8 +146,15 @@ fn reads_events(value: &Expr) -> bool {
         Expr::Cancelled => true,
         Expr::Member { base, .. } => reads_events(base),
         Expr::Construct { fields, .. } => fields.iter().any(reads_events),
-        Expr::Binary { left, right, .. } => reads_events(left) || reads_events(right),
-        Expr::Not(operand) | Expr::Len(operand) => reads_events(operand),
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        } => reads_events(left) || reads_events(right),
+        Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand)
+        | Expr::Truncate { text: operand, .. } => reads_events(operand),
         Expr::TextBuiltin { args, .. } => args.iter().any(reads_events),
     }
 }
@@ -258,8 +289,13 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     matches!(program.state[*field].ty, Type::List { .. }),
                     "clear and keep target a list field"
                 );
-                if let Kept::Last(count) = kept {
-                    expr(program, handler, count);
+                match kept {
+                    Kept::Nothing => {}
+                    Kept::Last(count) => expr(program, handler, count),
+                    Kept::LastAfter { count, first } => {
+                        expr(program, handler, count);
+                        expr(program, handler, first);
+                    }
                 }
             }
             Stmt::If {
@@ -344,7 +380,10 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
 
 fn parallel_pushes_only(statements: &[Stmt]) -> bool {
     statements.iter().all(|statement| match statement {
-        Stmt::Push { .. } => true,
+        Stmt::Push { .. } | Stmt::Let { .. } | Stmt::Assign { .. } => true,
+        Stmt::If {
+            then, otherwise, ..
+        } => parallel_pushes_only(then) && parallel_pushes_only(otherwise),
         Stmt::Match { arms, .. } => arms.iter().all(|arm| parallel_pushes_only(&arm.body)),
         _ => false,
     })
@@ -362,11 +401,24 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
         Expr::Construct { fields, .. } => fields
             .iter()
             .for_each(|field| expr(program, handler, field)),
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        } => {
             expr(program, handler, left);
             expr(program, handler, right);
         }
-        Expr::Not(operand) | Expr::Len(operand) => expr(program, handler, operand),
+        Expr::Truncate { text, tokens } => {
+            assert!(
+                ir::truncated_units_max(program.constants[*tokens].value).is_some(),
+                "a cut text's bound fits u64"
+            );
+            expr(program, handler, text);
+        }
+        Expr::Not(operand) | Expr::Len(operand) | Expr::TextLen(operand) => {
+            expr(program, handler, operand);
+        }
         Expr::TextBuiltin { op, args } => {
             assert_eq!(args.len(), op.arity(), "a text builtin takes its arity");
             args.iter().for_each(|arg| expr(program, handler, arg));

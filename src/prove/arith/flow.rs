@@ -21,6 +21,7 @@ impl Prover<'_> {
             Stmt::Let { local, value } => {
                 let linear = self.local_value(&mut state, *local, value);
                 self.bind(&mut state, *local, linear);
+                self.bind_text(&mut state, *local, value);
                 Some(self.compact(state))
             }
             Stmt::Assign { field, value } => {
@@ -54,10 +55,21 @@ impl Prover<'_> {
                 let text = self.names.expr(subject);
                 let variants = ty.variants(self.program).expect("a match subject is a sum");
                 let mut end = None;
+                let usage = self.usage_arm(ty);
                 for arm in arms {
                     let mut entered = state.clone();
-                    for binding in arm.bindings.iter().flatten() {
-                        self.bind(&mut entered, *binding, None);
+                    for (field, binding) in arm.bindings.iter().enumerate() {
+                        let Some(binding) = binding else { continue };
+                        match usage {
+                            Some((variant, window))
+                                if arm.variant == variant
+                                    && (crate::ir::ATTEMPT_USAGE..crate::ir::ATTEMPT_OK_FIELDS)
+                                        .contains(&field) =>
+                            {
+                                self.bind_bounded(&mut entered, *binding, window);
+                            }
+                            _ => self.bind(&mut entered, *binding, None),
+                        }
                     }
                     let label = format!("match {text}: {}", variants[arm.variant].name);
                     let arm_end = self.branch(label, &arm.body, entered);
@@ -92,8 +104,11 @@ impl Prover<'_> {
                 for arg in args {
                     self.value(&mut state, arg);
                 }
-                self.bind(&mut state, *result, None);
                 let handler = self.handler.expect("an effect belongs to a handler");
+                if let crate::ir::SiteKind::Wait(cap) = handler.sites[*site].kind {
+                    self.wait_bound(&mut state, &args[0], cap);
+                }
+                self.bind(&mut state, *result, None);
                 if handler.sites[*site].traps_on_decode() {
                     let what = self.names.site(*site, args);
                     self.invariants_hold(
@@ -114,6 +129,46 @@ impl Prover<'_> {
                 None
             }
         }
+    }
+
+    fn usage_arm(&self, ty: &Type) -> Option<(usize, i128)> {
+        let window = self.program.model.as_ref()?.window.as_ref()?;
+        (*ty == Type::Sum(window.attempt))
+            .then(|| (crate::ir::ATTEMPT_OK, i128::from(window.tokens.value)))
+    }
+
+    fn bind_text(&mut self, state: &mut State, local: LocalId, value: &Expr) {
+        let handler = self.handler.expect("a local belongs to a handler");
+        if handler.locals[local].ty != Type::Text {
+            return;
+        }
+        match value {
+            Expr::Truncate { tokens, .. } => {
+                let max = self.cut_max(*tokens);
+                self.bind_bounded(state, local, max);
+            }
+            Expr::Local(other) => {
+                if let Some(var) = state.env.get(&Quantity::TextLen(*other)).copied() {
+                    state.env.insert(Quantity::TextLen(local), var);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn wait_bound(&mut self, state: &mut State, duration: &Expr, cap: crate::ir::ConstId) {
+        let constant = &self.program.constants[cap];
+        let linear = self.numeric(state, duration);
+        let goal = linear
+            .plus(-i128::from(constant.value))
+            .expect("a wait's cap fits i128");
+        let message = format!(
+            "wait({}) may sleep past its cap {} and trap with bound({})",
+            self.names.expr(duration),
+            constant.name,
+            constant.name
+        );
+        self.obligation(state, goal, "wait_bound", message);
     }
 
     fn branch(&mut self, label: String, statements: &[Stmt], state: State) -> Option<State> {
@@ -175,7 +230,18 @@ impl Prover<'_> {
         state.env.insert(quantity, var);
     }
 
-    fn shrink(&mut self, mut state: State, field: usize, kept: &Kept) -> State {
+    fn shrink(&mut self, state: State, field: usize, kept: &Kept) -> State {
+        let Kept::LastAfter { count, first } = kept else {
+            return self.shrink_to(state, field, kept);
+        };
+        let mut state = state;
+        self.value(&mut state, first);
+        let mut state = self.shrink_to(state, field, &Kept::Last(count.clone()));
+        self.push(&mut state, field);
+        state
+    }
+
+    fn shrink_to(&mut self, mut state: State, field: usize, kept: &Kept) -> State {
         let program = self.program;
         let name = program.state[field].name.clone();
         let quantity = Quantity::FieldLen(field);
@@ -188,6 +254,9 @@ impl Prover<'_> {
                 format!("keep {name} last {}", self.names.expr(count)),
                 self.value(&mut state, count),
             ),
+            Kept::LastAfter { .. } => {
+                unreachable!("keep after shrinks with keep last, then pushes")
+            }
         };
         let Some(count) = count else {
             let var = self.fresh(&mut state, &label, cap);

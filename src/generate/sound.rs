@@ -51,7 +51,16 @@ fn pure(program: &Program, state: &[Value], expr: &Expr) -> Option<Value> {
             let right = pure(program, state, right)?;
             binary(*op, &left, &right)?
         }
-        Expr::Local(_) | Expr::Member { .. } | Expr::Construct { .. } => return None,
+        Expr::TextLen(operand) => Value::U64(crate::ir::utf16_len(
+            pure(program, state, operand)?.as_text(),
+        )),
+        Expr::Truncate { text, tokens } => Value::Text(crate::ir::truncate_middle(
+            pure(program, state, text)?.as_text(),
+            program.constants[*tokens].value,
+        )),
+        Expr::Local(_) | Expr::Member { .. } | Expr::Construct { .. } | Expr::With { .. } => {
+            return None;
+        }
     })
 }
 

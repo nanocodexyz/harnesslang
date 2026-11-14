@@ -2,8 +2,10 @@
 #[allow(dead_code)]
 mod json;
 
+use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use json::Value;
@@ -13,6 +15,7 @@ const HEADER_LINES_MAX: usize = 128;
 const USAGE_INPUT_PER_MESSAGE: u64 = 100;
 const USAGE_OUTPUT: u64 = 20;
 const USAGE_CACHE_READ: u64 = 3_000;
+const HTTP_TOO_MANY: u16 = 429;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,13 +34,27 @@ fn main() {
     let port = listener.local_addr().expect("a bound address").port();
     std::fs::write(format!("{port_file}.new"), port.to_string()).expect("write the port");
     std::fs::rename(format!("{port_file}.new"), port_file).expect("publish the port");
+    let throttled = Arc::new(Mutex::new(BTreeSet::new()));
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
         let steps = steps.clone();
-        std::thread::spawn(move || serve(stream, &steps, delay));
+        let throttled = Arc::clone(&throttled);
+        std::thread::spawn(move || serve(stream, &steps, delay, &throttled));
     }
+}
+
+fn throttle(steps: &[Value], step: usize, throttled: &Mutex<BTreeSet<usize>>) -> Option<u64> {
+    let seconds = steps
+        .get(step)?
+        .get("throttle")?
+        .as_u64()
+        .filter(|seconds| *seconds > 0)?;
+    let mut seen = throttled
+        .lock()
+        .expect("the throttle set is never poisoned");
+    seen.insert(step).then_some(seconds)
 }
 
 fn streamed(body: &str) -> bool {
@@ -140,10 +157,35 @@ fn serve_stream(mut stream: TcpStream, message: &Value, delay: Duration) {
     }
 }
 
-fn serve(mut stream: TcpStream, steps: &[Value], delay: Duration) {
+fn serve(
+    mut stream: TcpStream,
+    steps: &[Value],
+    delay: Duration,
+    throttled: &Mutex<BTreeSet<usize>>,
+) {
     let Some((headers, body)) = read_request(&stream) else {
         return;
     };
+    let step = Value::decode(&body).ok().and_then(|body| check(&body).ok());
+    if let Some(seconds) = step.and_then(|step| throttle(steps, step, throttled)) {
+        let text = Value::object([
+            ("type", Value::text("error")),
+            (
+                "error",
+                Value::object([
+                    ("type", Value::text("rate_limit_error")),
+                    ("message", Value::text("scripted throttle")),
+                ]),
+            ),
+        ])
+        .encode();
+        let response = format!(
+            "HTTP/1.1 {HTTP_TOO_MANY} Too Many Requests\r\nContent-Type: application/json\r\nretry-after: {seconds}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            text.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        return;
+    }
     if streamed(&body)
         && let Ok(message) = answer(&headers, &body, steps)
     {
@@ -342,10 +384,10 @@ fn answer(headers: &[String], body: &str, steps: &[Value]) -> Result<Value, Stri
             ),
         ]));
     }
-    let stop = if calls.is_empty() {
-        "end_turn"
-    } else {
-        "tool_use"
+    let stop = match script.get("stop").and_then(Value::as_str) {
+        Some(stop) => stop,
+        None if calls.is_empty() => "end_turn",
+        None => "tool_use",
     };
     Ok(Value::object([
         ("id", Value::String(format!("msg_{step}"))),
