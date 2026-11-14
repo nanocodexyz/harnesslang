@@ -7,6 +7,10 @@ kills_max="${AGENT_DRILL_KILLS:-12}"
 kill_ms_max="${AGENT_DRILL_KILL_MS_MAX:-1500}"
 steps="${AGENT_DRILL_STEPS:-6}"
 spawn_after="${AGENT_DRILL_SPAWN_AFTER:-2}"
+job_after="${AGENT_DRILL_JOB_AFTER:-1}"
+job_sleep="${AGENT_DRILL_JOB_SLEEP:-3}"
+job_timeout_ms="${AGENT_DRILL_JOB_TIMEOUT_MS:-100}"
+job_wait_polls="${AGENT_DRILL_JOB_WAIT_POLLS:-400}"
 child_steps="${AGENT_DRILL_CHILD_STEPS:-2}"
 mock_delay_ms="${AGENT_DRILL_MOCK_DELAY_MS:-300}"
 tool_sleep="${AGENT_DRILL_TOOL_SLEEP:-0.3}"
@@ -55,6 +59,9 @@ case "$mode" in
       printf '['
       for step in $(seq 1 "$steps"); do
         printf '{"text":"Step %d.","throttle":%d,"calls":[{"name":"Bash","input":{"command":"echo step%d >> effects.log && sleep %s","description":"Record step %d"}},{"name":"Read","input":{"file_path":"effects.log"}}]},' "$step" "$(( step == 1 ))" "$step" "$tool_sleep" "$step"
+        if [ "$step" -eq "$job_after" ]; then
+          printf '{"text":"Starting the slow step.","calls":[{"name":"Bash","input":{"command":"sleep %s && echo moved >> effects.log","timeout":%d,"description":"Slow step"}}]},' "$job_sleep" "$job_timeout_ms"
+        fi
         if [ "$step" -eq "$spawn_after" ]; then
           printf '{"text":"Delegating the child steps.","calls":[{"name":"spawn_agent","input":{"role":"recorder","task":"Record the child steps in effects.log, then submit what you recorded."}}]},'
         fi
@@ -65,7 +72,8 @@ case "$mode" in
       printf '{"calls":[{"name":"Read","input":{"file_path":"pixel.png"}}]},'
       printf '{"text":"Writing done.txt n","stop":"max_tokens"},'
       printf '{"calls":[{"name":"Write","input":{"file_path":"done.txt","content":"done\\n"}}]},'
-      printf '{"answer":"All steps ran."}]\n'
+      printf '{"answer":"All steps ran."},'
+      printf '{"answer":"The slow step reported."}]\n'
     } > "$out/script.json"
     {
       printf '['
@@ -104,6 +112,33 @@ esac
 run_agent() {
   "$agent" run --instruction "$out/instruction.md" --cwd "$workspace" --model "$model" --journal "$out/journal" >> "$out/agent.out" 2>> "$out/agent.err"
 }
+
+kill_run() {
+  local pid=$1
+  pkill -KILL -P "$pid" 2> /dev/null || true
+  kill -KILL "$pid" 2> /dev/null || true
+  set +e
+  wait "$pid" 2> /dev/null
+  set -e
+}
+
+kills_job=0
+if [ "$mode" = mock ]; then
+  run_agent &
+  pid=$!
+  for _ in $(seq 1 "$job_wait_polls"); do
+    grep -q 'became background job' "$out/agent.err" 2> /dev/null && break
+    kill -0 "$pid" 2> /dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$pid" 2> /dev/null && grep -q 'became background job' "$out/agent.err"; then
+    kill_run "$pid"
+    kills_job=1
+    echo "agent-drill: kill during the background job" >> "$out/kills.log"
+  else
+    kill_run "$pid"
+  fi
+fi
 
 RANDOM=$seed
 kills=0
@@ -189,7 +224,7 @@ effects = collections.Counter(open(log).read().split()) if os.path.exists(log) e
 twice = {step: count for step, count in effects.items() if count > 1}
 if mode == "mock" and twice:
     sys.exit(f"agent-drill: effects ran more than once: {twice}")
-expected = {f"step{index}" for index in range(1, steps + 1)} | {f"child{index}" for index in range(1, child_steps + 1)}
+expected = {f"step{index}" for index in range(1, steps + 1)} | {f"child{index}" for index in range(1, child_steps + 1)} | {"moved"}
 if set(effects) - expected:
     sys.exit(f"agent-drill: unexpected effects {sorted(effects)}")
 if open(f"{out}/ws/done.txt").read().strip() != "done":
@@ -197,6 +232,11 @@ if open(f"{out}/ws/done.txt").read().strip() != "done":
 unknown = 0
 child_unknown = 0
 discarded = []
+parent_unknown = set()
+for line in open(f"{out}/journal/journal.jsonl"):
+    record = json.loads(line)["record"]
+    if "recovery" in record:
+        parent_unknown.update(record["recovery"].get("unknown", []))
 for journal in journals:
     replies = set()
     for line in open(f"{journal}/journal.jsonl"):
@@ -214,15 +254,40 @@ for journal in journals:
     if unanswered:
         sys.exit(f"agent-drill: streams cut by a kill in {journal} were not requested again to a journaled reply: {unanswered}")
     leftover = [name for name in os.listdir(f"{journal}/state") if name.endswith(".sse")]
-    if leftover:
+    orphaned = journal != journals[0] and os.path.basename(journal).replace(".", "/") in parent_unknown
+    if leftover and not orphaned:
         sys.exit(f"agent-drill: partial streams left in {journal} after the turn finished: {leftover}")
+recovered = collections.Counter()
+for line in open(f"{out}/journal/usage.jsonl"):
+    record = json.loads(line)
+    if record.get("kind") == "recover":
+        recovered[record["answer"]] += 1
+started_jobs = []
+job_notices = []
+for line in open(f"{out}/journal/journal.jsonl"):
+    record = json.loads(line)["record"]
+    output = record.get("result", {}).get("output", {})
+    if isinstance(output.get("ok"), dict) and "job" in output["ok"]:
+        started_jobs.append(record["result"]["call_id"])
+    if "event" in record and "job" in record["event"]["event"]:
+        job_notices.append(record["event"]["event"]["job"]["id"])
+closed = [notice for notice in job_notices if notice.startswith(("done:", "lost:"))]
+if len(closed) != len(set(closed)):
+    sys.exit(f"agent-drill: a job was closed twice: {job_notices}")
+if mode == "mock" and len(started_jobs) > 1:
+    sys.exit(f"agent-drill: expected the slow step to become at most one background job, found {started_jobs}")
+if mode == "mock" and len(closed) != len(started_jobs):
+    sys.exit(f"agent-drill: the background job was started {len(started_jobs)} time(s) and closed by {closed}")
+if mode == "mock" and recovered["reply"] + recovered["not_dispatched"] == 0:
+    sys.exit(f"agent-drill: no kill left a call the recovery hook could answer: {dict(recovered)}")
 joined = []
 for line in open(f"{out}/journal/journal.jsonl"):
     record = json.loads(line)["record"]
     output = record.get("result", {}).get("output", {})
     if isinstance(output.get("ok"), str) and "the child recorded" in output["ok"]:
         joined.append(output["ok"])
-if mode == "mock":
+spawn_unknown = any(key.replace(".", "/") in parent_unknown for key in children)
+if mode == "mock" and not spawn_unknown:
     if len(children) != 1:
         sys.exit(f"agent-drill: expected one child journal under {children_dir}, found {children}")
     child_records = [json.loads(line)["record"] for line in open(f"{children_dir}/{children[0]}/journal.jsonl")]
@@ -239,7 +304,7 @@ for line in open(f"{out}/journal/journal.jsonl"):
 if mode == "mock" and (len(blobs) != 1 or "data" not in blobs[0]):
     sys.exit(f"agent-drill: the image read journaled {len(blobs)} blob results, expected one holding its data")
 child_dispatches = sum(count for (journal, _), count in dispatches.items() if journal != journals[0])
-print(f"agent-drill: children={len(children)} joined={len(joined)} child_dispatches={child_dispatches} child_unknown_recovered={child_unknown} children_reported={usage['children']} blobs_journaled={len(blobs)} external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
+print(f"agent-drill: spawn_unknown={spawn_unknown} jobs={len(started_jobs)} job_notices={job_notices} recovered={dict(recovered)} children={len(children)} joined={len(joined)} child_dispatches={child_dispatches} child_unknown_recovered={child_unknown} children_reported={usage['children']} blobs_journaled={len(blobs)} external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
 EOF
 finished=1
-echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool; in the child $kills_child)"
+echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool; in the child $kills_child) and $kills_job during the background job"

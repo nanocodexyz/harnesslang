@@ -54,10 +54,13 @@ pub enum Invariant {
     FamilyBounded,
     SideIsolated,
     IdleDue,
+    InterruptHonored,
+    JobOnce,
+    JobReported,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 42] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -97,6 +100,9 @@ impl Invariant {
         Self::FamilyBounded,
         Self::SideIsolated,
         Self::IdleDue,
+        Self::InterruptHonored,
+        Self::JobOnce,
+        Self::JobReported,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -140,6 +146,9 @@ impl Invariant {
             Self::FamilyBounded => "family_bounded",
             Self::SideIsolated => "side_isolated",
             Self::IdleDue => "idle_due",
+            Self::InterruptHonored => "interrupt_honored",
+            Self::JobOnce => "job_once",
+            Self::JobReported => "job_reported",
         }
     }
 }
@@ -280,6 +289,126 @@ fn seq_unique(records: &[Record]) -> Result<Calls, Violation> {
     Ok(calls)
 }
 
+pub fn interrupted_count(program: &Program, records: &[Record]) -> u64 {
+    let mut count = 0;
+    for record in records {
+        match record {
+            Record::Model { response, .. }
+                if *response == crate::run::engine::interrupted_response() =>
+            {
+                count += 1;
+            }
+            Record::Result {
+                output: Output::Failed(error),
+                ..
+            } if error == crate::ir::INTERRUPTED_REASON && program.any_interruptible() => {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
+struct Arrived {
+    inbound: journal::Inbound,
+    at: u64,
+}
+
+fn interrupt_honored(program: &Program, records: &[Record]) -> Result<(), Violation> {
+    if !program.any_interruptible() {
+        return Ok(());
+    }
+    let mut events: BTreeMap<u64, Vec<Arrived>> = BTreeMap::new();
+    let mut tools: BTreeMap<(u64, u64), String> = BTreeMap::new();
+    let mut replied: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for record in records {
+        let (turn, seq, interrupted, interrupts) = match record {
+            Record::Event {
+                turn, at, delivery, ..
+            } => {
+                events.entry(*turn).or_default().push(Arrived {
+                    inbound: delivery.inbound.clone(),
+                    at: *at,
+                });
+                continue;
+            }
+            Record::Call {
+                turn, seq, tool, ..
+            } => {
+                tools.insert((*turn, *seq), tool.clone());
+                continue;
+            }
+            Record::Model {
+                turn,
+                seq,
+                response,
+                ..
+            } => (
+                *turn,
+                *seq,
+                *response == crate::run::engine::interrupted_response(),
+                program.interrupts(crate::ir::SiteKind::Model, ""),
+            ),
+            Record::Result { turn, seq, output } => {
+                let tool = tools.get(&(*turn, *seq)).cloned().unwrap_or_default();
+                if replied.remove(&(*turn, *seq)) {
+                    continue;
+                }
+                let reason = matches!(output, Output::Failed(error) if error == crate::ir::INTERRUPTED_REASON);
+                (
+                    *turn,
+                    *seq,
+                    reason,
+                    program.interrupts(crate::ir::SiteKind::Dispatch, &tool),
+                )
+            }
+            Record::Recovery {
+                turn,
+                replied: attested,
+                undispatched,
+                ..
+            } => {
+                for seq in attested.iter().chain(undispatched) {
+                    replied.insert((*turn, *seq));
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        if !interrupts.any() {
+            continue;
+        }
+        let arrived = events.get(&turn).map_or(&[][..], Vec::as_slice);
+        let caused = arrived
+            .iter()
+            .any(|event| event.inbound.interrupts(interrupts));
+        let required = arrived.iter().any(|event| {
+            event.inbound.interrupts(interrupts)
+                && (event.at >= seq || event.inbound == journal::Inbound::Cancel)
+        });
+        let id = call_id(turn, seq);
+        if required && !interrupted {
+            return violation(
+                Invariant::InterruptHonored,
+                format!(
+                    "{id} is interruptible by {} and an event that interrupts it was recorded before its outcome, yet it records a finished outcome",
+                    interrupts.describe()
+                ),
+            );
+        }
+        if interrupted && !caused {
+            return violation(
+                Invariant::InterruptHonored,
+                format!(
+                    "{id} records an interrupted outcome, yet no event that interrupts it was recorded"
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn follows(last: &mut BTreeMap<u64, u64>, turn: u64, seq: u64) -> Result<(), Violation> {
     let previous = last.get(&turn).copied().unwrap_or(0);
     if seq <= previous {
@@ -305,6 +434,7 @@ pub fn check(
     liveness_and_replay(program, world, turns, records)?;
     world.inbox.kept(records)?;
     crate::sim::idle::check(program, world, records)?;
+    world.jobs.check(program, records)?;
     let session = session::fold(records).expect("liveness folded this journal");
     cells(program, &calls, &session)
 }
@@ -641,6 +771,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     mode_sent(world, records)?;
     blob_journaled(world.program, records)?;
     search_listed(world.program, records)?;
+    interrupt_honored(world.program, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()
@@ -675,7 +806,10 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             .dispatched
             .get(id)
             .map_or(0, |dispatched| dispatched.external);
-        if known && dispatches == 0 && !refused.contains(id) {
+        let preempted = calls.results.get(id).is_some_and(|results| {
+            results.first() == Some(&Output::Failed(crate::ir::INTERRUPTED_REASON.to_owned()))
+        });
+        if known && dispatches == 0 && !refused.contains(id) && !preempted {
             return violation(
                 Invariant::UnknownReported,
                 format!("external call {id} records a result although it was never dispatched"),
@@ -969,6 +1103,9 @@ fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> 
         else {
             continue;
         };
+        if *response == crate::run::engine::interrupted_response() {
+            continue;
+        }
         let answered: Vec<&Option<String>> = world
             .model_modes
             .get(&(*turn, *seq))

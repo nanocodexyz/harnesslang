@@ -922,6 +922,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             input: &call.input,
             returns: &returns,
             admitted: None,
+            job: false,
             nested: Some(NestedRef {
                 id,
                 record: self.record_id(id),

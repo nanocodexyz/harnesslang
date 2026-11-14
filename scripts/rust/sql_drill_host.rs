@@ -390,6 +390,7 @@ fn run(options: &Options) -> i32 {
         owner: options.text("owner").to_owned(),
         lease_ms: options.number("lease_ms"),
         head: 0,
+        last_turn: 0,
     };
     let ledger = host.ledger.try_clone().expect("the ledger handle clones");
     let mut sql = Recorded {
@@ -401,6 +402,7 @@ fn run(options: &Options) -> i32 {
     for turn in 1..=options.number("turns") {
         match harness::run_sql(&mut host, &mut sql, &mut journal, &request(seed, turn)) {
             Ok(Ran::Finished(_) | Ran::AlreadyFinished(_)) => {}
+            Ok(ran @ (Ran::Suspended(_) | Ran::NotDue(_))) => panic!("turn {turn}: the drill program neither suspends nor idles, found {ran:?}"),
             Err(error) => {
                 let status = exit_for(turn, error);
                 if status == EXIT_FENCED {

@@ -1,0 +1,8 @@
+harness worker
+
+const hold_ms: u64 = 1000
+
+on run() -> u64 {
+  let woke = hold(hold_ms)
+  return woke
+}

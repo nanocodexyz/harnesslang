@@ -40,7 +40,7 @@ pub fn jsonl_open(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
 }
 
 pub fn jsonl_open_tail(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
-    if program::HOLDS_BLOBS {
+    if reads_whole() {
         return jsonl_open(disk);
     }
     disk.sync().map_err(OpenError::Io)?;
@@ -404,6 +404,18 @@ impl<H: Host> World for JsonlWorld<'_, H> {
         self.host.resumed(suspension, resume, matched)
     }
 
+    fn recover(&mut self, request: &ToolRequest<'_>) -> Recovered {
+        self.host.recover(request)
+    }
+
+    fn jobs(&mut self, turn: u64, open: &[String]) -> Vec<String> {
+        self.host.jobs(turn, open)
+    }
+
+    fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        self.host.hold(turn, seq, until_ms)
+    }
+
     fn scope(&self) -> String {
         self.host.scope()
     }
@@ -491,8 +503,8 @@ impl<'d> JsonlJournal<'d> {
     }
 
     fn advance(&mut self, turn: u64, mut flushed: Vec<Record>) {
-        if program::HOLDS_BLOBS {
-            assert_eq!(self.start, Start::Beginning, "a journal of blobs is read whole, so every turn finds the blobs before it");
+        if reads_whole() {
+            assert_eq!(self.start, Start::Beginning, "a journal of blobs or jobs is read whole, so every turn finds the blobs and open jobs before it");
             self.records.extend(flushed);
             return;
         }

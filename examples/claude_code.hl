@@ -27,15 +27,18 @@ const tool_search_results_default: u64 = 5
 const cache_lifetime_ms: u64 = 300000
 const cache_refreshes: u64 = 12
 const clock_ms_max: u64 = 8640000000000000
+const bash_jobs_max: u64 = 8
+const job_notices_max: u64 = 8
+const job_hold_ms: u64 = 600000
 
 type outcome = completed(text) | failed(text) | exhausted
 type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
 type kept = refreshed(u64) | lapsed(text)
 
-tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
+tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external recoverable jobs at most bash_jobs_max
 tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text or blob<image_bytes_max> effect none
-tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool = false) -> text effect external
-tool Write(file_path: text, content: text) -> text effect external
+tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool = false) -> text effect external recoverable
+tool Write(file_path: text, content: text) -> text effect external recoverable
 tool ToolSearch(query: text, max_results: u64 = tool_search_results_default) -> text effect none finds mcp
 tools from listing(mcp, mcp_tools_max) (arguments: text) effect external
 tool list_agents(include_completed: bool = false) -> text effect none
@@ -45,6 +48,7 @@ spawn spawn_agent runs delegated from "claude_code_child.hl"
 model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only, refresh
 
 on resume
+on job(notice: text) bound job_notices_max
 
 state {
   context: list<entry, context_entries_max>
@@ -271,6 +275,19 @@ fn run_parallel(requested: list<call, calls_per_round_max>) {
   }
 }
 
+fn answered(reply: claude_reply, words: text, started: u64, opened: u64) {
+  push context assistant(reply)
+  let held = hold(job_hold_ms)
+  let notices = take jobs
+  if len(notices) == 0 {
+    keep_cache(started, opened)
+    return completed(words)
+  }
+  for notice in notices {
+    push context user(notice)
+  }
+}
+
 fn keep_cache(started: u64, opened: u64) {
   refresh_due = 0
   if started <= opened and opened <= clock_ms_max {
@@ -299,7 +316,7 @@ on prompt(input: text, rounds: u64) -> outcome
   round_entries = 0
   loop round below rounds_max {
     keep context blobs last images_kept
-    if len(context) + 5 + calls_per_round_max > context_entries_max {
+    if len(context) + 5 + calls_per_round_max + job_notices_max > context_entries_max {
       compact_pending = true
     }
     if context_tokens * 4 + pending_units >= (context_window_tokens - compaction_reserved_tokens) * 4 {
@@ -308,7 +325,7 @@ on prompt(input: text, rounds: u64) -> outcome
     if compact_pending {
       compact()
     } else {
-      if len(context) + 5 + calls_per_round_max > context_entries_max {
+      if len(context) + 5 + calls_per_round_max + job_notices_max > context_entries_max {
         return failed("the context has no room for a round after compaction")
       }
       if round >= rounds { return exhausted }
@@ -332,16 +349,8 @@ on prompt(input: text, rounds: u64) -> outcome
           match reply {
             answer(words, _) => {
               match stop {
-                "end" => {
-                  push context assistant(reply)
-                  keep_cache(started, opened)
-                  return completed(words)
-                }
-                "tool_use" => {
-                  push context assistant(reply)
-                  keep_cache(started, opened)
-                  return completed(words)
-                }
+                "end" => { answered(reply, words, started, opened) }
+                "tool_use" => { answered(reply, words, started, opened) }
                 "max_tokens" => {
                   push context assistant(reply)
                   if output_continuations >= continuations_max {

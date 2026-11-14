@@ -1,10 +1,13 @@
-use crate::ir::{Handler, Program};
+use std::collections::BTreeSet;
+
+use crate::ir::{Handler, Program, Type};
 use crate::run::blob::Blobs;
 use crate::run::engine::{
-    End, Engine, Exit, Finish, Mode, Setup, Suspension, World, close_inbox, steer_count,
+    End, Engine, Exit, Finish, Mode, Recovered, Setup, Suspension, ToolRequest, World, close_inbox,
+    steer_count,
 };
 use crate::run::journal::Inbound;
-use crate::run::journal::{Output, Record};
+use crate::run::journal::{Delivery, Output, Record, job_started, lost_delivery};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::session::{self, Session, SiteLog, TurnLog};
@@ -113,6 +116,7 @@ fn check_events(program: &Program, turn: u64, log: &TurnLog) -> Result<(), Exit>
         let taken = match &event.delivery.inbound {
             Inbound::Cancel => declared.cancel,
             Inbound::Steer(_) => declared.steers.is_some(),
+            Inbound::Job(_) => declared.jobs.is_some(),
         };
         if !taken {
             return Err(corrupt(format!(
@@ -120,6 +124,15 @@ fn check_events(program: &Program, turn: u64, log: &TurnLog) -> Result<(), Exit>
                 event.delivery.inbound.name()
             )));
         }
+    }
+    let jobs = crate::run::engine::job_count(&log.events);
+    if let Some(bound) = &declared.jobs
+        && jobs > bound.value
+    {
+        return Err(corrupt(format!(
+            "turn {turn} records {jobs} job notices, more than {} ({})",
+            bound.name, bound.value
+        )));
     }
     let steers = steer_count(&log.events);
     if let Some(bound) = &declared.steers
@@ -233,20 +246,115 @@ pub fn replay_all(
     Ok(state)
 }
 
-fn recover(log: &mut TurnLog, mutation: Mutation) -> Vec<u64> {
-    let unknown = log.open_seqs(|class| match mutation {
+#[derive(Default)]
+struct Recovering {
+    unknown: Vec<u64>,
+    replied: Vec<(u64, Output)>,
+    undispatched: Vec<u64>,
+}
+
+fn recover(
+    program: &Program,
+    world: &mut dyn World,
+    turn: u64,
+    log: &mut TurnLog,
+    mutation: Mutation,
+) -> Recovering {
+    let open = log.open_seqs(|class| match mutation {
         Mutation::RecoveryRedispatchesExternal | Mutation::RecoverySkipped => false,
         Mutation::IdempotentReportedUnknown => true,
         _ => class.may_be_unknown(),
     });
-    for seq in &unknown {
-        let site = log.sites.get_mut(seq).expect("an open seq has a site");
+    let mut recovering = Recovering::default();
+    for seq in open {
+        let site = log.sites.get_mut(&seq).expect("an open seq has a site");
         let SiteLog::Open(call) = site else {
             panic!("open_seqs returns open sites");
         };
-        *site = SiteLog::Unknown(call.clone());
+        let recovered = if call.effect.may_be_unknown() && program.recoverable(&call.tool) {
+            ask_recover(program, world, turn, seq, call)
+        } else {
+            Recovered::Unknown
+        };
+        let recovered = match recovered {
+            Recovered::Unknown
+                if mutation == Mutation::RecoverTrustsLost && program.recoverable(&call.tool) =>
+            {
+                Recovered::NotDispatched
+            }
+            recovered => recovered,
+        };
+        match recovered {
+            Recovered::Unknown => {
+                *site = SiteLog::Unknown(call.clone());
+                recovering.unknown.push(seq);
+            }
+            Recovered::NotDispatched => recovering.undispatched.push(seq),
+            Recovered::Reply(output) => {
+                *site = SiteLog::Done(call.clone(), output.clone());
+                recovering.replied.push((seq, output));
+            }
+        }
     }
-    unknown
+    recovering
+}
+
+fn ask_recover(
+    program: &Program,
+    world: &mut dyn World,
+    turn: u64,
+    seq: u64,
+    call: &crate::run::session::Call,
+) -> Recovered {
+    let returns = Type::Text;
+    let recovered = world.recover(&ToolRequest {
+        turn,
+        seq,
+        tool: &call.tool,
+        effect: call.effect,
+        input: &call.input,
+        returns: &returns,
+        nested: None,
+        admitted: None,
+        job: false,
+    });
+    match recovered {
+        Recovered::Reply(output)
+            if job_started(&output).is_some() && program.jobs_of(&call.tool).is_some() =>
+        {
+            Recovered::Reply(output)
+        }
+        Recovered::Reply(output) => {
+            Recovered::Reply(value::checked_output(program, &call.tool, &returns, output))
+        }
+        other => other,
+    }
+}
+
+fn lost_jobs(
+    program: &Program,
+    world: &mut dyn World,
+    turn: u64,
+    session: &crate::run::session::Session,
+    mutation: Mutation,
+) -> Vec<Delivery> {
+    if program.events.jobs.is_none() || session.jobs.is_empty() {
+        return Vec::new();
+    }
+    let open: Vec<String> = session.jobs.keys().cloned().collect();
+    let lost = world.jobs(turn, &open);
+    if mutation == Mutation::JobLostDropped {
+        return Vec::new();
+    }
+    let lost = if mutation == Mutation::JobLostAll {
+        open
+    } else {
+        lost
+    };
+    lost.iter()
+        .filter(|key| session.jobs.contains_key(*key))
+        .map(|key| lost_delivery(key))
+        .collect()
 }
 
 fn recover_nested(log: &mut TurnLog, mutation: Mutation) -> Vec<(u64, u64)> {
@@ -342,7 +450,7 @@ pub fn run_turn(
     let blobs = Blobs::of_session(program, &session).map_err(corrupt)?;
     blobs.check_state(program, &state).map_err(corrupt)?;
     let mut pending = Vec::new();
-    let mut unknown = Vec::new();
+    let mut recovering = Recovering::default();
     let mut assumed = Vec::new();
     let mut nested = Vec::new();
     let mut nested_assumed = Vec::new();
@@ -357,14 +465,14 @@ pub fn run_turn(
             check_events(program, request.turn, log)?;
             let mut log = log.clone();
             if matches!(target.recovery, target::Recovery::AtLoad) {
-                unknown = recover(&mut log, mutation);
+                recovering = recover(program, world, request.turn, &mut log, mutation);
                 nested = recover_nested(&mut log, mutation);
             }
             if mutation == Mutation::CellRecoveryReportsFailed {
                 nested_assumed = assume_nested_failed(&mut log, std::mem::take(&mut nested));
             }
             if mutation == Mutation::RecoveryReportsFailed {
-                assumed = assume_failed(&mut log, std::mem::take(&mut unknown));
+                assumed = assume_failed(&mut log, std::mem::take(&mut recovering.unknown));
             }
             log
         }
@@ -405,6 +513,16 @@ pub fn run_turn(
         mutation,
     };
     let snapshot = (!program.sides.is_empty()).then(|| state.clone());
+    let lost = lost_jobs(program, world, request.turn, &session, mutation);
+    let mut jobs = session.jobs.clone();
+    for (seq, output) in &recovering.replied {
+        if job_started(output).is_some()
+            && let Some(SiteLog::Done(call, _)) = log.sites.get(seq)
+        {
+            jobs.insert(crate::ir::spawn_key(request.turn, *seq), call.tool.clone());
+        }
+    }
+    let attested: BTreeSet<u64> = recovering.undispatched.iter().copied().collect();
     let mut engine = Engine::new(
         setup,
         handler,
@@ -414,20 +532,32 @@ pub fn run_turn(
         &log,
     )
     .with_next_cell(session.next_cell())
-    .with_blobs(blobs);
+    .with_blobs(blobs)
+    .with_jobs(jobs, lost)
+    .with_attested(attested);
     if let Some(snapshot) = snapshot {
         engine = engine.with_snapshot(snapshot);
     }
     for record in pending {
         engine.append(record);
     }
-    if !unknown.is_empty() || !nested.is_empty() {
+    let attested = !recovering.replied.is_empty() || !recovering.undispatched.is_empty();
+    if !recovering.unknown.is_empty() || !nested.is_empty() || attested {
         let attempt = engine.next_attempt();
         engine.append(Record::Recovery {
             turn: request.turn,
             attempt,
-            unknown,
+            unknown: recovering.unknown,
             nested,
+            replied: recovering.replied.iter().map(|(seq, _)| *seq).collect(),
+            undispatched: recovering.undispatched,
+        });
+    }
+    for (seq, output) in recovering.replied {
+        engine.append(Record::Result {
+            turn: request.turn,
+            seq,
+            output,
         });
     }
     for ((seq, inner), error) in nested_assumed {

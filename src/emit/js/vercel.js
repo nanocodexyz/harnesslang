@@ -1,7 +1,7 @@
 import { createContext, Script } from "node:vm";
 const VERCEL_TARGET = { ...TARGET_MODEL, inbound: "after_flush" };
 const VERCEL_EPOCH = 0;
-const STEPS_PER_EFFECT_MAX = 2;
+const STEPS_PER_EFFECT_MAX = 3;
 const STEPS_PER_SUSPENSION_MAX = 2;
 const STEPS_PER_TURN_FIXED = 2;
 
@@ -12,6 +12,46 @@ class StepWait {
   constructor(wait) {
     this.wait = wait;
   }
+}
+
+function ranJson(turn, ran) {
+  const outputs = ran.outputs.map(([position, output]) => [BigInt(position), ran.model ? output : outputJson(output)]);
+  return object([
+    ["events", BigInt(ran.events)],
+    ["model", ran.model],
+    ["outputs", outputs],
+    ["position", BigInt(ran.position)],
+    ["preempted", ran.preempted],
+    ["seq", BigInt(ran.seq)],
+    ["started", ran.started],
+    ["turn", BigInt(turn)],
+  ]);
+}
+
+function ranFrom(json) {
+  if (!isObject(json)) throw new DecodeError("a ran effect is an object");
+  const fields = new Fields("ran", json);
+  fields.exact(["events", "model", "outputs", "position", "preempted", "seq", "started", "turn"]);
+  const model = fields.boolean("model");
+  const outputs = fields.get("outputs");
+  const preempted = fields.get("preempted");
+  const started = fields.get("started");
+  if (!Array.isArray(outputs) || !Array.isArray(preempted) || !Array.isArray(started)) throw new DecodeError("a ran effect lists its outputs, preemptions and started jobs");
+  if (preempted.some((one) => typeof one !== "boolean")) throw new DecodeError("a ran effect's preemptions are bools");
+  if (started.some((pair) => !Array.isArray(pair) || pair.length !== 2 || pair.some((text) => typeof text !== "string"))) throw new DecodeError("a ran effect's started jobs are key and tool pairs");
+  return {
+    turn: fields.number("turn"),
+    seq: fields.number("seq"),
+    position: fields.number("position"),
+    events: fields.number("events"),
+    model,
+    preempted,
+    started,
+    outputs: outputs.map((pair) => {
+      if (!Array.isArray(pair) || pair.length !== 2) throw new DecodeError("a ran effect's output is a position and its output");
+      return [smallNumber(pair[0], "a ran effect's position"), model ? pair[1] : outputFrom(pair[1])];
+    }),
+  };
 }
 
 function waitJson(wait) {
@@ -31,11 +71,36 @@ function waitFrom(json) {
 }
 
 class StepWorld {
-  constructor(context, waited, resume) {
+  constructor(context, waited, resume, carried) {
     this.context = context;
     this.waitedTimers = waited;
     this.delivered = resume;
     this.resuming = null;
+    this.carried = carried;
+  }
+
+  async ran(turn, seq) {
+    const ran = this.carried.ran;
+    return ran !== null && ran.turn === turn && ran.seq === seq ? ran : null;
+  }
+
+  async undispatched(turn, seq) {
+    if (this.carried.turn !== turn || !this.carried.undispatched.includes(seq)) return false;
+    const attempt = this.context.attemptQuiet;
+    assert(Number.isSafeInteger(attempt) && attempt >= 1, "a step's attempt counts from 1");
+    return attempt === 1;
+  }
+
+  recover(request) {
+    return this.context.host.recover(request);
+  }
+
+  async jobs() {
+    return this.carried.lost;
+  }
+
+  hold(turn, seq, untilMs) {
+    return this.context.host.hold(turn, seq, untilMs);
   }
 
   clock() {
@@ -65,15 +130,15 @@ class StepWorld {
 
   async beforeExternal() {}
 
-  async flush(epoch, records) {
+  async flush(epoch, records, position) {
     assert(epoch === VERCEL_EPOCH, "a workflow run has one owner");
-    throw new StepEnd(records);
+    throw new StepEnd(records, position);
   }
 
-  async attempt() {
-    const attempt = this.context.attempt;
+  async attempt(turn, seq, attempted) {
+    const attempt = this.context.stepAttempt !== undefined ? this.context.stepAttempt(attempted) : this.context.attempt;
     assert(Number.isSafeInteger(attempt) && attempt >= 1, "a step's attempt counts from 1");
-    return attempt;
+    return attempted && attempt === 1 ? attempt + 1 : attempt;
   }
 
   async nestedAttempt(turn, seq, nested) {
@@ -201,7 +266,13 @@ async function runStep(input, context) {
   const setup = { target: VERCEL_TARGET, mutation: context.mutation ?? "none" };
   const waited = (input.waited ?? []).map((text) => decodeOrCorrupt(() => waitFrom(decodeJson(text))));
   const delivered = input.resume === undefined || input.resume === null ? null : decodeOrCorrupt(() => resumeFrom(decodeJson(input.resume)));
-  const world = new StepWorld(context, waited, delivered);
+  const carried = {
+    turn: request.turn,
+    ran: input.ran === undefined || input.ran === null ? null : decodeOrCorrupt(() => ranFrom(decodeJson(input.ran))),
+    undispatched: input.undispatched ?? [],
+    lost: input.lost ?? [],
+  };
+  const world = new StepWorld(context, waited, delivered, carried);
   try {
     const ran = await runTurn(setup, world, VERCEL_EPOCH, records, request);
     if (ran.ran === "suspended") return { lines: [], suspended: encodeJson(suspensionJson(ran.suspension)) };
@@ -209,7 +280,7 @@ async function runStep(input, context) {
     throw new Panic(`a step ends at a flush, found the turn ${ran.ran}`);
   } catch (error) {
     if (error instanceof StepEnd) {
-      const output = { lines: error.records.map((record) => encodeLine(record, false)) };
+      const output = { lines: error.records.map((record) => encodeLine(record, false)), position: error.position };
       const answered = world.resuming;
       if (answered !== null && error.records.some((record) => record.kind === "result" && record.turn === answered.suspension.turn && record.seq === answered.suspension.seq)) {
         output.resumed = encodeJson(object([["resume", resumeJson(answered.resume)], ["suspension", suspensionJson(answered.suspension)]]));
@@ -217,6 +288,7 @@ async function runStep(input, context) {
       return output;
     }
     if (error instanceof StepWait) return { lines: [], wait: encodeJson(waitJson(error.wait)) };
+    if (error instanceof StepRan) return { lines: [], ran: encodeJson(ranJson(request.turn, error.ran)) };
     throw error;
   }
 }
@@ -252,6 +324,10 @@ async function driveTurn(platform, lines, folded, requestText) {
   let live = false;
   const waited = [];
   let resume = null;
+  let ran = null;
+  let undispatched = [];
+  let asked = PROGRAM.events.jobs === null;
+  const lost = [];
   for (let step = 0; step < stepsMax; step++) {
     const log = folded.turns.get(request.turn);
     if (log !== undefined && log.finished !== null) {
@@ -261,8 +337,24 @@ async function driveTurn(platform, lines, folded, requestText) {
       if (eventsTaken()) await closeTurnInbox(platform, request.turn, log, acknowledged.live);
       return;
     }
-    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice(), resume });
+    if (!asked) {
+      const answer = await platform.jobs(request.turn, step, [...folded.jobs.keys()].sort());
+      if (answer !== null) {
+        asked = answer.live;
+        lost.splice(0, lost.length, ...answer.lost.filter((key) => folded.jobs.has(key)).map((key) => lostDelivery(key)));
+      }
+    }
+    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice(), resume, ran, undispatched, lost: lost.map((delivery) => delivery.key) });
     resume = null;
+    ran = null;
+    undispatched = [];
+    if (done.output.ran !== undefined) {
+      assert(done.output.lines.length === 0, "a step that ran an effect to drain events after it flushed before it ran");
+      const carried = decodeOrCorrupt(() => ranFrom(decodeJson(done.output.ran)));
+      if (eventsTaken()) await recordEvents(platform, lines, folded, request.turn, done.live, { position: carried.position, lost, started: carried.started });
+      if (done.live) ran = done.output.ran;
+      continue;
+    }
     if (done.output.notDue === true) return;
     if (done.output.suspended !== undefined) {
       const suspension = decodeOrCorrupt(() => suspensionFrom(decodeJson(done.output.suspended)));
@@ -282,8 +374,9 @@ async function driveTurn(platform, lines, folded, requestText) {
     }
     live = done.live;
     if (live) await platform.hook(POINT_AFTER_FLUSH);
-    const ran = folded.turns.get(request.turn);
-    if (eventsTaken() && ran.finished === null) await recordEvents(platform, lines, folded, request.turn, live);
+    if (live) undispatched = undispatchedIn(done.output.lines, request.turn);
+    const running = folded.turns.get(request.turn);
+    if (eventsTaken() && running.finished === null) await recordEvents(platform, lines, folded, request.turn, live, { position: done.output.position ?? running.lastSeq, lost, started: [] });
     if (live && done.output.resumed !== undefined) {
       const answered = decodeJson(done.output.resumed);
       await platform.resumed(decodeOrCorrupt(() => suspensionFrom(answered.suspension)), decodeOrCorrupt(() => resumeFrom(answered.resume)), true);
@@ -292,17 +385,38 @@ async function driveTurn(platform, lines, folded, requestText) {
   throw new Panic(`turn ${request.turn} did not finish within its ${stepsMax} steps`);
 }
 
-async function recordEvents(platform, lines, folded, turn, live) {
-  const arrived = await platform.inbox(turn, live);
+function undispatchedIn(lines, turn) {
+  const seqs = [];
+  for (const line of lines) {
+    const record = decodeOrCorrupt(() => decodeLine(line, false));
+    if (record.kind === "recovery" && record.turn === turn) seqs.push(...record.undispatched);
+  }
+  return seqs;
+}
+
+async function recordEvents(platform, lines, folded, turn, live, drained) {
+  const inbox = await platform.inbox(turn, live);
+  if (inbox === null) return;
+  const queued = drained.lost.splice(0);
+  const arrived = [...queued, ...inbox];
   if (arrived.length === 0) return;
   const log = folded.turns.get(turn);
-  const position = log.lastSeq;
+  const position = drained.position;
   const events = log.events.slice();
+  const open = new Map(folded.jobs);
+  for (const [key, tool] of drained.started) open.set(key, tool);
+  const unrecorded = new Set(drained.started.map(([key]) => key));
+  const jobs = { open, recorded: (key) => !unrecorded.has(key) && jobRecorded(log.sites, turn, key) };
   const answers = [];
   const recorded = [];
-  for (const delivery of arrived) {
-    const admitted = admitEvent(turn, events, position, delivery);
+  for (let index = 0; index < arrived.length; index++) {
+    const delivery = arrived[index];
+    const admitted = admitEvent(turn, events, position, delivery, jobs);
     if (admitted.record !== null) recorded.push(encodeLine(admitted.record, false));
+    if (index < queued.length) {
+      if (admitted.answer === "full") drained.lost.push(delivery);
+      continue;
+    }
     answers.push([delivery.id, admitted.answer]);
   }
   if (recorded.length > 0) {
@@ -316,7 +430,7 @@ async function recordEvents(platform, lines, folded, turn, live) {
 }
 
 async function closeTurnInbox(platform, turn, log, live) {
-  const arrived = await platform.inbox(turn, live);
+  const arrived = ((await platform.inbox(turn, live)) ?? []).filter((delivery) => delivery.kind !== "job");
   if (arrived.length === 0) return;
   const answers = closingAnswers(log.events, arrived);
   await platform.step(`close ${turn}`, { kind: "answer", turn, position: log.finished.last, answers });
@@ -332,6 +446,8 @@ const WORKFLOW_BINDING = [
   "    toolsUrl: process.env.HL_TOOLS_URL,",
   "    listingsUrl: process.env.HL_LISTINGS_URL,",
   "    modelUrl: process.env.HL_MODEL_URL,",
+  "    recoverUrl: process.env.HL_RECOVER_URL,",
+  "    jobsUrl: process.env.HL_JOBS_URL,",
   "    now: () => Date.now(),",
   "    random: harness.platformRandom,",
   "  });",
@@ -341,6 +457,7 @@ const WORKFLOW_BINDING = [
   "  \"use step\";",
   "  return harness.runStep(input, {",
   "    attempt: getStepMetadata().attempt,",
+  "    attemptQuiet: getStepMetadata().attempt,",
   "    async nestedAttempt() {",
   "      return getStepMetadata().attempt;",
   "    },",
@@ -358,6 +475,11 @@ const WORKFLOW_BINDING = [
   "      if (!response.ok) throw new Error(\"event answers answered \" + response.status);",
   "    },",
   "  });",
+  "}",
+  "",
+  "export async function harnessJobs(turn, open) {",
+  "  \"use step\";",
+  "  return host().jobs(turn, open);",
   "}",
   "",
   "export async function harnessSide(lines, request) {",
@@ -419,6 +541,10 @@ const WORKFLOW_BINDING = [
   "      return inbox.pending.splice(0);",
   "    },",
   "    async record() {},",
+  "    async jobs(turn, step, open) {",
+  "      if (step !== 0) return null;",
+  "      return { lost: open.length === 0 ? [] : await harnessJobs(turn, open), live: true };",
+  "    },",
   "  });",
   "}",
   "",

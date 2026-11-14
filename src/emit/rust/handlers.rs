@@ -157,9 +157,13 @@ impl<'a, 'p> Body<'a, 'p> {
             }
             Stmt::Parallel(parallel) => self.parallel(parallel),
             Stmt::Effect { site, args, result } => self.effect(*site, args, *result),
-            Stmt::Take { result } => {
+            Stmt::Take { result, taken } => {
                 let local = self.local(*result);
-                self.line(&format!("let {local} = engine.take_steers();"));
+                let read = match taken {
+                    ir::Taken::Steers => "take_steers",
+                    ir::Taken::Jobs => "take_jobs",
+                };
+                self.line(&format!("let {local} = engine.{read}();"));
             }
             Stmt::Finish { value } => {
                 let value = self.expr(value);
@@ -431,21 +435,24 @@ impl<'a, 'p> Body<'a, 'p> {
                 ("Model", run, decode)
             }
             SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
-            SiteKind::Wait(constant_id) => {
+            SiteKind::Wait(constant_id) | SiteKind::Hold(constant_id) => {
+                let (tool, variant) = match kind {
+                    SiteKind::Hold(_) => (ir::HOLD_TOOL, "Hold"),
+                    _ => (ir::WAIT_TOOL, "Wait"),
+                };
                 let cap = &self.program.constants[constant_id].name;
                 self.line(&format!(
                     "let argument0 = wait_capped(argument0, {}, {cap:?})?;",
                     constant(cap)
                 ));
                 self.line(&format!(
-                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
-                    ir::WAIT_TOOL,
+                    "let call = Call {{ tool: {tool:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
                     EffectClass::None,
                     crate::run::engine::WAIT_MS
                 ));
                 (
-                    "Wait",
-                    "Run::Wait".to_owned(),
+                    variant,
+                    format!("Run::{variant}"),
                     "scalar(engine, answer)?".to_owned(),
                 )
             }

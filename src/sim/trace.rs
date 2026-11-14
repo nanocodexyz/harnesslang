@@ -64,6 +64,15 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+pub fn recovered_json(recovered: &crate::run::engine::Recovered) -> Json {
+    match recovered {
+        crate::run::engine::Recovered::Reply(output) => {
+            Json::object([("reply", crate::run::journal::output_json(output))])
+        }
+        other => Json::text(other.name()),
+    }
+}
+
 pub fn answer(result: &Result<(), Stop>) -> Json {
     Json::text(match result {
         Ok(()) => "ok",

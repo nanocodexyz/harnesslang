@@ -1,6 +1,7 @@
 use crate::check::{
-    ALLOW, CANCELLED_READ, Checked, DENY, EVENT_RESUME, EVENT_STEER, Globals, JOIN,
-    STEER_PARAMETER, STEERS_READ, WILDCARD, bound, error, quoted, resolve,
+    ALLOW, CANCELLED_READ, Checked, DENY, EVENT_JOB, EVENT_RESUME, EVENT_STEER, Globals,
+    JOB_PARAMETER, JOBS_READ, JOIN, STEER_PARAMETER, STEERS_READ, WILDCARD, bound, error, quoted,
+    resolve,
 };
 use crate::effect::EffectClass;
 use crate::ir::{
@@ -218,27 +219,34 @@ impl Checker<'_> {
         events: &ast::Name,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
-        if events.text != STEERS_READ {
-            return error(
-                events.at,
-                format!("'take' reads '{STEERS_READ}', found '{}'", events.text),
-            );
-        }
-        let Some(ty) = self.program.events.steers_type() else {
+        let (taken, read, event, parameter) = match events.text.as_str() {
+            STEERS_READ => (ir::Taken::Steers, STEERS_READ, EVENT_STEER, STEER_PARAMETER),
+            JOBS_READ => (ir::Taken::Jobs, JOBS_READ, EVENT_JOB, JOB_PARAMETER),
+            other => {
+                return error(
+                    events.at,
+                    format!("'take' reads '{STEERS_READ}' or '{JOBS_READ}', found '{other}'"),
+                );
+            }
+        };
+        let Some(ty) = self.program.events.taken_type(taken) else {
             return error(
                 at,
                 format!(
-                    "'take {STEERS_READ}' needs 'on {EVENT_STEER}({STEER_PARAMETER}: text) bound N' on the harness"
+                    "'take {read}' needs 'on {event}({parameter}: text) bound N' on the harness"
                 ),
             );
         };
-        self.events_readable(at, &format!("take {STEERS_READ}"))?;
+        self.events_readable(at, &format!("take {read}"))?;
         let local = self.locals.len();
         self.locals.push(ir::Field {
             name: format!("{WILDCARD}take{local}"),
             ty: ty.clone(),
         });
-        out.push(Stmt::Take { result: local });
+        out.push(Stmt::Take {
+            result: local,
+            taken,
+        });
         Ok((Expr::Local(local), ty))
     }
 
@@ -378,7 +386,7 @@ impl Checker<'_> {
             format!("run code tool '{name}'")
         } else if self.globals.listings.contains_key(name) {
             format!("read listing '{name}'")
-        } else if ["dispatch", "wait", "suspend", "now", "random", JOIN].contains(&name) {
+        } else if ["dispatch", "wait", "hold", "suspend", "now", "random", JOIN].contains(&name) {
             format!("call '{name}'")
         } else {
             return Ok(());
@@ -1095,29 +1103,33 @@ impl Checker<'_> {
         &mut self,
         at: Position,
         args: &[ast::Expr],
+        hold: bool,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
+        let builtin = if hold { "hold" } else { "wait" };
         let (duration, cap) = match args {
             [ast::Expr::Name(name)] => (None, name),
             [duration, ast::Expr::Name(cap)] => (Some(duration), cap),
             [other] => {
                 return error(
                     other.at(),
-                    "the duration of 'wait' must be a named constant in milliseconds, or bounded by one: wait(duration) at most constant",
+                    format!(
+                        "the duration of '{builtin}' must be a named constant in milliseconds, or bounded by one: {builtin}(duration) at most constant"
+                    ),
                 );
             }
             _ => {
                 return error(
                     at,
-                    format!("wait takes 1 argument(s), found {}", args.len()),
+                    format!("{builtin} takes 1 argument(s), found {}", args.len()),
                 );
             }
         };
         let Some(&constant) = self.globals.constants.get(&cap.text) else {
             let what = if duration.is_some() {
-                "the most a wait sleeps"
+                format!("the most a {builtin} sleeps")
             } else {
-                "the duration of 'wait'"
+                format!("the duration of '{builtin}'")
             };
             return error(
                 cap.at,
@@ -1136,8 +1148,13 @@ impl Checker<'_> {
                 value
             }
         };
+        let kind = if hold {
+            SiteKind::Hold(constant)
+        } else {
+            SiteKind::Wait(constant)
+        };
         Ok(self.site(
-            SiteKind::Wait(constant),
+            kind,
             SiteClass::Fixed(EffectClass::None),
             Type::U64,
             vec![duration],
@@ -1375,7 +1392,19 @@ impl Checker<'_> {
                 let result = self.program.dispatch_result();
                 Ok(self.site(SiteKind::Dispatch, SiteClass::Dispatched, result, args, out))
             }
-            "wait" => self.wait(at, args, out),
+            "wait" => self.wait(at, args, false, out),
+            "hold" => {
+                if self.program.events.jobs.is_none() {
+                    return error(
+                        at,
+                        format!(
+                            "'hold' waits for job notices, so it needs 'on {EVENT_JOB}({JOB_PARAMETER}: text) bound N' on the harness"
+                        ),
+                    );
+                }
+                self.events_readable(at, "hold")?;
+                self.wait(at, args, true, out)
+            }
             JOIN => self.join(at, args, out),
             DENY | ALLOW => error(
                 at,
@@ -1658,7 +1687,9 @@ impl Checker<'_> {
     }
 }
 
-const EFFECT_BUILTINS: [&str; 6] = ["dispatch", "now", "random", "wait", "suspend", "join"];
+const EFFECT_BUILTINS: [&str; 7] = [
+    "dispatch", "now", "random", "wait", "hold", "suspend", "join",
+];
 
 fn parallel_body<'b>(
     at: Position,

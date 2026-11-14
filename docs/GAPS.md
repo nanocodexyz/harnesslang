@@ -9,7 +9,9 @@ summarizing compaction, recovery by stop reason, retry and backoff (a model's
 (`before tool`, `after tool`, the lifecycle hooks); subagents (`spawn`, `join`,
 spawn trees with `sessions at most`); tool catalogs that change within a turn
 (listing notices, `finds`); images and structured results (`blob<N>`); side
-questions (`on side`); and the prompt cache's lifetime (`on idle`), all in
+questions (`on side`); the prompt cache's lifetime (`on idle`); and effects in
+flight (`interruptible by cancel, steer`, background jobs with `jobs at most`,
+`on job` and `hold`, and recovery hooks with `external recoverable`), all in
 LANGUAGE.md. `hl-agent` runs real child sessions of `claude_code_child.hl`.
 
 The list below comes from a fresh read of nanocode c7679e3's Claude backend
@@ -19,14 +21,6 @@ blocks, each with what nanocode does, why harnesslang cannot write it, and the
 smallest language addition that would let it be written and how the compiler
 would keep checking it. A gap the language closes is removed and the others
 keep their numbers.
-
-## 1. Cancel and steer preempt an effect in flight
-
-Claude: a running tool races the cancel and is abandoned as outcome unknown (agent/durable.rs:955-959; a call reached after cancel gets the same, 910-911). A cancelled model stream ends the turn after pushing "[Request interrupted by user]" and committing the history (agent.rs:7700-7708). Calls of an interrupted batch that never started get StartedToolCall::REASON results (agent.rs:8051, 8105-8116). Lifecycle hooks and the turn hold also race the cancel (agent.rs:7187-7190, 8408-8422). Accepting a steer preempts running code cells (agent.rs:6798-6800). Codex: with instant_tool_steering, a pending steer preempts the running tool batch (model/run/turn.rs:1050-1070). Compaction races the cancel and keeps a resumable checkpoint (turn.rs:97-113). A cancelled turn terminates its cells and commits a cancelled checkpoint (turn.rs:302-313). Withdrawn steers are skipped (turn.rs:992).
-
-Why not: In harnesslang every effect runs to completion. `cancelled` and `take steers` are reads between effects, and an event that arrives during an effect is only stamped `at` that effect (LANGUAGE.md, on (events)). Nothing lets an event abort a tool, a model call, a wait or a cell, so a ten-minute Bash or a 600 s wait cannot be stopped. There is also no arm for an effect that was interrupted, and no steer withdrawal.
-
-Smallest addition: An `interruptible by cancel[, steer]` modifier on an effect site, plus an `interrupted` arm in its match. When an event the site lists is recorded at its sequence number, the runtime tells the host to abort the effect and records {"interrupted":event} as its result. For an external effect that result is `unknown`, since its call record is already durable. The `interrupted` arm then runs the epilogue, such as pushing the interrupted notice. Replay takes the same arm because the event's `at` names that seq. The prover adds the arm to the effect's choices and keeps external_once and unknown_reported. The worst case is unchanged, and waits interrupted by an event count at most their constant. The simulator draws events during effects and checks interrupt_recorded (an interrupted result has an event at its seq) and interrupt_external_unknown. Mutations: interrupt_ignored, where the effect runs on and the arm never fires, and interrupt_reruns, which redispatches the aborted external.
 
 ## 2. A parallel batch whose calls each run their own effects
 
@@ -44,14 +38,6 @@ Why not: CODE_MODE.md, Not in this spec, says it: a harnesslang turn blocks on i
 
 Smallest addition: A `waits name` clause on `code`. A site may finish with running(cell) after yield_ms, and a site of the wait tool continues that cell's journal. Every running cell is stopped at its turn's `return`, with open nested calls recorded unknown, unless the program says `detach`. Cell records are already keyed by cell, so C1 and C2 hold unchanged. cell_finish_once is extended to: exactly one `finished` per cell across all its sites. A new property, cell_settled_at_turn_end, requires each cell to be finished or detached when its turn's status is flushed, with open nested ids carried as unknown. The calls and timers bounds become per cell, summed over its sites in the worst case. The simulator yields cells and drives waits across rounds and crashes. Mutation: cell_leaks, a cell left running past its turn.
 
-## 4. Background jobs whose completion arrives later
-
-A foreground Bash that reaches its timeout, or one run with run_in_background, keeps running as a job and returns at once with its task id (claude_bash.rs:969-1034). A watcher delivers the job's completion, or a stall notice when it waits on interactive input. Depending on the binding it arrives as a steer into the running turn, a notice merged into the next round, or a new prompt (claude_bash.rs:337-377, 600-640, 651-678; round notices pushed at agent.rs:8124-8131). Before a turn ends, the turn hold waits for busy jobs, racing cancel (claude_bash.rs:570-597, agent.rs:8408-8422). Job state rides each tool receipt and is restored on replay (agent/durable.rs:399-452, 871). At load, jobs that were running when the process ended get a "killed, outcome unknown" notice (agent.rs:1756-1761, 2619-2670).
-
-Why not: harnesslang has no effect that returns before it finishes. Its only outside events are cancel, steer and resume, and its only waits are a fixed-time `wait` and a `join` that ends the run. Idle turns are admitted on the clock alone. So there is no construct for a job's completion as an event, for holding a turn open until pending jobs settle, for starting a turn when a job completes, or for reporting jobs lost in a restart. spawn and join cover child harness sessions, not host processes.
-
-Smallest addition: A `job name(params) effect external` tool that returns a handle keyed T.S, like spawn, bounded by `jobs at most N` per session. Add an event `on job done(key: text, output: text)`, read with `take jobs` and recorded with `at` like a steer. `hold jobs at most c` is a wait-like effect, flushed first, that wakes on a completion, a cancel or c. An idle admission `on idle name() when jobs` starts a turn on a completion. At load, every job open across a crash yields a lost(key) event in the recovery record. The worst case counts event records and hold milliseconds. The simulator completes, stalls and loses jobs across crashes. Invariants: job_once (each handle completes or is reported lost exactly once) and hold_bounded. Mutation: job_lost_dropped.
-
 ## 5. Rewriting entries already in the history
 
 On provider errors the Claude loop retries once after transforming the whole pending history. It drops thinking blocks whose signatures belong to another organization (agent.rs:7563-7586). It turns refused compaction blocks into plain-text summaries (7587-7608), and strips appended tool-change blocks while resending the current tool list (7609-7643). It cuts the unfinished server turn out as evidence (2862-2884, 7688, 7975), and omits images when a continuation produced at most one token (8256). Codex repairs a rejected request by replacing images or a tool definition in history (model/run/turn.rs:120, 337, 939-945) and reconciles reasoning items after a repair (turn.rs:969). Local compaction drops the first history item on context_exceeded and retries (lifecycle.rs:530-536).
@@ -59,14 +45,6 @@ On provider errors the Claude loop retries once after transforming the whole pen
 Why not: A list changes only through push, clear, `keep L last n [after e]` and `keep L blobs last N` (LANGUAGE.md, Statements, clear and keep, Blobs). No statement maps or filters the entries a list already holds, such as replacing a field of every assistant(...) entry or removing entries of one variant. A provider-error recovery that edits the history is not writable. Only dropping the first entry can be approximated with keep.
 
 Smallest addition: A statement `rewrite L { pattern => entry | drop, ... }`: a pure, total map over a state list, with patterns on entry and reply variants and no effects in the arms. The prover sets the new length to at most the old one, or equal when no arm drops, and checks text bounds such as cut lengths through the arm expressions. It writes no record: state is derived and the checkpoint written with the status holds the result, so checkpoint_compacted already covers it. The simulator replays it, with the mutation rewrite_live_only (the live run rewrites but replay does not), caught by checkpoint_compacted and replay_equal.
-
-## 6. Asking the tool host to resolve an unknown outcome
-
-After a crash, a tool call admitted as Interrupted is not reported unknown directly. Claude asks the host's recovery hook, which returns the real reply, NOT_DISPATCHED (the call then runs now), or unknown, the last also on cancel (agent.rs:6895-6927, agent/durable.rs:876-909). Codex runs an interrupted call with recover: true. tools.recover_tool returns the recovered output or the interrupted result (model/run/tool_calls.rs:707-713, 1132-1140), and an unsent code cell runs fresh (1277-1287).
-
-Why not: In harnesslang, recovery always writes `unknown` for an open external call, and the program meets it as final (ARCHITECTURE.md, Durability points; external_once). A program-level probe tool in the `unknown` arm cannot express this. It lacks the journal's turn/seq key the host knows the call by, and a re-dispatch takes a new sequence number and a new call record, so the host sees a second call rather than the same one.
-
-Smallest addition: An effect class modifier `external recoverable`. Before reporting an open call unknown, recovery asks the host recover(tool, turn/seq) and records the answer in the recovery record. A reply becomes the call's result (ok or failed), not_dispatched runs the call under the same seq (its call record is already durable), and anything else is unknown. The prover's external_once becomes: dispatched at most once, unless the host attested it was not dispatched. unknown_reported then holds only for an unknown answer. The simulator's host knows the truth and answers truthfully or unknown. Invariant: recovered_truthful. Mutation: recover_trusts_lost, a rerun after an unknown answer, caught by external_once.
 
 ## 7. Forking or rewinding a session at a boundary
 
@@ -83,3 +61,20 @@ Claude keeps effort, thinking, fast mode and the auto-compact limit as session s
 Why not: A model call carries at most one `mode`, a name fixed at the call site (LANGUAGE.md, model). It cannot be a state value, and modes from separate dimensions (effort by fast by text_only or refresh) do not combine, so each combination needs its own call site. Thresholds and pins can be state fields, but the request settings the host must send cannot follow them.
 
 Smallest addition: Typed model settings: `model m ... settings effort: effort_enum, fast: bool`, and `m(context) with {effort: e}`, where e is any expression of that text enum or bool and omitted settings take declared defaults. The model record journals the settings as it journals mode, and a replay whose settings differ diverges. The worst case is unchanged, since there is still one site. The simulator draws settings changes between turns through ordinary handlers and checks settings_sent, the analogue of mode_sent. Mutation: settings_dropped.
+
+## 9. What effects in flight leave out
+
+Gaps 1, 4 and 6 of the earlier list are closed (LANGUAGE.md, Effects in flight). What
+nanocode does there that the additions do not write:
+
+- A `wait`, a cell's nested calls and a running code cell are not interruptible:
+  only tools and the model are. nanocode's retry sleep, cell stop and turn hold
+  race the cancel; here only `hold` wakes on a cancel.
+- A steer cannot be withdrawn once recorded (Codex's skipped withdrawn steers).
+- A job notice that arrives while no turn runs is recorded by the next turn the
+  host admits; nothing admits a turn because a job finished (nanocode's
+  `Delivery::Prompted`). `examples/claude_code.hl` takes notices only when it
+  would answer, after its `hold`, not at every round (taking them every round cost
+  3.1M prover steps more).
+- hl-agent sends no stall notices: its jobs report only their end.
+

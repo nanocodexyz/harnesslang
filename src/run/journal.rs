@@ -38,6 +38,14 @@ pub enum Output {
 pub enum Inbound {
     Cancel,
     Steer(String),
+    Job(JobNotice),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobNotice {
+    pub key: String,
+    pub notice: String,
+    pub done: bool,
 }
 
 impl Inbound {
@@ -45,7 +53,46 @@ impl Inbound {
         match self {
             Self::Cancel => "cancel",
             Self::Steer(_) => "steer",
+            Self::Job(_) => "job",
         }
+    }
+
+    pub const fn interrupts(&self, interrupts: crate::ir::Interrupts) -> bool {
+        match self {
+            Self::Cancel => interrupts.cancel,
+            Self::Steer(_) => interrupts.steer,
+            Self::Job(_) => false,
+        }
+    }
+}
+
+pub const JOB_DONE: &str = "done";
+pub const JOB_KEY_FIELD: &str = "key";
+pub const LOST_PREFIX: &str = "lost:";
+
+pub fn lost_notice(key: &str) -> String {
+    format!(
+        "<task-notification>\n<task-id>{key}</task-id>\n<status>killed</status>\n<summary>Background command {key} was still running when the harness that started it ended, so its completion was never reported and never will be. It was most likely stopped then; its outcome is unknown.</summary>\n</task-notification>\nRead its output file and check its effects before you rely on it or run it again."
+    )
+}
+
+pub fn lost_delivery(key: &str) -> Delivery {
+    Delivery {
+        id: format!("{LOST_PREFIX}{key}"),
+        inbound: Inbound::Job(JobNotice {
+            key: key.to_owned(),
+            notice: lost_notice(key),
+            done: true,
+        }),
+    }
+}
+
+pub fn job_started(output: &Output) -> Option<&str> {
+    match output {
+        Output::Ok(Json::Object(map)) if map.len() == 1 => {
+            map.get(crate::ir::JOB_KEY).and_then(Json::as_str)
+        }
+        _ => None,
     }
 }
 
@@ -105,6 +152,8 @@ pub enum Record {
         attempt: u64,
         unknown: Vec<u64>,
         nested: Vec<(u64, u64)>,
+        replied: Vec<u64>,
+        undispatched: Vec<u64>,
     },
     Status {
         turn: u64,
@@ -183,6 +232,12 @@ pub fn delivery_json(delivery: &Delivery) -> Json {
             ("id", id),
             (crate::check::STEER_PARAMETER, Json::text(message)),
         ]),
+        Inbound::Job(job) => Json::object([
+            (JOB_DONE, Json::Bool(job.done)),
+            ("id", id),
+            (JOB_KEY_FIELD, Json::text(&job.key)),
+            (crate::check::JOB_PARAMETER, Json::text(&job.notice)),
+        ]),
     };
     Json::object([(delivery.inbound.name(), fields)])
 }
@@ -201,6 +256,14 @@ pub fn delivery_from(json: &Json) -> Result<Delivery, String> {
         "steer" => {
             fields.exact(&["id", crate::check::STEER_PARAMETER])?;
             Inbound::Steer(fields.text(crate::check::STEER_PARAMETER)?.to_owned())
+        }
+        "job" => {
+            fields.exact(&[JOB_DONE, "id", JOB_KEY_FIELD, crate::check::JOB_PARAMETER])?;
+            Inbound::Job(JobNotice {
+                key: fields.text(JOB_KEY_FIELD)?.to_owned(),
+                notice: fields.text(crate::check::JOB_PARAMETER)?.to_owned(),
+                done: fields.boolean(JOB_DONE)?,
+            })
         }
         other => return Err(format!("unknown event '{other}'")),
     };
@@ -294,14 +357,28 @@ pub fn to_json(record: &Record) -> Json {
             attempt,
             unknown,
             nested,
-        } => (
-            "recovery",
-            Json::object([
-                ("attempt", Json::Number(*attempt)),
-                ("turn", turn_text(*turn)),
-                ("unknown", recovery_ids(*turn, unknown, nested)),
-            ]),
-        ),
+            replied,
+            undispatched,
+        } => {
+            let mut fields = BTreeMap::from([
+                ("attempt".to_owned(), Json::Number(*attempt)),
+                ("turn".to_owned(), turn_text(*turn)),
+                ("unknown".to_owned(), recovery_ids(*turn, unknown, nested)),
+            ]);
+            if !replied.is_empty() {
+                fields.insert(
+                    RECOVERY_REPLIED.to_owned(),
+                    recovery_ids(*turn, replied, &[]),
+                );
+            }
+            if !undispatched.is_empty() {
+                fields.insert(
+                    RECOVERY_UNDISPATCHED.to_owned(),
+                    recovery_ids(*turn, undispatched, &[]),
+                );
+            }
+            ("recovery", Json::Object(fields))
+        }
         Record::NestedCall {
             turn,
             seq,
@@ -406,6 +483,34 @@ fn recovery_ids(turn: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Json {
 }
 
 pub const MODEL_MODE: &str = "mode";
+pub const RECOVERY_REPLIED: &str = "replied";
+pub const RECOVERY_UNDISPATCHED: &str = "not_dispatched";
+
+fn attested_seqs(fields: &Fields<'_>, key: &str, turn: u64) -> Result<Vec<u64>, String> {
+    let Some(json) = fields.map.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Json::Array(items) = json else {
+        return Err(format!("recovery record's {key} is not a list"));
+    };
+    let mut seqs = Vec::with_capacity(items.len());
+    for item in items {
+        let id = item
+            .as_str()
+            .ok_or_else(|| format!("recovery's {key} lists a call id that is not text"))?;
+        let (call_turn, seq) = parse_call_id(id)?;
+        if call_turn != turn {
+            return Err(format!("recovery's {key} lists a call of another turn"));
+        }
+        seqs.push(seq);
+    }
+    if seqs.is_empty() || seqs.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(format!(
+            "recovery's {key} lists no calls, or lists them out of order"
+        ));
+    }
+    Ok(seqs)
+}
 
 struct Fields<'a> {
     tag: &'a str,
@@ -523,7 +628,14 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
             })
         }
         "recovery" => {
-            fields.exact(&["attempt", "turn", "unknown"])?;
+            let mut keys = vec!["attempt", "turn", "unknown"];
+            for key in [RECOVERY_UNDISPATCHED, RECOVERY_REPLIED] {
+                if fields.map.contains_key(key) {
+                    keys.push(key);
+                }
+            }
+            keys.sort_unstable();
+            fields.exact(&keys)?;
             let turn = fields.turn()?;
             let Json::Array(items) = fields.get("unknown")? else {
                 return Err("recovery record's unknown is not a list".to_owned());
@@ -555,6 +667,8 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
                 attempt: fields.number("attempt")?,
                 unknown,
                 nested,
+                replied: attested_seqs(&fields, RECOVERY_REPLIED, turn)?,
+                undispatched: attested_seqs(&fields, RECOVERY_UNDISPATCHED, turn)?,
             };
             if to_json(&record)
                 .get("recovery")

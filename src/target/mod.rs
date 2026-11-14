@@ -422,7 +422,9 @@ pub fn longest_wait(program: &Program, handler: &crate::ir::Handler) -> Option<(
         .sites
         .iter()
         .filter_map(|site| match site.kind {
-            crate::ir::SiteKind::Wait(constant) => Some(&program.constants[constant]),
+            crate::ir::SiteKind::Wait(constant) | crate::ir::SiteKind::Hold(constant) => {
+                Some(&program.constants[constant])
+            }
             _ => None,
         })
         .max_by_key(|constant| constant.value)

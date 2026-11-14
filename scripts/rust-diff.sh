@@ -30,7 +30,7 @@ plant_expression() {
     recovery_skipped) echo 's/SiteLog::Open(call) if call.effect.may_be_unknown() => Some(\*seq),/SiteLog::Open(call) if false => Some(*seq),/' ;;
     nested_flush_after_dispatch) echo 's/if tool.effect.may_be_unknown() {/if false \&\& tool.effect.may_be_unknown() {/' ;;
     timeout_rides) echo 's/if self.header_unsaved {/if false \&\& self.header_unsaved {/' ;;
-    enum_unchecked) echo 's/checked_output(&call.tool, returns, output)$/output/' ;;
+    enum_unchecked) echo 's/None => checked_output(\&call.tool, returns, output),$/None => output,/' ;;
     nested_enum_unchecked) echo 's/Ok(checked_output(tool.name, tool.returns, output))$/Ok(output)/' ;;
     default_unfilled) echo 's/fields.entry(name.to_owned()).or_insert(value);/drop((fields, name, value));/' ;;
     mode_dropped) echo 's/                    mode: site.mode,$/                    mode: None,/' ;;
@@ -38,6 +38,9 @@ plant_expression() {
     blob_unjournaled) echo 's/Json::object(\[(BLOB_KEY, Json::text(\&digest)), (DATA_KEY, Json::text(base64))\])/digest_json(\&digest)/' ;;
     grandchild_unscoped) echo 's/^    if scope.is_empty() {$/    if true {/' ;;
     idle_early) echo 's/^                if clock < due {$/                if false \&\& clock < due {/' ;;
+    interrupt_ignored) echo 's/let interrupted = self.drain_interrupting(interrupts)? \&\& !preempted;/let interrupted = self.drain_interrupting(interrupts)? \&\& false;/' ;;
+    recover_skipped) echo 's/let recovered = if program::recoverable(&call.tool) {/let recovered = if false {/' ;;
+    job_lost_dropped) echo 's/        .map(|key| lost_delivery(key))$/        .filter(|_| false).map(|key| lost_delivery(key))/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }
