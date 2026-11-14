@@ -19,6 +19,7 @@ if [ ! -x "$oracle/node_modules/.bin/workerd" ]; then
   (cd "$oracle" && npm ci --no-audit --no-fund > /dev/null)
 fi
 echo "cloudflare drill: $("$oracle/node_modules/.bin/workerd" --version)"
+node "$oracle/loader.mjs" --dir "$scratch/loader" | grep -E '^(fact|FAIL|loader facts)' | cut -c1-160
 
 drill() {
   node "$oracle/drill.mjs" "$@"
