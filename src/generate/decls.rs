@@ -19,6 +19,7 @@ const TOOLS_MAX: u64 = 4;
 const PARAMS_PER_TOOL_MAX: u64 = 3;
 const STATE_FIELDS_MAX: u64 = 5;
 const MODEL_PERCENT: u64 = 80;
+const PROVABLE_PERCENT: u64 = 40;
 const UNDERSCORE_NUMBER_PERCENT: u64 = 20;
 const ARITHMETIC_VALUES: [u64; 6] = [0, 1, 7, 1 << 32, u64::MAX - 1, u64::MAX];
 
@@ -97,7 +98,10 @@ pub fn field_type(rng: &mut Rng, decls: &Decls, sums_below: usize) -> Ty {
 }
 
 pub fn generate(rng: &mut Rng) -> Decls {
-    let mut decls = Decls::default();
+    let mut decls = Decls {
+        provable: chance(rng, PROVABLE_PERCENT),
+        ..Decls::default()
+    };
     constants(rng, &mut decls);
     if chance(rng, MODEL_PERCENT) {
         decls.model = Some(fresh(rng, &mut decls.names, "m".to_owned()));

@@ -4,6 +4,7 @@ mod decls;
 mod expr;
 pub mod mutate;
 mod names;
+pub mod sound;
 
 use crate::effect::EffectClass;
 use crate::sim::rng::Rng;
@@ -52,6 +53,7 @@ pub struct Decls {
     pub model: Option<String>,
     pub fields: Vec<(String, Ty)>,
     pub names: std::collections::BTreeSet<String>,
+    pub provable: bool,
 }
 
 impl Decls {

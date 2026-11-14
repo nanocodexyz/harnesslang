@@ -47,6 +47,8 @@ struct Body<'a> {
     context: Context<'a>,
     used: std::collections::BTreeSet<String>,
     names: u64,
+    pushes: std::collections::BTreeMap<String, u64>,
+    multiplier: u64,
     statements_left: u64,
     loops: u32,
     returns: Ty,
@@ -57,15 +59,32 @@ pub fn invariants(rng: &mut Rng, decls: &Decls) -> Vec<String> {
     let mut context = Context {
         decls,
         locals: Vec::new(),
+        indices: Vec::new(),
         effects: false,
         fields: true,
     };
+    let lists: Vec<(String, Ty)> = context.lists();
     (0..rng.below(INVARIANTS_MAX + 1))
         .map(|index| {
-            let condition = context.boolean(rng, EXPRESSION_DEPTH_MAX);
+            let condition = if decls.provable {
+                provable_invariant(rng, decls, &lists)
+            } else {
+                context.boolean(rng, EXPRESSION_DEPTH_MAX)
+            };
             format!("invariant inv{index}: {condition}")
         })
         .collect()
+}
+
+fn provable_invariant(rng: &mut Rng, decls: &Decls, lists: &[(String, Ty)]) -> String {
+    if lists.is_empty() {
+        return "true".to_owned();
+    }
+    let (name, ty) = &lists[rng.pick(lists.len())];
+    let Ty::List(_, capacity) = ty else {
+        unreachable!("lists() returns lists")
+    };
+    format!("len({name}) <= {}", decls.constants[*capacity].0)
 }
 
 fn param_type(rng: &mut Rng, decls: &Decls) -> Ty {
@@ -76,6 +95,7 @@ fn return_type(rng: &mut Rng, decls: &Decls) -> Ty {
     let context = Context {
         decls,
         locals: Vec::new(),
+        indices: Vec::new(),
         effects: false,
         fields: true,
     };
@@ -113,11 +133,14 @@ pub fn handler(
         context: Context {
             decls,
             locals: params,
+            indices: Vec::new(),
             effects: false,
             fields: true,
         },
         used,
         names: 0,
+        pushes: std::collections::BTreeMap::new(),
+        multiplier: 1,
         statements_left: STATEMENTS_PER_HANDLER_MAX,
         loops: 0,
         returns: returns.clone(),
@@ -128,10 +151,8 @@ pub fn handler(
         rendered.join(", "),
         decls.render_type(&returns)
     ));
-    if chance(rng, REQUIRES_PERCENT) {
-        let condition = body.context.boolean(rng, EXPRESSION_DEPTH_MAX);
-        body.lines.push(format!("{INDENT}requires {condition}"));
-    }
+    let requires = (chance(rng, REQUIRES_PERCENT) && !decls.provable)
+        .then(|| body.context.boolean(rng, EXPRESSION_DEPTH_MAX));
     body.context.effects = true;
     body.lines.push("{".to_owned());
     let returned = body.statements(rng, 1);
@@ -139,10 +160,44 @@ pub fn handler(
         body.final_return(rng);
     }
     body.lines.push("}".to_owned());
+    let requires = requires.or_else(|| body.room());
+    if let Some(condition) = requires {
+        body.lines
+            .insert(1, format!("{INDENT}requires {condition}"));
+    }
     body.lines
 }
 
 impl Body<'_> {
+    fn room(&self) -> Option<String> {
+        let decls = self.context.decls;
+        let conditions: Vec<String> = self
+            .pushes
+            .iter()
+            .map(|(name, pushes)| {
+                let (_, ty) = decls
+                    .fields
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .expect("pushes go onto fields");
+                let Ty::List(_, capacity) = ty else {
+                    unreachable!("pushes go onto lists")
+                };
+                format!("len({name}) + {pushes} <= {}", decls.constants[*capacity].0)
+            })
+            .collect();
+        (!conditions.is_empty()).then(|| conditions.join("\n    and "))
+    }
+
+    fn repeated(&mut self, rng: &mut Rng, depth: u32, times: u64) {
+        let saved = self.multiplier;
+        self.multiplier = self.multiplier.saturating_mul(times);
+        self.loops += 1;
+        self.block(rng, depth + 1);
+        self.loops -= 1;
+        self.multiplier = saved;
+    }
+
     fn line(&mut self, depth: u32, text: String) {
         self.lines
             .push(format!("{}{text}", INDENT.repeat(depth as usize)));
@@ -264,6 +319,8 @@ impl Body<'_> {
         };
         if let Some(value) = self.context.expr(rng, &element, true, EXPRESSION_DEPTH_MAX) {
             self.line(depth, format!("push {name} {value}"));
+            let count = self.pushes.entry(name).or_insert(0);
+            *count = count.saturating_add(self.multiplier);
         }
     }
 
@@ -394,15 +451,14 @@ impl Body<'_> {
             return;
         }
         let (list, ty) = lists[rng.pick(lists.len())].clone();
-        let Ty::List(element, _) = ty else {
+        let Ty::List(element, capacity) = ty else {
             unreachable!("lists() returns lists")
         };
         let name = self.name(rng, "x");
         self.line(depth, format!("for {name} in {list} {{"));
         self.context.locals.push((name, *element));
-        self.loops += 1;
-        self.block(rng, depth + 1);
-        self.loops -= 1;
+        let times = self.context.decls.constants[capacity].1;
+        self.repeated(rng, depth, times);
         self.context.locals.pop();
         self.line(depth, "}".to_owned());
     }

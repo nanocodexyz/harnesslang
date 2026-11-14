@@ -70,6 +70,7 @@ const ARITHMETIC_WEIGHTS: [(usize, u64); 3] = [(0, 4), (1, 3), (2, 1)];
 pub struct Context<'a> {
     pub decls: &'a Decls,
     pub locals: Vec<(String, Ty)>,
+    pub indices: Vec<String>,
     pub effects: bool,
     pub fields: bool,
 }
@@ -175,6 +176,7 @@ impl Context<'_> {
         let picks = self.feasible(&U64_PICKS, depth);
         match weighted(rng, &picks) {
             Pick::Atom => self.atom(rng, &Ty::U64).expect("a feasible atom exists"),
+            Pick::Binary if self.decls.provable => self.bounded_sum(rng),
             Pick::Binary => {
                 let op = ARITHMETIC[weighted(rng, &ARITHMETIC_WEIGHTS)];
                 let left = self.number(rng, depth - 1);
@@ -191,8 +193,22 @@ impl Context<'_> {
         }
     }
 
+    fn bounded_sum(&mut self, rng: &mut Rng) -> String {
+        let small = rng.below(SMALL_NUMBER_MAX + 1);
+        let lists = self.lists();
+        let index = !self.indices.is_empty() && (lists.is_empty() || rng.below(2) == 0);
+        let base = if index {
+            self.indices[rng.pick(self.indices.len())].clone()
+        } else if !lists.is_empty() {
+            format!("len({})", lists[rng.pick(lists.len())].0)
+        } else {
+            return small.to_string();
+        };
+        format!("{base} + {small}")
+    }
+
     fn number_literal(&self, rng: &mut Rng) -> String {
-        if chance(rng, EDGE_NUMBER_PERCENT) {
+        if chance(rng, EDGE_NUMBER_PERCENT) && !self.decls.provable {
             return EDGE_NUMBERS[rng.pick(EDGE_NUMBERS.len())].to_string();
         }
         rng.below(SMALL_NUMBER_MAX + 1).to_string()

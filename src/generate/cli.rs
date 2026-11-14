@@ -7,7 +7,7 @@ const USAGE_EXIT: u8 = 2;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl gen --seed S\n       hl gen --seeds A..B --out DIR\n       hl fuzz-parse --seed S --cases N [--save DIR] [FILE]...\n       hl fuzz-parse --replay FILE"
+        "usage: hl gen --seed S\n       hl gen --seeds A..B --out DIR\n       hl fuzz-parse --seed S --cases N [--save DIR] [FILE]...\n       hl fuzz-parse --replay FILE\n       hl fuzz-prove --seeds A..B --sim-seeds N [--ignore-property P]"
     );
     ExitCode::from(USAGE_EXIT)
 }
@@ -70,6 +70,38 @@ fn gen_many(seeds: std::ops::Range<u64>, out: &str) -> ExitCode {
             generated.source.lines().count()
         );
     }
+    ExitCode::SUCCESS
+}
+
+pub fn fuzz_prove_command(args: &[String]) -> ExitCode {
+    let (args, ignored) = match args {
+        [rest @ .., flag, property] if flag == "--ignore-property" => {
+            (rest, Some(property.as_str()))
+        }
+        _ => (args, None),
+    };
+    let [seeds_flag, seeds, sim_flag, sim_seeds] = args else {
+        return usage();
+    };
+    let (Some(seeds), Ok(sim_seeds)) = (parse_range(seeds), sim_seeds.parse::<u64>()) else {
+        return usage();
+    };
+    if seeds_flag != "--seeds" || sim_flag != "--sim-seeds" {
+        return usage();
+    }
+    let mut stats = crate::generate::sound::Soundness::default();
+    for seed in seeds {
+        if let Err(error) =
+            crate::generate::sound::check_program(seed, sim_seeds, ignored, &mut stats)
+        {
+            println!("FAIL fuzz-prove: {error}");
+            return ExitCode::from(FAILURE_EXIT);
+        }
+    }
+    println!(
+        "fuzz-prove: programs={} proved={} runs={} turns={} checkpointed_states_checked={} traps_in_unproved={}",
+        stats.programs, stats.proved, stats.runs, stats.turns, stats.states, stats.traps_unproved
+    );
     ExitCode::SUCCESS
 }
 

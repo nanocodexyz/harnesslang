@@ -56,6 +56,7 @@ fn main() -> ExitCode {
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
         "gen" => harnesslang::generate::cli::gen_command(rest),
         "fuzz-parse" => harnesslang::generate::cli::fuzz_parse_command(rest),
+        "fuzz-prove" => harnesslang::generate::cli::fuzz_prove_command(rest),
         _ => usage(),
     }
 }
