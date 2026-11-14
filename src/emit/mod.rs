@@ -1,3 +1,5 @@
+pub mod sql;
+
 use crate::ir::Program;
 use crate::target::Target;
 

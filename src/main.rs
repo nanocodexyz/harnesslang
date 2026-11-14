@@ -50,6 +50,7 @@ fn main() -> ExitCode {
         "run" => run_command(rest),
         "sim" => sim_command(rest),
         "emit" => emit_command(rest),
+        "sql" => harnesslang::emit::sql::command::run(rest),
         _ => usage(),
     }
 }
@@ -357,6 +358,9 @@ fn traced_sweep(program: &Program, options: &Options, path: &str) -> Result<sim:
 }
 
 fn emit_command(args: &[String]) -> ExitCode {
+    if args.iter().any(|arg| arg == "--sql") {
+        return harnesslang::emit::sql::command::emit_listing(args);
+    }
     let Some(flags) = flags(args) else {
         return usage();
     };
