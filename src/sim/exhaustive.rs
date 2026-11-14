@@ -94,7 +94,6 @@ struct Session<'a> {
     mutation: Mutation,
     seed: u64,
     requests: Vec<TurnRequest>,
-    faults_per_session: u64,
     cuts: Cuts,
 }
 
@@ -802,7 +801,6 @@ fn explore_seed(program: &Program, options: &Options, seed: u64) -> Summary {
         mutation: options.mutation,
         seed,
         requests: workload(program, seed),
-        faults_per_session: options.faults_per_session,
         cuts: options.cuts,
     };
     let mut search = Search {
