@@ -1972,8 +1972,14 @@ impl<'a> Engine<'a> {
                 self.sites.insert(seq, SiteLog::Open(call.clone()));
             }
         }
-        let outcome = self.run_cell(code, seq, &call)?;
-        let output = outcome.output();
+        let output = if self.cell_preempted(code) {
+            if self.cells.get(&seq).is_some_and(|log| !log.finished) {
+                self.stop_cell(seq);
+            }
+            Output::Ok(Json::text(cell::STOPPED_TEXT))
+        } else {
+            self.run_cell(code, seq, &call)?.output()
+        };
         self.append(Record::Result {
             turn: self.turn,
             seq,
@@ -2108,7 +2114,16 @@ impl<'a> Engine<'a> {
             .and_then(Json::as_str)
             .unwrap_or_default();
         let terminate = input.get(ir::WAIT_TERMINATE) == Some(&Json::Bool(true));
-        let Some((origin, log)) = self.waited_cell(code, seq, id) else {
+        let found = self.waited_cell(code, seq, id);
+        if self.cell_preempted(code) {
+            if let Some((origin, log)) = &found
+                && !log.finished
+            {
+                self.stop_cell(*origin);
+            }
+            return Ok(Output::Ok(Json::text(cell::STOPPED_TEXT)));
+        }
+        let Some((origin, log)) = found else {
             return Ok(Output::Failed(cell::NOT_FOUND_TEXT.to_owned()));
         };
         if log.finished {
@@ -2148,6 +2163,13 @@ impl<'a> Engine<'a> {
         };
         let outcome = cell::run(site, self).map_err(Halt::from)?;
         Ok(outcome.output())
+    }
+
+    fn cell_preempted(&self, code: crate::ir::CodeId) -> bool {
+        let interrupts = self.program.codes[code].interrupts;
+        interrupts.cancel
+            && self.mutation != Mutation::CellCancelIgnored
+            && self.preempted(interrupts)
     }
 
     fn decode_cell(&self, output: &Output) -> Result<Value, Halt> {
@@ -2982,6 +3004,17 @@ impl CellHost for Engine<'_> {
 
     fn observe(&mut self, event: &CellEvent) {
         self.world().observe(event);
+    }
+
+    fn cancelled(&mut self, code: crate::ir::CodeId, drain: bool) -> Result<bool, Stop> {
+        let interrupts = self.program.codes[code].interrupts;
+        if !interrupts.cancel {
+            return Ok(false);
+        }
+        if drain {
+            self.drain_at(Drain::AfterRun).map_err(halt_stop)?;
+        }
+        Ok(self.mutation != Mutation::CellCancelIgnored && self.preempted(interrupts))
     }
 }
 

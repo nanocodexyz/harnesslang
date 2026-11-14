@@ -310,6 +310,12 @@ pub fn interrupted_count(program: &Program, records: &[Record]) -> u64 {
             } if error == crate::ir::INTERRUPTED_REASON && program.any_interruptible() => {
                 count += 1;
             }
+            Record::Result { output, .. }
+                if program.codes.iter().any(|code| code.interrupts.cancel)
+                    && crate::run::cell::stopped_output(output) =>
+            {
+                count += 1;
+            }
             _ => {}
         }
     }
@@ -361,7 +367,9 @@ fn interrupt_honored(program: &Program, records: &[Record]) -> Result<(), Violat
                 if replied.remove(&(*turn, *seq)) {
                     continue;
                 }
-                let reason = matches!(output, Output::Failed(error) if error == crate::ir::INTERRUPTED_REASON);
+                let reason = matches!(output, Output::Failed(error) if error == crate::ir::INTERRUPTED_REASON)
+                    || (program.cell_of(&tool).is_some()
+                        && crate::run::cell::stopped_output(output));
                 (
                     *turn,
                     *seq,
@@ -548,6 +556,22 @@ fn tool_class(program: &Program, name: &str) -> EffectClass {
     program.dispatch_class(name)
 }
 
+fn stopped_cell(program: &Program, log: &session::TurnLog, origin: u64, cell: u64) -> bool {
+    let id = cell.to_string();
+    log.sites.iter().any(|(seq, site)| match site {
+        SiteLog::Done(call, output) if crate::run::cell::stopped_output(output) => {
+            *seq == origin
+                || (program.waits(&call.tool).is_some()
+                    && call
+                        .input
+                        .get(crate::ir::WAIT_CELL_ID)
+                        .and_then(Json::as_str)
+                        == Some(id.as_str()))
+        }
+        _ => false,
+    })
+}
+
 fn cells(program: &Program, calls: &Calls, session: &Session) -> Result<(), Violation> {
     let unknown_encoded = unknown_outcome().encode();
     for (turn, log) in &session.turns {
@@ -613,7 +637,8 @@ fn cells(program: &Program, calls: &Calls, session: &Session) -> Result<(), Viol
                     }
                     continue;
                 }
-                if site_unknown {
+                if site_unknown || (result.is_none() && stopped_cell(program, log, *seq, cell.cell))
+                {
                     continue;
                 }
                 if result.is_none() || delivered_unknown {

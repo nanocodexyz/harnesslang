@@ -279,9 +279,13 @@ impl Program {
                 .model
                 .as_ref()
                 .map_or_else(Interrupts::default, |model| model.interrupts),
-            SiteKind::Tool(_) | SiteKind::Dispatch => self
-                .tool(tool)
-                .map_or_else(Interrupts::default, |(_, declared)| declared.interrupts),
+            SiteKind::Tool(_) | SiteKind::Dispatch | SiteKind::Cell(_) => {
+                if let Some(code) = self.cell_of(tool) {
+                    return self.codes[code].interrupts;
+                }
+                self.tool(tool)
+                    .map_or_else(Interrupts::default, |(_, declared)| declared.interrupts)
+            }
             _ => Interrupts::default(),
         }
     }
@@ -301,6 +305,13 @@ impl Program {
             .as_ref()
             .is_some_and(|model| model.interrupts.any())
             || self.tools.iter().any(|tool| tool.interrupts.any())
+            || self.codes.iter().any(|code| code.interrupts.any())
+    }
+
+    pub fn cell_of(&self, tool: &str) -> Option<CodeId> {
+        self.code(tool)
+            .map(|(code, _)| code)
+            .or_else(|| self.waits(tool).map(|(code, _)| code))
     }
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
@@ -506,6 +517,7 @@ pub struct Code {
     pub journal_bytes: Bound,
     pub yield_ms: Bound,
     pub waits: Option<Waits>,
+    pub interrupts: Interrupts,
 }
 
 pub const WAIT_CELL_ID: &str = "cell_id";

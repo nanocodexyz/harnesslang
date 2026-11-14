@@ -971,6 +971,10 @@ fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
         let (names, owner) = match item {
             Item::Tool(tool) => (&tool.interrupts, Some(tool.name.text.as_str())),
             Item::Model(model) => (&model.interrupts, None),
+            Item::Code(code) => {
+                code_interrupts(code, program)?;
+                continue;
+            }
             _ => continue,
         };
         let mut interrupts = ir::Interrupts::default();
@@ -1020,6 +1024,41 @@ fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn code_interrupts(code: &ast::Code, program: &mut ir::Program) -> Checked<()> {
+    let mut interrupts = ir::Interrupts::default();
+    for name in &code.interrupts {
+        if name.text != EVENT_CANCEL {
+            return error(
+                name.at,
+                format!(
+                    "code '{}' is interruptible by '{EVENT_CANCEL}' only: a cancel stops its cell, which nothing else does",
+                    code.name.text
+                ),
+            );
+        }
+        if !program.events.cancel {
+            return error(
+                name.at,
+                format!(
+                    "'interruptible by {EVENT_CANCEL}' needs 'on {EVENT_CANCEL}' on the harness"
+                ),
+            );
+        }
+        if interrupts.cancel {
+            return error(
+                name.at,
+                format!("'{EVENT_CANCEL}' interrupts the effect twice"),
+            );
+        }
+        interrupts.cancel = true;
+    }
+    let (id, _) = program
+        .code(&code.name.text)
+        .expect("codes are checked before interrupts");
+    program.codes[id].interrupts = interrupts;
     Ok(())
 }
 
@@ -1576,6 +1615,7 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         journal_bytes: take(CODE_FIELDS[4])?,
         yield_ms: take(CODE_FIELDS[5])?,
         waits,
+        interrupts: ir::Interrupts::default(),
     };
     code_bounds(code, &checked)?;
     Ok(checked)

@@ -168,6 +168,7 @@ pub struct Code {
     pub name: Name,
     pub tools: Vec<Name>,
     pub fields: Vec<CodeField>,
+    pub interrupts: Vec<Name>,
 }
 
 #[derive(Clone, Debug)]

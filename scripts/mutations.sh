@@ -78,7 +78,8 @@ job_lost_dropped docs/snippets/in_flight.hl --twice job_reported 0..1000
 job_lost_all docs/snippets/in_flight.hl --twice job_once
 fork_live_state docs/snippets/fork.hl --twice fork_state_equal
 fork_hook_skipped docs/snippets/fork.hl --twice fork_state_equal
-cell_leaks docs/snippets/code_wait.hl --twice cell_settled_at_turn_end"
+cell_leaks docs/snippets/code_wait.hl --twice cell_settled_at_turn_end
+cell_cancel_ignored docs/snippets/code_stop.hl --twice interrupt_honored"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

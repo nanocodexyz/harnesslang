@@ -376,12 +376,17 @@ impl<'a> Parser<'a> {
         let open = self.symbol(Symbol::LeftBrace)?;
         let mut tools = Vec::new();
         let mut fields = Vec::new();
+        let mut interrupts = Vec::new();
         while !self.is_symbol(Symbol::RightBrace) {
             if self.peek().token == Token::End {
                 return Err(Diagnostic::new(
                     open,
                     "code block is not closed before the end of the file",
                 ));
+            }
+            if self.is_word("interruptible") {
+                interrupts = self.interrupts()?;
+                continue;
             }
             let key = self.name(&format!("a field of code '{}'", name.text))?;
             if key.text == CODE_TOOLS_FIELD {
@@ -400,6 +405,7 @@ impl<'a> Parser<'a> {
             name,
             tools,
             fields,
+            interrupts,
         })
     }
 

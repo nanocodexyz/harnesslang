@@ -1413,6 +1413,18 @@ impl Lowering<'_> {
                 Vec::new(),
             ),
         ];
+        if declared.interrupts.cancel {
+            let mut stopped = Vec::new();
+            if declared.worst_class(self.program) == EffectClass::External {
+                stopped.push(Op::Append(Record::Recovery));
+            }
+            stopped.push(Op::Append(Record::CellFinished(site)));
+            ends.push(arm(
+                format!("a cancel stops the cell of {what}"),
+                Entry::CellRunning(site),
+                stopped,
+            ));
+        }
         if let Some(waits) = &declared.waits {
             ends.push(arm(
                 format!(
