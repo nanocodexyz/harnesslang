@@ -330,7 +330,10 @@ fn planned_tree(
                         limit.value,
                         limit.unit
                     ),
-                    path: child.worst.requests.describe_loops(),
+                    path: format!(
+                        "{child_chain} ({})",
+                        child.worst.requests.describe_loops()
+                    ),
                     counterexample: None,
                 });
                 return None;
