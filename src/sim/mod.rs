@@ -1,3 +1,4 @@
+pub mod dump;
 pub mod faults;
 pub mod invariants;
 pub mod rng;

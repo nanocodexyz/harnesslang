@@ -15,7 +15,7 @@ const FAILURE_EXIT: u8 = 1;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] FILE\n       hl emit --target {targets} FILE",
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE",
         targets = Target::names(),
         mutations = Mutation::names()
     );
@@ -64,6 +64,7 @@ struct Flags {
     arguments: Vec<String>,
     seed: u64,
     trace: Option<String>,
+    dump: Option<String>,
 }
 
 fn flags(args: &[String]) -> Option<Flags> {
@@ -77,6 +78,7 @@ fn flags(args: &[String]) -> Option<Flags> {
         arguments: Vec::new(),
         seed: 0,
         trace: None,
+        dump: None,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -89,6 +91,7 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--arg" => flags.arguments.push(rest.next()?.clone()),
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
             "--trace" => flags.trace = Some(rest.next()?.clone()),
+            "--dump-journal" => flags.dump = Some(rest.next()?.clone()),
             file if !file.starts_with("--") && flags.file.is_none() => {
                 flags.file = Some(file.to_owned())
             }
@@ -277,6 +280,12 @@ fn sim_command(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(USAGE_EXIT);
     }
+    if let Some(directory) = flags.dump {
+        if flags.twice || flags.trace.is_some() {
+            return usage();
+        }
+        return dump_command(&program, target, flags.mutation, seeds, &directory, &file);
+    }
     let options = Options {
         target,
         seeds,
@@ -298,6 +307,44 @@ fn sim_command(args: &[String]) -> ExitCode {
         ExitCode::from(FAILURE_EXIT)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn dump_command(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    seeds: std::ops::Range<u64>,
+    directory: &str,
+    file: &str,
+) -> ExitCode {
+    let label = std::path::Path::new(file)
+        .file_stem()
+        .map_or("journal".into(), |stem| stem.to_string_lossy());
+    let path = std::path::Path::new(directory);
+    match sim::dump::dump(program, target, mutation, seeds, path, &label) {
+        Ok(dumped) => {
+            for failure in &dumped.failures {
+                eprintln!("{file}: {failure}");
+            }
+            println!(
+                "dumped target={} mutation={} journals={} records={} failures={} to {directory}",
+                target.name(),
+                mutation.name(),
+                dumped.journals,
+                dumped.records,
+                dumped.failures.len()
+            );
+            if dumped.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(FAILURE_EXIT)
+            }
+        }
+        Err(error) => {
+            eprintln!("{file}: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
     }
 }
 
