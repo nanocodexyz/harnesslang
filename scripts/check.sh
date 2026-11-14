@@ -96,5 +96,29 @@ if [ "${HL_DRILL:-0}" = 1 ]; then
     exit 1
   fi
   echo "drill: flush_after_dispatch is caught on the real files"
+  SQL_DRILL_SESSIONS=2 scripts/rust-sql-drill.sh
+  for target in native-sqlite server-postgres; do
+    log="$scratch/sql-drill-flush_after_dispatch-$target.log"
+    if SQL_DRILL_TARGETS=$target SQL_DRILL_MODE=crash SQL_DRILL_MUTATION=flush_after_dispatch scripts/rust-sql-drill.sh > "$log" 2>&1; then
+      echo "drill: flush_after_dispatch survived the SQL crash drill on $target" >&2
+      exit 1
+    fi
+    if ! grep -qE 'external [0-9]+/[0-9]+ ran (before its call record was durable|as its recorded tool)' "$log"; then
+      echo "drill: flush_after_dispatch failed for another reason on $target:" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+    log="$scratch/sql-drill-no_fence-$target.log"
+    if SQL_DRILL_TARGETS=$target SQL_DRILL_MODE=takeover SQL_DRILL_MUTATION=no_fence scripts/rust-sql-drill.sh > "$log" 2>&1; then
+      echo "drill: no_fence survived the takeover drill on $target" >&2
+      exit 1
+    fi
+    if ! grep -qE 'fence: external [0-9]+/[0-9]+ dispatched by run a\.|taken_over: only a stale owner writes the marker' "$log"; then
+      echo "drill: no_fence failed for another reason on $target:" >&2
+      cat "$log" >&2
+      exit 1
+    fi
+  done
+  echo "drill: flush_after_dispatch and no_fence are caught in the real SQLite and Postgres databases"
 fi
 echo "check.sh: ok"

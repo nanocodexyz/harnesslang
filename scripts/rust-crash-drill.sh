@@ -45,8 +45,9 @@ if [ "$mutation" = flush_after_dispatch ]; then
   sed -i "s/$flush_before_external/if false \&\& site.durability.flushes(call.effect) {/" "$out/harness.rs.new"
 fi
 cp scripts/rust/drill_host.rs "$out/drill_host.rs"
+cp scripts/rust/sql_drill_checks.rs "$out/sql_drill_checks.rs"
 mv "$out/harness.rs.new" "$out/harness.rs"
-key=$(cat "$out/harness.rs" "$out/drill_host.rs" | cksum | cut -d' ' -f1)
+key=$(cat "$out/harness.rs" "$out/drill_host.rs" "$out/sql_drill_checks.rs" | cksum | cut -d' ' -f1)
 if [ ! -x "$out/drill_host" ] || [ "$(cat "$out/key" 2>/dev/null)" != "$key" ]; then
   rustc --edition 2024 -O -o "$out/drill_host" "$out/drill_host.rs"
   echo "$key" > "$out/key"
