@@ -1,5 +1,4 @@
 use crate::ir::{BinaryOp, Expr, Type};
-use crate::prove::Severity;
 use crate::prove::arith::{Alternatives, Prover, State, U64_MAX, product};
 use crate::prove::linear::{self, Extent, Linear};
 
@@ -67,7 +66,6 @@ impl Prover<'_> {
         self.obligation(
             state,
             goal,
-            Severity::Error,
             "no_overflow",
             format!("u64 overflow in '{text}' is possible"),
         );
@@ -86,7 +84,6 @@ impl Prover<'_> {
         self.obligation(
             state,
             goal,
-            Severity::Error,
             "no_overflow",
             format!("u64 underflow in '{text}' is possible"),
         );
@@ -109,7 +106,7 @@ impl Prover<'_> {
         if let Some(scaled) = scaled
             && let Some(goal) = scaled.plus(-U64_MAX)
         {
-            self.obligation(state, goal, Severity::Error, "no_overflow", message);
+            self.obligation(state, goal, "no_overflow", message);
             return scaled;
         }
         let high_left = self.extent(state, left, true);
@@ -137,12 +134,7 @@ impl Prover<'_> {
                     describe(high_left),
                     describe(high_right)
                 );
-                self.report(
-                    Severity::Error,
-                    "no_overflow",
-                    message,
-                    Some(counterexample),
-                );
+                self.report("no_overflow", message, Some(counterexample));
                 Linear::var(self.fresh(state, &product_name, U64_MAX))
             }
         }
@@ -271,7 +263,6 @@ impl Prover<'_> {
                 Err(counterexample) => {
                     let text = self.names.expr(&invariant.condition);
                     self.report(
-                        Severity::Error,
                         property,
                         format!(
                             "invariant '{}' ({text}) may not hold {when}",

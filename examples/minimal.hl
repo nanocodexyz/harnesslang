@@ -10,7 +10,9 @@ state {
   history: list<entry, history_max>
 }
 
-on ask(question: text) -> text {
+on ask(question: text) -> text
+  requires len(history) + 1 + steps_max * (1 + calls_max) <= history_max
+{
   push history user(question)
   loop step below steps_max {
     let reply = think(history)

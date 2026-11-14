@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::effect::EffectClass;
 use crate::ir::{Program, SiteId};
 use crate::prove::lower::{Entry, HandlerPlan, Op, Plan, Record, Seen};
-use crate::prove::{Finding, Report, Severity};
+use crate::prove::{Finding, Report};
 use crate::target::{AtomicUnit, Others, Recovery};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -123,7 +123,6 @@ impl Prover<'_> {
             self.path.join(" > ")
         };
         let finding = Finding {
-            severity: Severity::Error,
             handler: self.handler.name.clone(),
             target: Some(self.plan.model.target),
             property,

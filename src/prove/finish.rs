@@ -1,6 +1,6 @@
 use crate::ir::{Handler, Program, Stmt};
 use crate::prove::text::Names;
-use crate::prove::{Finding, Report, Severity};
+use crate::prove::{Finding, Report};
 
 pub fn prove(program: &Program, report: &mut Report) {
     for handler in &program.handlers {
@@ -48,7 +48,6 @@ impl Walk<'_> {
             self.path.join(" > ")
         };
         self.findings.push(Finding {
-            severity: Severity::Error,
             handler: self.handler.name.clone(),
             target: None,
             property: "finish_once",

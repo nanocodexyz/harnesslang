@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ir::{BinaryOp, Bound, Expr, FieldId, Handler, LocalId, Program, Stmt, Type};
 use crate::prove::linear::{self, Budget, Extent, Linear, Var};
 use crate::prove::text::Names;
-use crate::prove::{Finding, PROOF_CONSTRAINTS_MAX, PROOF_STEPS_PER_HANDLER_MAX, Report, Severity};
+use crate::prove::{Finding, PROOF_CONSTRAINTS_MAX, PROOF_STEPS_PER_HANDLER_MAX, Report};
 
 const U64_MAX: i128 = u64::MAX as i128;
 const ZERO_STATE: &str = "(zero state)";
@@ -209,10 +209,7 @@ impl<'a> Prover<'a> {
 
     fn summarize(self, report: &mut Report) {
         let name = self.handler_name();
-        let errors = self
-            .findings
-            .iter()
-            .any(|finding| finding.severity == Severity::Error);
+        let errors = !self.findings.is_empty();
         let count = |property| self.proved.get(property).copied().unwrap_or(0);
         if !errors {
             report.proved.push(format!(
@@ -356,13 +353,7 @@ impl<'a> Prover<'a> {
         }
     }
 
-    fn report(
-        &mut self,
-        severity: Severity,
-        property: &'static str,
-        message: String,
-        counterexample: Option<String>,
-    ) {
+    fn report(&mut self, property: &'static str, message: String, counterexample: Option<String>) {
         if self.quiet > 0 {
             return;
         }
@@ -372,7 +363,6 @@ impl<'a> Prover<'a> {
             self.path.join(" > ")
         };
         let finding = Finding {
-            severity,
             handler: self.handler_name(),
             target: None,
             property,
@@ -415,7 +405,6 @@ impl<'a> Prover<'a> {
         &mut self,
         state: &mut State,
         goal: Linear,
-        severity: Severity,
         property: &'static str,
         message: String,
     ) -> bool {
@@ -433,7 +422,7 @@ impl<'a> Prover<'a> {
             } else {
                 message
             };
-            self.report(severity, property, hint, counterexample);
+            self.report(property, hint, counterexample);
         }
         state.facts.push(goal);
         proven

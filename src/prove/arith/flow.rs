@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
 use crate::ir::{Expr, LocalId, SiteKind, Stmt, Type};
-use crate::prove::Severity;
 use crate::prove::arith::{LoopKind, Prover, Quantity, State, U64_MAX, capacity, quantity_name};
 use crate::prove::linear::{self, Linear, Var};
 
@@ -157,28 +156,8 @@ impl Prover<'_> {
         let length = Linear::var(state.env[&quantity]);
         let cap = capacity(&program.state[field].ty).expect("push targets a list");
         let goal = length.plus(1 - cap).expect("a capacity fits i128");
-        let safe = self.proves(&state.facts, &goal);
-        if safe {
-            if self.quiet == 0 {
-                *self.proved.entry("push_bound").or_insert(0) += 1;
-            }
-        } else if self.quiet == 0 {
-            let counterexample = self.counterexample(state, &goal);
-            self.report(
-                Severity::Warning,
-                "push_bound",
-                format!("push onto {name} may find it full and trap with bound({name})"),
-                counterexample,
-            );
-            let mut trapped = state.clone();
-            trapped.facts.extend(linear::negation(&goal));
-            self.invariants_hold(
-                &trapped,
-                &format!("when push onto {name} traps"),
-                "invariant_preserved",
-            );
-        }
-        state.facts.push(goal);
+        let message = format!("push onto {name} may find it full and trap with bound({name})");
+        self.obligation(state, goal, "push_bound", message);
         let grown = length.plus(1);
         let var = self.fresh_equal(state, &format!("len({name})"), cap, grown);
         state.env.insert(quantity, var);

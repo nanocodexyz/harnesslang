@@ -1,5 +1,5 @@
 use crate::ir::Program;
-use crate::prove::{self, Mutation, Severity};
+use crate::prove::{self, Mutation};
 use crate::target::Target;
 
 pub const USAGE_EXIT: u8 = 2;
@@ -19,10 +19,7 @@ pub fn report(file: &str, program: &Program, targets: &[Target], mutation: Mutat
         println!("  proved {line}");
     }
     for finding in &report.findings {
-        match finding.severity {
-            Severity::Warning => println!("{file}: warning: {}", finding.render()),
-            Severity::Error => eprintln!("{file}: error: {}", finding.render()),
-        }
+        eprintln!("{file}: error: {}", finding.render());
     }
     let names: Vec<&str> = targets.iter().map(|target| target.name()).collect();
     let errors = report.errors();

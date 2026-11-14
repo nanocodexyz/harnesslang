@@ -10,7 +10,9 @@ state {
   context: list<entry, context_entries_max>
 }
 
-on prompt(input: text) -> text {
+on prompt(input: text) -> text
+  requires len(context) + 1 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+{
   push context user(input)
   loop step below turn_steps_max {
     let reply = infer(context)
