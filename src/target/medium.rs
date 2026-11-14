@@ -83,6 +83,15 @@ pub struct Rows {
     pub attempts: BTreeMap<(u64, u64), u64>,
     pub nested_attempts: BTreeMap<(u64, u64, u64), u64>,
     pub waited: std::collections::BTreeSet<(u64, u64)>,
+    pub deadlines: BTreeMap<(u64, u64, u64), u64>,
+    pub pending_deadlines: BTreeMap<(u64, u64, u64), u64>,
+}
+
+impl Rows {
+    pub fn keep_deadlines(&mut self) {
+        let pending = std::mem::take(&mut self.pending_deadlines);
+        self.deadlines.extend(pending);
+    }
 }
 
 impl Rows {

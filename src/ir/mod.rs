@@ -394,6 +394,9 @@ impl Program {
         if let Some((_, declared)) = self.tool(tool) {
             return declared.effect;
         }
+        if self.waits(tool).is_some() {
+            return EffectClass::None;
+        }
         self.listed(tool)
             .map_or(EffectClass::undeclared(), |(id, _)| {
                 self.listings[id].effect
@@ -403,6 +406,9 @@ impl Program {
     pub fn input_params(&self, tool: &str) -> Option<&[Field]> {
         if let Some((_, declared)) = self.tool(tool) {
             return Some(&declared.params);
+        }
+        if let Some((_, waits)) = self.waits(tool) {
+            return Some(&waits.params);
         }
         self.listed(tool)
             .map(|(id, _)| self.listings[id].params.as_slice())
@@ -416,6 +422,8 @@ impl Program {
                 "a tool has one default slot per parameter"
             );
             &declared.defaults
+        } else if let Some((_, waits)) = self.waits(tool) {
+            &waits.defaults
         } else {
             let (id, _) = self.listed(tool)?;
             let listing = &self.listings[id];
@@ -459,6 +467,20 @@ impl Program {
             .find(|(_, code)| code.name == name)
     }
 
+    pub fn cells_yield(&self) -> bool {
+        self.codes.iter().any(|code| code.waits.is_some())
+    }
+
+    pub fn waits(&self, tool: &str) -> Option<(CodeId, &Waits)> {
+        self.codes.iter().enumerate().find_map(|(code, declared)| {
+            declared
+                .waits
+                .as_ref()
+                .filter(|waits| waits.name == tool)
+                .map(|waits| (code, waits))
+        })
+    }
+
     pub fn resolve_dispatch(&self, tool: &str) -> Resolved {
         match self.code(tool) {
             Some((code, _)) => Resolved::Cell(code),
@@ -483,6 +505,36 @@ pub struct Code {
     pub timer_ms: Bound,
     pub journal_bytes: Bound,
     pub yield_ms: Bound,
+    pub waits: Option<Waits>,
+}
+
+pub const WAIT_CELL_ID: &str = "cell_id";
+pub const WAIT_TERMINATE: &str = "terminate";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waits {
+    pub name: String,
+    pub params: Vec<Field>,
+    pub defaults: Vec<Option<Literal>>,
+}
+
+impl Waits {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            params: vec![
+                Field {
+                    name: WAIT_CELL_ID.to_owned(),
+                    ty: Type::Text,
+                },
+                Field {
+                    name: WAIT_TERMINATE.to_owned(),
+                    ty: Type::Bool,
+                },
+            ],
+            defaults: vec![None, Some(Literal::Bool(false))],
+        }
+    }
 }
 
 impl Code {

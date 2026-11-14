@@ -35,6 +35,7 @@ plant_expression() {
     recover_reply_ignored) echo 's/if (recovered.kind !== "reply") return recovered;/return { kind: "unknown" };/' ;;
     job_unopened) echo 's/if (jobStarted(record.output) !== null) session.jobs.set/if (false) session.jobs.set/' ;;
     fork_hook_skipped) echo 's/const state = await runForked({ target: setup.target, mutation: "none" }, before, origin, selected.discarded);/const state = before;/' ;;
+    cell_leaks) echo 's/^    if (!cellsYield()) return;$/    return;/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

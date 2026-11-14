@@ -1453,7 +1453,18 @@ impl Checker<'_> {
                     out,
                 ))
             }
-            _ => self.construct(callee, args, expected, out),
+            _ => {
+                if let Some((code, _)) = self.program.waits(&callee.text) {
+                    return error(
+                        at,
+                        format!(
+                            "wait tool '{}' of code '{}' is called by the model, through dispatch: a handler cannot call it",
+                            callee.text, self.program.codes[code].name
+                        ),
+                    );
+                }
+                self.construct(callee, args, expected, out)
+            }
         }
     }
 

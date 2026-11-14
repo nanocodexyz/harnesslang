@@ -405,14 +405,37 @@ journal it checks:
   equals the simulator engine's, step for step under `same_step`; then djs
   replays that journal and must not diverge.
 
+## Cells across calls
+
+`waits NAME` on a `code` declaration adds nanocode's wait tool
+(`cell_id: text`, `terminate: bool = false`, result `maybe<text>`, call record
+effect `none`). A site of the code tool, or of the wait tool, runs its cell
+until the cell ends or would sleep past `yield_ms` after the site went live;
+then the site records `ok("Script running with cell ID N")` and the cell stays
+unfinished. A wait site replays the cell from its journal (nested ids stay
+`T/S/code-K` of the origin site) and runs it on, or with `terminate` writes its
+finished update and records `ok("Script terminated")`; an id that names no cell
+this turn left running records `failed("exec cell ID not found")`. Nothing is
+journaled about the decision to yield but the result. When a cell that yielded
+in the same run is continued and its header is not yet durable, C2 flushes
+before its first timer wait. The turn's end writes a finished update for every
+cell it left running before its status (`cell_settled_at_turn_end`, mutation
+`cell_leaks`); `cell_finishes_once` counts one finished update per cell
+across all its sites. A wait site counts as a cell site in the worst case, and
+the turn-end stop uses the finish its code site counted. LANGUAGE.md, Cells
+across calls, has the example.
+
+The clock a site's deadline starts from is read once per site. On Vercel,
+where every flush ends a step and the next step replays the turn, the step
+that reads it returns it with its output and the workflow hands it to the
+site's later steps, as it hands them the timers already waited on, so a
+replayed site decides against the same deadline.
+
 ## Not in this spec
 
-- Yield and `wait`: nanocode returns "Script running" after
-  `yield_time_ms` so the model can work while a cell runs, and a later
-  `wait` collects it. A harnesslang turn blocks on its cell; the header
-  carries `yield_time_ms` only so nanocode's fold reads it. Adding yield
-  means a second tool and a cell that outlives its site, which is its own
-  change.
+- Detached cells: nanocode's Codex detaches the cells of a failed turn with no
+  active call, so they outlive the turn, and reattaches a cell still running on
+  its host after a crash. Every harnesslang cell ends with its turn.
 - Hands: nanocode can run a cell on another machine and route nested calls
   by `hand`. harnesslang cells run where the target puts them.
 - `stored` values, the `prelude`, `max_output_tokens` and nanocode's

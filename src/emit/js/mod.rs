@@ -379,7 +379,7 @@ fn bound_literal(bound: &crate::ir::Bound) -> String {
 fn code_literal(code: &crate::ir::Code) -> String {
     let tools: Vec<String> = code.tools.iter().map(ToString::to_string).collect();
     format!(
-        "    {{ name: {}, tools: [{}], calls: {}, parallel: {}, timers: {}, timerMs: {}, journalBytes: {}, yieldMs: {} }},\n",
+        "    {{ name: {}, tools: [{}], calls: {}, parallel: {}, timers: {}, timerMs: {}, journalBytes: {}, yieldMs: {}, waits: {} }},\n",
         js_string(&code.name),
         tools.join(", "),
         bound_literal(&code.calls),
@@ -387,7 +387,16 @@ fn code_literal(code: &crate::ir::Code) -> String {
         bound_literal(&code.timers),
         bound_literal(&code.timer_ms),
         bound_literal(&code.journal_bytes),
-        bound_literal(&code.yield_ms)
+        bound_literal(&code.yield_ms),
+        code.waits.as_ref().map_or_else(
+            || "null".to_owned(),
+            |waits| format!(
+                "{{ name: {}, params: {}, defaults: {} }}",
+                js_string(&waits.name),
+                fields_literal(&waits.params),
+                defaults_literal(&waits.defaults)
+            )
+        )
     )
 }
 

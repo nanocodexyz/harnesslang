@@ -97,6 +97,12 @@ pub struct Resume {
 }
 
 pub const WAIT_TOOL: &str = "wait";
+pub const WAIT_CELL_ID: &str = "cell_id";
+pub const WAIT_TERMINATE: &str = "terminate";
+
+pub fn cells_yield() -> bool {
+    program::CODES.iter().any(|code| code.waits.is_some())
+}
 pub const HOLD_TOOL: &str = "hold";
 pub const INTERRUPTED_REASON: &str = "Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.";
 pub const ATTEMPT_INTERRUPTED: &str = "interrupted";
@@ -1188,7 +1194,50 @@ impl<'a> Engine<'a> {
 
     pub fn append(&mut self, record: Record) {
         if matches!(self.mode, Mode::Live { .. }) {
+            if cells_yield()
+                && let Record::Cell { cell, fresh, update, .. } = &record
+            {
+                self.fold_cell(*cell, *fresh, update);
+            }
             self.buffer.push(record);
+        }
+    }
+
+    fn fold_cell(&mut self, cell: u64, fresh: bool, update: &CellUpdate) {
+        if fresh {
+            let header = update.header.as_ref().expect("a fresh update has its header");
+            let (_, seq, _) = parse_any_call_id(&header.origin_call_id).expect("a cell's origin is a call id");
+            let log = CellLog::start(update).expect("a cell's first update starts its log");
+            self.cells.insert(seq, log);
+            return;
+        }
+        let log = self
+            .cells
+            .values_mut()
+            .find(|log| log.cell == cell)
+            .expect("an update follows its cell's header");
+        log.apply(update).expect("a cell's updates fold in order");
+    }
+
+    fn stop_cell(&mut self, origin: u64) {
+        let log = &self.cells[&origin];
+        let update = log.stopped(program::HARNESS_NAME);
+        let cell = log.cell;
+        self.append(Record::Cell {
+            cell,
+            fresh: false,
+            session: program::HARNESS_NAME.to_owned(),
+            update,
+        });
+    }
+
+    fn stop_cells(&mut self) {
+        if !cells_yield() {
+            return;
+        }
+        let running: Vec<u64> = self.cells.iter().filter(|(_, log)| !log.finished).map(|(seq, _)| *seq).collect();
+        for origin in running {
+            self.stop_cell(origin);
         }
     }
 
@@ -1363,6 +1412,7 @@ impl<'a> Engine<'a> {
             outcome,
             result: result.clone(),
         };
+        self.stop_cells();
         self.append(Record::Status {
             turn: self.turn,
             last: self.seq,
@@ -1491,6 +1541,7 @@ impl<'a> Engine<'a> {
                 None => CellStart::Fresh(fresh),
             },
             nested: &nested,
+            header_buffered: false,
         };
         if existing.is_none() {
             self.next_cell += 1;
@@ -1504,7 +1555,108 @@ impl<'a> Engine<'a> {
             CellOutcome::Done(text) => Answer::Output(Output::Ok(Json::String(text))),
             CellOutcome::Threw(error) => Answer::Output(Output::Failed(error)),
             CellOutcome::Unknown(_) => Answer::Unknown,
+            CellOutcome::Running(text) => Answer::Output(Output::Ok(Json::String(text))),
         })
+    }
+
+    fn wait_cell_site(&mut self, code: usize, seq: u64, call: Call) -> Result<Answer, Halt> {
+        let call = Call {
+            effect: EffectClass::None,
+            ..call
+        };
+        let rerun = match self.sites.get(&seq).cloned() {
+            Some(SiteLog::Done(recorded, output)) => {
+                self.same(seq, &recorded, &call)?;
+                return self.cell_answer(&output);
+            }
+            Some(SiteLog::Unknown(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                return Ok(Answer::Unknown);
+            }
+            Some(SiteLog::Reply(..)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Open(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                self.require_live(seq)?;
+                true
+            }
+            None => {
+                self.require_live(seq)?;
+                self.append(Record::Call {
+                    turn: self.turn,
+                    seq,
+                    tool: call.tool.clone(),
+                    effect: call.effect,
+                    input: call.input.clone(),
+                });
+                self.sites.insert(seq, SiteLog::Open(call.clone()));
+                false
+            }
+        };
+        let output = self.collect_cell(code, seq, &call, rerun)?;
+        self.append(Record::Result {
+            turn: self.turn,
+            seq,
+            output: output.clone(),
+        });
+        self.sites.insert(seq, SiteLog::Done(call, output.clone()));
+        self.cell_answer(&output)
+    }
+
+    fn waited_cell(&self, code: usize, seq: u64, id: &str) -> Option<(u64, CellLog)> {
+        let name = program::CODES[code].name;
+        self.cells
+            .range(..seq)
+            .find(|(origin, log)| {
+                log.cell.to_string() == id
+                    && matches!(self.sites.get(origin), Some(SiteLog::Done(call, _)) if call.tool == name)
+            })
+            .map(|(origin, log)| (*origin, log.clone()))
+    }
+
+    fn collect_cell(&mut self, code: usize, seq: u64, call: &Call, rerun: bool) -> Result<Output, Halt> {
+        let input = match &call.input {
+            Json::String(raw) => match program::tool_input(&call.tool, raw) {
+                ToolInput::Invalid(error) => return Ok(Output::Failed(error)),
+                ToolInput::Typed(_) | ToolInput::Untyped => panic!("a wait call keeps its raw input only when it does not fit"),
+            },
+            typed => typed.clone(),
+        };
+        let id = input.get(WAIT_CELL_ID).and_then(Json::as_str).unwrap_or_default().to_owned();
+        let terminate = input.get(WAIT_TERMINATE) == Some(&Json::Bool(true));
+        let Some((origin, log)) = self.waited_cell(code, seq, &id) else {
+            return Ok(Output::Failed(NOT_FOUND_TEXT.to_owned()));
+        };
+        if log.finished {
+            if !rerun {
+                return Ok(Output::Failed(NOT_FOUND_TEXT.to_owned()));
+            }
+            if terminate {
+                return Ok(Output::Ok(Json::text(TERMINATED_TEXT)));
+            }
+            let reason = "it finished but its result was lost with the journal's tail";
+            return Ok(CellOutcome::Unknown(divergence_text(log.cell, reason)).output());
+        }
+        if terminate {
+            self.stop_cell(origin);
+            return Ok(Output::Ok(Json::text(TERMINATED_TEXT)));
+        }
+        let nested = self.nested.clone();
+        let header_buffered = self
+            .buffer
+            .iter()
+            .any(|record| matches!(record, Record::Cell { cell, fresh: true, .. } if *cell == log.cell));
+        let site = CellSite {
+            code,
+            session: program::HARNESS_NAME,
+            turn: self.turn,
+            seq: origin,
+            script: &log.header.script,
+            cell: CellStart::Existing(&log),
+            nested: &nested,
+            header_buffered,
+        };
+        let outcome = run_cell(site, self).map_err(Halt::from)?;
+        Ok(outcome.output())
     }
 
     fn world(&mut self) -> &mut dyn World {
@@ -1517,6 +1669,11 @@ impl<'a> Engine<'a> {
     pub fn effect(&mut self, site: Site, call: Call, run: Run<'_>) -> Result<Answer, Halt> {
         self.seq += 1;
         let seq = self.seq;
+        if site.kind == Kind::Dispatch
+            && let Some(code) = program::waits_of(&call.tool)
+        {
+            return self.wait_cell_site(code, seq, call);
+        }
         if site.kind == Kind::Dispatch
             && let Some(code) = program::code_of(&call.tool)
         {

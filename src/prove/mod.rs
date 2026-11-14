@@ -74,7 +74,7 @@ pub enum Mutation {
     DropCellFinish,
 }
 
-const LOWERING_MUTATIONS: [run::mutation::Mutation; 29] = [
+const LOWERING_MUTATIONS: [run::mutation::Mutation; 30] = [
     run::mutation::Mutation::FlushAfterDispatch,
     run::mutation::Mutation::RecoveryRedispatchesExternal,
     run::mutation::Mutation::VercelRetryRedispatches,
@@ -104,6 +104,7 @@ const LOWERING_MUTATIONS: [run::mutation::Mutation; 29] = [
     run::mutation::Mutation::SuspendBeforeFlush,
     run::mutation::Mutation::ResumeReplaysSuspend,
     run::mutation::Mutation::RecoverTrustsLost,
+    run::mutation::Mutation::CellLeaks,
 ];
 
 const PROGRAM_MUTATIONS: [Mutation; 5] = [
@@ -562,6 +563,11 @@ fn planned(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Planned> {
             | Op::Wait { .. }
             | Op::Sleep { .. }
             | Op::CloseCell(..)
+            | Op::CloseWait(..)
+            | Op::CellYields(_)
+            | Op::CellLeftRunning(_)
+            | Op::ResumeCell(_)
+            | Op::StopCells
             | Op::Acknowledge => Planned {
                 through: Some(cost(op)),
                 ended: None,
@@ -663,7 +669,7 @@ fn appended(program: &Program, op: &Op) -> Count {
         }
         Op::Append(Record::Timeout(_) | Record::Recovery) => 0,
         Op::Append(_) => 1,
-        Op::CloseCell(_, code) => program.codes[*code]
+        Op::CloseCell(_, code) | Op::CloseWait(_, code) => program.codes[*code]
             .timers
             .value
             .checked_mul(TIMER_UPDATE_RECORDS)

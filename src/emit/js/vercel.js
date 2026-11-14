@@ -77,6 +77,16 @@ class StepWorld {
     this.delivered = resume;
     this.resuming = null;
     this.carried = carried;
+    this.deadlines = [];
+  }
+
+  async cellDeadline(turn, site, cell) {
+    const key = `${turn}/${site}/${cell}`;
+    const carried = this.carried.deadlines.find(([held]) => held === key);
+    if (carried !== undefined) return BigInt(carried[1]);
+    const clock = BigInt(await this.now());
+    this.deadlines.push([key, clock.toString()]);
+    return clock;
   }
 
   async ran(turn, seq) {
@@ -271,6 +281,7 @@ async function runStep(input, context) {
     ran: input.ran === undefined || input.ran === null ? null : decodeOrCorrupt(() => ranFrom(decodeJson(input.ran))),
     undispatched: input.undispatched ?? [],
     lost: input.lost ?? [],
+    deadlines: input.deadlines ?? [],
   };
   const world = new StepWorld(context, waited, delivered, carried);
   try {
@@ -280,15 +291,15 @@ async function runStep(input, context) {
     throw new Panic(`a step ends at a flush, found the turn ${ran.ran}`);
   } catch (error) {
     if (error instanceof StepEnd) {
-      const output = { lines: error.records.map((record) => encodeLine(record, false)), position: error.position };
+      const output = { lines: error.records.map((record) => encodeLine(record, false)), position: error.position, deadlines: world.deadlines };
       const answered = world.resuming;
       if (answered !== null && error.records.some((record) => record.kind === "result" && record.turn === answered.suspension.turn && record.seq === answered.suspension.seq)) {
         output.resumed = encodeJson(object([["resume", resumeJson(answered.resume)], ["suspension", suspensionJson(answered.suspension)]]));
       }
       return output;
     }
-    if (error instanceof StepWait) return { lines: [], wait: encodeJson(waitJson(error.wait)) };
-    if (error instanceof StepRan) return { lines: [], ran: encodeJson(ranJson(request.turn, error.ran)) };
+    if (error instanceof StepWait) return { lines: [], wait: encodeJson(waitJson(error.wait)), deadlines: world.deadlines };
+    if (error instanceof StepRan) return { lines: [], ran: encodeJson(ranJson(request.turn, error.ran)), deadlines: world.deadlines };
     throw error;
   }
 }
@@ -330,6 +341,7 @@ async function driveTurn(platform, lines, folded, requestText) {
   const stepsMax = (STEPS_PER_EFFECT_MAX + STEPS_PER_SUSPENSION_MAX) * handler.effectsMax + STEPS_PER_TURN_FIXED;
   let live = false;
   const waited = [];
+  const deadlines = [];
   let resume = null;
   let ran = null;
   let undispatched = [];
@@ -351,7 +363,8 @@ async function driveTurn(platform, lines, folded, requestText) {
         lost.splice(0, lost.length, ...answer.lost.filter((key) => folded.jobs.has(key)).map((key) => lostDelivery(key)));
       }
     }
-    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice(), resume, ran, undispatched, lost: lost.map((delivery) => delivery.key) });
+    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice(), deadlines: deadlines.slice(), resume, ran, undispatched, lost: lost.map((delivery) => delivery.key) });
+    deadlines.push(...(done.output.deadlines ?? []));
     resume = null;
     ran = null;
     undispatched = [];

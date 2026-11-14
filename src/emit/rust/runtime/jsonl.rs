@@ -152,27 +152,31 @@ fn next_cell_before(disk: &mut dyn Disk, end: u64) -> Result<u64, OpenError> {
 }
 
 fn last_cell(bytes: &[u8], from_start: bool) -> Result<CellScan, OpenError> {
-    let found = bytes
-        .windows(CELL_OPENING.len())
-        .rposition(|window| window == CELL_OPENING);
-    let Some(at) = found else {
-        return Ok(if from_start { CellScan::Absent } else { CellScan::Wider });
-    };
-    let line_start = match bytes[..at].iter().rposition(|byte| *byte == LINE_END) {
-        Some(newline) => newline + 1,
-        None if from_start => 0,
-        None => return Ok(CellScan::Wider),
-    };
-    let corrupt = |what: String| OpenError::Corrupt(format!("the cell line before the checkpoint {what}"));
-    let length = bytes[at..]
-        .iter()
-        .position(|byte| *byte == LINE_END)
-        .ok_or_else(|| corrupt("has no end".to_owned()))?;
-    let line = std::str::from_utf8(&bytes[line_start..at + length]).map_err(|_| corrupt("is not utf-8".to_owned()))?;
-    match decode_line(line, true) {
-        Ok(Record::Cell { cell, .. }) => Ok(CellScan::Found(cell)),
-        Ok(other) => Err(corrupt(format!("decodes as a {} record", other.tag()))),
-        Err(error) => Err(corrupt(error)),
+    let mut limit = bytes.len();
+    loop {
+        let found = bytes[..limit]
+            .windows(CELL_OPENING.len())
+            .rposition(|window| window == CELL_OPENING);
+        let Some(at) = found else {
+            return Ok(if from_start { CellScan::Absent } else { CellScan::Wider });
+        };
+        let line_start = match bytes[..at].iter().rposition(|byte| *byte == LINE_END) {
+            Some(newline) => newline + 1,
+            None if from_start => 0,
+            None => return Ok(CellScan::Wider),
+        };
+        let corrupt = |what: String| OpenError::Corrupt(format!("the cell line before the checkpoint {what}"));
+        let length = bytes[at..]
+            .iter()
+            .position(|byte| *byte == LINE_END)
+            .ok_or_else(|| corrupt("has no end".to_owned()))?;
+        let line = std::str::from_utf8(&bytes[line_start..at + length]).map_err(|_| corrupt("is not utf-8".to_owned()))?;
+        match decode_line(line, true) {
+            Ok(Record::Cell { cell, fresh: true, .. }) => return Ok(CellScan::Found(cell)),
+            Ok(Record::Cell { .. }) => limit = line_start,
+            Ok(other) => return Err(corrupt(format!("decodes as a {} record", other.tag()))),
+            Err(error) => return Err(corrupt(error)),
+        }
     }
 }
 

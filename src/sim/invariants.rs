@@ -58,10 +58,11 @@ pub enum Invariant {
     JobOnce,
     JobReported,
     ForkStateEqual,
+    CellSettledAtTurnEnd,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -105,6 +106,7 @@ impl Invariant {
         Self::JobOnce,
         Self::JobReported,
         Self::ForkStateEqual,
+        Self::CellSettledAtTurnEnd,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -152,6 +154,7 @@ impl Invariant {
             Self::JobOnce => "job_once",
             Self::JobReported => "job_reported",
             Self::ForkStateEqual => "fork_state_equal",
+            Self::CellSettledAtTurnEnd => "cell_settled_at_turn_end",
         }
     }
 }
@@ -500,6 +503,47 @@ fn nested_reported(world: &SimWorld<'_>, calls: &Calls) -> Result<(), Violation>
     Ok(())
 }
 
+fn cell_settled(records: &[Record]) -> Result<(), Violation> {
+    let mut origins: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut finished: BTreeMap<u64, u64> = BTreeMap::new();
+    for record in records {
+        match record {
+            Record::Cell { cell, update, .. } => {
+                if let Some(header) = &update.header
+                    && let Ok((turn, _, _)) = journal::parse_any_call_id(&header.origin_call_id)
+                {
+                    origins.insert(*cell, turn);
+                }
+                if update.finished {
+                    let count = finished.entry(*cell).or_default();
+                    *count += 1;
+                    if *count > 1 {
+                        return violation(
+                            Invariant::CellFinishesOnce,
+                            format!("cell {cell} has {count} finished updates"),
+                        );
+                    }
+                }
+            }
+            Record::Status { turn, .. } => {
+                if let Some((cell, _)) = origins
+                    .iter()
+                    .find(|(cell, origin)| *origin == turn && !finished.contains_key(cell))
+                {
+                    return violation(
+                        Invariant::CellSettledAtTurnEnd,
+                        format!(
+                            "cell {cell} of turn {turn} has no finished update before the turn's status"
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn tool_class(program: &Program, name: &str) -> EffectClass {
     program.dispatch_class(name)
 }
@@ -767,6 +811,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     crate::sim::park::check(world, records)?;
     world.inbox.safety(records)?;
     let calls = seq_unique(records)?;
+    cell_settled(records)?;
     nested_reported(world, &calls)?;
     enum_valid(world, records)?;
     nested_enum_valid(world, records)?;

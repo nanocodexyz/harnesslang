@@ -121,7 +121,9 @@ fn call_of(tool: &str, effect: EffectClass, input: &Json) -> Call {
 
 fn nested_call(log: &mut TurnLog, turn: u64, id: (u64, u64), call: Call) -> Result<(), String> {
     let (seq, nested) = id;
-    if !matches!(log.sites.get(&seq), Some(SiteLog::Open(_))) {
+    let continued = log.cells.get(&seq).is_some_and(|cell| !cell.finished)
+        && matches!(log.sites.last_key_value(), Some((_, SiteLog::Open(_))));
+    if !continued && !matches!(log.sites.get(&seq), Some(SiteLog::Open(_))) {
         return Err(format!(
             "nested call {seq}/{nested} of turn {turn} comes from a site that is not running"
         ));

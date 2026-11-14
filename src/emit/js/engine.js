@@ -229,9 +229,32 @@ class Engine {
 
   append(record) {
     if (this.mode.live) {
+      if (record.kind === "cell" && cellsYield()) this.foldCell(record);
       this.buffer.push(record);
       this.mode.world.append(record);
     }
+  }
+
+  foldCell(record) {
+    if (record.fresh) {
+      const [, seq] = parseAnyCallId(record.update.header.originCallId);
+      this.cells.set(seq, cellLogStart(record.update));
+      return;
+    }
+    const log = [...this.cells.values()].find((candidate) => candidate.cell === record.cell);
+    assert(log !== undefined, "an update follows its cell's header");
+    cellLogApply(log, record.update);
+  }
+
+  stopCell(origin) {
+    const log = this.cells.get(origin);
+    this.append({ kind: "cell", cell: log.cell, fresh: false, session: PROGRAM.name, update: cellLogStopped(log, PROGRAM.name) });
+  }
+
+  stopCells() {
+    if (!cellsYield()) return;
+    const running = [...this.cells.entries()].filter(([, log]) => !log.finished).map(([seq]) => seq).sort((left, right) => left - right);
+    for (const origin of running) this.stopCell(origin);
   }
 
   nextAttempt() {
@@ -262,6 +285,7 @@ class Engine {
 
   async finish(outcome, result) {
     const finish = { turn: this.turn, outcome, result };
+    this.stopCells();
     this.append({ kind: "status", turn: this.turn, last: this.seq, outcome, result });
     this.append({ kind: "checkpoint", revision: this.turn, state: PROGRAM.name, payload: encodeJson(stateJson(this.state)) });
     await this.flush();
@@ -367,6 +391,8 @@ class Engine {
     this.seq += 1;
     const seq = this.seq;
     const call = this.resolve(site, args);
+    const waits = site.kind === "dispatch" ? waitsNamed(call.tool) : null;
+    if (waits !== null) return this.waitCellSite(waits, seq, { ...call, effect: "none" });
     const code = site.kind === "cell" ? site.code : site.kind === "dispatch" ? codeNamed(call.tool) : null;
     if (code !== null) return this.cellSite(code, seq, { ...call, effect: "none" });
     if (site.kind === "suspend") return this.suspendSite(siteId, seq, call);
@@ -542,14 +568,96 @@ class Engine {
       script: call.input,
       cell: existing === undefined ? { kind: "fresh", id: this.nextCell } : { kind: "existing", log: existing },
       nested: new Map(this.nested),
+      site: seq,
     };
     if (existing === undefined) this.nextCell += 1;
     return runCell(site, new EngineCellHost(this));
   }
 
+  async waitCellSite(code, seq, call) {
+    const logged = this.sites.get(seq);
+    let rerun = false;
+    if (logged !== undefined) {
+      switch (logged.kind) {
+        case "done":
+          this.same(seq, logged.call, call);
+          return this.decodeCell(logged.output);
+        case "unknown":
+          this.same(seq, logged.call, call);
+          return variant(VARIANT_UNKNOWN, []);
+        case "reply":
+          throw this.diverged(seq, "a model reply", call.tool);
+        case "open":
+          this.same(seq, logged.call, call);
+          this.requireLive(seq);
+          rerun = true;
+          break;
+        default:
+          throw new Panic(`unknown site log ${logged.kind}`);
+      }
+    } else {
+      this.requireLive(seq);
+      this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
+      this.sites.set(seq, { kind: "open", call });
+    }
+    const output = await this.collectCell(code, seq, call, rerun);
+    this.append({ kind: "result", turn: this.turn, seq, output });
+    this.sites.set(seq, { kind: "done", call, output });
+    return this.decodeCell(output);
+  }
+
+  waitedCell(code, seq, id) {
+    const name = PROGRAM.codes[code].name;
+    const origins = [...this.cells.keys()].filter((origin) => origin < seq).sort((left, right) => left - right);
+    for (const origin of origins) {
+      const log = this.cells.get(origin);
+      const site = this.sites.get(origin);
+      if (String(log.cell) === id && site !== undefined && site.kind === "done" && site.call.tool === name) return [origin, log];
+    }
+    return null;
+  }
+
+  async collectCell(code, seq, call, rerun) {
+    const input = call.input;
+    if (typeof input === "string") {
+      const typed = toolInput(call.tool, input);
+      assert(typed.kind === "invalid", "a wait call keeps its raw input only when it does not fit");
+      return { tag: "failed", error: typed.error };
+    }
+    const id = typeof input.cell_id === "string" ? input.cell_id : "";
+    const terminate = input.terminate === true;
+    const found = this.waitedCell(code, seq, id);
+    if (found === null) return { tag: "failed", error: NOT_FOUND_TEXT };
+    const [origin, log] = found;
+    if (log.finished) {
+      if (!rerun) return { tag: "failed", error: NOT_FOUND_TEXT };
+      if (terminate) return { tag: "ok", value: TERMINATED_TEXT };
+      return cellOutcomeOutput({ kind: "unknown", text: divergenceText(log.cell, "it finished but its result was lost with the journal's tail") });
+    }
+    if (terminate) {
+      this.stopCell(origin);
+      return { tag: "ok", value: TERMINATED_TEXT };
+    }
+    const headerBuffered = this.buffer.some((record) => record.kind === "cell" && record.fresh && record.cell === log.cell);
+    const site = {
+      code,
+      target: this.target,
+      mutation: this.mutation,
+      session: PROGRAM.name,
+      turn: this.turn,
+      seq: origin,
+      script: log.header.script,
+      cell: { kind: "existing", log: cellLogClone(log) },
+      nested: new Map(this.nested),
+      headerBuffered,
+      site: seq,
+    };
+    return cellOutcomeOutput(await runCell(site, new EngineCellHost(this)));
+  }
+
   decodeCell(output) {
     const outcome = decodeOrCorrupt(() => cellOutcomeFrom(output));
-    if (outcome.kind === "done") return variant(VARIANT_OK, [outcome.text]);
+    if (outcome.kind === "done" || outcome.kind === "running") return variant(VARIANT_OK, [outcome.text]);
     if (outcome.kind === "threw") return variant(VARIANT_FAILED, [outcome.text]);
     return variant(VARIANT_UNKNOWN, []);
   }
@@ -1037,6 +1145,11 @@ class EngineCellHost {
 
   clock() {
     return this.world.now();
+  }
+
+  deadline(site, cell) {
+    if (this.world.cellDeadline === undefined) return this.world.now();
+    return this.world.cellDeadline(this.engine.turn, site, cell);
   }
 
   random() {
