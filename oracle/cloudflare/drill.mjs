@@ -18,13 +18,12 @@ const { values } = parseArgs({
     seed: { type: "string", default: "0" },
     delay_ms_max: { type: "string", default: "40" },
     jobs: { type: "string", default: "4" },
-    handler: { type: "string", default: "prompt" },
-    arg: { type: "string", default: "input" },
-    tools: { type: "string", default: "read,edit,bash" },
+    tools: { type: "string", default: "" },
+    profile: { type: "string", default: "all" },
   },
 });
-if (!["kill", "trace"].includes(values.mode) || !values.module || !values.dir || (values.mode === "trace" && !values.trace)) {
-  console.error("usage: node drill.mjs --mode kill|trace --module WORKER.mjs --dir DIR [--trace TRACE.jsonl] [--sessions N] [--turns N] [--seed S] [--jobs N]");
+if (!["kill", "trace"].includes(values.mode) || !values.module || !values.dir || !values.trace) {
+  console.error("usage: node drill.mjs --mode kill|trace --module WORKER.mjs --dir DIR --trace TRACE.jsonl [--tools a,b] [--sessions N] [--turns N] [--seed S] [--jobs N] [--seeds_max N]");
   process.exit(2);
 }
 const module = resolve(values.module);
@@ -36,8 +35,8 @@ const options = {
   turns: Number(values.turns),
   seed: Number(values.seed),
   delayMsMax: Number(values.delay_ms_max),
-  handler: values.handler,
-  arg: values.arg,
+  requests: [],
+  profile: values.profile,
   tools: values.tools === "" ? [] : values.tools.split(","),
 };
 
@@ -75,17 +74,28 @@ function histogram(map) {
 }
 
 async function killMode() {
+  options.requests = parseTrace(rt, values.trace).flatMap((seed) => seed.events.filter((event) => event.event === "turn"));
   const indexes = Array.from({ length: options.sessions }, (_, index) => index + 1);
   const started = Date.now();
   const { results, failure } = await pool(indexes, Number(values.jobs), (index) => killSession(rt, options, index));
   if (failure !== null) fail(`session=${failure.item} seed=${options.seed + failure.item}`, failure.error);
   const totals = {};
   const rowsPerTurn = new Map();
+  const shapes = new Map();
   for (const result of results) {
-    const { rowsPerTurn: perTurn, seed, ...numbers } = result;
+    const { rowsPerTurn: perTurn, shapes: perShape, seed, ...numbers } = result;
+    for (const [turn, shape] of perShape) {
+      const key = `model_replies=${shape.models} calls=${shape.calls}`;
+      const rows = shapes.get(key) ?? new Map();
+      rows.set(perTurn.get(turn), (rows.get(perTurn.get(turn)) ?? 0) + 1);
+      shapes.set(key, rows);
+    }
     console.log(`session seed=${seed} ${Object.entries(numbers).map(([key, value]) => `${key}=${value}`).join(" ")} rows_per_turn=${histogram(perTurn)}`);
     for (const [key, value] of Object.entries(numbers)) totals[key] = (totals[key] ?? 0) + value;
     for (const [turn, rows] of perTurn) rowsPerTurn.set(`${seed}/${turn}`, rows);
+  }
+  if (options.profile === "clean") {
+    for (const [key, rows] of [...shapes.entries()].sort()) console.log(`shape ${key} rows:turns=${[...rows.entries()].map(([count, turns]) => `${count}:${turns}`).join(",")}`);
   }
   console.log(`totals ${Object.entries(totals).map(([key, value]) => `${key}=${value}`).join(" ")} rows_per_turn=${histogram(rowsPerTurn)} ms=${Date.now() - started}`);
   console.log(`drill: ${options.sessions} sessions of ${options.turns} turns on workerd survived ${totals.kills} kill -9s, ${totals.storageFaults} storage faults and ${totals.duplicates} duplicate requests: external_once, unknown_reported, idempotent_known, finish_once and seq_unique hold on the object's SQL`);

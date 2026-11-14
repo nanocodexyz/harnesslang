@@ -26,11 +26,15 @@ function foldOrFail(rt, records) {
 }
 
 function journalFacts(records) {
-  const facts = { calls: new Map(), results: new Set(), recovered: new Map(), statuses: new Map(), seqs: new Map(), rowsPerTurn: new Map(), recoveries: 0 };
+  const facts = { calls: new Map(), results: new Set(), recovered: new Map(), statuses: new Map(), seqs: new Map(), rowsPerTurn: new Map(), shapes: new Map(), recoveries: 0 };
   for (const record of records) {
     const turn = record.kind === "checkpoint" ? record.revision : record.turn;
     if (record.kind === "recovery") facts.recoveries += 1;
     else facts.rowsPerTurn.set(turn, (facts.rowsPerTurn.get(turn) ?? 0) + 1);
+    const shape = facts.shapes.get(turn) ?? { models: 0, calls: 0 };
+    if (record.kind === "model") shape.models += 1;
+    if (record.kind === "call") shape.calls += 1;
+    facts.shapes.set(turn, shape);
     if (record.kind === "call" || record.kind === "model") {
       const seqs = facts.seqs.get(record.turn) ?? [];
       if (seqs.length > 0 && record.seq <= seqs[seqs.length - 1]) {
@@ -104,7 +108,7 @@ function verifyJournal(rt, rows, ledger, acks, turns) {
   const facts = journalFacts(records);
   const counts = checkCalls(facts, ledger);
   checkFinishes(rt, facts, acks, turns);
-  return { rows: rows.length, recoveries: facts.recoveries, rowsPerTurn: facts.rowsPerTurn, ...counts };
+  return { rows: rows.length, recoveries: facts.recoveries, rowsPerTurn: facts.rowsPerTurn, shapes: facts.shapes, ...counts };
 }
 
 function statusOf(rt, rows, turn) {

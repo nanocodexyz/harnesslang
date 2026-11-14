@@ -17,6 +17,16 @@ const ALARM_POLL_MS = 25;
 const ALARM_WAIT_MS_MAX = 20000;
 const ATTEMPTS_PER_TURN_MAX = 400;
 const INJECTED = "hl-drill injected";
+const NO_FAULTS = {
+  killBeforeRunPpm: 0,
+  killAfterRunPpm: 0,
+  killTimerPpm: 0,
+  storageFaultPpm: 0,
+  alarmResumePpm: 0,
+  duplicatePpm: 0,
+  insertsFaultRange: 1,
+  alarmsFaultRange: 1,
+};
 
 const FAULTS = {
   killBeforeRunPpm: 60_000,
@@ -28,6 +38,8 @@ const FAULTS = {
   insertsFaultRange: 12,
   alarmsFaultRange: 2,
 };
+const STORAGE_FAULTS = { ...NO_FAULTS, storageFaultPpm: PPM, insertsFaultRange: FAULTS.insertsFaultRange, alarmsFaultRange: FAULTS.alarmsFaultRange };
+const PROFILES = { all: FAULTS, clean: NO_FAULTS, storage: STORAGE_FAULTS };
 
 class Rng {
   constructor(seed) {
@@ -57,6 +69,8 @@ class KillWorld {
     this.rt = rt;
     this.options = options;
     this.rng = new Rng(seed);
+    this.faults = PROFILES[options.profile];
+    assert(this.faults !== undefined, `a fault profile is one of ${Object.keys(PROFILES).join(", ")}`);
     this.platform = null;
     this.ledger = new Map();
     this.failure = null;
@@ -95,13 +109,13 @@ class KillWorld {
       const failure = this.gate(request);
       if (failure !== null) return this.fail(failure);
     }
-    if (this.rng.chance(FAULTS.killBeforeRunPpm)) {
+    if (this.rng.chance(this.faults.killBeforeRunPpm)) {
       this.stats.killsBeforeRun += 1;
       await this.platform.kill();
       return null;
     }
     const answer = path === "/tool" ? this.tool(request) : this.model(request);
-    if (this.rng.chance(FAULTS.killAfterRunPpm)) {
+    if (this.rng.chance(this.faults.killAfterRunPpm)) {
       this.stats.killsAfterRun += 1;
       await this.platform.kill();
       return null;
@@ -137,16 +151,18 @@ class KillWorld {
   }
 
   fault() {
-    if (!this.rng.chance(FAULTS.storageFaultPpm)) return "none";
+    if (!this.rng.chance(this.faults.storageFaultPpm)) return "none";
     this.stats.storageFaults += 1;
-    if (this.rng.chance(PPM / 2)) return `alarm ${1 + this.rng.below(FAULTS.alarmsFaultRange)}`;
-    return `insert ${1 + this.rng.below(FAULTS.insertsFaultRange)}`;
+    if (this.rng.chance(PPM / 2)) return `alarm ${1 + this.rng.below(this.faults.alarmsFaultRange)}`;
+    return `insert ${1 + this.rng.below(this.faults.insertsFaultRange)}`;
   }
 }
 
-function turnBody(rt, options, seed, turn) {
-  const args = Object.assign(Object.create(null), { [options.arg]: `drill-${seed}-${turn}` });
-  return rt.encodeJson(Object.assign(Object.create(null), { arguments: args, handler: options.handler, turn: BigInt(turn) }));
+function turnBody(rt, options, index, turn) {
+  const requests = options.requests;
+  assert(requests.length > 0, "the trace holds turn requests");
+  const request = requests[((index - 1) * options.turns + turn - 1) % requests.length];
+  return rt.encodeJson(Object.assign(Object.create(null), { arguments: request.arguments, handler: request.handler, turn: BigInt(turn) }));
 }
 
 async function waitAlarm(world, turn) {
@@ -184,16 +200,16 @@ function settleResponse(world, turn, settled, acks) {
 
 async function attempt(world, body, turn, acks, killed) {
   const platform = world.platform;
-  if (!platform.alive()) await platform.start(world.fault(), false);
+  if (!platform.alive()) await platform.start(world.fault(), null);
   world.run += 1;
   world.stats.attempts += 1;
-  if (killed && platform.alarm() && world.rng.chance(FAULTS.alarmResumePpm)) {
+  if (killed && platform.alarm() && world.rng.chance(world.faults.alarmResumePpm)) {
     world.stats.alarmResumes += 1;
     if (!(await waitAlarm(world, turn))) return false;
   }
   const kills = platform.kills;
   let timer = null;
-  if (world.rng.chance(FAULTS.killTimerPpm)) {
+  if (world.rng.chance(world.faults.killTimerPpm)) {
     const delay = world.rng.below(world.options.delayMsMax + 1);
     timer = setTimeout(() => {
       if (platform.kills === kills && platform.alive()) {
@@ -203,7 +219,7 @@ async function attempt(world, body, turn, acks, killed) {
     }, delay);
   }
   const requests = [platform.turn(body)];
-  if (world.rng.chance(FAULTS.duplicatePpm)) {
+  if (world.rng.chance(world.faults.duplicatePpm)) {
     world.stats.duplicates += 1;
     const delay = world.rng.below(world.options.delayMsMax + 1);
     requests.push(sleep(delay).then(() => (platform.alive() ? platform.turn(body) : Promise.reject(new Error("killed")))));
@@ -226,7 +242,7 @@ async function killSession(rt, options, index) {
   const acks = [];
   try {
     for (let turn = 1; turn <= options.turns; turn++) {
-      const body = turnBody(rt, options, seed, turn);
+      const body = turnBody(rt, options, index, turn);
       let done = false;
       let killed = false;
       for (let tries = 0; !done; tries++) {
@@ -236,7 +252,7 @@ async function killSession(rt, options, index) {
         killed = world.platform.kills > kills;
       }
     }
-    if (!world.platform.alive()) await world.platform.start("none", false);
+    if (!world.platform.alive()) await world.platform.start("none", null);
     const verified = verifyJournal(rt, world.platform.rows(), world.ledger, acks, options.turns);
     return { seed, ...world.stats, kills: world.platform.kills, starts: world.platform.starts, acks: acks.length, ...verified };
   } finally {

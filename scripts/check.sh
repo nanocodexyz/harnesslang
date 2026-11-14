@@ -121,4 +121,7 @@ if [ "${HL_DRILL:-0}" = 1 ]; then
   done
   echo "drill: flush_after_dispatch and no_fence are caught in the real SQLite and Postgres databases"
 fi
+if [ "${HL_CLOUDFLARE:-0}" = 1 ]; then
+  scripts/cloudflare-drill.sh
+fi
 echo "check.sh: ok"
