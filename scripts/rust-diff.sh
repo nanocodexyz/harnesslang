@@ -41,6 +41,7 @@ plant_expression() {
     interrupt_ignored) echo 's/let interrupted = self.drain_interrupting(interrupts)? \&\& !preempted;/let interrupted = self.drain_interrupting(interrupts)? \&\& false;/' ;;
     recover_skipped) echo 's/let recovered = if program::recoverable(&call.tool) {/let recovered = if false {/' ;;
     job_lost_dropped) echo 's/        .map(|key| lost_delivery(key))$/        .filter(|_| false).map(|key| lost_delivery(key))/' ;;
+    cell_leaks) echo 's/^        if !cells_yield() {$/        if true {/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

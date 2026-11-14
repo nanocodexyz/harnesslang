@@ -553,6 +553,15 @@ fn dispatch(out: &mut String, program: &Program) {
         )
         .expect("writing to a string succeeds");
     }
+    for waits in program.codes.iter().filter_map(|code| code.waits.as_ref()) {
+        writeln!(
+            arms,
+            "        {:?} => EffectClass::{:?},",
+            waits.name,
+            EffectClass::None
+        )
+        .expect("writing to a string succeeds");
+    }
     let mut listed = String::new();
     let mut listings = Vec::new();
     for (id, listing) in program.listings.iter().enumerate() {
@@ -674,6 +683,7 @@ fn nested_tool(program: &Program, tool: ir::ToolId) -> String {
 fn codes(out: &mut String, program: &Program) {
     let mut specs = String::new();
     let mut arms = String::new();
+    let mut waited = String::new();
     for (index, code) in program.codes.iter().enumerate() {
         let tools: Vec<String> = code
             .tools
@@ -682,7 +692,7 @@ fn codes(out: &mut String, program: &Program) {
             .collect();
         writeln!(
             specs,
-            "    CodeSpec {{ name: {:?}, tools: &[{}], calls: {}, parallel: {}, timers: {}, timer_ms: {}, journal_bytes: {}, yield_ms: {} }},",
+            "    CodeSpec {{ name: {:?}, tools: &[{}], calls: {}, parallel: {}, timers: {}, timer_ms: {}, journal_bytes: {}, yield_ms: {}, waits: {:?} }},",
             code.name,
             tools.join(", "),
             limit(&code.calls),
@@ -690,15 +700,20 @@ fn codes(out: &mut String, program: &Program) {
             limit(&code.timers),
             limit(&code.timer_ms),
             limit(&code.journal_bytes),
-            limit(&code.yield_ms)
+            limit(&code.yield_ms),
+            code.waits.as_ref().map(|waits| waits.name.as_str())
         )
         .expect("writing to a string succeeds");
         writeln!(arms, "        {:?} => Some({index}),", code.name)
             .expect("writing to a string succeeds");
+        if let Some(waits) = &code.waits {
+            writeln!(waited, "        {:?} => Some({index}),", waits.name)
+                .expect("writing to a string succeeds");
+        }
     }
     writeln!(
         out,
-        "pub const CODES: &[CodeSpec] = &[\n{specs}];\n\npub fn code_of(tool: &str) -> Option<usize> {{\n    match tool {{\n{arms}        _ => None,\n    }}\n}}\n"
+        "pub const CODES: &[CodeSpec] = &[\n{specs}];\n\npub fn code_of(tool: &str) -> Option<usize> {{\n    match tool {{\n{arms}        _ => None,\n    }}\n}}\n\npub fn waits_of(tool: &str) -> Option<usize> {{\n    match tool {{\n{waited}        _ => None,\n    }}\n}}\n"
     )
     .expect("writing to a string succeeds");
 }
@@ -714,7 +729,13 @@ fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
         .listings
         .iter()
         .map(|listing| (listing.name.as_str(), &listing.params, &listing.defaults));
-    for (index, (name, params, defaults)) in declared.chain(families).enumerate() {
+    let waits = program
+        .codes
+        .iter()
+        .filter_map(|code| code.waits.as_ref())
+        .map(|waits| (waits.name.as_str(), &waits.params, &waits.defaults));
+    let typed = program.tools.len() + program.listings.len();
+    for (index, (name, params, defaults)) in declared.chain(families).chain(waits).enumerate() {
         let names: Vec<String> = params
             .iter()
             .map(|param| format!("{:?}", param.name))
@@ -755,8 +776,10 @@ fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
         )
         .expect("writing to a string succeeds");
         match index.checked_sub(program.tools.len()) {
-            None => writeln!(arms, "        {name:?} => input_{index},"),
-            Some(listing) => writeln!(listed, "            Some(({listing}, _)) => input_{index},"),
+            Some(listing) if index < typed => {
+                writeln!(listed, "            Some(({listing}, _)) => input_{index},")
+            }
+            _ => writeln!(arms, "        {name:?} => input_{index},"),
         }
         .expect("writing to a string succeeds");
     }
