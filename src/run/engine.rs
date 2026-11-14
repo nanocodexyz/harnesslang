@@ -1938,6 +1938,7 @@ impl<'a> Engine<'a> {
     }
 
     fn cell_site(&mut self, code: crate::ir::CodeId, seq: u64, call: Call) -> Result<Value, Halt> {
+        let rerun = matches!(self.sites.get(&seq), Some(SiteLog::Open(_)));
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
@@ -1972,10 +1973,8 @@ impl<'a> Engine<'a> {
                 self.sites.insert(seq, SiteLog::Open(call.clone()));
             }
         }
-        let output = if self.cell_preempted(code) {
-            if self.cells.get(&seq).is_some_and(|log| !log.finished) {
-                self.stop_cell(seq);
-            }
+        let starts = !rerun || self.cells.get(&seq).is_some_and(|log| log.finished);
+        let output = if starts && self.cell_preempted(code) {
             Output::Ok(Json::text(cell::STOPPED_TEXT))
         } else {
             self.run_cell(code, seq, &call)?.output()
@@ -2115,7 +2114,8 @@ impl<'a> Engine<'a> {
             .unwrap_or_default();
         let terminate = input.get(ir::WAIT_TERMINATE) == Some(&Json::Bool(true));
         let found = self.waited_cell(code, seq, id);
-        if self.cell_preempted(code) {
+        let starts = !rerun || found.as_ref().is_none_or(|(_, log)| log.finished);
+        if starts && self.cell_preempted(code) {
             if let Some((origin, log)) = &found
                 && !log.finished
             {
