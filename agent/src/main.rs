@@ -241,7 +241,7 @@ impl Agent {
             Some(children) if tool == children::SPAWN_TOOL => children.spawn(turn, seq, input),
             Some(children) if tool == children::LIST_TOOL => children.list(input),
             None if tool == children::SUBMIT_TOOL => children::submitted(input),
-            _ if receipted => self.bash(turn, seq, input, room),
+            _ if receipted && tool == "Bash" => self.bash(turn, seq, input, room),
             _ => self.workspace.run(tool, input),
         };
         if receipted {
