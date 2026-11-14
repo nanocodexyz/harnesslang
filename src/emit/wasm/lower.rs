@@ -202,7 +202,7 @@ impl<'p> Function<'_, 'p> {
                 self.emit("local.set $result");
                 self.emit("br $exit");
             }
-            Stmt::Shrink { .. } => return not_yet("clear and keep"),
+            Stmt::Shrink { field, kept } => self.shrink(*field, kept)?,
             Stmt::KeepBlobs { .. } => return not_yet("keep blobs"),
             Stmt::Rewrite { .. } => return not_yet("rewrite"),
             Stmt::Parallel(_) => return not_yet("parallel for"),
@@ -225,6 +225,41 @@ impl<'p> Function<'_, 'p> {
         self.emit(format!("i64.const {capacity}"));
         self.emit(format!("i32.const {name}"));
         self.emit("call $list_push");
+        self.halt_check();
+        self.emit(format!("i64.store offset={}", field * SLOT_BYTES));
+        Ok(())
+    }
+
+    fn shrink(&mut self, field: usize, kept: &ir::Kept) -> Result<(), String> {
+        let definition = &self.program().state[field];
+        let Type::List { capacity, .. } = &definition.ty else {
+            panic!("the checker clears and keeps only lists");
+        };
+        let capacity = capacity.value;
+        let name = self.tables.text(&definition.name);
+        self.emit("global.get $state");
+        self.emit("global.get $state");
+        self.emit(format!("i64.load offset={}", field * SLOT_BYTES));
+        match kept {
+            ir::Kept::Nothing => {
+                self.emit("i64.const 0");
+                self.emit("i32.const 0");
+                self.emit("i64.const 0");
+            }
+            ir::Kept::Last(count) => {
+                self.expr(count)?;
+                self.emit("i32.const 0");
+                self.emit("i64.const 0");
+            }
+            ir::Kept::LastAfter { count, first } => {
+                self.expr(count)?;
+                self.emit("i32.const 1");
+                self.expr(first)?;
+            }
+        }
+        self.emit(format!("i64.const {capacity}"));
+        self.emit(format!("i32.const {name}"));
+        self.emit("call $list_keep");
         self.halt_check();
         self.emit(format!("i64.store offset={}", field * SLOT_BYTES));
         Ok(())
