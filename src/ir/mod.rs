@@ -228,6 +228,14 @@ impl Program {
         self.sides.iter().find(|side| side.name == name)
     }
 
+    pub fn kind_of(&self, handler: &Handler) -> &'static str {
+        if self.side(&handler.name).is_some() {
+            "side handler"
+        } else {
+            "handler"
+        }
+    }
+
     pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
         self.tool(tool)
             .and_then(|(_, declared)| declared.spawn.as_ref())

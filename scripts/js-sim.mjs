@@ -8,6 +8,7 @@ const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
 const LISTINGS_URL = "https://listings.simulation.invalid/list";
 const TURN_URL = "https://harness.simulation.invalid/turn";
+const SIDE_URL = "https://harness.simulation.invalid/side";
 const DETAIL_CHARACTERS_MAX = 400;
 const HTTP_OK = 200;
 
@@ -109,7 +110,7 @@ class Seed {
     this.acks = [];
     this.dispatched = new Map();
     this.nestedDispatched = new Map();
-    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0 };
+    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0 };
     this.durableLines = () => [];
     this.checks = new CellChecks(rt, (invariant, detail) => new Failure(invariant, detail));
     this.cells = new TracedCells(this, {
@@ -157,6 +158,41 @@ class Seed {
     same("run exit", event.result, kind);
   }
 
+  sideQuestion(turn, seq) {
+    const event = this.cursor.next("side", `side question at ${turn}/${seq}`);
+    same("side question turn", event.turn, turn === null ? null : BigInt(turn));
+    same("side question seq", event.seq, seq === null ? null : BigInt(seq));
+    return event;
+  }
+
+  side(turn, seq) {
+    if (this.cursor.peek()?.event !== "side") return null;
+    const event = this.sideQuestion(turn, seq);
+    return rt.sideRequestFromJson(rt.object([["arguments", event.arguments], ["handler", event.handler]]));
+  }
+
+  sided(request, answer) {
+    const event = this.cursor.next("side_answer", `the answer to side question ${request.handler}`);
+    if (answer.error !== undefined) throw new Failure("backend_equal", short(`the generated code did not answer side question ${request.handler}: ${answer.error}`));
+    same("side answer outcome", event.outcome, answer.outcome);
+    same("side answer result", event.result, answer.result);
+    this.stats.sides += 1;
+  }
+
+  async sidesBetween(medium, ask) {
+    while (this.cursor.peek()?.event === "side_open") {
+      const event = this.cursor.next("side_open", "a side question between runs");
+      const expected = this.opened.slice(0, Number(event.keep)) + hexText(event.tail);
+      if (expected !== medium()) throw differ("journal a side question reads", JSON.stringify(short(expected)), JSON.stringify(short(medium())));
+      this.opened = expected;
+      const question = this.sideQuestion(null, null);
+      const body = rt.encodeJson(rt.object([["arguments", question.arguments], ["handler", question.handler]]));
+      const answer = await ask(body);
+      if (medium() !== expected) throw new Failure("side_isolated", `side question ${question.handler} changed the session's journal`);
+      this.sided({ handler: question.handler }, answer);
+    }
+  }
+
   nestedTool(request) {
     const callId = `${request.turn}/${request.seq}/code-${request.nested.id}`;
     const external = request.effect === "external" ? 1 : 0;
@@ -173,7 +209,16 @@ class Seed {
     }
   }
 
+  sideTool(request) {
+    const event = this.cursor.next("side_tool", short(rt.encodeJson(request)));
+    same("side tool seq", event.seq, request.seq);
+    same("side tool name", event.tool, request.tool);
+    same("side tool input", event.input, request.input);
+    return event.output;
+  }
+
   tool(request, durable) {
+    if (Number(request.turn) === rt.SIDE_TURN) return this.sideTool(request);
     if (request.nested === null) return this.topTool(request, durable);
     if (durable !== null && durable.alarmed !== undefined) durable.alarmed(`${request.turn}/${request.seq}/code-${request.nested.id}`, request.effect);
     const event = this.cursor.next("tool", short(rt.encodeJson({ ...request, nested: BigInt(request.nested.id) })));
@@ -252,6 +297,13 @@ class Seed {
   }
 
   model(request) {
+    if (Number(request.turn) === rt.SIDE_TURN) {
+      const side = this.cursor.next("side_model", `side ${request.seq}`);
+      same("side model seq", side.seq, request.seq);
+      same("side model mode", side.mode ?? null, request.mode);
+      same("side model context crc", side.context_crc, BigInt(rt.crc32(rt.encodeJson(request.context))));
+      return side.response;
+    }
     const event = this.cursor.next("model", `${request.turn}/${request.seq}`);
     same("model call turn", event.turn, request.turn);
     same("model call seq", event.seq, request.seq);
@@ -343,10 +395,11 @@ class Seed {
     const seed = this;
     const fakeFetch = async (url, init) => {
       const body = rt.decodeJson(init.body);
+      const side = Number(body.turn) === rt.SIDE_TURN;
       if (url === TOOLS_URL) {
         const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
         if (request.nested !== null) seed.nestedTool(request);
-        fetchCheck(request);
+        if (!side) fetchCheck(request);
         const output = seed.tool(request, fetchCheck.durable === undefined ? null : fetchCheck);
         return new Response(rt.encodeJson(output), { status: HTTP_OK });
       }
@@ -356,7 +409,7 @@ class Seed {
         return new Response(rt.encodeJson(output), { status: HTTP_OK });
       }
       if (url === MODEL_URL) {
-        fetchCheck(null);
+        if (!side) fetchCheck(null);
         const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, context: body.context });
         return new Response(rt.encodeJson(response), { status: HTTP_OK });
       }
@@ -487,6 +540,8 @@ async function cloudflareSeed(seed) {
     answer: (turn, position, answers) => seed.answered(turn, position, answers),
     resume: (suspension) => seed.resume(suspension),
     resumed: (suspension, resume, matched) => seed.resumed(suspension, resume, matched),
+    side: (turn, seq) => seed.side(turn, seq),
+    sided: (request, answer) => seed.sided(request, answer),
     tools: (world, requests, limit) => seed.tools(world, requests, limit),
     gate: (records) => {
       const bytes = storage.pendingBytes();
@@ -537,6 +592,12 @@ async function cloudflareSeed(seed) {
         kind = "crash";
       }
       seed.exited(kind);
+      await seed.sidesBetween(() => storage.medium() + storage.pendingBytes(), async (body) => {
+        instance ??= new loaded.HarnessObject(ctx, env);
+        const response = await instance.fetch(new Request(SIDE_URL, { method: "POST", body }));
+        if (response.status !== HTTP_OK) throw new Failure("liveness", `a side question: the object answered ${response.status}: ${await response.text()}`);
+        return rt.decodeJson(await response.text());
+      });
       if (kind !== "crash" && kind !== "suspended") break;
     }
   }
@@ -626,6 +687,8 @@ class SimWorkflow {
       tools: (world, requests, limit) => seed.tools(world, requests, limit),
       resume: (suspension) => seed.resume(suspension),
       resumed: (suspension, resume, matched) => seed.resumed(suspension, resume, matched),
+      side: (turn, seq) => seed.side(turn, seq),
+      sided: (request, answer) => seed.sided(request, answer),
       host: this.state.host,
       mutation: values.mutation,
       acknowledge: async (finish) => seed.acknowledged(finish, (turn) => statusIn(this.state.lines(), turn)),
@@ -704,6 +767,7 @@ async function vercelSeed(seed) {
         else throw error;
       }
       seed.exited(kind);
+      await seed.sidesBetween(() => state.lines().map((line) => line + "\n").join(""), async (body) => rt.decodeJson(await harness.side(state.lines(), body, state.host)));
       if (kind !== "crash" && kind !== "suspended") break;
     }
   }
@@ -711,7 +775,7 @@ async function vercelSeed(seed) {
 }
 
 const seeds = parseTrace(values.trace);
-const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0 };
+const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0 };
 const engineTotals = { cells: 0, steps: 0, unparsed: 0 };
 const started = performance.now();
 for (const traced of seeds) {
@@ -738,7 +802,7 @@ for (const traced of seeds) {
     process.exit(1);
   }
   totals.seeds += 1;
-  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits", "sleeps", "resumes"]) totals[key] += seed.stats[key];
+  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits", "sleeps", "resumes", "sides"]) totals[key] += seed.stats[key];
 }
 const elapsed = Math.round(performance.now() - started);
-console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""} ms=${elapsed}`);
+console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""}${totals.sides > 0 ? ` side_questions=${totals.sides}` : ""} ms=${elapsed}`);

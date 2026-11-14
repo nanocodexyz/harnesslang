@@ -141,6 +141,15 @@ class StepWorld {
   async answer() {
     throw new Panic("a step answers no events: the workflow function does, by an answer step");
   }
+
+  async side(turn, seq) {
+    if (this.context.side === undefined) return null;
+    return this.context.side(turn, seq);
+  }
+
+  async sided(request, answer) {
+    if (this.context.sided !== undefined) await this.context.sided(request, answer);
+  }
 }
 
 class ProcessCells {
@@ -204,6 +213,14 @@ async function runStep(input, context) {
     if (error instanceof StepWait) return { lines: [], wait: encodeJson(waitJson(error.wait)) };
     throw error;
   }
+}
+
+async function side(lines, requestText, host) {
+  const records = lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false)));
+  const request = decodeOrCorrupt(() => sideRequestFromJson(decodeJson(requestText)));
+  const world = { tool: (call) => host.tool(call), model: (call) => host.model(call) };
+  const answer = await answerSide({ target: VERCEL_TARGET, mutation: "none" }, world, records, request);
+  return encodeJson(sideAnswerJson(answer));
 }
 
 async function session(platform) {
@@ -329,6 +346,10 @@ const WORKFLOW_BINDING = [
   "  });",
   "}",
   "",
+  "export async function harnessSide(lines, request) {",
+  "  return harness.side(lines, request, host());",
+  "}",
+  "",
   "export async function harnessSession(sessionId, turnsMax) {",
   "  \"use workflow\";",
   "  const inboxes = new Map();",
@@ -379,6 +400,7 @@ const harness = {
   target: "vercel",
   runtime,
   session,
+  side,
   runStep,
   platformRandom,
   processCells: () => new ProcessCells(),

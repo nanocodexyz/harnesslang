@@ -244,11 +244,14 @@ impl<'a> Prover<'a> {
 
     fn summarize(self, report: &mut Report) {
         let name = self.handler_name();
+        let kind = self
+            .handler
+            .map_or("handler", |handler| self.program.kind_of(handler));
         let errors = !self.findings.is_empty();
         let count = |property| self.proved.get(property).copied().unwrap_or(0);
         if !errors {
             report.proved.push(format!(
-                "handler {name}: no_overflow: {} arithmetic operation(s) proved in range; invariant_preserved: {} invariant check(s) at returns and trap points; push_bound: {} push(es) proved below capacity ({} prover steps)",
+                "{kind} {name}: no_overflow: {} arithmetic operation(s) proved in range; invariant_preserved: {} invariant check(s) at returns and trap points; push_bound: {} push(es) proved below capacity ({} prover steps)",
                 count("no_overflow"),
                 count("invariant_preserved"),
                 count("push_bound"),
@@ -256,7 +259,7 @@ impl<'a> Prover<'a> {
             ));
             if !self.shrinks.is_empty() {
                 report.proved.push(format!(
-                    "handler {name}: shrink: {}",
+                    "{kind} {name}: shrink: {}",
                     shrink_lines(&self.shrinks)
                 ));
             }

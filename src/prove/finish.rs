@@ -24,7 +24,8 @@ pub fn prove(program: &Program, report: &mut Report) {
         }
         if clean {
             report.proved.push(format!(
-                "handler {}: finish_once: every path ends in exactly one of {finishes} return(s)",
+                "{} {}: finish_once: every path ends in exactly one of {finishes} return(s)",
+                program.kind_of(handler),
                 handler.name
             ));
         }

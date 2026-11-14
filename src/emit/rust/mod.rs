@@ -399,9 +399,16 @@ fn side_arguments(out: &mut String, program: &Program, types: &mut Types<'_>) {
     let mut run = String::new();
     for side in &program.sides {
         let variant = camel(&side.name);
-        let params: Vec<&ir::Field> = side.params.iter().map(|local| &side.locals[*local]).collect();
+        let params: Vec<&ir::Field> = side
+            .params
+            .iter()
+            .map(|local| &side.locals[*local])
+            .collect();
         let bindings: Vec<String> = (0..params.len()).map(|index| format!("p{index}")).collect();
-        let refs: Vec<String> = bindings.iter().map(|binding| format!("ref {binding}")).collect();
+        let refs: Vec<String> = bindings
+            .iter()
+            .map(|binding| format!("ref {binding}"))
+            .collect();
         let pattern = if params.is_empty() {
             format!("SideArguments::{variant}")
         } else {
@@ -419,10 +426,20 @@ fn side_arguments(out: &mut String, program: &Program, types: &mut Types<'_>) {
         let entries: Vec<String> = params
             .iter()
             .zip(&bindings)
-            .map(|(param, binding)| format!("({:?}, {}({binding}))", param.name, types.to_json(&param.ty)))
+            .map(|(param, binding)| {
+                format!(
+                    "({:?}, {}({binding}))",
+                    param.name,
+                    types.to_json(&param.ty)
+                )
+            })
             .collect();
-        writeln!(to_json, "        {pattern} => Json::object(vec![{}]),", entries.join(", "))
-            .expect("writing to a string succeeds");
+        writeln!(
+            to_json,
+            "        {pattern} => Json::object(vec![{}]),",
+            entries.join(", ")
+        )
+        .expect("writing to a string succeeds");
         let parsed: Vec<String> = params
             .iter()
             .map(|param| {
@@ -441,7 +458,10 @@ fn side_arguments(out: &mut String, program: &Program, types: &mut Types<'_>) {
         };
         writeln!(decode, "        {:?} => Ok({value}),", side.name)
             .expect("writing to a string succeeds");
-        let clones: Vec<String> = bindings.iter().map(|binding| format!(", {binding}.clone()")).collect();
+        let clones: Vec<String> = bindings
+            .iter()
+            .map(|binding| format!(", {binding}.clone()"))
+            .collect();
         writeln!(
             run,
             "        {pattern} => Ok({}(&handler_{}(engine, state{})?)),",

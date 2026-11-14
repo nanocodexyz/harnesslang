@@ -251,8 +251,13 @@ fn check_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
+    let sides = if program.sides.is_empty() {
+        String::new()
+    } else {
+        format!(", {} side handler(s)", program.sides.len())
+    };
     println!(
-        "{file}: harness {}: {} tool(s), {} state field(s), {} handler(s)",
+        "{file}: harness {}: {} tool(s), {} state field(s), {} handler(s){sides}",
         program.name,
         program.tools.len(),
         program.state.len(),
