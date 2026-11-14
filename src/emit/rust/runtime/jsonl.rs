@@ -305,6 +305,14 @@ impl<H: Host> World for JsonlWorld<'_, H> {
     fn acknowledge(&mut self, finish: &Finish) {
         self.host.acknowledge(finish)
     }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        self.host.inbox(turn)
+    }
+
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]) {
+        self.host.answer(turn, position, answers)
+    }
 }
 
 #[derive(Debug)]

@@ -10,27 +10,6 @@ each with the smallest language addition that would let it be written and
 how the compiler would keep checking it. A gap the language closes is removed
 and the others keep their numbers.
 
-
-## 3. Interrupts and steering are polled through none tools
-
-nanocode delivers a cancellation (`Cancellation`, `TurnCancelled`) and
-steer messages (`accept_steer`, Codex's `pending_steers`) into a running
-turn between rounds. harnesslang has no inbound events inside a turn, so
-the ports poll: `cancel_requested()`, `steer_waiting()` and `steer_take()`
-are declared none tools. Each poll is a `call` and a `result` record, two
-records and one sequence number per poll: `claude_agent.hl` spends up to 3
-of its 21 effects per round on polls (worst case 1,344 outbound requests
-against 1,152 without them), and a cancel that arrives during a long tool
-call is seen only after the whole batch.
-
-Smallest addition: inbound events declared on the harness, `on cancel` and
-`on steer(message: text)`, read in a handler with `if cancelled { ... }` and
-`take steers` (a `list<text, N>`). The runtime appends one `cancel` or
-`steer` record when an event arrives (nanocode's turn inbox does this), and
-a read returns the events recorded before the current sequence number, so
-replay stays deterministic and a read costs no record when nothing arrived.
-
-
 ## 7. Permission prompts and lifecycle hooks
 
 nanocode's hooks (`hooks.rs`: `UserPromptSubmit`, `Stop`, `PreCompact`,
@@ -43,7 +22,7 @@ stop) as a tool returning a text enum, without the reasons `Block` and
 takes hours does not, because a handler cannot end a turn and resume where
 it was. Smallest addition: a `suspend` effect that finishes the turn with a
 durable waiting status and resumes it from its journal when a matching
-inbound event (gap 3) arrives, as nanocode's parked turns
+inbound event (an `on` event, LANGUAGE.md) arrives, as nanocode's parked turns
 (`agent/parked.rs`) do.
 
 ## 8. Timers and waits

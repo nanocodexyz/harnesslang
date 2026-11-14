@@ -173,6 +173,24 @@ harness's declarations. There is no recursion (a fn may not call itself,
 directly or through others) and no unbounded loop: a handler is straight-line
 code over bounded loops, so its worst case is a number the checker computes.
 
+### Events
+
+`on cancel` and `on steer(message: text) bound N` declare the events a running
+turn takes from outside it. `cancelled` and `take steers` (a `list<text, N>`)
+read them in a handler's body, at no record and no sequence number. The
+runtime appends one `event` record (nanocode-turnlog's `Event`) per event that
+reaches a running turn, with `at`, the sequence number of the effect it
+arrived during; a read between effects `s` and `s + 1` sees the events with
+`at <= s`. Events enter only while an effect runs (on Vercel, at a step
+boundary), and a re-run takes none at the effects it replays, so replay shows
+every read what it saw. Events that arrive during a parallel for's calls are
+recorded at its last call's sequence number, and only when that call runs in
+this run: a re-run that finishes a batch whose last call is already in the
+journal (its external calls recovered as unknown) leaves them for the next
+effect. The sender is answered once the record is durable.
+LANGUAGE.md has the details and `src/target/inbound.rs` each target's delivery
+path with its platform facts.
+
 ### Code mode
 
 Not built yet: the parser has no `code` declaration and no target runs a cell.
@@ -491,8 +509,12 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `event_before_read` | a read sees only events recorded before its place in the turn (`event_read_unstamped` ignores the place) |
+| `event_replay_equal` | a read the run replays sees exactly the events its journal holds there, and no event is recorded at an earlier place than one before it (`event_drain_on_replay` takes events at replayed effects, `batch_drains_replayed` in a parallel for whose last call is replayed) |
+| `event_once` | no event is recorded twice (`event_redelivered` records a delivery sent again) |
+| `event_kept` | every event is answered, one answered as delivered is in the journal and one answered otherwise is not (`event_ack_early` answers before the flush) |
 | `checkpoint_compacted` | every checkpoint holds the state that replaying the journal reaches at its turn, so a list `clear` or `keep` shrank is short in it (`retire_skipped` writes the dropped entries back), and a turn that dropped entries flushes its checkpoint with its status, so the next load never replays the dropped prefix (`seal_skipped` leaves it out) |
-| `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
+| `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed that sends no events the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md), not built yet |

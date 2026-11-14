@@ -151,7 +151,7 @@ fn describe(program: &Program, state: &[Value]) -> String {
 
 fn kept(program: &Program, state: &[Value], when: &str) -> Result<(), Violation> {
     for invariant in &program.invariants {
-        let detail = match engine::evaluate(program, state, &[], &invariant.condition) {
+        let detail = match engine::evaluate(program, state, &[], None, &invariant.condition) {
             Ok(Value::Bool(true)) => continue,
             Ok(Value::Bool(false)) => {
                 format!("invariant '{}' does not hold {when}", invariant.name)
@@ -192,13 +192,14 @@ fn within_worst(
             .handler(&log.handler)
             .expect("a replayed turn names a handler");
         let written = counts.get(turn).copied().unwrap_or(0);
-        let worst = handler.worst.records.total;
+        let events = program.events.records_max();
+        let worst = handler.worst.records.total + events;
         if written > worst {
             return violation(
                 Invariant::WorstCase,
                 format!(
-                    "turn {turn} ({}) wrote {written} journal records besides recoveries, over the worst case of {worst}",
-                    log.handler
+                    "turn {turn} ({}) wrote {written} journal records besides recoveries, over the worst case of {} plus {events} event record(s)",
+                    log.handler, handler.worst.records.total
                 ),
             );
         }

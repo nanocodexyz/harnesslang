@@ -20,6 +20,10 @@ pub enum Invariant {
     ReplayEqual,
     Panic,
     EnumValid,
+    EventOnce,
+    EventKept,
+    EventBeforeRead,
+    EventReplayEqual,
     ToolAdmitted,
     NoTrap,
     InvariantKept,
@@ -29,7 +33,7 @@ pub enum Invariant {
 }
 
 impl Invariant {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 19] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -39,6 +43,10 @@ impl Invariant {
         Self::ReplayEqual,
         Self::Panic,
         Self::EnumValid,
+        Self::EventOnce,
+        Self::EventKept,
+        Self::EventBeforeRead,
+        Self::EventReplayEqual,
         Self::ToolAdmitted,
         Self::NoTrap,
         Self::InvariantKept,
@@ -58,6 +66,10 @@ impl Invariant {
             Self::ReplayEqual => "replay_equal",
             Self::Panic => "panic",
             Self::EnumValid => "enum_valid",
+            Self::EventOnce => "event_once",
+            Self::EventKept => "event_kept",
+            Self::EventBeforeRead => "event_before_read",
+            Self::EventReplayEqual => "event_replay_equal",
             Self::ToolAdmitted => "tool_admitted",
             Self::NoTrap => "no_trap",
             Self::InvariantKept => "invariant_kept",
@@ -171,7 +183,8 @@ pub fn check(
     finish_once(world, &calls, turns)?;
     idempotent_known(&calls, records)?;
     checkpoint_compacted(program, world, records)?;
-    liveness_and_replay(program, world, turns, records)
+    liveness_and_replay(program, world, turns, records)?;
+    world.inbox.kept(records)
 }
 
 pub fn checkpoint_compacted(
@@ -241,6 +254,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             );
         }
     }
+    world.inbox.safety(records)?;
     let calls = seq_unique(records)?;
     enum_valid(world, records)?;
     let refused = tool_admitted(world, records)?;
@@ -538,6 +552,7 @@ fn canonical_key(record: &Record) -> (u64, u8, u64, u8) {
         }
         Record::Call { turn, seq, .. } => (*turn, 2, *seq, 0),
         Record::Result { turn, seq, .. } | Record::Model { turn, seq, .. } => (*turn, 2, *seq, 1),
+        Record::Event { turn, at, .. } => (*turn, 2, *at, 2),
         Record::Status { turn, .. } => (*turn, 3, 0, 0),
         Record::Checkpoint { revision, .. } => (*revision, 4, 0, 0),
     }
