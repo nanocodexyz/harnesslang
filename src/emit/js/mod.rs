@@ -1,0 +1,391 @@
+use std::fmt::Write;
+
+use crate::ir::{
+    BinaryOp, Durability, Expr, Handler, Program, Site, SiteClass, SiteKind, Stmt, Type,
+};
+use crate::target::{self, Target};
+
+const RUNTIME: &str = include_str!("runtime.js");
+const ENGINE: &str = include_str!("engine.js");
+const CLOUDFLARE: &str = include_str!("cloudflare.js");
+const VERCEL: &str = include_str!("vercel.js");
+const INDENT: &str = "  ";
+const LINE_SEPARATOR: char = '\u{2028}';
+const PARAGRAPH_SEPARATOR: char = '\u{2029}';
+const CONTROL_END: u32 = 0x20;
+
+pub fn emit(program: &Program, target: Target) -> Result<String, String> {
+    let adapter = match target {
+        Target::Cloudflare => CLOUDFLARE,
+        Target::Vercel => VERCEL,
+        other => {
+            return Err(format!(
+                "the JavaScript backend emits cloudflare and vercel, not {}",
+                other.name()
+            ));
+        }
+    };
+    let errors = target::check_limits(program, &target::model(target));
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    let mut out = String::new();
+    for constant in &program.constants {
+        writeln!(
+            out,
+            "const constant_{} = {}n;",
+            constant.name, constant.value
+        )
+        .expect("writing to a string succeeds");
+    }
+    out.push_str(&program_literal(program));
+    out.push_str(RUNTIME);
+    out.push_str(ENGINE);
+    for (index, handler) in program.handlers.iter().enumerate() {
+        out.push_str(&handler_function(program, index, handler));
+    }
+    out.push_str(adapter);
+    Ok(out)
+}
+
+pub fn js_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            control
+                if u32::from(control) < CONTROL_END
+                    || control == LINE_SEPARATOR
+                    || control == PARAGRAPH_SEPARATOR =>
+            {
+                write!(out, "\\u{:04x}", u32::from(control)).expect("writing to a string succeeds");
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn type_literal(ty: &Type) -> String {
+    match ty {
+        Type::U64 => "\"u64\"".to_owned(),
+        Type::Bool => "\"bool\"".to_owned(),
+        Type::Text => "\"text\"".to_owned(),
+        Type::Sum(sum) => format!("{{ sum: {sum} }}"),
+        Type::List { element, capacity } => format!(
+            "{{ list: {}, capacity: {}n, bound: {} }}",
+            type_literal(element),
+            capacity.value,
+            js_string(&capacity.name)
+        ),
+        Type::Known(inner) => format!("{{ known: {} }}", type_literal(inner)),
+        Type::Maybe(inner) => format!("{{ maybe: {} }}", type_literal(inner)),
+    }
+}
+
+fn fields_literal(fields: &[crate::ir::Field]) -> String {
+    let items: Vec<String> = fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{{ name: {}, ty: {} }}",
+                js_string(&field.name),
+                type_literal(&field.ty)
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+fn site_literal(site: &Site) -> String {
+    let tool = match site.kind {
+        SiteKind::Tool(tool) => tool.to_string(),
+        SiteKind::Dispatch | SiteKind::Model | SiteKind::Now | SiteKind::Random => {
+            "null".to_owned()
+        }
+    };
+    let class = match site.class {
+        SiteClass::Fixed(effect) => effect.name(),
+        SiteClass::Dispatched => "dispatched",
+    };
+    let durability = match site.durability {
+        Durability::RidesNextFlush => "rides_next_flush",
+        Durability::FlushBeforeRun => "flush_before_run",
+        Durability::FlushBeforeRunWhenExternal => "flush_before_run_when_external",
+    };
+    format!(
+        "{{ kind: \"{}\", tool: {tool}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",
+        site.kind.name(),
+        type_literal(&site.result)
+    )
+}
+
+fn program_literal(program: &Program) -> String {
+    let mut out = format!(
+        "const PROGRAM = {{\n  name: {},\n  sums: [\n",
+        js_string(&program.name)
+    );
+    for sum in &program.sums {
+        let variants: Vec<String> = sum
+            .variants
+            .iter()
+            .map(|variant| {
+                let fields: Vec<String> = variant.fields.iter().map(type_literal).collect();
+                format!(
+                    "{{ name: {}, fields: [{}] }}",
+                    js_string(&variant.name),
+                    fields.join(", ")
+                )
+            })
+            .collect();
+        writeln!(
+            out,
+            "    {{ name: {}, variants: [{}] }},",
+            js_string(&sum.name),
+            variants.join(", ")
+        )
+        .expect("writing to a string succeeds");
+    }
+    out.push_str("  ],\n  tools: [\n");
+    for tool in &program.tools {
+        writeln!(
+            out,
+            "    {{ name: {}, params: {}, returns: {}, effect: \"{}\" }},",
+            js_string(&tool.name),
+            fields_literal(&tool.params),
+            type_literal(&tool.returns),
+            tool.effect.name()
+        )
+        .expect("writing to a string succeeds");
+    }
+    let model = program.model.as_ref().map_or("null".to_owned(), |model| {
+        format!(
+            "{{ name: {}, calls: {}n }}",
+            js_string(&model.name),
+            model.calls.value
+        )
+    });
+    write!(
+        out,
+        "  ],\n  model: {model},\n  state: {},\n  handlers: [\n",
+        fields_literal(&program.state)
+    )
+    .expect("writing to a string succeeds");
+    for (index, handler) in program.handlers.iter().enumerate() {
+        out.push_str(&handler_literal(index, handler));
+    }
+    out.push_str("  ],\n};\n");
+    out
+}
+
+fn handler_literal(index: usize, handler: &Handler) -> String {
+    let params: Vec<crate::ir::Field> = handler
+        .params
+        .iter()
+        .map(|local| handler.locals[*local].clone())
+        .collect();
+    let sites: Vec<String> = handler.sites.iter().map(site_literal).collect();
+    format!(
+        "    {{\n      name: {},\n      params: {},\n      returns: {},\n      effectsMax: {},\n      sites: [\n        {}\n      ],\n      run: handler_{index},\n    }},\n",
+        js_string(&handler.name),
+        fields_literal(&params),
+        type_literal(&handler.returns),
+        handler.worst.effects.total,
+        sites.join(",\n        ")
+    )
+}
+
+fn handler_function(program: &Program, index: usize, handler: &Handler) -> String {
+    let mut out = format!("async function handler_{index}(rt, state, args) {{\n");
+    if !handler.locals.is_empty() {
+        let locals: Vec<String> = (0..handler.locals.len())
+            .map(|local| format!("local_{local}"))
+            .collect();
+        writeln!(out, "{INDENT}let {};", locals.join(", ")).expect("writing to a string succeeds");
+    }
+    for (position, local) in handler.params.iter().enumerate() {
+        writeln!(out, "{INDENT}local_{local} = args[{position}];")
+            .expect("writing to a string succeeds");
+    }
+    if let Some(requires) = &handler.requires {
+        writeln!(
+            out,
+            "{INDENT}if (!({})) throw new Trap({});",
+            expr(program, requires),
+            js_string(&format!("requires({})", handler.name))
+        )
+        .expect("writing to a string succeeds");
+    }
+    let mut writer = Writer {
+        program,
+        out,
+        depth: 1,
+    };
+    writer.block(&handler.body);
+    let mut out = writer.out;
+    out.push_str("}\n\n");
+    out
+}
+
+struct Writer<'a> {
+    program: &'a Program,
+    out: String,
+    depth: usize,
+}
+
+impl Writer<'_> {
+    fn line(&mut self, text: &str) {
+        for _ in 0..self.depth {
+            self.out.push_str(INDENT);
+        }
+        self.out.push_str(text);
+        self.out.push('\n');
+    }
+
+    fn nested(&mut self, statements: &[Stmt]) {
+        self.depth += 1;
+        self.block(statements);
+        self.depth -= 1;
+    }
+
+    fn block(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            self.statement(statement);
+        }
+    }
+
+    fn statement(&mut self, statement: &Stmt) {
+        let program = self.program;
+        let depth = self.depth;
+        match statement {
+            Stmt::Let { local, value } => {
+                self.line(&format!("local_{local} = {};", expr(program, value)))
+            }
+            Stmt::Assign { field, value } => {
+                self.line(&format!("state[{field}] = {};", expr(program, value)))
+            }
+            Stmt::Push { field, value } => {
+                self.line(&format!("rt.push({field}, {});", expr(program, value)))
+            }
+            Stmt::If {
+                condition,
+                then,
+                otherwise,
+            } => {
+                self.line(&format!("if ({}) {{", expr(program, condition)));
+                self.nested(then);
+                self.line("} else {");
+                self.nested(otherwise);
+                self.line("}");
+            }
+            Stmt::Match { subject, arms, .. } => {
+                self.line("{");
+                self.depth += 1;
+                self.line(&format!(
+                    "const subject_{depth} = {};",
+                    expr(program, subject)
+                ));
+                self.line(&format!("switch (subject_{depth}.v) {{"));
+                for (position, arm) in arms.iter().enumerate() {
+                    assert_eq!(arm.variant, position, "arms are in variant order");
+                    self.line(&format!("case {position}: {{"));
+                    self.depth += 1;
+                    for (field, binding) in arm.bindings.iter().enumerate() {
+                        if let Some(local) = binding {
+                            self.line(&format!("local_{local} = subject_{depth}.f[{field}];"));
+                        }
+                    }
+                    self.block(&arm.body);
+                    self.line("break;");
+                    self.depth -= 1;
+                    self.line("}");
+                }
+                self.line("default:");
+                self.line(&format!(
+                    "{INDENT}throw new Panic(\"a match covers every variant\");"
+                ));
+                self.line("}");
+                self.depth -= 1;
+                self.line("}");
+            }
+            Stmt::Loop { index, bound, body } => {
+                self.line(&format!(
+                    "for (let index_{depth} = 0n; index_{depth} < {}n; index_{depth} += 1n) {{",
+                    bound.value
+                ));
+                self.depth += 1;
+                self.line(&format!("local_{index} = index_{depth};"));
+                self.block(body);
+                self.depth -= 1;
+                self.line("}");
+            }
+            Stmt::For {
+                item,
+                list,
+                bound,
+                body,
+            } => {
+                self.line(&format!(
+                    "for (const item_{depth} of within({}, {}n)) {{",
+                    expr(program, list),
+                    bound.value
+                ));
+                self.depth += 1;
+                self.line(&format!("local_{item} = item_{depth};"));
+                self.block(body);
+                self.depth -= 1;
+                self.line("}");
+            }
+            Stmt::Effect { site, args, result } => {
+                let args: Vec<String> = args.iter().map(|arg| expr(program, arg)).collect();
+                self.line(&format!(
+                    "local_{result} = await rt.effect({site}, [{}]);",
+                    args.join(", ")
+                ));
+            }
+            Stmt::Finish { value } => self.line(&format!("return {};", expr(program, value))),
+        }
+    }
+}
+
+fn binary(op: BinaryOp, left: String, right: String) -> String {
+    match op {
+        BinaryOp::Add => format!("add({left}, {right})"),
+        BinaryOp::Subtract => format!("subtract({left}, {right})"),
+        BinaryOp::Multiply => format!("multiply({left}, {right})"),
+        BinaryOp::Concat => format!("({left} + {right})"),
+        BinaryOp::Equal => format!("valueEqual({left}, {right})"),
+        BinaryOp::NotEqual => format!("!valueEqual({left}, {right})"),
+        BinaryOp::Less => format!("({left} < {right})"),
+        BinaryOp::LessEqual => format!("({left} <= {right})"),
+        BinaryOp::Greater => format!("({left} > {right})"),
+        BinaryOp::GreaterEqual => format!("({left} >= {right})"),
+        BinaryOp::And => format!("both({left}, {right})"),
+        BinaryOp::Or => format!("either({left}, {right})"),
+    }
+}
+
+fn expr(program: &Program, expression: &Expr) -> String {
+    match expression {
+        Expr::U64(value) => format!("{value}n"),
+        Expr::Bool(value) => value.to_string(),
+        Expr::Text(value) => js_string(value),
+        Expr::Constant(constant) => format!("constant_{}", program.constants[*constant].name),
+        Expr::Local(local) => format!("local_{local}"),
+        Expr::Field(field) => format!("state[{field}]"),
+        Expr::Member { base, index } => format!("({}).f[{index}]", expr(program, base)),
+        Expr::Construct {
+            variant, fields, ..
+        } => {
+            let fields: Vec<String> = fields.iter().map(|field| expr(program, field)).collect();
+            format!("variant({variant}, [{}])", fields.join(", "))
+        }
+        Expr::Binary {
+            op, left, right, ..
+        } => binary(*op, expr(program, left), expr(program, right)),
+        Expr::Not(operand) => format!("!({})", expr(program, operand)),
+        Expr::Len(operand) => format!("BigInt(({}).length)", expr(program, operand)),
+    }
+}
