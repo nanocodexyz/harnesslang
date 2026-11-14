@@ -4,6 +4,7 @@ const rounds_max: u64 = 64
 const calls_per_round_max: u64 = 16
 const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
+const compact_kept: u64 = 32
 const turns_max: u64 = 1000000
 const mcp_tools_max: u64 = 64
 
@@ -27,11 +28,10 @@ state {
 }
 
 invariant turns_bounded: turns <= turns_max
-invariant context_bounded: len(context) <= context_entries_max
+invariant context_room: len(context) < context_entries_max
 
 on prompt(input: text) -> outcome
   requires turns < turns_max
-    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
 {
   push context user(input)
   turns = turns + 1
@@ -39,6 +39,20 @@ on prompt(input: text) -> outcome
     match mcp() {
       ok(_) => {}
       failed(_) => {}
+    }
+    if len(context) + 1 + (1 + calls_per_round_max) > context_entries_max {
+      keep context last context_entries_max - 2
+      push context user("Summarize the conversation so far for a fresh start: the task, what was done, what is left.")
+      match responses(context) {
+        failed(error) => { return failed("compaction failed: " ++ error) }
+        ok(summary) => {
+          keep context last compact_kept
+          match summary {
+            message(_, _) => { push context assistant(summary) }
+            calls(_) => { return failed("compaction answered with tool calls") }
+          }
+        }
+      }
     }
     match responses(context) {
       failed(error) => { return failed("model call failed: " ++ error) }

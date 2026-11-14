@@ -8,7 +8,7 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const NESTING_DEPTH_MAX: u32 = 64;
 
-pub const KEYWORDS: [&str; 24] = [
+pub const KEYWORDS: [&str; 26] = [
     "harness",
     "const",
     "type",
@@ -18,6 +18,8 @@ pub const KEYWORDS: [&str; 24] = [
     "on",
     "let",
     "push",
+    "clear",
+    "keep",
     "if",
     "else",
     "match",
@@ -495,6 +497,18 @@ impl<'a> Parser<'a> {
                 let list = self.name("a list to push onto")?;
                 let value = self.expr()?;
                 Ok(Stmt::Push { at, list, value })
+            }
+            "clear" => {
+                self.advance();
+                let list = self.name("a list to clear")?;
+                Ok(Stmt::Clear { at, list })
+            }
+            "keep" => {
+                self.advance();
+                let list = self.name("a list to keep the end of")?;
+                self.word("last")?;
+                let count = self.expr()?;
+                Ok(Stmt::Keep { at, list, count })
             }
             "if" => self.if_statement(),
             "match" => self.match_statement(),

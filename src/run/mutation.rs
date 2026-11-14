@@ -22,6 +22,8 @@ pub enum Mutation {
     EventDrainOnReplay,
     BatchDrainsReplayed,
     ModelFailureUnrecorded,
+    RetireSkipped,
+    SealSkipped,
     ListingUnchecked,
     ListedClassDropped,
     InputUnchecked,
@@ -31,7 +33,7 @@ pub enum Mutation {
 }
 
 impl Mutation {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 28] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -52,6 +54,8 @@ impl Mutation {
         Self::EventDrainOnReplay,
         Self::BatchDrainsReplayed,
         Self::ModelFailureUnrecorded,
+        Self::RetireSkipped,
+        Self::SealSkipped,
         Self::ListingUnchecked,
         Self::ListedClassDropped,
         Self::InputUnchecked,
@@ -82,6 +86,8 @@ impl Mutation {
             Self::EventDrainOnReplay => "event_drain_on_replay",
             Self::BatchDrainsReplayed => "batch_drains_replayed",
             Self::ModelFailureUnrecorded => "model_failure_unrecorded",
+            Self::RetireSkipped => "retire_skipped",
+            Self::SealSkipped => "seal_skipped",
             Self::ListingUnchecked => "listing_unchecked",
             Self::ListedClassDropped => "listed_class_dropped",
             Self::InputUnchecked => "input_unchecked",
@@ -139,6 +145,8 @@ impl Mutation {
             | Self::EventReadUnstamped
             | Self::EventDrainOnReplay
             | Self::ModelFailureUnrecorded
+            | Self::RetireSkipped
+            | Self::SealSkipped
             | Self::ResultsInCompletionOrder
             | Self::BatchPushesReversed
             | Self::ListingUnchecked

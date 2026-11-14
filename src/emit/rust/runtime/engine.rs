@@ -1096,6 +1096,20 @@ pub fn push<T>(list: &mut Vec<T>, value: T, capacity: u64, field: &str) -> Resul
     Ok(())
 }
 
+pub fn keep_last<T>(list: &mut Vec<T>, count: u64) {
+    let length = list.len() as u64;
+    if count >= length {
+        return;
+    }
+    let dropped = usize::try_from(length - count).expect("a list's length fits usize");
+    list.drain(..dropped);
+    assert_eq!(
+        list.len() as u64,
+        count,
+        "keep leaves exactly the last count entries"
+    );
+}
+
 pub fn parse_u64(json: &Json) -> Result<u64, String> {
     json.as_u64()
         .ok_or_else(|| format!("expected u64, found {}", json.encode()))

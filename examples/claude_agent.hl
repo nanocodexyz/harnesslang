@@ -4,6 +4,7 @@ const rounds_max: u64 = 64
 const calls_per_round_max: u64 = 16
 const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
+const compact_kept: u64 = 32
 const turns_max: u64 = 1000000
 const continuations_max: u64 = 3
 const throttled_attempts_max: u64 = 10
@@ -39,13 +40,34 @@ state {
 }
 
 invariant turns_bounded: turns <= turns_max
-invariant context_bounded: len(context) <= context_entries_max
+invariant context_room: len(context) < context_entries_max
 invariant continuations_bounded: output_continuations <= continuations_max
 invariant throttled_bounded: throttled < throttled_attempts_max
 
+fn compact() {
+  keep context last context_entries_max - 2
+  push context user("Summarize the conversation so far for a fresh start: the task, what was done, what is left.")
+  match messages(context) {
+    failed(error) => { return failed("compaction failed: " ++ error) }
+    ok(summary) => {
+      keep context last compact_kept
+      match summary {
+        answer(_, tokens) => {
+          context_tokens = tokens
+          push context assistant(summary)
+        }
+        calls(_, _) => { return failed("compaction answered with tool calls") }
+        truncated(_) => { return failed("compaction reached the output token limit") }
+        paused => { return failed("compaction paused") }
+        context_full => { return failed("compaction exhausted the context window") }
+        refused(reason) => { return failed("provider refused compaction: " ++ reason) }
+      }
+    }
+  }
+}
+
 on prompt(input: text) -> outcome
   requires turns < turns_max
-    and len(context) + 1 + rounds_max * (1 + calls_per_round_max + steers_per_turn_max) <= context_entries_max
 {
   push context user(input)
   turns = turns + 1
@@ -53,6 +75,9 @@ on prompt(input: text) -> outcome
   throttled = 0
   context_recovery_attempted = false
   loop round below rounds_max {
+    if len(context) + 1 + (1 + calls_per_round_max + steers_per_turn_max) > context_entries_max {
+      compact()
+    }
     if cancelled { return interrupted }
     match messages(context) {
       failed(error) => {
@@ -97,7 +122,8 @@ on prompt(input: text) -> outcome
               return failed("context window exhausted after recovery")
             }
             context_recovery_attempted = true
-            push context user("Continue the current task from the interrupted response. The context window was exhausted. Do not repeat completed tool actions.")
+            compact()
+            push context user("Continue the current task from the interrupted response. The context window was exhausted and the conversation was compacted. Do not repeat completed tool actions.")
           }
           refused(reason) => { return failed("provider refused the request; turn stopped: " ++ reason) }
         }

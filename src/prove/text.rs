@@ -124,7 +124,11 @@ fn collect<'a>(
                 effects.insert(parallel.result, (parallel.site, parallel.args.as_slice()));
                 collect(&parallel.body, effects, takes);
             }
-            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Finish { .. } => {}
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
+            | Stmt::Finish { .. } => {}
         }
     }
 }

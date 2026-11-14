@@ -207,9 +207,11 @@ fn block(handler: &Handler, statements: &[Stmt]) -> Result<Paths, Overflow> {
 
 fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Paths, Overflow> {
     match statement {
-        Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Take { .. } => {
-            Ok(continuing(zero()))
-        }
+        Stmt::Let { .. }
+        | Stmt::Assign { .. }
+        | Stmt::Push { .. }
+        | Stmt::Take { .. }
+        | Stmt::Shrink { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => {
             let kind = handler.sites[*site].kind;
             let records = if kind == SiteKind::Model {

@@ -125,6 +125,7 @@ impl Walk<'_> {
             Stmt::Let { .. }
             | Stmt::Assign { .. }
             | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. } => true,
         }

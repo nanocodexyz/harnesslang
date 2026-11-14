@@ -10,30 +10,6 @@ each with the smallest language addition that would let it be written and
 how the compiler would keep checking it. A gap the language closes is removed
 and the others keep their numbers.
 
-## 2. Compaction
-
-nanocode compacts on a token threshold (`auto_compact_window_tokens`), on
-context exhaustion and on request: a summarizing model call
-(`compact_locked`, `prompts/compact.md`) whose summary replaces the
-history, keeping the most recent messages verbatim (`COMPACT_KEPT`). Codex
-installs pre- and mid-turn compactions (`lifecycle.rs`). harnesslang lists
-only grow: there is no way to replace or clear a list, and no model whose
-reply is plain text. `examples/claude_agent.hl` handles
-`model_context_window_exceeded` once by sending the context again, where
-nanocode compacts. So every port carries
-`requires len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max`
-and refuses a turn once the context lacks room, and `subagents.hl`'s roster
-of spawned agents never shrinks.
-
-Smallest addition: `clear list` and `keep list last N` statements (the
-prover sets the length to 0 or to `min(len, N)`, both linear), plus a model
-declared with `reply text` for summaries (its record is a `model` record
-like any other). Compaction is then a handler branch:
-`let summary = summarize(context)`, `keep context last kept_max`,
-`push context user(summary)`. nanocode-sim's `retire_skipped` and
-`seal_skipped` mutations then have a counterpart: the simulator checks that
-a checkpoint after `clear` no longer replays the cleared prefix.
-
 ## 7. Permission prompts and lifecycle hooks
 
 nanocode's hooks (`hooks.rs`: `UserPromptSubmit`, `Stop`, `PreCompact`,

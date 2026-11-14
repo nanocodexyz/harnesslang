@@ -95,7 +95,7 @@ echo "check: every fn program emits, checks and proves exactly as its written-ou
 pids=()
 for target in $targets; do
   (
-    for file in examples/*.hl; do
+    for file in examples/*.hl docs/snippets/compaction.hl; do
       "$hl" sim --target "$target" --seeds "$seeds" "$file"
     done
     "$hl" sim --target "$target" --seeds "$twice_seeds" --twice examples/agent.hl

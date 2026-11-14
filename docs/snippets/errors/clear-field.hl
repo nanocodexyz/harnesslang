@@ -1,0 +1,10 @@
+harness notes
+
+state {
+  turns: u64
+}
+
+on reset() -> u64 {
+  clear turns
+  return turns
+}

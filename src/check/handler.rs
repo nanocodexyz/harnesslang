@@ -3,7 +3,9 @@ use crate::check::{
     error, quoted, resolve,
 };
 use crate::effect::EffectClass;
-use crate::ir::{self, BinaryOp, Durability, Expr, LocalId, Site, SiteClass, SiteKind, Stmt, Type};
+use crate::ir::{
+    self, BinaryOp, Durability, Expr, Kept, LocalId, Site, SiteClass, SiteKind, Stmt, Type,
+};
 use crate::syntax::Position;
 use crate::syntax::ast;
 
@@ -287,6 +289,17 @@ impl Checker<'_> {
         )
     }
 
+    fn list_field(&self, name: &ast::Name, action: &str) -> Checked<(ir::FieldId, Type)> {
+        let field = self.state_field(name, action)?;
+        let Type::List { element, .. } = &self.program.state[field].ty else {
+            return error(
+                name.at,
+                format!("cannot {action} '{}': it is not a list", name.text),
+            );
+        };
+        Ok((field, (**element).clone()))
+    }
+
     fn statement(&mut self, statement: &ast::Stmt, out: &mut Vec<Stmt>) -> Checked<bool> {
         match statement {
             ast::Stmt::Let { name, ty, value } => {
@@ -313,17 +326,30 @@ impl Checker<'_> {
                 Ok(false)
             }
             ast::Stmt::Push { list, value, .. } => {
-                let field = self.state_field(list, "push onto")?;
-                let Type::List { element, .. } = self.program.state[field].ty.clone() else {
-                    return error(
-                        list.at,
-                        format!("cannot push onto '{}': it is not a list", list.text),
-                    );
-                };
+                let (field, element) = self.list_field(list, "push onto")?;
                 let at = value.at();
                 let (value, ty) = self.expr(value, Some(&element), out)?;
                 self.expect(at, &element, &ty)?;
                 out.push(Stmt::Push { field, value });
+                Ok(false)
+            }
+            ast::Stmt::Clear { list, .. } => {
+                let (field, _) = self.list_field(list, "clear")?;
+                out.push(Stmt::Shrink {
+                    field,
+                    kept: Kept::Nothing,
+                });
+                Ok(false)
+            }
+            ast::Stmt::Keep { list, count, .. } => {
+                let (field, _) = self.list_field(list, "keep the end of")?;
+                let at = count.at();
+                let (count, ty) = self.expr(count, Some(&Type::U64), out)?;
+                self.expect(at, &Type::U64, &ty)?;
+                out.push(Stmt::Shrink {
+                    field,
+                    kept: Kept::Last(count),
+                });
                 Ok(false)
             }
             ast::Stmt::If {
@@ -1188,6 +1214,8 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         ast::Stmt::Let { .. } => "a let".to_owned(),
         ast::Stmt::Assign { .. } => "an assignment".to_owned(),
         ast::Stmt::Push { .. } => "a push".to_owned(),
+        ast::Stmt::Clear { .. } => "a clear".to_owned(),
+        ast::Stmt::Keep { .. } => "a keep".to_owned(),
         ast::Stmt::If { .. } => "an if".to_owned(),
         ast::Stmt::Match { .. } => "a match".to_owned(),
         ast::Stmt::Loop { .. } => "a loop".to_owned(),
@@ -1215,6 +1243,8 @@ pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
         ast::Stmt::Call { callee, .. } => callee.at,
         ast::Stmt::Inlined { at, .. } => *at,
         ast::Stmt::Push { at, .. }
+        | ast::Stmt::Clear { at, .. }
+        | ast::Stmt::Keep { at, .. }
         | ast::Stmt::If { at, .. }
         | ast::Stmt::Match { at, .. }
         | ast::Stmt::Loop { at, .. }

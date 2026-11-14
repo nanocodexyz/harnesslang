@@ -325,6 +325,15 @@ impl<'a> Inliner<'a> {
                 self.expr(walk, value)?;
                 Ok(statement.clone())
             }
+            Stmt::Clear { list, .. } => {
+                walk.reference(&self.declared, list)?;
+                Ok(statement.clone())
+            }
+            Stmt::Keep { list, count, .. } => {
+                walk.reference(&self.declared, list)?;
+                self.expr(walk, count)?;
+                Ok(statement.clone())
+            }
             Stmt::Return { value, .. } => {
                 self.expr(walk, value)?;
                 Ok(statement.clone())
