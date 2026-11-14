@@ -1,0 +1,19 @@
+harness lookup
+
+const notes_max: u64 = 20000
+
+tool fetch(key: text) -> text effect idempotent
+
+state {
+  notes: list<text, notes_max>
+}
+
+on first() -> text {
+  for note in notes {
+    match fetch(note) {
+      ok(body) => { return body }
+      failed(error) => { return error }
+    }
+  }
+  return "no notes"
+}

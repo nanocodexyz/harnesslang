@@ -188,29 +188,145 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
         let model = target::model(*target);
         let plan = lower::lower(&program, &model, mutation);
         durability::prove(&program, &plan, &mut report);
+        records(&program, &plan, mutation, &mut report);
         bounds(&program, &plan, &mut report);
     }
     report
 }
 
-fn outbound_max(ops: &[Op]) -> Option<u64> {
-    let mut total: u64 = 0;
+#[derive(Clone, Copy, Debug)]
+struct Planned {
+    through: Option<u64>,
+    ended: Option<u64>,
+}
+
+fn larger(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, None) => left,
+        (None, right) => right,
+    }
+}
+
+fn after(before: u64, cost: Option<u64>) -> Option<Option<u64>> {
+    match cost {
+        Some(cost) => Some(Some(before.checked_add(cost)?)),
+        None => Some(None),
+    }
+}
+
+fn then(first: Planned, second: Planned) -> Option<Planned> {
+    let Some(before) = first.through else {
+        return Some(first);
+    };
+    Some(Planned {
+        through: after(before, second.through)?,
+        ended: larger(first.ended, after(before, second.ended)?),
+    })
+}
+
+fn repeated(body: Planned, bound: u64, every_iteration: bool) -> Option<Planned> {
+    if bound == 0 {
+        return Some(Planned {
+            through: Some(0),
+            ended: None,
+        });
+    }
+    let through = match body.through {
+        Some(each) => Some(each.checked_mul(bound)?),
+        None if every_iteration => None,
+        None => Some(0),
+    };
+    let before = body.through.unwrap_or(0).checked_mul(bound - 1)?;
+    Some(Planned {
+        through,
+        ended: after(before, body.ended)?,
+    })
+}
+
+fn planned(ops: &[Op], cost: fn(&Op) -> u64) -> Option<Planned> {
+    let mut paths = Planned {
+        through: Some(0),
+        ended: None,
+    };
     for op in ops {
-        let cost = match op {
-            Op::Run { outbound, .. } => u64::from(*outbound),
+        let step = match op {
             Op::Choice(arms) => {
-                let mut widest = 0;
+                let mut widest = Planned {
+                    through: None,
+                    ended: None,
+                };
                 for arm in arms {
-                    widest = widest.max(outbound_max(&arm.ops)?);
+                    let one = planned(&arm.ops, cost)?;
+                    widest = Planned {
+                        through: larger(widest.through, one.through),
+                        ended: larger(widest.ended, one.ended),
+                    };
                 }
                 widest
             }
-            Op::Repeat { bound, body, .. } => outbound_max(body)?.checked_mul(*bound)?,
-            Op::Append(_) | Op::Flush(_) | Op::Yield { .. } | Op::Acknowledge | Op::End => 0,
+            Op::Repeat {
+                bound,
+                every_iteration,
+                body,
+                ..
+            } => repeated(planned(body, cost)?, *bound, *every_iteration)?,
+            Op::End => Planned {
+                through: None,
+                ended: Some(0),
+            },
+            Op::Append(_) | Op::Flush(_) | Op::Run { .. } | Op::Yield { .. } | Op::Acknowledge => {
+                Planned {
+                    through: Some(cost(op)),
+                    ended: None,
+                }
+            }
         };
-        total = total.checked_add(cost)?;
+        paths = then(paths, step)?;
     }
-    Some(total)
+    Some(paths)
+}
+
+fn planned_max(ops: &[Op], cost: fn(&Op) -> u64) -> Option<u64> {
+    let paths = planned(ops, cost)?;
+    larger(paths.through, paths.ended)
+}
+
+fn outbound(op: &Op) -> u64 {
+    match op {
+        Op::Run { outbound, .. } => u64::from(*outbound),
+        _ => 0,
+    }
+}
+
+fn appended(op: &Op) -> u64 {
+    u64::from(matches!(op, Op::Append(_)))
+}
+
+fn records(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Report) {
+    let model = &plan.model;
+    for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
+        let counted = &handler.worst.records;
+        let planned = planned_max(&lowered.ops, appended)
+            .expect("the IR's record count fits u64, and the plan appends no more");
+        assert!(
+            planned <= counted.total,
+            "the IR's journal record worst case covers every path of the plan"
+        );
+        if mutation == Mutation::None {
+            assert_eq!(
+                planned, counted.total,
+                "the IR's journal record worst case is a path of the plan"
+            );
+        }
+        report.proved.push(format!(
+            "handler {} on {}: worst_case: {} journal records per run on the plan's longest path, as hl check counts ({})",
+            handler.name,
+            model.target.name(),
+            planned,
+            counted.describe_loops()
+        ));
+    }
 }
 
 fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
@@ -220,7 +336,7 @@ fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
     };
     for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
         let requests = &handler.worst.requests;
-        let Some(planned) = outbound_max(&lowered.ops) else {
+        let Some(planned) = planned_max(&lowered.ops, outbound) else {
             report.add(Finding {
                 handler: handler.name.clone(),
                 target: Some(model.target),

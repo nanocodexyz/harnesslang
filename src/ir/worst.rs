@@ -34,6 +34,12 @@ pub const MEASURES: [&str; 3] = ["effects", "journal records", "outbound request
 
 type Costs = [Cost; 3];
 
+#[derive(Clone, Debug)]
+struct Paths {
+    through: Option<Costs>,
+    ended: Option<Costs>,
+}
+
 impl Cost {
     fn of(total: u64) -> Self {
         Self {
@@ -60,8 +66,8 @@ impl Cost {
         }
     }
 
-    fn times(self, factor: &Factor) -> Option<Self> {
-        let total = self.total.checked_mul(factor.bound.value)?;
+    fn times(self, factor: &Factor, count: u64) -> Option<Self> {
+        let total = self.total.checked_mul(count)?;
         if self.total == 0 {
             return Some(self);
         }
@@ -91,24 +97,28 @@ fn zero() -> Costs {
     [Cost::default(), Cost::default(), Cost::default()]
 }
 
-fn combine(left: Costs, right: Costs, factor: Option<&Factor>) -> Result<Costs, Overflow> {
+fn combine(left: Costs, right: Costs) -> Result<Costs, Overflow> {
     let mut out = zero();
     for (index, (left, right)) in left.into_iter().zip(right).enumerate() {
-        let combined = left.clone().then(right.clone()).ok_or_else(|| Overflow {
+        out[index] = left.clone().then(right).ok_or_else(|| Overflow {
             measure: MEASURES[index],
             loops: left.loops.clone(),
         })?;
-        out[index] = match factor {
-            None => combined,
-            Some(factor) => combined.clone().times(factor).ok_or_else(|| {
-                let mut loops = vec![factor.clone()];
-                loops.extend(combined.loops.clone());
-                Overflow {
-                    measure: MEASURES[index],
-                    loops,
-                }
-            })?,
-        };
+    }
+    Ok(out)
+}
+
+fn repeated(costs: Costs, factor: &Factor, count: u64) -> Result<Costs, Overflow> {
+    let mut out = zero();
+    for (index, cost) in costs.into_iter().enumerate() {
+        out[index] = cost.clone().times(factor, count).ok_or_else(|| {
+            let mut loops = vec![factor.clone()];
+            loops.extend(cost.loops.clone());
+            Overflow {
+                measure: MEASURES[index],
+                loops,
+            }
+        })?;
     }
     Ok(out)
 }
@@ -119,18 +129,85 @@ fn widest(left: Costs, right: Costs) -> Costs {
     [a.or(x), b.or(y), c.or(z)]
 }
 
-fn block(handler: &Handler, statements: &[Stmt]) -> Result<Costs, Overflow> {
-    let mut total = zero();
-    for statement in statements {
-        let cost = statement_cost(handler, statement)?;
-        total = combine(total, cost, None)?;
+fn either(left: Option<Costs>, right: Option<Costs>) -> Option<Costs> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(widest(left, right)),
+        (left, None) => left,
+        (None, right) => right,
     }
-    Ok(total)
 }
 
-fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Costs, Overflow> {
+fn continuing(costs: Costs) -> Paths {
+    Paths {
+        through: Some(costs),
+        ended: None,
+    }
+}
+
+fn branch(left: Paths, right: Paths) -> Paths {
+    Paths {
+        through: either(left.through, right.through),
+        ended: either(left.ended, right.ended),
+    }
+}
+
+fn sequence(first: Paths, second: Paths) -> Result<Paths, Overflow> {
+    let Paths { through, ended } = first;
+    let Some(before) = through else {
+        return Ok(Paths {
+            through: None,
+            ended,
+        });
+    };
+    let ended_after = match second.ended {
+        Some(after) => Some(combine(before.clone(), after)?),
+        None => None,
+    };
+    let through_after = match second.through {
+        Some(after) => Some(combine(before, after)?),
+        None => None,
+    };
+    Ok(Paths {
+        through: through_after,
+        ended: either(ended, ended_after),
+    })
+}
+
+fn repeat(body: Paths, factor: &Factor, every_iteration: bool) -> Result<Paths, Overflow> {
+    let count = factor.bound.value;
+    if count == 0 {
+        return Ok(continuing(zero()));
+    }
+    let through = match &body.through {
+        Some(each) => Some(repeated(each.clone(), factor, count)?),
+        None if every_iteration => None,
+        None => Some(zero()),
+    };
+    let ended = match body.ended {
+        Some(last) => {
+            let before = match body.through {
+                Some(each) => repeated(each, factor, count - 1)?,
+                None => zero(),
+            };
+            Some(combine(before, last)?)
+        }
+        None => None,
+    };
+    Ok(Paths { through, ended })
+}
+
+fn block(handler: &Handler, statements: &[Stmt]) -> Result<Paths, Overflow> {
+    let mut paths = continuing(zero());
+    for statement in statements {
+        let cost = statement_cost(handler, statement)?;
+        paths = sequence(paths, cost)?;
+    }
+    Ok(paths)
+}
+
+fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Paths, Overflow> {
     match statement {
-        Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } => Ok(zero()),
+        Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => {
             let kind = handler.sites[*site].kind;
             let records = if kind == SiteKind::Model {
@@ -138,20 +215,26 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Costs, Overflow
             } else {
                 EFFECT_RECORDS
             };
-            Ok([
+            Ok(continuing([
                 Cost::of(1),
                 Cost::of(records),
                 Cost::of(u64::from(kind.outbound())),
-            ])
+            ]))
         }
-        Stmt::Finish { .. } => Ok([Cost::of(0), Cost::of(FINISH_RECORDS), Cost::of(0)]),
+        Stmt::Finish { .. } => Ok(Paths {
+            through: None,
+            ended: Some([Cost::of(0), Cost::of(FINISH_RECORDS), Cost::of(0)]),
+        }),
         Stmt::If {
             then, otherwise, ..
-        } => Ok(widest(block(handler, then)?, block(handler, otherwise)?)),
+        } => Ok(branch(block(handler, then)?, block(handler, otherwise)?)),
         Stmt::Match { arms, .. } => {
-            let mut widest_arm = zero();
+            let mut widest_arm = Paths {
+                through: None,
+                ended: None,
+            };
             for arm in arms {
-                widest_arm = widest(widest_arm, block(handler, &arm.body)?);
+                widest_arm = branch(widest_arm, block(handler, &arm.body)?);
             }
             Ok(widest_arm)
         }
@@ -160,7 +243,7 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Costs, Overflow
                 name: handler.locals[*index].name.clone(),
                 bound: bound.clone(),
             };
-            combine(zero(), block(handler, body)?, Some(&factor))
+            repeat(block(handler, body)?, &factor, true)
         }
         Stmt::For {
             item, bound, body, ..
@@ -169,15 +252,17 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Costs, Overflow
                 name: handler.locals[*item].name.clone(),
                 bound: bound.clone(),
             };
-            combine(zero(), block(handler, body)?, Some(&factor))
+            repeat(block(handler, body)?, &factor, false)
         }
     }
 }
 
 pub fn compute(handler: &Handler) -> Result<WorstCase, Overflow> {
     let body = block(handler, &handler.body)?;
+    let longest =
+        either(body.through, body.ended).expect("a block keeps a path through it or ending in it");
     let admission = [Cost::of(0), Cost::of(ADMISSION_RECORDS), Cost::of(0)];
-    let [effects, records, requests] = combine(admission, body, None)?;
+    let [effects, records, requests] = combine(admission, longest)?;
     Ok(WorstCase {
         effects,
         records,

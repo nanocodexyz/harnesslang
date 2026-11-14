@@ -190,7 +190,9 @@ impl Prover<'_> {
                 }
                 out
             }
-            Op::Repeat { label, bound, body } => {
+            Op::Repeat {
+                label, bound, body, ..
+            } => {
                 self.path.push(label.clone());
                 let mut all = states.clone();
                 let mut frontier = states;

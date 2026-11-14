@@ -72,6 +72,7 @@ pub enum Op {
     Repeat {
         label: String,
         bound: u64,
+        every_iteration: bool,
         body: Vec<Op>,
     },
     End,
@@ -310,6 +311,7 @@ impl Lowering<'_> {
                     self.handler.locals[*index].name, bound.name, bound.value
                 ),
                 bound: bound.value,
+                every_iteration: true,
                 body: self.block(body),
             }),
             Stmt::For {
@@ -328,6 +330,7 @@ impl Lowering<'_> {
                         bound.value
                     ),
                     bound: bound.value,
+                    every_iteration: false,
                     body: self.block(body),
                 });
             }

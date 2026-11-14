@@ -68,6 +68,7 @@ the worst case is a number the compiler checks against each platform:
 ```console
 $ hl check --target cloudflare docs/snippets/readme.hl | grep -E 'worst|ok for'
   handler ask: worst case 40 effects, 75 journal records, 40 outbound requests
+  proved handler ask on cloudflare: worst_case: 75 journal records per run on the plan's longest path, as hl check counts (step below steps_max (8) x call below calls_max (4))
   proved handler ask on cloudflare: worst_case: 40 outbound requests <= 10000 outbound requests per invocation (step below steps_max (8) x call below calls_max (4))
 docs/snippets/readme.hl: ok for cloudflare
 $ hl sim --target server-postgres --seeds 0..100 docs/snippets/readme.hl
