@@ -46,7 +46,11 @@ fn main() {
 }
 
 fn throttle(steps: &[Value], step: usize, throttled: &Mutex<BTreeSet<usize>>) -> Option<u64> {
-    let seconds = steps.get(step)?.get("throttle")?.as_u64()?;
+    let seconds = steps
+        .get(step)?
+        .get("throttle")?
+        .as_u64()
+        .filter(|seconds| *seconds > 0)?;
     let mut seen = throttled
         .lock()
         .expect("the throttle set is never poisoned");
