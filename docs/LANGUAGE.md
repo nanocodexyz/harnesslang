@@ -1275,7 +1275,8 @@ and the kill -9 drill of generated code.
 | --- | --- |
 | `hl check [--target T] FILE` | parse, type-check, report each handler's worst case and prove it; with a target, also check the target's limits |
 | `hl prove [--target T] [--mutation M] FILE` | the proofs alone; a mutation plants a lowering bug the proofs must catch |
-| `hl sim --target T --seeds A..B [--twice] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs |
+| `hl sim --target T --seeds A..B [--twice] [--strict [--any-state]] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs; `--strict` also checks what the proofs promise (no trap but requires and model replies, invariants after every turn, the worst case within the target's limit), and `--any-state` starts each session from a drawn state that satisfies the invariants |
+| `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal` |
 | `hl run FILE --handler NAME [--arg VALUE]... [--seed S]` | run one turn in the interpreter and print the journal |
 | `hl emit --target T FILE` | print the generated program |
 

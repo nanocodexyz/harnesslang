@@ -79,6 +79,7 @@ echo "sim: every example passes seeds $seeds on every target, and agent.hl seeds
 
 scripts/mutations.sh
 scripts/exhaustive.sh
+scripts/strict.sh
 scripts/prove-mutations.sh
 scripts/docs-check.sh
 if [ "${HL_ORACLE:-0}" = 1 ]; then
