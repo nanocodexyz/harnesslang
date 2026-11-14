@@ -7,6 +7,7 @@ scratch=output/prove-mutations
 files="examples/agent.hl examples/reviewer.hl examples/code_agent.hl"
 cell_files="examples/code_agent.hl"
 park_files="examples/hooks.hl"
+recover_files="docs/snippets/in_flight.hl"
 plain_files="examples/agent.hl examples/reviewer.hl"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 usage_exit=2
@@ -37,6 +38,7 @@ property_of() {
     nested_idempotent_reported_unknown) echo nested_known ;;
     suspend_before_flush) echo suspend_durable ;;
     resume_replays_suspend) echo seq_unique ;;
+    recover_trusts_lost) echo external_once ;;
     *) return 1 ;;
   esac
 }
@@ -99,6 +101,10 @@ check_mutation() {
   fi
   if is_park_mutation "$mutation"; then
     mutated=$park_files
+    check_untouched "$mutation" || return 1
+  fi
+  if [ "$mutation" = recover_trusts_lost ]; then
+    mutated=$recover_files
     check_untouched "$mutation" || return 1
   fi
   for file in $mutated; do

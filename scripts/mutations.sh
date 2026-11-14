@@ -70,7 +70,12 @@ grandchild_unscoped docs/snippets/tree.hl --twice child_scoped
 family_one_level docs/snippets/tree.hl --twice family_bounded
 side_live_state docs/snippets/side.hl --twice side_isolated
 side_journaled docs/snippets/side.hl --twice side_isolated
-idle_early docs/snippets/keep.hl --twice idle_due"
+idle_early docs/snippets/keep.hl --twice idle_due
+interrupt_ignored docs/snippets/in_flight.hl --twice interrupt_honored
+interrupt_reruns docs/snippets/in_flight.hl --twice external_once
+recover_trusts_lost docs/snippets/in_flight.hl --twice external_once
+job_lost_dropped docs/snippets/in_flight.hl --twice job_reported 0..1000
+job_lost_all docs/snippets/in_flight.hl --twice job_once"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

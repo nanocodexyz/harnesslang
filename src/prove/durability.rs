@@ -740,6 +740,15 @@ fn enter(mut state: State, entry: Entry) -> Option<State> {
             state.open_calls.insert(Slot::Site(site));
             state.durable_calls.insert(Slot::Site(site));
         }
+        Entry::Attested(_) | Entry::AttestedInBatch(_) if !replaying(&state) => return None,
+        Entry::Attested(slot) => {
+            state.reopened.remove(&slot);
+            state.attempt = Some((slot, true));
+        }
+        Entry::AttestedInBatch(site) => {
+            state.open_calls.insert(Slot::Site(site));
+            state.durable_calls.insert(Slot::Site(site));
+        }
         Entry::Has(site) => {
             if !state.open_calls.contains(&Slot::Site(site)) {
                 return None;

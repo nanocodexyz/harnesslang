@@ -66,7 +66,11 @@ impl Jobs {
         let stall_ms = rng
             .chance(JOB_STALL_PPM)
             .then(|| clock + rng.below(done_ms - clock));
-        let previous = self.jobs.insert(
+        let reply = Json::object([(crate::ir::JOB_KEY, Json::String(started_text(key)))]);
+        if self.jobs.contains_key(key) {
+            return reply;
+        }
+        self.jobs.insert(
             key.to_owned(),
             SimJob {
                 turn,
@@ -79,9 +83,8 @@ impl Jobs {
                 drained: false,
             },
         );
-        assert!(previous.is_none(), "a call starts at most one job");
         self.started += 1;
-        Json::object([(crate::ir::JOB_KEY, Json::String(started_text(key)))])
+        reply
     }
 
     pub fn crash(&mut self, seed: u64, crashes: u64) {
