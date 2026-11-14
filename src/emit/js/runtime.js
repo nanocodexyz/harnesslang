@@ -1048,6 +1048,7 @@ function typeName(type) {
   if (typeof type === "string") return type;
   if (type.sum !== undefined) return PROGRAM.sums[type.sum].name;
   if (type.list !== undefined) return `list<${typeName(type.list)}, ${type.bound}>`;
+  if (type.blob !== undefined) return `blob<${type.bound}>`;
   if (type.known !== undefined) return `known<${typeName(type.known)}>`;
   return `maybe<${typeName(type.maybe)}>`;
 }
@@ -1068,6 +1069,10 @@ function toJson(type, value) {
   if (type.list !== undefined) {
     assert(Array.isArray(value), "a list value is an array");
     return value.map((item) => toJson(type.list, item));
+  }
+  if (type.blob !== undefined) {
+    assert(typeof value === "string", "a blob value is its digest");
+    return blobJson(value);
   }
   assert(value !== null && typeof value === "object" && Number.isInteger(value.v), "a sum value is a variant");
   if (type.sum === SUM_CALL) {
@@ -1098,6 +1103,7 @@ function fromJson(type, json) {
     if (BigInt(json.length) > type.capacity) throw new DecodeError(`bound(${type.bound})`);
     return json.map((item) => fromJson(type.list, item));
   }
+  if (type.blob !== undefined) return digestOf(json);
   if (type.sum === SUM_CALL) {
     const fields = CALL_FIELDS.map((name) => {
       const field = isObject(json) && Object.hasOwn(json, name) ? json[name] : undefined;
@@ -1179,6 +1185,8 @@ function returnedName(type) {
 }
 
 function checkedOutput(tool, returns, output) {
+  const bound = blobReturned(tool);
+  if (bound !== null && (returns.blob !== undefined || (output.tag === "ok" && isObject(output.value)))) return blobChecked(tool, bound, output);
   if (output.tag !== "ok") return output;
   try {
     fromJson(returns, output.value);
