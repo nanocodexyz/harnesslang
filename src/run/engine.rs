@@ -172,7 +172,11 @@ impl<'a> Engine<'a> {
             self.locals[*local] = Some(argument.clone());
         }
         let body = &self.handler.body;
-        let finish = match self.block(body) {
+        let flow = match self.admit() {
+            Ok(()) => self.block(body),
+            Err(halt) => Err(halt),
+        };
+        let finish = match flow {
             Ok(Flow::Return(value)) => self.finish(
                 Outcome::Completed,
                 value::to_json(self.program, &self.handler.returns, &value),
@@ -188,6 +192,16 @@ impl<'a> Engine<'a> {
             finish,
             state: self.state,
         })
+    }
+
+    fn admit(&mut self) -> Result<(), Halt> {
+        let Some(requires) = &self.handler.requires else {
+            return Ok(());
+        };
+        if self.eval(requires)?.as_bool() {
+            return Ok(());
+        }
+        Err(Halt::Trap(format!("requires({})", self.handler.name)))
     }
 
     fn finish(&mut self, outcome: Outcome, result: Json) -> Result<Finish, Exit> {
@@ -385,6 +399,10 @@ impl<'a> Engine<'a> {
                 op, left, right, ..
             } => binary(*op, self.eval(left)?, self.eval(right)?)?,
             Expr::Not(operand) => Value::Bool(!self.eval(operand)?.as_bool()),
+            Expr::Len(operand) => match self.eval(operand)? {
+                Value::List(items) => Value::U64(items.len() as u64),
+                other => panic!("the checker types len's operand as a list, found {other:?}"),
+            },
         })
     }
 

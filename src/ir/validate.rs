@@ -5,8 +5,25 @@ pub fn program(program: &Program) {
         program.sums.len() >= crate::ir::BUILTIN_SUMS,
         "every program carries the builtin sums"
     );
+    for invariant in &program.invariants {
+        assert!(
+            !reads_local(&invariant.condition),
+            "an invariant reads only state and constants"
+        );
+    }
     for handler in &program.handlers {
         self::handler(program, handler);
+    }
+}
+
+fn reads_local(value: &Expr) -> bool {
+    match value {
+        Expr::U64(_) | Expr::Bool(_) | Expr::Text(_) | Expr::Constant(_) | Expr::Field(_) => false,
+        Expr::Local(_) => true,
+        Expr::Member { base, .. } => reads_local(base),
+        Expr::Construct { fields, .. } => fields.iter().any(reads_local),
+        Expr::Binary { left, right, .. } => reads_local(left) || reads_local(right),
+        Expr::Not(operand) | Expr::Len(operand) => reads_local(operand),
     }
 }
 
@@ -40,6 +57,9 @@ fn handler(program: &Program, handler: &Handler) {
     }
     for param in &handler.params {
         assert!(*param < handler.locals.len(), "a parameter is a local");
+    }
+    if let Some(requires) = &handler.requires {
+        expr(handler, requires);
     }
     block(program, handler, &handler.body, &mut used);
     for (site, count) in used.iter().enumerate() {
@@ -120,6 +140,6 @@ fn expr(handler: &Handler, value: &Expr) {
             expr(handler, left);
             expr(handler, right);
         }
-        Expr::Not(operand) => expr(handler, operand),
+        Expr::Not(operand) | Expr::Len(operand) => expr(handler, operand),
     }
 }

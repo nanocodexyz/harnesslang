@@ -118,7 +118,14 @@ pub struct Program {
     pub tools: Vec<Tool>,
     pub model: Option<Model>,
     pub state: Vec<Field>,
+    pub invariants: Vec<Invariant>,
     pub handlers: Vec<Handler>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Invariant {
+    pub name: String,
+    pub condition: Expr,
 }
 
 impl Program {
@@ -170,6 +177,7 @@ pub struct Handler {
     pub name: String,
     pub params: Vec<LocalId>,
     pub returns: Type,
+    pub requires: Option<Expr>,
     pub locals: Vec<Field>,
     pub sites: Vec<Site>,
     pub body: Vec<Stmt>,
@@ -316,4 +324,5 @@ pub enum Expr {
         right: Box<Expr>,
     },
     Not(Box<Expr>),
+    Len(Box<Expr>),
 }

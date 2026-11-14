@@ -32,6 +32,13 @@ pub fn check(
         let ty = resolve(program, globals, &param.ty)?;
         params.push(checker.declare(&param.name, ty)?);
     }
+    let requires = match &definition.requires {
+        Some(condition) => Some(checker.condition(
+            condition,
+            &format!("the requires of handler '{}'", definition.name.text),
+        )?),
+        None => None,
+    };
     let (body, returned) = checker.block(&definition.body)?;
     if !returned {
         return error(
@@ -46,6 +53,7 @@ pub fn check(
         name: definition.name.text.clone(),
         params,
         returns,
+        requires,
         locals: checker.locals,
         sites: checker.sites,
         body,
@@ -69,7 +77,41 @@ pub fn check(
     Ok(handler)
 }
 
+pub fn invariant(
+    program: &ir::Program,
+    globals: &Globals,
+    definition: &ast::Invariant,
+) -> Checked<ir::Invariant> {
+    let mut checker = Checker {
+        program,
+        globals,
+        locals: Vec::new(),
+        scopes: vec![Vec::new()],
+        sites: Vec::new(),
+        returns: Type::Bool,
+    };
+    let condition = checker.condition(
+        &definition.condition,
+        &format!("invariant '{}'", definition.name.text),
+    )?;
+    Ok(ir::Invariant {
+        name: definition.name.text.clone(),
+        condition,
+    })
+}
+
 impl Checker<'_> {
+    fn condition(&mut self, condition: &ast::Expr, what: &str) -> Checked<Expr> {
+        let at = condition.at();
+        let mut out = Vec::new();
+        let (value, ty) = self.expr(condition, Some(&Type::Bool), &mut out)?;
+        self.expect(at, &Type::Bool, &ty)?;
+        if !out.is_empty() {
+            return error(at, format!("{what} must be pure: it calls an effect"));
+        }
+        Ok(value)
+    }
+
     fn type_name(&self, ty: &Type) -> String {
         ty.name(self.program)
     }
@@ -548,6 +590,20 @@ impl Checker<'_> {
             ));
         }
         match callee.text.as_str() {
+            "len" => {
+                let [list] = args else {
+                    return error(at, "len takes one list");
+                };
+                let list_at = list.at();
+                let (value, ty) = self.expr(list, None, out)?;
+                if !matches!(ty, Type::List { .. }) {
+                    return error(
+                        list_at,
+                        format!("len takes a list, found {}", self.type_name(&ty)),
+                    );
+                }
+                Ok((Expr::Len(Box::new(value)), Type::U64))
+            }
             "dispatch" => {
                 let args = self.args(at, "dispatch", args, &[Type::Sum(ir::CALL)], out)?;
                 Ok(self.site(

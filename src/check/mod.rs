@@ -8,7 +8,7 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 3] = ["dispatch", "now", "random"];
+pub const BUILTIN_FUNCTIONS: [&str; 4] = ["dispatch", "now", "random", "len"];
 pub const WILDCARD: &str = "_";
 
 pub struct Globals {
@@ -33,6 +33,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         tools: Vec::new(),
         model: None,
         state: Vec::new(),
+        invariants: Vec::new(),
         handlers: Vec::new(),
     };
     let mut globals = Globals {
@@ -48,6 +49,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
     sums(source, &mut program, &mut globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
+    invariants(source, &mut program, &globals)?;
     handlers(source, &mut program, &globals)?;
     ir::validate::program(&program);
     Ok(program)
@@ -425,6 +427,27 @@ fn state(
                 ty,
             });
         }
+    }
+    Ok(())
+}
+
+fn invariants(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let mut names: BTreeMap<String, Position> = BTreeMap::new();
+    for item in &source.items {
+        let Item::Invariant(definition) = item else {
+            continue;
+        };
+        if let Some(previous) = names.insert(definition.name.text.clone(), definition.name.at) {
+            return error(
+                definition.name.at,
+                format!(
+                    "invariant '{}' is already declared at {previous}",
+                    definition.name.text
+                ),
+            );
+        }
+        let checked = handler::invariant(program, globals, definition)?;
+        program.invariants.push(checked);
     }
     Ok(())
 }

@@ -1,17 +1,41 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Const, Expr, Handler, Item, Model, Name, Param, Program, State, Stmt,
-    Tool, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Const, Expr, Handler, Invariant, Item, Model, Name, Param, Program,
+    State, Stmt, Tool, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
 
 pub const NESTING_DEPTH_MAX: u32 = 64;
 
-pub const KEYWORDS: [&str; 22] = [
-    "harness", "const", "type", "tool", "model", "state", "on", "let", "push", "if", "else",
-    "match", "loop", "for", "return", "true", "false", "and", "or", "not", "list", "effect",
+pub const KEYWORDS: [&str; 24] = [
+    "harness",
+    "const",
+    "type",
+    "tool",
+    "model",
+    "state",
+    "on",
+    "let",
+    "push",
+    "if",
+    "else",
+    "match",
+    "loop",
+    "for",
+    "return",
+    "true",
+    "false",
+    "and",
+    "or",
+    "not",
+    "list",
+    "effect",
+    "invariant",
+    "requires",
 ];
+
+const ITEMS: &str = "'const', 'type', 'tool', 'model', 'state', 'invariant' or 'on'";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -140,7 +164,7 @@ impl<'a> Parser<'a> {
 
     fn item(&mut self) -> Parsed<Item> {
         let Token::Name(word) = &self.peek().token else {
-            return Err(self.unexpected("'const', 'type', 'tool', 'model', 'state' or 'on'"));
+            return Err(self.unexpected(ITEMS));
         };
         match word.as_str() {
             "const" => self.constant().map(Item::Const),
@@ -148,9 +172,18 @@ impl<'a> Parser<'a> {
             "tool" => self.tool().map(Item::Tool),
             "model" => self.model().map(Item::Model),
             "state" => self.state().map(Item::State),
+            "invariant" => self.invariant().map(Item::Invariant),
             "on" => self.handler().map(Item::Handler),
-            _ => Err(self.unexpected("'const', 'type', 'tool', 'model', 'state' or 'on'")),
+            _ => Err(self.unexpected(ITEMS)),
         }
+    }
+
+    fn invariant(&mut self) -> Parsed<Invariant> {
+        self.word("invariant")?;
+        let name = self.name("an invariant name")?;
+        self.symbol(Symbol::Colon)?;
+        let condition = self.expr()?;
+        Ok(Invariant { name, condition })
     }
 
     fn constant(&mut self) -> Parsed<Const> {
@@ -254,11 +287,18 @@ impl<'a> Parser<'a> {
         let params = self.params()?;
         self.symbol(Symbol::Arrow)?;
         let returns = self.type_expr()?;
+        let requires = if self.is_word("requires") {
+            self.advance();
+            Some(self.expr()?)
+        } else {
+            None
+        };
         let body = self.block()?;
         Ok(Handler {
             name,
             params,
             returns,
+            requires,
             body,
         })
     }

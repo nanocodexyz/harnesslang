@@ -20,7 +20,14 @@ pub enum Item {
     Tool(Tool),
     Model(Model),
     State(State),
+    Invariant(Invariant),
     Handler(Handler),
+}
+
+#[derive(Clone, Debug)]
+pub struct Invariant {
+    pub name: Name,
+    pub condition: Expr,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +80,7 @@ pub struct Handler {
     pub name: Name,
     pub params: Vec<Param>,
     pub returns: TypeExpr,
+    pub requires: Option<Expr>,
     pub body: Block,
 }
 
