@@ -264,6 +264,8 @@ Rows per turn, clean profile, 4 sessions of 6 turns per example: rows = 3 (admit
 
 Default drill (trace seeds 0..4, kill 3 sessions of 4 turns, per example, then the seven mutations): agent.hl trace 4 seeds, 57 runs, 46 crashes at hooks, 33 alarm-driven runs, 987 comparisons; kill 30 kill -9s, 7 storage faults, 3 duplicates, 60 externals; minimal.hl trace 36 runs, 25 crashes; kill 19 kill -9s; reviewer.hl trace 30 runs, 19 crashes. Before the default was set: agent.hl trace seeds 0..6 passed three times in a row (109 runs, 93 crashes, 1,616 comparisons each, 50 s with 2 jobs), and the storage profile passed 8 sessions of 6 turns (443 externals, 8 injected errors).
 
+After rebasing onto integrate, which added five examples, the default drill (`CLOUDFLARE_JOBS=2 scripts/cloudflare-drill.sh`, 2026-11-14, load average 11 to 16) passed on all eight in 241 s: trace mode 422 runs, 334 crashes at hooks, 229 alarm-driven runs and 7,050 comparisons in all (agent 57 runs, claude_agent 55, codex_agent 94, minimal 36, probe 30, reviewer 30, subagent_child 63, subagents 57); kill mode 208 kill -9s, 65 storage faults and 50 duplicates; all seven mutations caught, `no_sync` at trace seed 1.
+
 Code mode's Cloudflare facts, checked by `oracle/cloudflare/loader.mjs` on the same workerd (a Durable Object with a `workerLoader` binding loading cells with `LOADER.get`):
 
 - Without `--experimental` workerd refuses the binding: "Worker loader bindings are an experimental feature ... You must run workerd with `--experimental`". Production availability (open beta on Workers Paid) comes from a web search summary of developers.cloudflare.com, not a page read.
