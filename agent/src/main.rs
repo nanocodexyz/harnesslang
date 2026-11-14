@@ -24,7 +24,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
 const JOINS_PER_TURN_MAX: u64 = program::ROUNDS_MAX * program::CALLS_PER_ROUND_MAX;
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N] [--turn N]";
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]";
 const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 
 struct Options {
@@ -35,6 +35,8 @@ struct Options {
     rounds: u64,
     keep_warm: u64,
     turn: u64,
+    fork_from: Option<PathBuf>,
+    at: Option<u64>,
 }
 
 fn fail_usage(message: &str) -> ! {
@@ -51,6 +53,7 @@ fn options() -> Options {
         (None, None, None, None, None);
     let mut keep_warm = 0;
     let mut turn = FIRST_TURN;
+    let (mut fork_from, mut at) = (None, None);
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let value = rest
@@ -92,8 +95,18 @@ fn options() -> Options {
                     .filter(|turn| *turn >= FIRST_TURN)
                     .unwrap_or_else(|| fail_usage(&format!("--turn {value} is not a turn number")));
             }
+            "--fork-from" => fork_from = Some(PathBuf::from(value)),
+            "--at" => {
+                at =
+                    Some(value.parse().unwrap_or_else(|_| {
+                        fail_usage(&format!("--at {value} is not a turn number"))
+                    }));
+            }
             other => fail_usage(&format!("unknown flag {other}")),
         }
+    }
+    if at.is_some() && fork_from.is_none() {
+        fail_usage("--at needs --fork-from");
     }
     Options {
         instruction: instruction.unwrap_or_else(|| fail_usage("--instruction is required")),
@@ -103,6 +116,8 @@ fn options() -> Options {
         rounds: rounds.unwrap_or(program::ROUNDS_MAX),
         keep_warm,
         turn,
+        fork_from,
+        at,
     }
 }
 
@@ -779,6 +794,54 @@ fn tool_definitions() -> (Value, Value) {
     (Value::Array(parent), Value::Array(child))
 }
 
+fn fork_into(parent: &Path, at: Option<u64>, disk: &mut FileDisk) -> Result<(), String> {
+    let parent = if parent.is_dir() {
+        parent.join("journal.jsonl")
+    } else {
+        parent.to_path_buf()
+    };
+    if harness::Disk::length(disk).map_err(|error| error.to_string())? > 0 {
+        let opened = harness::jsonl_open(disk).map_err(|error| error.to_string())?;
+        return match opened.records.first() {
+            Some(harness::Record::Host { key, .. }) if key == harness::FORKED_HOST_KEY => Ok(()),
+            _ => Err("--fork-from names a parent, but the journal already holds a session that was not forked".to_owned()),
+        };
+    }
+    if !parent.is_file() {
+        return Err(format!("{}: no such journal", parent.display()));
+    }
+    let mut source =
+        FileDisk::open(&parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    let opened = harness::jsonl_open(&mut source)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let origin = parent.display().to_string();
+    let records = harness::fork_entry(opened.start, &opened.records, at, &origin)
+        .map_err(|refused| format!("{}: {}", parent.display(), refused.describe()))?;
+    if let harness::Record::Checkpoint { payload, .. } = &records[1] {
+        let state = Json::decode(payload)
+            .map_err(|error| format!("the forked state: {error:?}"))
+            .and_then(|json| program::state_from_json(&json))?;
+        let mut digests = Vec::new();
+        program::state_blobs(&state, &mut digests);
+        if !digests.is_empty() {
+            return Err(format!(
+                "the forked state holds {} image(s) whose bytes stay in the parent's journal; this host forks only a session without images",
+                digests.len()
+            ));
+        }
+    }
+    harness::jsonl_flush(disk, &records)
+        .map_err(|stop| format!("write the forked journal: {stop:?}"))?;
+    eprintln!(
+        "hl-agent: forked from {origin} at {}",
+        match records[0] {
+            harness::Record::Host { ref value, .. } => value.encode(),
+            _ => String::new(),
+        }
+    );
+    Ok(())
+}
+
 fn run_turn(
     agent: &mut Agent,
     disk: &mut FileDisk,
@@ -818,6 +881,12 @@ fn main() {
         eprintln!("hl-agent: {}: {error}", journal_path.display());
         std::process::exit(EXIT_HARNESS_ERROR)
     });
+    if let Some(parent) = &options.fork_from
+        && let Err(error) = fork_into(parent, options.at, &mut disk)
+    {
+        eprintln!("hl-agent: --fork-from: {error}");
+        std::process::exit(EXIT_HARNESS_ERROR);
+    }
     let request = TurnRequest {
         turn: options.turn,
         arguments: Arguments::Prompt(instruction, options.rounds),
