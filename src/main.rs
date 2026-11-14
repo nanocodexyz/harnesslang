@@ -277,8 +277,11 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
         let steers = events.steers.as_ref().map_or_else(String::new, |bound| {
             format!(", {} ({}) steer(s)", bound.name, bound.value)
         });
+        let jobs = events.jobs.as_ref().map_or_else(String::new, |bound| {
+            format!(", {} ({}) job notice(s)", bound.name, bound.value)
+        });
         lines.push(format!(
-            "    plus at most {} event record(s) per turn ({} cancel{steers})",
+            "    plus at most {} event record(s) per turn ({} cancel{steers}{jobs})",
             events.records_max(),
             u64::from(events.cancel)
         ));
