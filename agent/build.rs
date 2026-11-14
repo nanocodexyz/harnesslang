@@ -3,26 +3,46 @@ use std::process::Command;
 
 const PROGRAM_DEFAULT: &str = "../examples/claude_code.hl";
 const CHILD_PROGRAM_DEFAULT: &str = "../examples/claude_code_child.hl";
+const CLIMB_PROGRAM_DEFAULT: &str = "../examples/autoresearch.hl";
 const HL_DEFAULT: &str = "../target/release/hl";
 
 fn main() {
     let program = std::env::var("HL_AGENT_PROGRAM").unwrap_or_else(|_| PROGRAM_DEFAULT.to_owned());
     let child = std::env::var("HL_AGENT_CHILD_PROGRAM")
         .unwrap_or_else(|_| CHILD_PROGRAM_DEFAULT.to_owned());
+    let climb =
+        std::env::var("HL_CLIMB_PROGRAM").unwrap_or_else(|_| CLIMB_PROGRAM_DEFAULT.to_owned());
     let hl = std::env::var("HL_BIN").unwrap_or_else(|_| HL_DEFAULT.to_owned());
     println!("cargo::rerun-if-env-changed=HL_AGENT_PROGRAM");
     println!("cargo::rerun-if-env-changed=HL_AGENT_CHILD_PROGRAM");
+    println!("cargo::rerun-if-env-changed=HL_CLIMB_PROGRAM");
     println!("cargo::rerun-if-env-changed=HL_BIN");
     println!("cargo::rerun-if-env-changed=HL_AGENT_PLANT");
     println!("cargo::rerun-if-changed={program}");
     println!("cargo::rerun-if-changed={child}");
+    println!("cargo::rerun-if-changed={climb}");
     println!("cargo::rerun-if-changed={hl}");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    emit(&hl, &program, "harness", &out.join("harness_mod.rs"));
-    emit(&hl, &child, "child_harness", &out.join("child_mod.rs"));
+    emit(&hl, &program, "harness", &out.join("harness_mod.rs"), true);
+    emit(
+        &hl,
+        &child,
+        "child_harness",
+        &out.join("child_mod.rs"),
+        true,
+    );
+    let climb_mod = out.join("climb_mod.rs");
+    if Path::new(&climb).is_file() {
+        emit(&hl, &climb, "climb_harness", &climb_mod, false);
+    } else {
+        let missing = format!(
+            "compile_error!(\"hl-climb hosts {climb}, which does not exist: write it or set HL_CLIMB_PROGRAM\");\n"
+        );
+        std::fs::write(&climb_mod, missing).expect("write the missing climb harness");
+    }
 }
 
-fn emit(hl: &str, program: &str, module: &str, path: &Path) {
+fn emit(hl: &str, program: &str, module: &str, path: &Path, planted: bool) {
     let output = Command::new(hl)
         .args(["emit", "--target", "native-jsonl", program])
         .output()
@@ -35,6 +55,7 @@ fn emit(hl: &str, program: &str, module: &str, path: &Path) {
     let mut emitted = String::from_utf8(output.stdout).expect("hl emits UTF-8");
     if let Some((from, to)) = std::env::var("HL_AGENT_PLANT")
         .ok()
+        .filter(|_| planted)
         .filter(|plant| !plant.is_empty())
         .as_deref()
         .and_then(|plant| plant.split_once(" ==> "))

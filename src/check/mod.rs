@@ -1,3 +1,4 @@
+pub mod climb;
 mod handler;
 mod inline;
 
@@ -79,6 +80,16 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
 }
 
 pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::Program> {
+    check_mutated(source, load, crate::run::mutation::Mutation::None)
+}
+
+pub fn check_mutated(
+    source: &ast::Program,
+    load: &mut Loader<'_>,
+    mutation: crate::run::mutation::Mutation,
+) -> Checked<ir::Program> {
+    let declared = climb::declare(source)?;
+    let source = declared.as_ref().unwrap_or(source);
     let mut program = ir::Program {
         name: source.name.text.clone(),
         constants: Vec::new(),
@@ -97,6 +108,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
         blobs: None,
         idle: None,
         forked: None,
+        climbs: Vec::new(),
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -122,6 +134,8 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     events(source, &mut program, &globals, &mut values)?;
     interrupts(source, &mut program)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
+    let expanded =
+        climb::expand(&expanded, &mut program, &globals, mutation)?.unwrap_or(expanded);
     globals.hooks = hooks(&expanded, &program, &globals)?;
     let expanded = session_end(&expanded).unwrap_or(expanded);
     let expanded = idle(&expanded, &mut program, &globals)?.unwrap_or(expanded);
@@ -134,7 +148,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
 }
 
 fn claim(values: &mut BTreeMap<String, Position>, name: &ast::Name, what: &str) -> Checked<()> {
-    if name.text.starts_with(WILDCARD) {
+    if name.text.starts_with(WILDCARD) && !name.text.starts_with(climb::PREFIX) {
         return error(
             name.at,
             format!(

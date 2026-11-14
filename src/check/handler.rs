@@ -171,7 +171,7 @@ impl Checker<'_> {
     }
 
     fn declare(&mut self, name: &ast::Name, ty: Type) -> Checked<LocalId> {
-        if name.text.starts_with(WILDCARD) {
+        if name.text.starts_with(WILDCARD) && !name.text.starts_with(crate::check::climb::PREFIX) {
             return error(
                 name.at,
                 format!("'{}': names starting with '_' are reserved", name.text),
@@ -538,8 +538,14 @@ impl Checker<'_> {
                 Ok(true)
             }
             ast::Stmt::Inlined {
-                arguments, body, ..
-            } => self.inlined(arguments, body, out),
+                arguments,
+                body,
+                sees_caller,
+                ..
+            } => self.inlined(arguments, body, *sees_caller, out),
+            ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
+                panic!("climbs are expanded before handlers are lowered")
+            }
             ast::Stmt::Call { callee, .. } if callee.text == DENY || callee.text == ALLOW => error(
                 callee.at,
                 format!(
@@ -560,8 +566,12 @@ impl Checker<'_> {
         &mut self,
         arguments: &[(ast::Param, ast::Expr)],
         body: &ast::Block,
+        sees_caller: bool,
         out: &mut Vec<Stmt>,
     ) -> Checked<bool> {
+        if sees_caller {
+            return self.scoped_block(arguments, body, out);
+        }
         let mut parameters = Vec::with_capacity(arguments.len());
         for (param, argument) in arguments {
             let wanted = resolve(self.program, self.globals, &param.ty)?;
@@ -582,6 +592,40 @@ impl Checker<'_> {
         let checked = self.block(body);
         let own = std::mem::replace(&mut self.scopes, caller);
         assert_eq!(own.len(), 1, "a fn body leaves only its parameters' scope");
+        let (statements, returned) = checked?;
+        out.extend(statements);
+        Ok(returned)
+    }
+
+    fn scoped_block(
+        &mut self,
+        arguments: &[(ast::Param, ast::Expr)],
+        body: &ast::Block,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let mut values = Vec::with_capacity(arguments.len());
+        for (param, argument) in arguments {
+            let wanted = resolve(self.program, self.globals, &param.ty)?;
+            let at = argument.at();
+            let (value, ty) = self.expr(argument, Some(&wanted), out)?;
+            self.expect(at, &wanted, &ty)?;
+            values.push((param, value, ty));
+        }
+        let depth = self.scopes.len();
+        self.scopes.push(Vec::new());
+        let mut declared = Ok(());
+        for (param, value, ty) in values {
+            match self.declare(&param.name, ty) {
+                Ok(local) => out.push(Stmt::Let { local, value }),
+                Err(failure) => {
+                    declared = Err(failure);
+                    break;
+                }
+            }
+        }
+        let checked = declared.and_then(|()| self.block(body));
+        self.scopes.pop().expect("the scoped block's own scope is popped");
+        assert_eq!(self.scopes.len(), depth, "a scoped block leaves its caller's scopes");
         let (statements, returned) = checked?;
         out.extend(statements);
         Ok(returned)
@@ -1961,6 +2005,9 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         | ast::Stmt::Inlined {
             function: callee, ..
         } => format!("a call of fn '{}'", callee.text),
+        ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
+            panic!("climbs are expanded before handlers are lowered")
+        }
     };
     error(at, format!("{shape}: found {found}"))
 }
@@ -1969,7 +2016,8 @@ pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
     match statement {
         ast::Stmt::Let { name, .. } | ast::Stmt::Assign { name, .. } => name.at,
         ast::Stmt::Call { callee, .. } => callee.at,
-        ast::Stmt::Inlined { at, .. } => *at,
+        ast::Stmt::Inlined { at, .. } | ast::Stmt::Yield { at, .. } => *at,
+        ast::Stmt::Climb(climb) => climb.at,
         ast::Stmt::Push { at, .. }
         | ast::Stmt::Clear { at, .. }
         | ast::Stmt::Keep { at, .. }

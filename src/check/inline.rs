@@ -6,7 +6,9 @@ use crate::check::{
 };
 use crate::ir;
 use crate::syntax::Position;
-use crate::syntax::ast::{self, Arm, Block, Expr, Function, HookKind, Item, Name, Pattern, Stmt};
+use crate::syntax::ast::{
+    self, Arm, Block, Climb, Expr, Function, HookKind, Item, Name, Pattern, Rule, Stmt, Yield,
+};
 use crate::syntax::parser::NESTING_DEPTH_MAX;
 
 pub const STATEMENTS_PER_HANDLER_MAX: u64 = 65_536;
@@ -59,14 +61,21 @@ impl<'a> Walk<'a> {
         self.scopes.iter().flatten().any(|bound| bound == name)
     }
 
-    fn bind(&mut self, name: &Name) {
+    fn bind(&mut self, name: &Name) -> Checked<()> {
         if name.text == WILDCARD {
-            return;
+            return Ok(());
+        }
+        if name.text.starts_with(crate::check::climb::PREFIX) {
+            return error(
+                name.at,
+                format!("'{}': names starting with '_' are reserved", name.text),
+            );
         }
         self.scopes
             .last_mut()
             .expect("a walk always has a scope")
             .push(name.text.clone());
+        Ok(())
     }
 
     fn scoped<T>(
@@ -75,8 +84,10 @@ impl<'a> Walk<'a> {
         body: impl FnOnce(&mut Self) -> Checked<T>,
     ) -> Checked<T> {
         self.scopes.push(Vec::new());
-        names.iter().for_each(|name| self.bind(name));
-        let result = body(self);
+        let result = names
+            .iter()
+            .try_for_each(|name| self.bind(name))
+            .and_then(|()| body(self));
         self.scopes.pop().expect("every pushed scope is popped");
         result
     }
@@ -271,7 +282,7 @@ impl<'a> Inliner<'a> {
         function
             .params
             .iter()
-            .for_each(|param| walk.bind(&param.name));
+            .try_for_each(|param| walk.bind(&param.name))?;
         let body = self.block(&mut walk, &function.body)?;
         let finished = self.stack.pop();
         assert_eq!(
@@ -296,7 +307,7 @@ impl<'a> Inliner<'a> {
         handler
             .params
             .iter()
-            .for_each(|param| walk.bind(&param.name));
+            .try_for_each(|param| walk.bind(&param.name))?;
         if let Some(requires) = &handler.requires {
             self.expr(&mut walk, requires)?;
         }
@@ -315,7 +326,7 @@ impl<'a> Inliner<'a> {
 
     fn hook(&mut self, hook: &'a ast::Hook) -> Checked<ast::Hook> {
         let mut walk = Walk::new(Owner::Hook(hook.kind));
-        hook.params.iter().for_each(|param| walk.bind(&param.name));
+        hook.params.iter().try_for_each(|param| walk.bind(&param.name))?;
         let body = self.block(&mut walk, &hook.body)?;
         Ok(ast::Hook {
             kind: hook.kind,
@@ -388,7 +399,7 @@ impl<'a> Inliner<'a> {
         match statement {
             Stmt::Let { name, value, .. } => {
                 self.expr(walk, value)?;
-                walk.bind(name);
+                walk.bind(name)?;
                 Ok(statement.clone())
             }
             Stmt::Assign { name, value }
@@ -438,7 +449,55 @@ impl<'a> Inliner<'a> {
             }
             Stmt::Call { callee, args } => self.call(walk, callee, args),
             Stmt::Inlined { .. } => panic!("the parser never writes an inlined block"),
+            Stmt::Climb(climb) => self.climb(walk, climb),
+            Stmt::Yield { kind, .. } => {
+                match kind {
+                    Yield::Candidate { value, hypothesis } => {
+                        self.expr(walk, value)?;
+                        self.expr(walk, hypothesis)?;
+                    }
+                    Yield::Score(values) => {
+                        for value in values {
+                            self.expr(walk, value)?;
+                        }
+                    }
+                    Yield::Cost(value) => self.expr(walk, value)?,
+                }
+                Ok(statement.clone())
+            }
         }
+    }
+
+    fn climb(&mut self, walk: &mut Walk<'a>, climb: &'a Climb) -> Checked<Stmt> {
+        walk.reference(&self.declared, &climb.over)?;
+        walk.reference(&self.declared, &climb.ledger)?;
+        if let Some(end) = &climb.end {
+            walk.reference(&self.declared, end)?;
+        }
+        if let Some(from) = &climb.from {
+            self.expr(walk, from)?;
+        }
+        let metrics: Vec<Name> = climb
+            .metrics
+            .iter()
+            .map(|metric| metric.name.clone())
+            .collect();
+        for gate in &climb.gates {
+            walk.scoped(&metrics, |walk| self.expr(walk, gate))?;
+        }
+        if let Rule::When { names, condition } = &climb.rule {
+            walk.scoped(names, |walk| self.expr(walk, condition))?;
+        }
+        let propose = walk.scoped(std::slice::from_ref(&climb.propose.param), |walk| {
+            self.block(walk, &climb.propose.body)
+        })?;
+        let measure = walk.scoped(std::slice::from_ref(&climb.measure.param), |walk| {
+            self.block(walk, &climb.measure.body)
+        })?;
+        let mut expanded = climb.clone();
+        expanded.propose.body = propose;
+        expanded.measure.body = measure;
+        Ok(Stmt::Climb(Box::new(expanded)))
     }
 
     fn compound(&mut self, walk: &mut Walk<'a>, statement: &'a Stmt) -> Checked<Stmt> {
@@ -567,6 +626,7 @@ impl<'a> Inliner<'a> {
                 .zip(args.iter().cloned())
                 .collect(),
             body: expansion.body.clone(),
+            sees_caller: false,
         })
     }
 

@@ -742,6 +742,9 @@ fn decides(statement: &ast::Stmt) -> Checked<bool> {
             Ok(false)
         }
         ast::Stmt::Inlined { body, .. } => any(&body.statements),
+        ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
+            panic!("climbs are expanded before hooks are read")
+        }
         ast::Stmt::Let { .. }
         | ast::Stmt::Assign { .. }
         | ast::Stmt::Push { .. }

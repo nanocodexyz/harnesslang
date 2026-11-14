@@ -354,7 +354,70 @@ pub enum Stmt {
         function: Name,
         arguments: Vec<(Param, Expr)>,
         body: Block,
+        sees_caller: bool,
     },
+    Climb(Box<Climb>),
+    Yield {
+        at: Position,
+        kind: Yield,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct Climb {
+    pub at: Position,
+    pub name: Name,
+    pub over: Name,
+    pub from: Option<Expr>,
+    pub ledger: Name,
+    pub end: Option<Name>,
+    pub cycles: Name,
+    pub candidates: Option<Name>,
+    pub trials: Name,
+    pub cost: Option<ClimbCost>,
+    pub wall: Option<Name>,
+    pub failures: Option<Name>,
+    pub metrics: Vec<Metric>,
+    pub gates: Vec<Expr>,
+    pub rule: Rule,
+    pub propose: ClimbBlock,
+    pub measure: ClimbBlock,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClimbCost {
+    pub budget: Name,
+    pub propose: Name,
+    pub trial: Name,
+}
+
+#[derive(Clone, Debug)]
+pub struct Metric {
+    pub name: Name,
+    pub higher: bool,
+    pub max: Name,
+    pub within: Option<Name>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Rule {
+    Mean(Name),
+    Sign(Name),
+    Best(Name),
+    When { names: Vec<Name>, condition: Expr },
+}
+
+#[derive(Clone, Debug)]
+pub struct ClimbBlock {
+    pub param: Name,
+    pub body: Block,
+}
+
+#[derive(Clone, Debug)]
+pub enum Yield {
+    Candidate { value: Expr, hypothesis: Expr },
+    Score(Vec<Expr>),
+    Cost(Expr),
 }
 
 #[derive(Clone, Debug)]

@@ -81,10 +81,14 @@ pub enum Mutation {
     ForkHookSkipped,
     CellLeaks,
     CellCancelIgnored,
+    ClimbAcceptAny,
+    ClimbRevertSkipped,
+    ClimbLedgerDropsLosses,
+    ClimbBudgetUnchecked,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 83] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -164,6 +168,10 @@ impl Mutation {
         Self::ForkHookSkipped,
         Self::CellLeaks,
         Self::CellCancelIgnored,
+        Self::ClimbAcceptAny,
+        Self::ClimbRevertSkipped,
+        Self::ClimbLedgerDropsLosses,
+        Self::ClimbBudgetUnchecked,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -247,6 +255,10 @@ impl Mutation {
             Self::ForkHookSkipped => "fork_hook_skipped",
             Self::CellLeaks => "cell_leaks",
             Self::CellCancelIgnored => "cell_cancel_ignored",
+            Self::ClimbAcceptAny => "climb_accept_any",
+            Self::ClimbRevertSkipped => "climb_revert_skipped",
+            Self::ClimbLedgerDropsLosses => "climb_ledger_drops_losses",
+            Self::ClimbBudgetUnchecked => "climb_budget_unchecked",
         }
     }
 
@@ -340,7 +352,11 @@ impl Mutation {
             | Self::ForkLiveState
             | Self::ForkHookSkipped
             | Self::CellLeaks
-            | Self::CellCancelIgnored => all,
+            | Self::CellCancelIgnored
+            | Self::ClimbAcceptAny
+            | Self::ClimbRevertSkipped
+            | Self::ClimbLedgerDropsLosses
+            | Self::ClimbBudgetUnchecked => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

@@ -182,6 +182,29 @@ pub struct Program {
     pub blobs: Option<Blobs>,
     pub idle: Option<Idle>,
     pub forked: Option<Handler>,
+    pub climbs: Vec<Climb>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Climb {
+    pub name: String,
+    pub over: FieldId,
+    pub ledger: FieldId,
+    pub evaluated: FieldId,
+    pub cycles: u64,
+    pub candidates: u64,
+    pub trials: u64,
+    pub budget: Option<u64>,
+    pub higher: bool,
+    pub rule: ClimbRule,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClimbRule {
+    Mean(u64),
+    Sign(u64),
+    Best(u64),
+    When,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

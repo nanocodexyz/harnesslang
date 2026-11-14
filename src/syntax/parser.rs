@@ -1,8 +1,9 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Fork, Function, Handler, Hook,
-    HookKind, Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, RewriteArm,
-    Settings, Spawn, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Climb, ClimbBlock, ClimbCost, Code, CodeField, Const, Event, Expr, Fork,
+    Function, Handler, Hook, HookKind, Idle, Invariant, Item, Listing, Metric, Model, Name, Param,
+    Pattern, Program, RewriteArm, Rule, Settings, Spawn, State, Stmt, Tool, TypeBody, TypeDef,
+    TypeExpr, VariantDef, Yield,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -44,6 +45,22 @@ pub const SESSION_END_HANDLER: &str = "session_end";
 pub const CODE_TOOLS_FIELD: &str = "tools";
 pub const WAIT_BUILTIN: &str = "wait";
 pub const HOLD_BUILTIN: &str = "hold";
+
+#[derive(Default)]
+struct ClimbClauses {
+    from: Option<Expr>,
+    ledger: Option<Name>,
+    end: Option<Name>,
+    cycles: Option<Name>,
+    candidates: Option<Name>,
+    trials: Option<Name>,
+    cost: Option<ClimbCost>,
+    wall: Option<Name>,
+    failures: Option<Name>,
+    metrics: Vec<Metric>,
+    gates: Vec<Expr>,
+    rule: Option<Rule>,
+}
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -843,6 +860,8 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::Push { at, list, value })
             }
             "rewrite" if matches!(self.peek_second(), Token::Name(_)) => self.rewrite(),
+            "climb" if matches!(self.peek_second(), Token::Name(_)) => self.climb(),
+            "yield" if matches!(self.peek_second(), Token::Name(_)) => self.yield_statement(),
             "clear" => {
                 self.advance();
                 let list = self.name("a list to clear")?;
@@ -971,6 +990,248 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         Ok(Stmt::Match { at, subject, arms })
+    }
+
+    pub fn fragment(mut self) -> Parsed<Vec<Stmt>> {
+        let mut statements = Vec::new();
+        while self.peek().token != Token::End {
+            statements.push(self.statement()?);
+        }
+        Ok(statements)
+    }
+
+    fn yield_statement(&mut self) -> Parsed<Stmt> {
+        let at = self.word("yield")?;
+        let kind = if self.is_word("candidate") {
+            self.advance();
+            self.symbol(Symbol::LeftParen)?;
+            let args = self.arguments()?;
+            let [value, hypothesis]: [Expr; 2] = args.try_into().map_err(|args: Vec<Expr>| {
+                Diagnostic::new(
+                    at,
+                    format!(
+                        "yield candidate takes (value, hypothesis), found {} argument(s)",
+                        args.len()
+                    ),
+                )
+            })?;
+            Yield::Candidate { value, hypothesis }
+        } else if self.is_word("score") {
+            self.advance();
+            self.symbol(Symbol::LeftParen)?;
+            Yield::Score(self.arguments()?)
+        } else if self.is_word("cost") {
+            self.advance();
+            Yield::Cost(self.expr()?)
+        } else {
+            return Err(self.unexpected("'candidate', 'score' or 'cost' after yield"));
+        };
+        Ok(Stmt::Yield { at, kind })
+    }
+
+    fn climb(&mut self) -> Parsed<Stmt> {
+        let at = self.word("climb")?;
+        let name = self.name("a climb name")?;
+        self.word("over")?;
+        let over = self.name("the state field a climb improves")?;
+        let mut clauses = ClimbClauses::default();
+        while !self.is_symbol(Symbol::LeftBrace) {
+            self.climb_clause(&mut clauses)?;
+        }
+        self.symbol(Symbol::LeftBrace)?;
+        let propose = self.climb_block("propose")?;
+        let measure = self.climb_block("measure")?;
+        self.symbol(Symbol::RightBrace)?;
+        let missing = |what: &str| {
+            Diagnostic::new(
+                name.at,
+                format!("climb '{}' needs a '{what}' clause", name.text),
+            )
+        };
+        let ledger = clauses.ledger.ok_or_else(|| missing("ledger"))?;
+        let cycles = clauses.cycles.ok_or_else(|| missing("cycles"))?;
+        let trials = clauses.trials.ok_or_else(|| missing("trials"))?;
+        let rule = clauses.rule.ok_or_else(|| missing("accept"))?;
+        if clauses.metrics.is_empty() {
+            return Err(missing("metric"));
+        }
+        Ok(Stmt::Climb(Box::new(Climb {
+            at,
+            name,
+            over,
+            from: clauses.from,
+            ledger,
+            end: clauses.end,
+            cycles,
+            candidates: clauses.candidates,
+            trials,
+            cost: clauses.cost,
+            wall: clauses.wall,
+            failures: clauses.failures,
+            metrics: clauses.metrics,
+            gates: clauses.gates,
+            rule,
+            propose,
+            measure,
+        })))
+    }
+
+    fn climb_block(&mut self, word: &str) -> Parsed<ClimbBlock> {
+        self.word(word)?;
+        self.symbol(Symbol::LeftParen)?;
+        let param = self.name(&format!("the parameter of a climb's {word} block"))?;
+        self.symbol(Symbol::RightParen)?;
+        let body = self.block()?;
+        Ok(ClimbBlock { param, body })
+    }
+
+    fn climb_once<T>(&self, slot: &Option<T>, word: &str) -> Parsed<()> {
+        if slot.is_some() {
+            return Err(Diagnostic::new(
+                self.at(),
+                format!("a climb has one '{word}' clause"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn climb_clause(&mut self, clauses: &mut ClimbClauses) -> Parsed<()> {
+        let Token::Name(word) = &self.peek().token else {
+            return Err(self.unexpected("a climb clause or '{'"));
+        };
+        let word = word.clone();
+        match word.as_str() {
+            "from" => {
+                self.climb_once(&clauses.from, "from")?;
+                self.advance();
+                clauses.from = Some(self.expr()?);
+            }
+            "ledger" | "end" => {
+                let slot = if word == "ledger" {
+                    &mut clauses.ledger
+                } else {
+                    &mut clauses.end
+                };
+                if slot.is_some() {
+                    return Err(Diagnostic::new(
+                        self.at(),
+                        format!("a climb has one '{word}' clause"),
+                    ));
+                }
+                self.advance();
+                *slot = Some(self.name(&format!("the state field of a climb's {word}"))?);
+            }
+            "cycles" | "candidates" | "trials" | "wall" | "failures" => {
+                let slot = match word.as_str() {
+                    "cycles" => &mut clauses.cycles,
+                    "candidates" => &mut clauses.candidates,
+                    "trials" => &mut clauses.trials,
+                    "wall" => &mut clauses.wall,
+                    _ => &mut clauses.failures,
+                };
+                if slot.is_some() {
+                    return Err(Diagnostic::new(
+                        self.at(),
+                        format!("a climb has one '{word}' clause"),
+                    ));
+                }
+                self.advance();
+                *slot = Some(self.bound(&format!("a climb's {word}"))?);
+            }
+            "cost" => {
+                self.climb_once(&clauses.cost, "cost")?;
+                self.advance();
+                let budget = self.bound("a climb's cost budget")?;
+                self.word("propose")?;
+                let propose = self.bound("the cost of a climb's proposal")?;
+                self.word("trial")?;
+                let trial = self.bound("the cost of a climb's trial")?;
+                clauses.cost = Some(ClimbCost {
+                    budget,
+                    propose,
+                    trial,
+                });
+            }
+            "metric" => {
+                self.advance();
+                clauses.metrics.push(self.metric()?);
+            }
+            "gate" => {
+                self.advance();
+                clauses.gates.push(self.expr()?);
+            }
+            "accept" => {
+                self.climb_once(&clauses.rule, "accept")?;
+                self.advance();
+                clauses.rule = Some(self.rule()?);
+            }
+            _ => return Err(self.unexpected("a climb clause or '{'")),
+        }
+        Ok(())
+    }
+
+    fn metric(&mut self) -> Parsed<Metric> {
+        let name = self.name("a metric name")?;
+        let higher = if self.is_word("higher") {
+            true
+        } else if self.is_word("lower") {
+            false
+        } else {
+            return Err(self.unexpected("'lower' or 'higher' after a metric's name"));
+        };
+        self.advance();
+        self.word("at")?;
+        self.word("most")?;
+        let max = self.bound(&format!("the largest value of metric '{}'", name.text))?;
+        let within = if self.is_word("within") {
+            self.advance();
+            Some(self.bound(&format!("the tolerance of metric '{}'", name.text))?)
+        } else {
+            None
+        };
+        Ok(Metric {
+            name,
+            higher,
+            max,
+            within,
+        })
+    }
+
+    fn rule(&mut self) -> Parsed<Rule> {
+        if self.is_word("mean") || self.is_word("best") {
+            let mean = self.is_word("mean");
+            self.advance();
+            self.word("by")?;
+            let margin = self.bound("a climb's margin")?;
+            return Ok(if mean {
+                Rule::Mean(margin)
+            } else {
+                Rule::Best(margin)
+            });
+        }
+        if self.is_word("sign") {
+            self.advance();
+            self.word("at")?;
+            self.word("least")?;
+            return Ok(Rule::Sign(self.bound("the wins a sign rule needs")?));
+        }
+        if !self.is_word("when") {
+            return Err(self.unexpected("'mean', 'sign', 'best' or 'when' after accept"));
+        }
+        self.advance();
+        self.symbol(Symbol::LeftParen)?;
+        let mut names = Vec::new();
+        loop {
+            names.push(self.name("a name an accept rule binds")?);
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+                continue;
+            }
+            self.symbol(Symbol::RightParen)?;
+            break;
+        }
+        let condition = self.expr()?;
+        Ok(Rule::When { names, condition })
     }
 
     fn rewrite(&mut self) -> Parsed<Stmt> {
