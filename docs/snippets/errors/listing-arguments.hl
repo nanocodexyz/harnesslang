@@ -1,0 +1,12 @@
+harness notes
+
+const docs_max: u64 = 16
+
+tools from listing(docs, docs_max) (query: text) effect none
+
+on admit(query: text) -> u64 {
+  match docs(query) {
+    ok(listed) => { return listed }
+    failed(error) => { return 0 }
+  }
+}

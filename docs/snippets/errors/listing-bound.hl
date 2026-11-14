@@ -1,0 +1,5 @@
+harness notes
+
+tools from listing(docs, 16) (query: text) effect none
+
+on ping() -> u64 { return 1 }

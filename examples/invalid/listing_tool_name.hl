@@ -1,0 +1,8 @@
+harness listing_tool_name
+
+const docs_max: u64 = 16
+
+tool docs__search(query: text) -> text effect none
+tools from listing(docs, docs_max) (query: text) effect none
+
+on ping() -> u64 { return 1 }

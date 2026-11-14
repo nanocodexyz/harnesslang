@@ -74,6 +74,13 @@ fn tools_json(program: &Program) -> Json {
         );
         tools.insert(tool.name.clone(), Json::text(tool.effect.name()));
     }
+    for listing in &program.listings {
+        tools.insert(listing.name.clone(), Json::text(EffectClass::None.name()));
+        for word in crate::sim::world::WORDS {
+            let name = format!("{}{}{word}", listing.name, crate::ir::LISTED_TOOL_SEPARATOR);
+            tools.insert(name, Json::text(listing.effect.name()));
+        }
+    }
     Json::Object(tools)
 }
 

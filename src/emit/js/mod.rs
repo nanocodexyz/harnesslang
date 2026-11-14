@@ -107,7 +107,7 @@ fn fields_literal(fields: &[crate::ir::Field]) -> String {
 
 fn site_literal(site: &Site) -> String {
     let tool = match site.kind {
-        SiteKind::Tool(tool) => tool.to_string(),
+        SiteKind::Tool(tool) | SiteKind::Listing(tool) => tool.to_string(),
         SiteKind::Dispatch | SiteKind::Model | SiteKind::Now | SiteKind::Random => {
             "null".to_owned()
         }
@@ -167,6 +167,19 @@ fn program_literal(program: &Program) -> String {
             fields_literal(&tool.params),
             type_literal(&tool.returns),
             tool.effect.name()
+        )
+        .expect("writing to a string succeeds");
+    }
+    out.push_str("  ],\n  listings: [\n");
+    for listing in &program.listings {
+        writeln!(
+            out,
+            "    {{ name: {}, bound: {}n, boundName: {}, params: {}, effect: \"{}\" }},",
+            js_string(&listing.name),
+            listing.bound.value,
+            js_string(&listing.bound.name),
+            fields_literal(&listing.params),
+            listing.effect.name()
         )
         .expect("writing to a string succeeds");
     }

@@ -241,6 +241,106 @@ pub fn checked_output(program: &Program, tool: &str, returns: &Type, output: Out
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    Untyped,
+    Typed(Json),
+    Invalid(String),
+}
+
+pub fn tool_input(program: &Program, tool: &str, raw: &str) -> Input {
+    let Some(params) = program.input_params(tool) else {
+        return Input::Untyped;
+    };
+    match typed_input(program, params, raw) {
+        Ok(input) => Input::Typed(input),
+        Err(error) => Input::Invalid(format!("input of {tool}: {error}")),
+    }
+}
+
+fn typed_input(program: &Program, params: &[ir::Field], raw: &str) -> Result<Json, String> {
+    let Ok(Json::Object(fields)) = crate::run::json::decode(raw) else {
+        return Err("not a JSON object".to_owned());
+    };
+    let input = Json::Object(fields);
+    input_fits(program, params, &input)?;
+    Ok(input)
+}
+
+pub fn input_fits(program: &Program, params: &[ir::Field], input: &Json) -> Result<(), String> {
+    let Json::Object(fields) = input else {
+        return Err("not a JSON object".to_owned());
+    };
+    for param in params {
+        let Some(field) = fields.get(&param.name) else {
+            return Err(format!("missing '{}'", param.name));
+        };
+        from_json(program, &param.ty, field)
+            .map_err(|error| format!("'{}': {error}", param.name))?;
+    }
+    if let Some(extra) = fields
+        .keys()
+        .find(|key| !params.iter().any(|param| param.name == **key))
+    {
+        return Err(format!("'{extra}' is not a parameter"));
+    }
+    Ok(())
+}
+
+pub fn not_admitted(tool: &str, listing: &str, name: &str) -> String {
+    format!("{tool} was not admitted: listing {listing} did not list {name} in this turn")
+}
+
+pub fn changed_since_admission(tool: &str) -> String {
+    format!("{tool} changed since admission; rediscover before executing")
+}
+
+pub fn checked_listing(listing: &ir::Listing, output: Output) -> Output {
+    let Output::Ok(json) = &output else {
+        return output;
+    };
+    let fingerprints = match json {
+        Json::Object(map)
+            if map
+                .iter()
+                .all(|(name, fingerprint)| !name.is_empty() && fingerprint.as_str().is_some()) =>
+        {
+            map.len() as u64
+        }
+        other => {
+            return Output::Failed(format!(
+                "listing {} returned {}, which is not an object of fingerprints",
+                listing.name,
+                other.encode()
+            ));
+        }
+    };
+    if fingerprints > listing.bound.value {
+        return Output::Failed(format!(
+            "listing {} returned {fingerprints} tools, over its bound {} ({})",
+            listing.name, listing.bound.name, listing.bound.value
+        ));
+    }
+    output
+}
+
+pub fn admitted(json: &Json) -> Result<BTreeMap<String, String>, String> {
+    let Json::Object(map) = json else {
+        return Err(format!("a listing is an object, found {}", json.encode()));
+    };
+    let mut tools = BTreeMap::new();
+    for (name, fingerprint) in map {
+        let fingerprint = fingerprint.as_str().ok_or_else(|| {
+            format!(
+                "listed tool '{name}' has fingerprint {}, not text",
+                fingerprint.encode()
+            )
+        })?;
+        tools.insert(name.clone(), fingerprint.to_owned());
+    }
+    Ok(tools)
+}
+
 pub fn fallback_output(program: &Program, returns: &Type, output: Output) -> Output {
     match (&output, program.text_enum(returns)) {
         (Output::Ok(json), Some(sum)) if from_json(program, returns, json).is_err() => {
