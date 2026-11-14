@@ -1,14 +1,16 @@
 # What nanocode's Claude agent loop does that harnesslang cannot write
 
-`examples/claude_agent.hl`, `codex_agent.hl`, `hooks.hl`, `subagents.hl` and
-`subagent_child.hl` port the shapes of nanocode's harnesses. Every gap those
-ports listed is now closed (the last two by `suspend` and `wait`, LANGUAGE.md),
-so this file lists what a fresh read of nanocode's Claude backend loop,
+`examples/claude_agent.hl`, `claude_code.hl`, `codex_agent.hl`, `hooks.hl`,
+`subagents.hl` and `subagent_child.hl` port the shapes of nanocode's harnesses. Gaps 1 to 8 of the
+earlier list are closed (the last two by `suspend` and `wait`, LANGUAGE.md), so
+numbers 1 to 8 now list what a fresh read of nanocode's Claude backend loop,
 `crates/backends/claude/src/agent.rs` and `agent/` at nanocode c7679e3, still
 does that harnesslang cannot express. They are ranked by how much of a real
 harness each blocks, each with the smallest language addition that would let
 it be written and how the compiler would keep checking it. A gap the language
-closes is removed and the others keep their numbers.
+closes is removed and the others keep their numbers. Numbers 9 to 11 are what
+porting nanocode's Claude Code prompt and tools as `examples/claude_code.hl`
+left out.
 
 ## 1. Token accounting and truncation
 
@@ -110,3 +112,15 @@ and refreshed (`agent/keep.rs:24-177`). A tool returns `u64`, `bool`, `text`
 or a text enum. Smallest addition: an opaque `blob` type journaled by its
 digest, which a tool returns and a list holds, with `keep last N` bounding how
 many stay.
+
+## 9. Optional tool parameters
+
+Claude's tools have optional parameters (Bash's `timeout`, Read's `offset` and `limit`, Edit's `replace_all`), and typed input requires exactly the declared parameters. `examples/claude_code.hl` declares every parameter and `agent/`'s host fills a missing one with the schema's default before the engine sees the call, so the journal holds the defaulted input rather than what the model sent. Smallest addition: `param: type = default` in a tool's parameters, filled by `dispatch` and journaled as filled, with the simulator drawing inputs that leave it out.
+
+## 10. Options on a model call
+
+nanocode's compaction call offers no tools (`disable_tools`) and retries once forcing text; a harnesslang model call has no options, so `claude_code.hl`'s compaction keeps the tools offered and fails the turn if the summary calls one. Smallest addition: a declared, finite set of call modes (`messages(context) mode text_only`) passed to the host and journaled with the call.
+
+## 11. Text processing
+
+nanocode strips the summary's `<analysis>` block and rewrites its `<summary>` tag (`compact_summary`); harnesslang text has only `++`, so the summary enters the context as written. Smallest addition: pure, bounded text builtins (find, slice) that the interpreter and every backend implement identically.
