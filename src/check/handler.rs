@@ -146,12 +146,10 @@ impl Checker<'_> {
                 format!("'{}' is already a state field or constant", name.text),
             );
         }
-        if self.globals.tools.contains_key(&name.text)
-            || self.globals.model.as_deref() == Some(name.text.as_str())
-        {
+        if self.globals.effect(&name.text) {
             return error(
                 name.at,
-                format!("'{}' is already a tool or model", name.text),
+                format!("'{}' is already a tool, listing or model", name.text),
             );
         }
         Ok(self.bind(name.text.clone(), ty))
@@ -656,6 +654,16 @@ impl Checker<'_> {
                 out,
             ));
         }
+        if let Some(&listing) = self.globals.listings.get(&callee.text) {
+            self.args(at, &format!("listing '{}'", callee.text), args, &[], out)?;
+            return Ok(self.site(
+                SiteKind::Listing(listing),
+                SiteClass::Fixed(EffectClass::None),
+                Type::Known(Box::new(Type::U64)),
+                Vec::new(),
+                out,
+            ));
+        }
         if self.globals.model.as_deref() == Some(callee.text.as_str()) {
             let [context] = args else {
                 return error(
@@ -902,9 +910,7 @@ impl Checker<'_> {
         if let Some(&constant) = self.globals.constants.get(&name.text) {
             return Ok((Expr::Constant(constant), Type::U64));
         }
-        if self.globals.tools.contains_key(&name.text)
-            || self.globals.model.as_deref() == Some(name.text.as_str())
-        {
+        if self.globals.effect(&name.text) {
             return error(
                 name.at,
                 format!("'{}' is an effect: call it with arguments", name.text),

@@ -55,6 +55,13 @@ pub struct ToolRequest<'a> {
     pub effect: EffectClass,
     pub input: &'a Json,
     pub returns: &'a Type,
+    pub admitted: Option<&'a str>,
+}
+
+pub struct ListingRequest<'a> {
+    pub turn: u64,
+    pub seq: u64,
+    pub listing: &'a str,
 }
 
 pub struct ModelRequest<'a> {
@@ -69,6 +76,7 @@ pub trait World {
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop>;
     fn attempt(&mut self, turn: u64, seq: u64) -> Result<u64, Stop>;
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output;
     fn model(&mut self, request: &ModelRequest<'_>) -> Json;
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
@@ -104,6 +112,7 @@ pub struct Engine<'a> {
     attempts: u64,
     buffer: Vec<Record>,
     acknowledged: bool,
+    admitted: BTreeMap<ir::ListingId, BTreeMap<String, String>>,
 }
 
 enum Flow {
@@ -148,6 +157,7 @@ impl<'a> Engine<'a> {
             attempts: log.attempts,
             buffer: Vec::new(),
             acknowledged: false,
+            admitted: BTreeMap::new(),
         }
     }
 
@@ -393,14 +403,32 @@ impl<'a> Engine<'a> {
                     input: Json::Object(input),
                 }
             }
+            SiteKind::Listing(listing) => Call {
+                tool: self.program.listings[listing].name.clone(),
+                effect: EffectClass::None,
+                input: Json::Null,
+            },
             SiteKind::Dispatch => {
                 let (_, fields) = args[0].as_variant();
                 let tool = fields[ir::CALL_TOOL].as_text().to_owned();
-                let effect = self.program.dispatch_class(&tool);
+                let raw = fields[ir::CALL_INPUT].as_text();
+                let dropped = self.mutation == Mutation::ListedClassDropped
+                    && self.program.listed(&tool).is_some();
+                let effect = if dropped {
+                    EffectClass::None
+                } else {
+                    self.program.dispatch_class(&tool)
+                };
+                let input = match value::tool_input(self.program, &tool, raw) {
+                    value::Input::Typed(input) => input,
+                    value::Input::Untyped | value::Input::Invalid(_) => {
+                        Json::String(raw.to_owned())
+                    }
+                };
                 Call {
                     tool,
                     effect,
-                    input: Json::String(fields[ir::CALL_INPUT].as_text().to_owned()),
+                    input,
                 }
             }
             SiteKind::Model => {
@@ -442,6 +470,7 @@ impl<'a> Engine<'a> {
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
+                self.admit_listing(site, &output)?;
                 self.decode(site, &output)
             }
             Some(SiteLog::Reply(response)) => {
@@ -592,6 +621,7 @@ impl<'a> Engine<'a> {
     ) -> Result<Value, Halt> {
         let site = self.handler.sites[site_id].clone();
         self.hook(Point::BeforeRun(site.kind, call.effect))?;
+        let gate = self.gate(&site, call);
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
@@ -622,23 +652,38 @@ impl<'a> Engine<'a> {
             }
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
             SiteKind::Random => Output::Ok(Json::Number(world.random())),
+            SiteKind::Listing(listing) => {
+                let listing = &self.program.listings[listing];
+                let output = world.listing(&ListingRequest {
+                    turn: self.turn,
+                    seq,
+                    listing: &listing.name,
+                });
+                value::checked_listing(listing, output)
+            }
             SiteKind::Tool(_) | SiteKind::Dispatch => {
                 let returns = match &site.result {
                     Type::Known(inner) | Type::Maybe(inner) => (**inner).clone(),
                     other => panic!("a tool site yields known or maybe, found {other:?}"),
                 };
-                let output = world.tool(&ToolRequest {
-                    turn: self.turn,
-                    seq,
-                    tool: &call.tool,
-                    effect: call.effect,
-                    input: &call.input,
-                    returns: &returns,
-                });
-                if self.mutation == Mutation::EnumUnchecked {
-                    value::fallback_output(self.program, &returns, output)
-                } else {
-                    value::checked_output(self.program, &call.tool, &returns, output)
+                match gate {
+                    Err(refused) => Output::Failed(refused),
+                    Ok(admitted) => {
+                        let output = world.tool(&ToolRequest {
+                            turn: self.turn,
+                            seq,
+                            tool: &call.tool,
+                            effect: call.effect,
+                            input: &call.input,
+                            returns: &returns,
+                            admitted: admitted.as_deref(),
+                        });
+                        if self.mutation == Mutation::EnumUnchecked {
+                            value::fallback_output(self.program, &returns, output)
+                        } else {
+                            value::checked_output(self.program, &call.tool, &returns, output)
+                        }
+                    }
                 }
             }
         };
@@ -653,7 +698,56 @@ impl<'a> Engine<'a> {
         if step {
             self.flush()?;
         }
+        self.admit_listing(&site, &output)?;
         self.decode(&site, &output)
+    }
+
+    fn gate(&self, site: &Site, call: &Call) -> Result<Option<String>, String> {
+        if site.kind != SiteKind::Dispatch {
+            return Ok(None);
+        }
+        if let Json::String(raw) = &call.input
+            && let value::Input::Invalid(error) = value::tool_input(self.program, &call.tool, raw)
+            && self.mutation != Mutation::InputUnchecked
+        {
+            return Err(error);
+        }
+        let Some((listing, name)) = self.program.listed(&call.tool) else {
+            return Ok(None);
+        };
+        if self.mutation == Mutation::ListingUnchecked {
+            return Ok(None);
+        }
+        match self
+            .admitted
+            .get(&listing)
+            .and_then(|tools| tools.get(name))
+        {
+            Some(fingerprint) => Ok(Some(fingerprint.clone())),
+            None => Err(value::not_admitted(
+                &call.tool,
+                &self.program.listings[listing].name,
+                name,
+            )),
+        }
+    }
+
+    fn admit_listing(&mut self, site: &Site, output: &Output) -> Result<(), Halt> {
+        let SiteKind::Listing(listing) = site.kind else {
+            return Ok(());
+        };
+        match output {
+            Output::Ok(json) => {
+                let tools = value::admitted(json).map_err(|error| {
+                    Halt::Exit(Exit::Corrupt(format!("turn {} result: {error}", self.turn)))
+                })?;
+                self.admitted.insert(listing, tools);
+            }
+            Output::Failed(_) => {
+                self.admitted.remove(&listing);
+            }
+        }
+        Ok(())
     }
 
     fn reply(&self, response: &Json) -> Result<Value, Halt> {
@@ -679,6 +773,10 @@ impl<'a> Engine<'a> {
         let corrupt = |error: String| {
             Halt::Exit(Exit::Corrupt(format!("turn {} result: {error}", self.turn)))
         };
+        if let (SiteKind::Listing(_), Output::Ok(json)) = (site.kind, output) {
+            let tools = value::admitted(json).map_err(corrupt)?;
+            return Ok(Value::Variant(ir::OK, vec![Value::U64(tools.len() as u64)]));
+        }
         match (&site.result, output) {
             (Type::U64, Output::Ok(json)) => json
                 .as_u64()

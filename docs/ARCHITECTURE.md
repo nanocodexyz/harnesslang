@@ -144,6 +144,20 @@ the call's tool up among the declared tools at run time and always has type
 `maybe<text>`; a declared none or idempotent tool reached through it never
 yields `unknown`.
 
+A tool's parameters are its input type. `dispatch` checks the call's input
+text against them before the tool runs: a JSON object holding exactly the
+parameters, each of its type, is journaled as that object and sent; anything
+else is journaled as the text and recorded as the call's failure without
+running. `tools from listing(name, bound) (params) effect class` declares a
+family of tools named `name__TOOL` at run time (nanocode's `mcp__SERVER__TOOL`)
+with one class and one input type, so `dispatch`'s class stays a function of
+the program and the tool's name. `name()` reads the listing as a `none` effect
+whose recorded result is the listing (tool name to fingerprint) and admits
+its tools for the rest of the turn. `dispatch` refuses a listed tool the
+latest read did not list, and sends the admitted fingerprint with the call so
+the host refuses a tool that changed since admission, as nanocode's MCP host
+does (`native_call_admitted`); both refusals are recorded failures.
+
 ### Statements
 
 `let`, assignment to a state field, `push list value`, `if` / `else`, `match`
@@ -471,6 +485,7 @@ Invariants, named as nanocode-sim names them:
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
+| `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md), not built yet |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a

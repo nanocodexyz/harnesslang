@@ -282,6 +282,10 @@ impl<H: Host> World for JsonlWorld<'_, H> {
         self.host.tool(request)
     }
 
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output {
+        self.host.listing(request)
+    }
+
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         self.host.model(request)
     }
