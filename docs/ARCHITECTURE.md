@@ -98,6 +98,9 @@ handlers.
   that case has.
 - `list<T, N>`: a list with capacity `N`, a named constant. `push` onto a full
   list fails the handler with `bound(name)`, naming the list.
+- State fields start at zero (`0`, `false`, empty text, an empty list), so
+  they are `u64`, `bool`, `text` or lists. A tool returns `u64`, `bool` or
+  `text`. In a pattern, `_` ignores a field.
 - Builtins every program has:
   - `call = call(id: text, tool: text, input: text)`, with fields `id`, `tool`, `input`
   - `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's
@@ -166,6 +169,47 @@ places:
    that is safe to repeat.
 
 How a flush happens is the target's business, and is where targets differ most.
+
+### Journal encoding
+
+Each record is one line: `{"crc":N,"record":R}`, where `R` is the record as
+nanocode-turnlog's serde writes it (externally tagged, snake_case, keys
+sorted) and `N` is the CRC-32 (ISO-HDLC) of `R`'s bytes. Call ids are
+`turn/seq`, turns are decimal text, `call`, `result` and `model` also carry
+`seq`, and a checkpoint's `payload` is the state as JSON text. A line whose
+checksum fails or that lacks its newline ends the readable journal: it and
+everything after it are dropped. Row targets store the same `R` per row.
+
+## IR
+
+`check` lowers a program to `ir::Program`, which the interpreter runs and the
+emitters read. Names are resolved to indices: constants, sums, tools, state
+fields, and per handler its locals and effect sites. Types are explicit: `u64`,
+`bool`, `text`, a sum by index (`call`, `reply` and `entry` first), `list`
+with its named capacity, and `known`/`maybe` with fixed variants `ok`,
+`failed`, `unknown`.
+
+A handler is a tree of statements: `Let`, `Assign` and `Push` on state
+fields, `If`, `Match` with one arm per variant in variant order, `Loop` and
+`For` with their named bound, `Effect` and `Finish`. Expressions are pure:
+lowering hoists every effect out of the expression it appears in into an
+`Effect` statement that binds a temporary local, so a statement's effects run
+first, left to right, then its expression. `and` and `or` evaluate both sides.
+
+Each effect site has a kind (a tool, `dispatch`, the model, `now`, `random`),
+a class (fixed, or resolved at run time for `dispatch`), a result type and a
+durability: `RidesNextFlush`, `FlushBeforeRun` (external), or
+`FlushBeforeRunWhenExternal` (dispatch). An effect runs as: take the next
+sequence number; return the journaled result if there is one; otherwise append
+its `call` record (the model writes none), flush if its durability says so,
+run it, append its `result` or `model` record. `Finish` appends the `status`
+and `checkpoint` records, flushes, then acknowledges: durability point 2. A
+trap ends the turn the same way with outcome `failed`. A target may flush
+more often than the IR asks (the output gate before every outbound request, a
+step boundary after every external step) but never less.
+
+Each handler also carries its worst case: effects, journal records and
+outbound requests, each with the chain of loops that multiplies into it.
 
 ## Targets
 
