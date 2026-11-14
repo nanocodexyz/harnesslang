@@ -4302,7 +4302,8 @@ host writes the child's two records from the input and runs up to
 `FORK_CHILD_TURNS_MAX` (2) turns of the harness over them, with faults and
 every invariant, as a spawned child is run. A quarter of the seeds of a
 harness with a fork tool (`FORKED_ENTRY_PPM` = 250000) start from a forked
-entry themselves, so every backend's load of one is checked in the
+entry themselves, as do a quarter of the seeds of a harness that declares
+`on forked` without a fork tool, so every backend's load of one is checked in the
 differential runs. `fork_state_equal` requires the
 records to equal the hook applied to the state after turn `N` of the
 parent's durable journal up to the call, with `N`, `D` and the key in the
@@ -4325,6 +4326,18 @@ are some. This departs from nanocode, which forks from a checkpoint the
 running turn published: here the snapshot is a finished turn's, the same on
 every target, and a fork never sees a turn a crash could roll back. A harness
 with blobs cannot fork, since a checkpoint holds no blob's bytes.
+
+A host forks a session it holds through the same `fork_entry` (the
+interpreter's, the generated Rust runtime's, or the generated JavaScript's
+`forkEntry`), so `on forked` needs no fork tool. `hl-agent run --fork-from
+J [--at T]` writes the two records from journal `J` at its latest finished
+turn, or at turn `T`, as the first records of a new journal and runs its
+instruction as that session's first turn; `--turn N` runs an instruction as a
+later turn of the same journal, which gives a parent turns to rewind.
+`examples/claude_code.hl`'s `on forked` disarms the prompt cache refresh, whose
+due belongs to the parent's last request, and with `discarded > 0` pushes
+nanocode's rewind notice. hl-agent refuses to fork a state that holds images,
+whose bytes stay in the parent's journal.
 
 ### Idle turns
 
