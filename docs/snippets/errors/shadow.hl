@@ -1,0 +1,9 @@
+harness notes
+
+on ping(value: u64) -> u64 {
+  if value > 1 {
+    let value = 2
+    return value
+  }
+  return value
+}

@@ -1,0 +1,11 @@
+harness notes
+
+type outcome = completed(text) | failed(text) | exhausted
+
+on finish(done: bool, words: text) -> outcome {
+  let result = completed(words)
+  match result {
+    completed(words_out) => { return result }
+    failed(error) => { return result }
+  }
+}

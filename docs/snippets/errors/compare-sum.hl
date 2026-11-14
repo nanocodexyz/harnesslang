@@ -1,0 +1,5 @@
+harness notes
+
+type light = red | green
+
+on ping(left: light, right: light) -> bool { return left == right }

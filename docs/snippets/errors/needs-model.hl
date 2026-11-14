@@ -1,0 +1,3 @@
+harness notes
+
+on ping(said: entry) -> u64 { return 1 }

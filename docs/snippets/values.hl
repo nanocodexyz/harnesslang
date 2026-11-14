@@ -1,0 +1,51 @@
+harness values
+
+const calls_max: u64 = 4
+const notes_max: u64 = 32
+const width_max: u64 = 1000
+
+type size = small | large(u64)
+
+model think calls calls_max
+
+state {
+  notes: list<text, notes_max>
+  history: list<entry, notes_max>
+  seen: u64
+  quiet: bool
+  last: text
+}
+
+on measure(width: u64, label: text) -> size
+  requires width <= width_max and seen < width_max and len(notes) < notes_max
+{
+  seen = seen + 1
+  last = "measured " ++ label
+  quiet = width == 0 or label == ""
+  if width > 100 and not quiet {
+    push notes label
+    return large(width * 2)
+  } else if width > 10 {
+    return large(width - 10)
+  }
+  return small
+}
+
+on recount() -> u64 {
+  for note in notes {
+    if note == last { return len(notes) }
+  }
+  return 0
+}
+
+on tools_of(reply: reply) -> text {
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => {
+      for call in requested {
+        if call.tool == "bash" { return call.id ++ ": " ++ call.input }
+      }
+      return "no bash call"
+    }
+  }
+}

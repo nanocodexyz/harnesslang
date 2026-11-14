@@ -1,0 +1,9 @@
+harness notes
+
+const calls_max: u64 = 4
+
+model think calls calls_max
+
+tool plan(goal: text) -> reply effect none
+
+on ping() -> u64 { return 1 }

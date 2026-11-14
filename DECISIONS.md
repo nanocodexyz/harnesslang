@@ -143,3 +143,29 @@ Known limit: every checkpoint still holds the whole state, as the spec and the i
 Formatting: `runtime/jsonl.rs` and `scripts/rust/sim_store_jsonl.rs` are rustfmt --edition 2024 clean; `engine.rs` and `journal.rs` were not rustfmt clean before and were edited in their existing style.
 
 Commands: `drill_host open JOURNAL REPEATS`, `drill_host bench JOURNAL LEDGER ACKS TURNS group`, `DRILL_TURNS=200 DRILL_DELAY_MS_MAX=30 scripts/rust-crash-drill.sh`, `RUST_DIFF_TARGETS=native-jsonl RUST_DIFF_SEEDS=0..20000 scripts/rust-diff.sh`.
+
+## 2026-11-14: the language reference, checked: docs/LANGUAGE.md and scripts/docs-check.sh
+
+`docs/LANGUAGE.md` is the reference for harness authors: a tutorial that builds `examples/agent.hl` through the four errors a first draft meets (`push_bound` without `requires`, a `maybe` match without `unknown`, `push_bound` in the loop, `no_overflow` on a counter), then the lexical structure, the grammar, every declaration, the types, statements, effect classes and what each target guarantees for them, traps, bounds, invariants and `requires`, the targets with their generated code, the commands and a code-mode section marked in progress. The README is rewritten as a front page. AGENTS.md's list of docs now names LANGUAGE.md and CODE_MODE.md.
+
+Nothing in a doc is typed by hand. `scripts/docs-check.sh`, run by `scripts/check.sh` after the prover mutations, checks:
+
+- every fenced block opened with `hl PATH` equals the file at PATH, and an `hl` block without a path is an error;
+- every file under `docs/snippets/` is shown in a doc; one under an `errors/` directory must fail `hl check` and be run by a command in a doc, every other must pass `hl check` on every target;
+- every `$ command` in a `console` block is run from the repository root with `target/release` on PATH, stdout and stderr together, and must print exactly the lines after it (a line `...` skips lines); an `: error: ` outside a console block is refused, so no error is quoted unchecked;
+- the `Keywords`, `Symbols`, `Builtins` and `Contextual words` lines equal `KEYWORDS` (parser.rs), `Symbol::text` (lexer.rs), `BUILTIN_FUNCTIONS` (check/mod.rs) and the words the parser expects that are not keywords; the set of terminals in the `ebnf` grammar block equals those plus the effect class names, in both directions;
+- every `NAME` = value in LANGUAGE.md equals the constant of that name in src, evaluated.
+
+Then it plants seven bugs in a copy of LANGUAGE.md and requires each to fail with its own message: a changed error line, a snippet block that differs from its file, an hl block without a file, a dropped keyword, an extra grammar terminal, a wrong constant and an error quoted in prose. By hand on 2026-11-14: an unshown snippet file fails with "is not shown in any doc", and a passing program under `errors/` fails with "is an error snippet, but hl check passes".
+
+Contents: 30 snippets (4 passing, 26 errors: 21 checker and parser errors, 5 tutorial steps), 46 commands in LANGUAGE.md and 2 in the README, 12 named constants. Every checker error the snippets show was produced by running it; the prover errors come from the tutorial and `examples/invalid/`.
+
+What writing it found:
+
+- `ir::worst` counts a `return`'s two finish records as if execution went on after it, so a `return` inside a loop or before more code adds to the journal-record worst case: `recount` in `docs/snippets/values.hl` reports 67 journal records (3 + 32 x 2) where a turn writes at most 3. It is an over-count, so not unsound, and only effects and outbound requests are checked against a limit; not fixed here.
+- ARCHITECTURE.md's targets table lists "outbound requests and wall time per Function" as Vercel's checked limits, but the Vercel model has no request limit and reports its duration without checking it; it also says Cloudflare splits an over-limit handler into continuations, which is not built (`hl check` refuses it), and lists `spawn` and `wait` among effects, which the parser does not have. LANGUAGE.md states what the code does.
+- The language has no comments (the lexer has none), so snippets carry no annotation and the doc's prose explains them.
+
+Measurements (5-core Linux Hand shared with about 14 agents, load average 12 to 18): `scripts/docs-check.sh` end to end took 45 s at load 18 and 54 s at load 20, most of it the seven planted-bug runs, each of which rereads the source lists and constants and reruns commands up to its failure; `scripts/check.sh` end to end passed in 141 s at load 20; the 46 LANGUAGE.md commands alone take 2.0 s at load 12, of which 1.2 s is the 200-seed `hl sim`.
+
+Commands: `scripts/docs-check.sh`, `DOCS_CHECK_SELF=0 scripts/docs-check.sh` (without the snippet census and the planted bugs, as the planted bugs themselves run it).

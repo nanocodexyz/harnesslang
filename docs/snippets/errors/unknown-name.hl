@@ -1,0 +1,5 @@
+harness notes
+
+on echo(input: text) -> text {
+  return inpt
+}

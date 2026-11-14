@@ -10,6 +10,6 @@
 - A target is a model. A platform guarantee the compiler relies on is written once in `src/target/`, with where it comes from (the platform's documentation or a measurement), and drives the checker, the lowering and the simulator's faults alike.
 - Validate with `scripts/check.sh` (build, every example through `hl check` and `hl emit`, a seed sweep per target, the mutations, and the differential runs of generated code against the interpreter). Back performance changes with reproducible before/after measurements.
 - Keep scratch work and artifacts in ignored `output/`; never commit them, credentials or personal data.
-- Docs are this file, a short README and `docs/ARCHITECTURE.md`. No status reports, results tables, hashes, agent names or dates in them; those go in DECISIONS.md. Commit messages and names carry no ticket IDs.
+- Docs are this file, a short README, `docs/ARCHITECTURE.md`, `docs/CODE_MODE.md` and the language reference `docs/LANGUAGE.md`, whose programs live in `docs/snippets/` and whose commands `scripts/docs-check.sh` reruns, so every quoted output is real. No status reports, results tables, hashes, agent names or dates in them; those go in DECISIONS.md. Commit messages and names carry no ticket IDs.
 - Work on master, commit only your own changes and push each one; no pull requests. There is no CI: run `scripts/check.sh` before pushing.
 - This file holds principles only and rarely changes. DECISIONS.md is the growing log: add what each change establishes and why, with the commands, dates and measurements behind it.

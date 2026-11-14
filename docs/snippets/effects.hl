@@ -1,0 +1,41 @@
+harness effects
+
+const tries_max: u64 = 3
+const lines_max: u64 = 64
+
+type report = posted(text, u64) | refused(text) | lost(u64)
+
+tool read(path: text) -> text effect none
+tool label(change: text, name: text) -> bool effect idempotent
+tool comment(change: text, body: text) -> text effect external
+
+state {
+  lines: list<text, lines_max>
+  posts: u64
+}
+
+invariant posts_bounded: posts <= tries_max
+
+on post(change: text, path: text) -> report
+  requires len(lines) + 2 <= lines_max and posts == 0
+{
+  let started = now()
+  match read(path) {
+    ok(body) => { push lines body }
+    failed(error) => { return refused(error) }
+  }
+  match label(change, "posted") {
+    ok(applied) => {
+      if not applied { push lines "label was already there" }
+    }
+    failed(error) => { push lines "label failed: " ++ error }
+  }
+  match comment(change, "see " ++ path) {
+    ok(link) => {
+      posts = posts + 1
+      return posted(link, started)
+    }
+    failed(error) => { return refused(error) }
+    unknown => { return lost(started) }
+  }
+}
