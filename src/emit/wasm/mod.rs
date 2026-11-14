@@ -6,8 +6,9 @@ pub mod lower;
 use crate::ir::Program;
 use crate::target::Target;
 
-pub const RUNTIME: [&str; 6] = [
+pub const RUNTIME: [&str; 7] = [
     include_str!("runtime/base.wat"),
+    include_str!("runtime/text.wat"),
     include_str!("runtime/json.wat"),
     include_str!("runtime/value.wat"),
     include_str!("runtime/journal.wat"),

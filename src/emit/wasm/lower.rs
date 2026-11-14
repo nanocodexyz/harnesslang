@@ -98,13 +98,41 @@ impl<'p> Function<'_, 'p> {
                 self.emit(format!("i64.const {LOW_WORD}"));
                 self.emit("i64.and");
             }
-            Expr::TextLen(_) => return not_yet("len of text"),
-            Expr::Truncate { .. } => return not_yet("truncate_middle"),
-            Expr::With { .. } => return not_yet("with"),
-            Expr::TextBuiltin { .. } => return not_yet("text builtins"),
+            Expr::TextLen(operand) => {
+                self.expr(operand)?;
+                self.emit("i32.wrap_i64");
+                self.emit("call $text_utf16_len");
+            }
+            Expr::Truncate { text, tokens } => {
+                self.expr(text)?;
+                self.emit(format!(
+                    "i64.const {}",
+                    self.program().constants[*tokens].value
+                ));
+                self.emit("call $truncate_middle");
+            }
+            Expr::With { list, entry } => {
+                self.expr(list)?;
+                self.expr(entry)?;
+                self.emit("call $list_append");
+            }
+            Expr::TextBuiltin { op, args } => self.text_builtin(*op, args)?,
             Expr::ListingNotice(_) => return not_yet("listing notices"),
             Expr::Cancelled => return not_yet("cancelled"),
         }
+        Ok(())
+    }
+
+    fn text_builtin(&mut self, op: ir::TextOp, args: &[Expr]) -> Result<(), String> {
+        assert_eq!(args.len(), op.arity(), "a text builtin has its arity");
+        self.emit(format!("i32.const {}", op as usize));
+        for arg in args {
+            self.expr(arg)?;
+        }
+        if op.arity() == 1 {
+            self.emit("i64.const 0");
+        }
+        self.emit("call $text_op");
         Ok(())
     }
 
