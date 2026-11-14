@@ -144,11 +144,14 @@ fn sum_definition(out: &mut String, types: &Types<'_>, id: ir::SumId, sum: &ir::
             }
         })
         .collect();
+    let body: String = program_variants
+        .iter()
+        .map(|variant| format!("    {variant},\n"))
+        .collect();
     writeln!(
         out,
-        "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum {} {{\n    {},\n}}\n",
-        sum_name(types.program(), id),
-        program_variants.join(",\n    ")
+        "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum {} {{\n{body}}}\n",
+        sum_name(types.program(), id)
     )
     .expect("writing to a string succeeds");
 }

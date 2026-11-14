@@ -523,7 +523,10 @@ impl<'a> Parser<'a> {
         operator: fn(&Self) -> Option<BinaryOp>,
     ) -> Parsed<Expr> {
         let mut left = next(self)?;
+        let mut entered = 0;
         while let Some(op) = operator(self) {
+            self.enter()?;
+            entered += 1;
             let at = self.advance().at;
             let right = next(self)?;
             left = Expr::Binary {
@@ -532,6 +535,9 @@ impl<'a> Parser<'a> {
                 left: Box::new(left),
                 right: Box::new(right),
             };
+        }
+        for _ in 0..entered {
+            self.leave();
         }
         Ok(left)
     }
@@ -597,7 +603,10 @@ impl<'a> Parser<'a> {
 
     fn postfix(&mut self) -> Parsed<Expr> {
         let mut expr = self.primary()?;
+        let mut entered = 0;
         while self.is_symbol(Symbol::Dot) {
+            self.enter()?;
+            entered += 1;
             self.advance();
             let at = self.at();
             let Token::Name(text) = self.peek().token.clone() else {
@@ -609,6 +618,9 @@ impl<'a> Parser<'a> {
                 base: Box::new(expr),
                 field,
             };
+        }
+        for _ in 0..entered {
+            self.leave();
         }
         Ok(expr)
     }

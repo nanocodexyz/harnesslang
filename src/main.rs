@@ -54,6 +54,9 @@ fn main() -> ExitCode {
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
+        "gen" => harnesslang::generate::cli::gen_command(rest),
+        "fuzz-parse" => harnesslang::generate::cli::fuzz_parse_command(rest),
+        "fuzz-prove" => harnesslang::generate::cli::fuzz_prove_command(rest),
         _ => usage(),
     }
 }
@@ -294,10 +297,6 @@ fn sim_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
-    if let Err(error) = sim::supported(&program) {
-        eprintln!("{file}: error: {error}");
-        return ExitCode::from(FAILURE_EXIT);
-    }
     if !flags.mutation.targets().contains(&target) {
         eprintln!(
             "{file}: error: mutation {} does not apply to {}",
