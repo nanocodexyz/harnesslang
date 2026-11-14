@@ -505,6 +505,7 @@ Losses, kept: hl-agent's children are threads, so a kill -9 kills parent and chi
 
 Measurements (5-core Hand shared with other agents, `nice`):
 
+- `CHECK_JOBS=2 nice scripts/check.sh` on cd51e33 (the code of this branch's head, which adds only this file and GAPS.md, neither read by a check): ok in 1,284 s (sim 620 s wall / 1,238 s busy, js-diff 994 s wall, rust-diff 211 s, strict 179 s, diff-plants 106 s, mutations 65 s for 66 plans, examples 54 s, agent 34 s).
 - `scripts/agent-drill.sh` (mock, seed 1) on the merge: 12 kills (9 in a model call, 3 in a tool, 3 while the child ran), 10 external dispatches of 10 distinct across the parent's and the child's journals, 2 child dispatches recovered unknown and never rerun, 1 child joined, 1 blob journaled, 6 cut streams requested again.
 - Real task, claude-haiku-4-5, the merged hl-agent (delegate a word count to a subagent while the parent writes lines.txt): exit 0 in 10.0 s, 6 requests, 6 tool calls, 10,954 input, 684 output, 8,571 cache-read and 4,573 cache-write tokens, 1 child; lines.txt 5 and words.txt 9, both right; the parent's journal 41 records, the child's (children/1.5/journal.jsonl) 9.
 - `hl sim --seeds 0..50` on the merge: keep.hl, side.hl and tree.hl ok on native-jsonl, cloudflare and vercel (keep.hl native-jsonl 89 idle turns, side.hl 238 side questions, tree.hl 156 children); claude_code.hl seeds 0..2000 in check.sh, e.g. native-sqlite 1,714 children and 1,355 idle turns.
