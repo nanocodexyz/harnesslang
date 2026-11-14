@@ -168,6 +168,7 @@ pub enum Stmt {
         at: Position,
         name: Name,
         list: Expr,
+        parallel: bool,
         body: Block,
     },
     Return {

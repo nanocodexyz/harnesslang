@@ -146,6 +146,10 @@ yields `unknown`.
 
 `let`, assignment to a state field, `push list value`, `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
+`for call in list parallel` (one `match dispatch(call)` whose arms only push:
+every call record is appended before any dispatch, none and idempotent calls
+run at once, an external call alone after one flush of the batch, results in
+list order),
 `return value`, and a call of a `fn`, whose body the checker inlines at each
 call before lowering, in a scope that sees only its parameters and the
 harness's declarations. There is no recursion (a fn may not call itself,
@@ -227,7 +231,8 @@ with its named capacity, and `known`/`maybe` with fixed variants `ok`,
 
 A handler is a tree of statements: `Let`, `Assign` and `Push` on state
 fields, `If`, `Match` with one arm per variant in variant order, `Loop` and
-`For` with their named bound, `Effect` and `Finish`. Expressions are pure:
+`For` with their named bound, `Parallel` (a `For` over calls whose one
+dispatch site runs as a batch, with its push-only arms), `Effect` and `Finish`. Expressions are pure:
 lowering hoists every effect out of the expression it appears in into an
 `Effect` statement that binds a temporary local, so a statement's effects run
 first, left to right, then its expression. `and` and `or` evaluate both sides.
@@ -463,6 +468,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md), not built yet |
 
