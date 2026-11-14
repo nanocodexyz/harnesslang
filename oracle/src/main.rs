@@ -1,4 +1,7 @@
+mod cells;
 mod compare;
+mod djs;
+mod golden;
 mod journal;
 mod summary;
 
@@ -12,6 +15,7 @@ const SUMMARY_SUFFIX: &str = ".summary.jsonl";
 const JOURNAL_SUFFIX: &str = ".jsonl";
 const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
+const GOLDEN_FLAG: &str = "--golden";
 
 fn pairs(directory: &Path) -> Result<Vec<(String, PathBuf, PathBuf)>, String> {
     let entries = std::fs::read_dir(directory)
@@ -45,10 +49,28 @@ fn check_directory(
     Ok(())
 }
 
+fn write_golden(directory: &str) -> ExitCode {
+    match golden::write(Path::new(directory)) {
+        Ok(count) => {
+            println!("ok golden cells={count} directory={directory}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("hl-oracle: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let directories: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, directory] = directories.as_slice()
+        && flag == GOLDEN_FLAG
+    {
+        return write_golden(directory);
+    }
     if directories.is_empty() {
-        eprintln!("usage: hl-oracle DIR...");
+        eprintln!("usage: hl-oracle DIR... | hl-oracle --golden DIR");
         return ExitCode::from(USAGE_EXIT);
     }
     let mut tally = Tally::default();
