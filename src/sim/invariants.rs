@@ -17,10 +17,12 @@ pub enum Invariant {
     Liveness,
     ReplayEqual,
     Panic,
+    NoTrap,
+    InvariantKept,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -29,6 +31,8 @@ impl Invariant {
         Self::Liveness,
         Self::ReplayEqual,
         Self::Panic,
+        Self::NoTrap,
+        Self::InvariantKept,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -41,6 +45,8 @@ impl Invariant {
             Self::Liveness => "liveness",
             Self::ReplayEqual => "replay_equal",
             Self::Panic => "panic",
+            Self::NoTrap => "no_trap",
+            Self::InvariantKept => "invariant_kept",
         }
     }
 }

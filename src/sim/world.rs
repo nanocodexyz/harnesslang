@@ -10,6 +10,7 @@ use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value;
 use crate::sim::faults::{PowerLoss, Profile, SECTOR_PERSISTED_PPM};
 use crate::sim::rng::Rng;
+use crate::sim::strict::{self, Edges};
 use crate::sim::trace::{self, Trace};
 use crate::target::medium::Medium;
 use crate::target::{self, Target};
@@ -59,6 +60,7 @@ pub struct SimWorld<'a> {
     pub owner_faults: Vec<String>,
     pub stats: Stats,
     pub trace: Option<Trace>,
+    pub edges: Option<Edges>,
     rng: Rng,
     faults_left: u64,
     armed: bool,
@@ -91,6 +93,7 @@ impl<'a> SimWorld<'a> {
             owner_faults: Vec::new(),
             stats: Stats::default(),
             trace: None,
+            edges: None,
             rng: Rng::derive(seed, "faults"),
             faults_left: 0,
             armed: faults,
@@ -246,9 +249,12 @@ impl<'a> SimWorld<'a> {
         )
     }
 
-    fn tool_value(rng: &mut Rng, returns: &Type) -> Json {
+    fn tool_value(rng: &mut Rng, returns: &Type, edges: Option<&Edges>) -> Json {
         match returns {
-            Type::U64 => Json::Number(rng.draw() >> 32),
+            Type::U64 => Json::Number(match edges {
+                Some(edges) => edges.draw(rng),
+                None => rng.draw() >> 32,
+            }),
             Type::Bool => Json::Bool(rng.draw() & 1 == 1),
             Type::Text => Json::String(Self::generated_text(rng)),
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
@@ -365,14 +371,22 @@ impl World for SimWorld<'_> {
     }
 
     fn now(&mut self) -> u64 {
-        self.clock += self.rng.range(1, CLOCK_STEP_MAX);
-        let clock = self.clock;
+        let clock = match &self.edges {
+            Some(edges) => edges.draw(&mut self.rng),
+            None => {
+                self.clock += self.rng.range(1, CLOCK_STEP_MAX);
+                self.clock
+            }
+        };
         self.record("now", || vec![("answer", Json::Number(clock))]);
         clock
     }
 
     fn random(&mut self) -> u64 {
-        let random = self.rng.draw();
+        let random = match &self.edges {
+            Some(edges) => edges.draw(&mut self.rng),
+            None => self.rng.draw(),
+        };
         self.record("random", || vec![("answer", Json::Number(random))]);
         random
     }
@@ -447,7 +461,11 @@ impl SimWorld<'_> {
                 Self::generated_text(&mut rng)
             ))
         } else {
-            Output::Ok(Self::tool_value(&mut rng, request.returns))
+            Output::Ok(Self::tool_value(
+                &mut rng,
+                request.returns,
+                self.edges.as_ref(),
+            ))
         };
         let entry = self
             .dispatched
@@ -469,7 +487,12 @@ impl SimWorld<'_> {
         if rng.chance(ANSWER_PPM) {
             return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
         }
-        let over = rng.chance(OVER_CAPACITY_PPM);
+        let over_ppm = if self.edges.is_some() {
+            strict::OVER_CAPACITY_PPM
+        } else {
+            OVER_CAPACITY_PPM
+        };
+        let over = rng.chance(over_ppm);
         let count = if over {
             request.calls_max + 1
         } else {

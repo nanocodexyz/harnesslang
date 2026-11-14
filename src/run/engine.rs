@@ -373,37 +373,7 @@ impl<'a> Engine<'a> {
     }
 
     fn eval(&self, expr: &Expr) -> Result<Value, Halt> {
-        Ok(match expr {
-            Expr::U64(value) => Value::U64(*value),
-            Expr::Bool(value) => Value::Bool(*value),
-            Expr::Text(value) => Value::Text(value.clone()),
-            Expr::Constant(constant) => Value::U64(self.program.constants[*constant].value),
-            Expr::Local(local) => self.locals[*local]
-                .clone()
-                .expect("the checker binds a local before its use"),
-            Expr::Field(field) => self.state[*field].clone(),
-            Expr::Member { base, index } => {
-                let base = self.eval(base)?;
-                base.as_variant().1[*index].clone()
-            }
-            Expr::Construct {
-                variant, fields, ..
-            } => {
-                let mut values = Vec::with_capacity(fields.len());
-                for field in fields {
-                    values.push(self.eval(field)?);
-                }
-                Value::Variant(*variant, values)
-            }
-            Expr::Binary {
-                op, left, right, ..
-            } => binary(*op, self.eval(left)?, self.eval(right)?)?,
-            Expr::Not(operand) => Value::Bool(!self.eval(operand)?.as_bool()),
-            Expr::Len(operand) => match self.eval(operand)? {
-                Value::List(items) => Value::U64(items.len() as u64),
-                other => panic!("the checker types len's operand as a list, found {other:?}"),
-            },
-        })
+        evaluate(self.program, &self.state, &self.locals, expr).map_err(Halt::Trap)
     }
 
     fn resolve(&self, site: &Site, args: &[Value]) -> Call {
@@ -732,11 +702,48 @@ fn halt_exit(halt: Halt) -> Exit {
     }
 }
 
-fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, Halt> {
+pub fn evaluate(
+    program: &Program,
+    state: &[Value],
+    locals: &[Option<Value>],
+    expr: &Expr,
+) -> Result<Value, String> {
+    let eval = |expr: &Expr| evaluate(program, state, locals, expr);
+    Ok(match expr {
+        Expr::U64(value) => Value::U64(*value),
+        Expr::Bool(value) => Value::Bool(*value),
+        Expr::Text(value) => Value::Text(value.clone()),
+        Expr::Constant(constant) => Value::U64(program.constants[*constant].value),
+        Expr::Local(local) => locals[*local]
+            .clone()
+            .expect("the checker binds a local before its use"),
+        Expr::Field(field) => state[*field].clone(),
+        Expr::Member { base, index } => eval(base)?.as_variant().1[*index].clone(),
+        Expr::Construct {
+            variant, fields, ..
+        } => {
+            let mut values = Vec::with_capacity(fields.len());
+            for field in fields {
+                values.push(eval(field)?);
+            }
+            Value::Variant(*variant, values)
+        }
+        Expr::Binary {
+            op, left, right, ..
+        } => binary(*op, eval(left)?, eval(right)?)?,
+        Expr::Not(operand) => Value::Bool(!eval(operand)?.as_bool()),
+        Expr::Len(operand) => match eval(operand)? {
+            Value::List(items) => Value::U64(items.len() as u64),
+            other => panic!("the checker types len's operand as a list, found {other:?}"),
+        },
+    })
+}
+
+fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, String> {
     let arithmetic = |result: Option<u64>, what: &str| {
         result
             .map(Value::U64)
-            .ok_or_else(|| Halt::Trap(format!("u64 {what} in '{}'", op.symbol())))
+            .ok_or_else(|| format!("u64 {what} in '{}'", op.symbol()))
     };
     Ok(match op {
         BinaryOp::Add => arithmetic(left.as_u64().checked_add(right.as_u64()), "overflow")?,

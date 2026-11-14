@@ -15,7 +15,7 @@ const FAILURE_EXIT: u8 = 1;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -63,6 +63,7 @@ struct Flags {
     target: Option<Target>,
     seeds: Option<std::ops::Range<u64>>,
     twice: bool,
+    strict: bool,
     mutation: Mutation,
     handler: Option<String>,
     arguments: Vec<String>,
@@ -77,6 +78,7 @@ fn flags(args: &[String]) -> Option<Flags> {
         target: None,
         seeds: None,
         twice: false,
+        strict: false,
         mutation: Mutation::None,
         handler: None,
         arguments: Vec::new(),
@@ -90,6 +92,7 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--target" => flags.target = Some(Target::parse(rest.next()?)?),
             "--seeds" => flags.seeds = Some(parse_seeds(rest.next()?)?),
             "--twice" => flags.twice = true,
+            "--strict" => flags.strict = true,
             "--mutation" => flags.mutation = Mutation::parse(rest.next()?)?,
             "--handler" => flags.handler = Some(rest.next()?.clone()),
             "--arg" => flags.arguments.push(rest.next()?.clone()),
@@ -147,7 +150,9 @@ fn check_command(args: &[String]) -> ExitCode {
     for handler in &program.handlers {
         println!("{}", worst_lines(handler));
     }
-    let proved_targets = flags.target.map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
+    let proved_targets = flags
+        .target
+        .map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
     let proved = harnesslang::prove::cli::report(
         &file,
         &program,
@@ -296,7 +301,7 @@ fn sim_command(args: &[String]) -> ExitCode {
         return ExitCode::from(USAGE_EXIT);
     }
     if let Some(directory) = flags.dump {
-        if flags.twice || flags.trace.is_some() {
+        if flags.twice || flags.strict || flags.trace.is_some() {
             return usage();
         }
         return dump_command(&program, target, flags.mutation, seeds, &directory, &file);
@@ -306,6 +311,7 @@ fn sim_command(args: &[String]) -> ExitCode {
         seeds,
         twice: flags.twice,
         mutation: flags.mutation,
+        strict: flags.strict,
     };
     let summary = match &flags.trace {
         None => sim::sweep(&program, &options),
