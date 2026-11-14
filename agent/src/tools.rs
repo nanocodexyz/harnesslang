@@ -46,6 +46,35 @@ const BINARY_EXTENSIONS: [&str; 87] = [
     ".blend", ".3ds", ".max", ".swf", ".fla", ".lockb", ".dat", ".data",
 ];
 const MEDIA_EXTENSIONS: [&str; 6] = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"];
+const IMAGE_EXTENSIONS: [&str; 5] = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
+const IMAGE_TOO_LARGE: &str =
+    "image content omitted because it exceeded the supported size limit; use a smaller image";
+const IMAGE_UNPROCESSABLE: &str = "image content omitted because it could not be processed";
+const PNG_SIGNATURE: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff];
+const GIF_SIGNATURES: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];
+const RIFF_SIGNATURE: &[u8] = b"RIFF";
+const WEBP_SIGNATURE: &[u8] = b"WEBP";
+const WEBP_SIGNATURE_AT: usize = 8;
+
+pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(PNG_SIGNATURE) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(JPEG_SIGNATURE) {
+        return Some("image/jpeg");
+    }
+    if GIF_SIGNATURES
+        .iter()
+        .any(|signature| bytes.starts_with(signature))
+    {
+        return Some("image/gif");
+    }
+    let webp = bytes.starts_with(RIFF_SIGNATURE)
+        && bytes.get(WEBP_SIGNATURE_AT..WEBP_SIGNATURE_AT + WEBP_SIGNATURE.len())
+            == Some(WEBP_SIGNATURE);
+    webp.then_some("image/webp")
+}
 
 pub fn unknown_outcome() -> &'static str {
     UNKNOWN_OUTCOME
@@ -66,10 +95,12 @@ pub fn unavailable(name: &str, offered: &[&str]) -> String {
 pub struct Workspace {
     pub root: PathBuf,
     pub state: PathBuf,
+    pub image_bytes_max: Option<u64>,
 }
 
 pub enum Ran {
     Ok(String),
+    Image(Vec<u8>),
     Failed(String),
 }
 
@@ -150,6 +181,12 @@ impl Workspace {
             Ok(real) if !real.is_file() => return Err("path is not a regular file".into()),
             Ok(_) => {}
         }
+        let image = IMAGE_EXTENSIONS
+            .iter()
+            .any(|extension| file_path.to_ascii_lowercase().ends_with(*extension));
+        if let (true, Some(bytes_max)) = (image, self.image_bytes_max) {
+            return self.read_image(&path, bytes_max);
+        }
         if let Some(extension) = MEDIA_EXTENSIONS
             .iter()
             .find(|extension| file_path.to_ascii_lowercase().ends_with(*extension))
@@ -167,6 +204,17 @@ impl Workspace {
             Ok(text) => Ran::Ok(text),
             Err(text) => Ran::Failed(text),
         })
+    }
+
+    fn read_image(&self, path: &Path, bytes_max: u64) -> Result<Ran, String> {
+        let bytes = std::fs::read(path).map_err(|error| format!("read: {error}"))?;
+        if media_type(&bytes).is_none() {
+            return Ok(Ran::Failed(IMAGE_UNPROCESSABLE.to_owned()));
+        }
+        if bytes.len() as u64 > bytes_max {
+            return Ok(Ran::Failed(IMAGE_TOO_LARGE.to_owned()));
+        }
+        Ok(Ran::Image(bytes))
     }
 
     fn write_target(&self, text: &str) -> Result<PathBuf, String> {
