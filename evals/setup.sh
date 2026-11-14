@@ -12,7 +12,7 @@ if [ ! -d "$out/src/nanoeval" ]; then git clone -q https://github.com/nanocodexy
 git -C "$out/src/nanoeval" checkout -q "$nanoeval_commit"
 rm -rf "$out/tasks/nanoeval"
 cp -R "$out/src/nanoeval/tasks" "$out/tasks/nanoeval"
-python3 "$here/fetch.py" terminal-bench-2.1 "$out/tasks/terminal-bench-2.1" $(awk '$1 == "terminal-bench-2.1" { print $2 }' "$here/suite.txt")
+python3 "$here/fetch.py" terminal-bench-2.1 "$out/tasks/terminal-bench-2.1" $(awk '$1 == "terminal-bench-2.1" { print $2 }' "$here/suite.txt" "$here/suite2.txt")
 
 if [ ! -x "$out/tools/bin/patchelf" ]; then
   curl -fsSL -o "$out/tools/patchelf.tgz" "$patchelf_url"
