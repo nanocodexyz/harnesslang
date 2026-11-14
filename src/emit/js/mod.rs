@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::ir::{
-    BinaryOp, Durability, Expr, Handler, Program, Site, SiteClass, SiteKind, Stmt, Type,
+    BinaryOp, Durability, Expr, Handler, Program, Site, SiteClass, SiteKind, Stmt, SumKind, Type,
 };
 use crate::target::{self, Target};
 
@@ -140,9 +140,13 @@ fn program_literal(program: &Program) -> String {
                 )
             })
             .collect();
+        let text = match sum.kind {
+            SumKind::Tagged => "",
+            SumKind::Text => ", text: true",
+        };
         writeln!(
             out,
-            "    {{ name: {}, variants: [{}] }},",
+            "    {{ name: {}, variants: [{}]{text} }},",
             js_string(&sum.name),
             variants.join(", ")
         )

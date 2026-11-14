@@ -1,4 +1,4 @@
-use crate::check::{Checked, Globals, WILDCARD, bound, error, resolve};
+use crate::check::{Checked, Globals, WILDCARD, bound, error, quoted, resolve};
 use crate::effect::EffectClass;
 use crate::ir::{self, BinaryOp, Durability, Expr, LocalId, Site, SiteClass, SiteKind, Stmt, Type};
 use crate::syntax::Position;
@@ -385,42 +385,39 @@ impl Checker<'_> {
                 format!("'match' needs a sum type, found {}", self.type_name(&ty)),
             );
         };
+        let text = self.program.text_enum(&ty).is_some();
         let mut checked: Vec<Option<(ir::Arm, bool)>> = vec![None; variants.len()];
         for arm in arms {
-            let Some(index) = variants
-                .iter()
-                .position(|variant| variant.name == arm.variant.text)
-            else {
-                return error(
-                    arm.variant.at,
-                    format!(
-                        "'{}' is not a variant of {}",
-                        arm.variant.text,
-                        self.type_name(&ty)
-                    ),
-                );
-            };
+            let index = self.arm_index(&ty, &variants, &arm.pattern)?;
+            let name = arm.pattern.name();
             if checked[index].is_some() {
-                return error(
-                    arm.variant.at,
-                    format!("variant '{}' is matched twice", arm.variant.text),
-                );
+                let shown = if text {
+                    format!("value {}", quoted(&name.text))
+                } else {
+                    format!("variant '{}'", name.text)
+                };
+                return error(name.at, format!("{shown} is matched twice"));
             }
             let fields = &variants[index].fields;
-            if arm.bindings.len() != fields.len() {
+            let empty = Vec::new();
+            let names = match &arm.pattern {
+                ast::Pattern::Variant { bindings, .. } => bindings,
+                ast::Pattern::Value(_) => &empty,
+            };
+            if names.len() != fields.len() {
                 return error(
-                    arm.variant.at,
+                    name.at,
                     format!(
                         "variant '{}' has {} field(s), the pattern binds {}",
-                        arm.variant.text,
+                        name.text,
                         fields.len(),
-                        arm.bindings.len()
+                        names.len()
                     ),
                 );
             }
             let arm_checked = self.scoped(|checker| {
                 let mut bindings = Vec::new();
-                for (binding, field) in arm.bindings.iter().zip(fields) {
+                for (binding, field) in names.iter().zip(fields) {
                     bindings.push(if binding.text == WILDCARD {
                         None
                     } else {
@@ -445,6 +442,17 @@ impl Checker<'_> {
             .filter(|(_, arm)| arm.is_none())
             .map(|(variant, _)| variant.name.as_str())
             .collect();
+        if text && !missing.is_empty() {
+            let listed: Vec<String> = missing.iter().map(|value| quoted(value)).collect();
+            return error(
+                at,
+                format!(
+                    "match on {} is missing {}",
+                    self.type_name(&ty),
+                    listed.join(", ")
+                ),
+            );
+        }
         if missing.contains(&ir::OUTCOME_VARIANTS[ir::UNKNOWN]) && matches!(ty, Type::Maybe(_)) {
             return error(
                 at,
@@ -478,6 +486,49 @@ impl Checker<'_> {
             arms: out_arms,
         });
         Ok(all_return)
+    }
+
+    fn arm_index(
+        &self,
+        ty: &Type,
+        variants: &[ir::Variant],
+        pattern: &ast::Pattern,
+    ) -> Checked<usize> {
+        let name = pattern.name();
+        let position = variants
+            .iter()
+            .position(|variant| variant.name == name.text);
+        match (pattern, self.program.text_enum(ty).is_some(), position) {
+            (ast::Pattern::Value(_), true, Some(index))
+            | (ast::Pattern::Variant { .. }, false, Some(index)) => Ok(index),
+            (ast::Pattern::Value(_), true, None) => error(
+                name.at,
+                format!(
+                    "{} is not a value of {}",
+                    quoted(&name.text),
+                    self.type_name(ty)
+                ),
+            ),
+            (ast::Pattern::Variant { .. }, false, None) => error(
+                name.at,
+                format!("'{}' is not a variant of {}", name.text, self.type_name(ty)),
+            ),
+            (ast::Pattern::Variant { .. }, true, _) => error(
+                name.at,
+                format!(
+                    "{} is a text enum: match its values as text, such as {}",
+                    self.type_name(ty),
+                    quoted(&variants[0].name)
+                ),
+            ),
+            (ast::Pattern::Value(_), false, _) => error(
+                name.at,
+                format!(
+                    "a text pattern matches a text enum, not {}",
+                    self.type_name(ty)
+                ),
+            ),
+        }
     }
 
     fn site(
@@ -639,6 +690,7 @@ impl Checker<'_> {
         expected: Option<&Type>,
     ) -> Checked<(Type, ir::VariantId, Vec<Type>)> {
         if let Some(expected) = expected
+            && self.program.text_enum(expected).is_none()
             && let Some(variants) = expected.variants(self.program)
             && let Some(index) = variants
                 .iter()
@@ -646,7 +698,10 @@ impl Checker<'_> {
         {
             return Ok((expected.clone(), index, variants[index].fields.clone()));
         }
-        let usable = |sum: usize| !self.program.sums[sum].variants.is_empty();
+        let usable = |sum: usize| {
+            let sum = &self.program.sums[sum];
+            sum.kind == ir::SumKind::Tagged && !sum.variants.is_empty()
+        };
         let mut candidates = Vec::new();
         for (sum_id, sum) in self
             .program
@@ -721,7 +776,7 @@ impl Checker<'_> {
     ) -> Checked<(Expr, Type)> {
         match expr {
             ast::Expr::Number(value, _) => Ok((Expr::U64(*value), Type::U64)),
-            ast::Expr::Text(text, _) => Ok((Expr::Text(text.clone()), Type::Text)),
+            ast::Expr::Text(text, at) => self.text(text, *at, expected),
             ast::Expr::Bool(value, _) => Ok((Expr::Bool(*value), Type::Bool)),
             ast::Expr::Name(name) => self.name(name, expected, out),
             ast::Expr::Member { base, field } => {
@@ -755,6 +810,27 @@ impl Checker<'_> {
                 Ok((Expr::Not(Box::new(operand)), Type::Bool))
             }
         }
+    }
+
+    fn text(&self, text: &str, at: Position, expected: Option<&Type>) -> Checked<(Expr, Type)> {
+        let Some(sum) = expected.and_then(|expected| self.program.text_enum(expected)) else {
+            return Ok((Expr::Text(text.to_owned()), Type::Text));
+        };
+        let ty = expected.expect("a text enum is expected").clone();
+        let Some(variant) = sum.variants.iter().position(|value| value.name == text) else {
+            return error(
+                at,
+                format!("{} is not a value of {}", quoted(text), sum.name),
+            );
+        };
+        Ok((
+            Expr::Construct {
+                ty: ty.clone(),
+                variant,
+                fields: Vec::new(),
+            },
+            ty,
+        ))
     }
 
     fn name(
@@ -803,6 +879,16 @@ impl Checker<'_> {
         let left_at = left.at();
         let right_at = right.at();
         let (left, left_type) = self.expr(left, operand.as_ref(), out)?;
+        if operand.is_none() && !matches!(left_type, Type::U64 | Type::Bool | Type::Text) {
+            return error(
+                at,
+                format!(
+                    "'{}' compares u64, bool or text, not {}",
+                    op.symbol(),
+                    self.type_name(&left_type)
+                ),
+            );
+        }
         let (right, right_type) =
             self.expr(right, Some(operand.as_ref().unwrap_or(&left_type)), out)?;
         let operand = match operand {
@@ -812,16 +898,6 @@ impl Checker<'_> {
                 wanted
             }
             None => {
-                if !matches!(left_type, Type::U64 | Type::Bool | Type::Text) {
-                    return error(
-                        at,
-                        format!(
-                            "'{}' compares u64, bool or text, not {}",
-                            op.symbol(),
-                            self.type_name(&left_type)
-                        ),
-                    );
-                }
                 self.expect(right_at, &left_type, &right_type)?;
                 left_type
             }

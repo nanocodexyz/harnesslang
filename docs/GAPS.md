@@ -110,7 +110,10 @@ effect rule stays a compile-time fact.
 nanocode's hooks (`hooks.rs`: `UserPromptSubmit`, `Stop`, `PreCompact`,
 `SubagentStop` and others) can block a stop and force one more round
 (`stop_hook_active`), and a tool call can wait for a person's approval. A
-hook ports as a declared tool called at the same point; an approval that
+hook ports as a declared tool called at the same point: `examples/hooks.hl`
+ports the `Stop` hook's decision (`ClaudeLifecycleDecision`: continue, block,
+stop) as a tool returning a text enum, without the reasons `Block` and
+`Stop` carry. An approval that
 takes hours does not, because a handler cannot end a turn and resume where
 it was. Smallest addition: a `suspend` effect that finishes the turn with a
 durable waiting status and resumes it from its journal when a matching
@@ -135,12 +138,3 @@ nanocode retries throttled model calls (`THROTTLED_ATTEMPTS` 10,
 `known<reply>`, so a provider error cannot be handled in the program.
 Smallest addition: the model returns `known<reply>` (it is idempotent),
 leaving retries to the program under a named bound.
-
-## 10. The simulator draws text at random
-
-Handler arguments and tool results are random words, so `subagents.hl`'s
-`completion` handler always takes its "interrupted" branch: a compare
-against `"completed"` is never true in `hl sim`. The durability invariants
-do not depend on it; branch coverage does. Smallest addition: text enums
-(`type status = "completed" | "failed" | "interrupted"`) as parameter
-types, which the checker makes exhaustive and the simulator draws from.

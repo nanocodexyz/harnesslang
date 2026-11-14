@@ -1,0 +1,10 @@
+harness notes
+
+type status = "completed" | "failed"
+
+on show(status: status) -> text {
+  match status {
+    completed => { return "done" }
+    failed => { return "failed" }
+  }
+}

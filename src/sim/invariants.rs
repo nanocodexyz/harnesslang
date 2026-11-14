@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::Program;
 use crate::run::journal::{Output, Record, call_id};
+use crate::run::json::Json;
 use crate::run::session;
 use crate::run::turn;
 use crate::run::value;
@@ -17,10 +18,11 @@ pub enum Invariant {
     Liveness,
     ReplayEqual,
     Panic,
+    EnumValid,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -29,6 +31,7 @@ impl Invariant {
         Self::Liveness,
         Self::ReplayEqual,
         Self::Panic,
+        Self::EnumValid,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -41,6 +44,7 @@ impl Invariant {
             Self::Liveness => "liveness",
             Self::ReplayEqual => "replay_equal",
             Self::Panic => "panic",
+            Self::EnumValid => "enum_valid",
         }
     }
 }
@@ -153,6 +157,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
         }
     }
     let calls = seq_unique(records)?;
+    enum_valid(world, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()
@@ -219,6 +224,50 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
         }
     }
     Ok(calls)
+}
+
+fn enum_valid(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    let mut calls: BTreeMap<String, (&str, &Json)> = BTreeMap::new();
+    for record in records {
+        match record {
+            Record::Call {
+                turn,
+                seq,
+                tool,
+                input,
+                ..
+            } => {
+                calls.insert(call_id(*turn, *seq), (tool, input));
+            }
+            Record::Result { turn, seq, output } => {
+                let id = call_id(*turn, *seq);
+                let (Some(dispatched), Some(&(tool, input))) =
+                    (world.dispatched.get(&id), calls.get(&id))
+                else {
+                    continue;
+                };
+                let returned: Vec<_> = dispatched
+                    .values
+                    .iter()
+                    .filter(|returned| returned.tool == tool && &returned.input == input)
+                    .collect();
+                if returned.is_empty()
+                    || returned.iter().any(|returned| &returned.expected == output)
+                {
+                    continue;
+                }
+                let outputs: Vec<_> = returned.iter().map(|returned| &returned.output).collect();
+                return violation(
+                    Invariant::EnumValid,
+                    format!(
+                        "call {id} ({tool}) records {output:?}, but the tool returned {outputs:?}: a result outside its text enum must be recorded as failed"
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn finish_once(world: &SimWorld<'_>, calls: &Calls, turns: u64) -> Result<(), Violation> {

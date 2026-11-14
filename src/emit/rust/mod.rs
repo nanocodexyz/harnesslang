@@ -9,12 +9,12 @@ use crate::ir::{self, Program};
 use crate::target::Target;
 
 use handlers::Body;
-use types::{Types, camel, constant, ident, sum_name};
+use types::{Types, camel, constant, ident, sum_name, variant_ident};
 
 const RUNTIME_JOURNAL: &str = include_str!("runtime/journal.rs");
 const RUNTIME_ENGINE: &str = include_str!("runtime/engine.rs");
 const RUNTIME_JSONL: &str = include_str!("runtime/jsonl.rs");
-const LINTS: &str = "#![allow(dead_code, unused_variables, unused_parens, unreachable_code, unused_comparisons, clippy::all)]\n";
+const LINTS: &str = "#![allow(dead_code, unused_variables, unused_parens, unreachable_code, unused_comparisons, non_camel_case_types, clippy::all)]\n";
 
 pub const TARGETS: [Target; 3] = [
     Target::NativeJsonl,
@@ -50,11 +50,11 @@ fn check_names(program: &Program) -> Result<(), String> {
     for sum in &program.sums {
         let mut variants = std::collections::BTreeSet::new();
         for variant in &sum.variants {
-            if !variants.insert(camel(&variant.name)) {
+            if !variants.insert(variant_ident(&variant.name)) {
                 return Err(format!(
                     "type '{}': variants map to the same Rust name {}",
                     sum.name,
-                    camel(&variant.name)
+                    variant_ident(&variant.name)
                 ));
             }
         }
@@ -133,24 +133,32 @@ fn sum_definition(out: &mut String, types: &Types<'_>, id: ir::SumId, sum: &ir::
         .iter()
         .map(|variant| {
             if variant.fields.is_empty() {
-                camel(&variant.name)
+                variant_ident(&variant.name)
             } else {
                 let fields: Vec<String> = variant
                     .fields
                     .iter()
                     .map(|field| types.rust(field))
                     .collect();
-                format!("{}({})", camel(&variant.name), fields.join(", "))
+                format!("{}({})", variant_ident(&variant.name), fields.join(", "))
             }
         })
         .collect();
+    let (derives, first) = match sum.kind {
+        ir::SumKind::Tagged => ("Clone, Debug, PartialEq, Eq", ""),
+        ir::SumKind::Text => ("Clone, Debug, Default, PartialEq, Eq", "#[default]\n    "),
+    };
     let body: String = program_variants
         .iter()
-        .map(|variant| format!("    {variant},\n"))
+        .enumerate()
+        .map(|(index, variant)| {
+            let marker = if index == 0 { first } else { "" };
+            format!("    {marker}{variant},\n")
+        })
         .collect();
     writeln!(
         out,
-        "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum {} {{\n{body}}}\n",
+        "#[derive({derives})]\npub enum {} {{\n{body}}}\n",
         sum_name(types.program(), id)
     )
     .expect("writing to a string succeeds");

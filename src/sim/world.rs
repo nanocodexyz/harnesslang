@@ -19,6 +19,7 @@ pub const ANSWER_PPM: u64 = 350_000;
 pub const UNDECLARED_TOOL_PPM: u64 = 250_000;
 pub const OVER_CAPACITY_PPM: u64 = 5_000;
 pub const TOOL_FAILURE_PPM: u64 = 150_000;
+pub const TEXT_ENUM_INVALID_PPM: u64 = 100_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const WORDS: [&str; 8] = [
@@ -31,6 +32,15 @@ pub struct Dispatched {
     pub external: u64,
     pub other: u64,
     pub outputs: Vec<Output>,
+    pub values: Vec<Returned>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Returned {
+    pub tool: String,
+    pub input: Json,
+    pub output: Output,
+    pub expected: Output,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -247,11 +257,20 @@ impl<'a> SimWorld<'a> {
         )
     }
 
-    fn tool_value(rng: &mut Rng, returns: &Type) -> Json {
+    fn tool_value(program: &Program, rng: &mut Rng, returns: &Type) -> Json {
         match returns {
             Type::U64 => Json::Number(rng.draw() >> 32),
             Type::Bool => Json::Bool(rng.draw() & 1 == 1),
             Type::Text => Json::String(Self::generated_text(rng)),
+            Type::Sum(_) => {
+                let sum = program
+                    .text_enum(returns)
+                    .expect("the checker admits only text enums among sum tool results");
+                if rng.chance(TEXT_ENUM_INVALID_PPM) {
+                    return Json::String(Self::generated_text(rng));
+                }
+                Json::String(sum.variants[rng.pick(sum.variants.len())].name.clone())
+            }
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
         }
     }
@@ -448,14 +467,25 @@ impl SimWorld<'_> {
                 Self::generated_text(&mut rng)
             ))
         } else {
-            Output::Ok(Self::tool_value(&mut rng, request.returns))
+            Output::Ok(Self::tool_value(self.program, &mut rng, request.returns))
         };
+        let expected =
+            value::checked_output(self.program, request.tool, request.returns, output.clone());
+        let checked = self.program.text_enum(request.returns).is_some();
         let entry = self
             .dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
             .expect("inserted above");
         if request.effect == EffectClass::External {
-            entry.outputs.push(output.clone());
+            entry.outputs.push(expected.clone());
+        }
+        if checked {
+            entry.values.push(Returned {
+                tool: request.tool.to_owned(),
+                input: request.input.clone(),
+                output: output.clone(),
+                expected,
+            });
         }
         output
     }

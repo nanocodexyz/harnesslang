@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{self, Program, Type, VariantId};
+use crate::run::journal::Output;
 use crate::run::json::Json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,13 +14,17 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn zero(ty: &Type) -> Option<Self> {
+    pub fn zero(program: &Program, ty: &Type) -> Option<Self> {
         match ty {
             Type::U64 => Some(Self::U64(0)),
             Type::Bool => Some(Self::Bool(false)),
             Type::Text => Some(Self::Text(String::new())),
             Type::List { .. } => Some(Self::List(Vec::new())),
-            Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => None,
+            Type::Sum(_) => program.text_enum(ty).map(|sum| {
+                assert!(!sum.variants.is_empty(), "a text enum has a value");
+                Self::Variant(0, Vec::new())
+            }),
+            Type::Known(_) | Type::Maybe(_) => None,
         }
     }
 
@@ -188,6 +193,44 @@ fn variant_from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value,
     Ok(Value::Variant(index, values))
 }
 
+pub fn returned(program: &Program, returns: &Type) -> String {
+    match program.text_enum(returns) {
+        Some(sum) => format!("a value of {}", sum.name),
+        None => match returns {
+            Type::U64 => "a u64".to_owned(),
+            Type::Bool => "a bool".to_owned(),
+            Type::Text => "text".to_owned(),
+            other => {
+                panic!("the checker admits only scalar or text enum tool results, found {other:?}")
+            }
+        },
+    }
+}
+
+pub fn checked_output(program: &Program, tool: &str, returns: &Type, output: Output) -> Output {
+    let Output::Ok(json) = &output else {
+        return output;
+    };
+    if from_json(program, returns, json).is_ok() {
+        return output;
+    }
+    Output::Failed(format!(
+        "{tool} returned {}, which is not {}",
+        json.encode(),
+        returned(program, returns)
+    ))
+}
+
+pub fn fallback_output(program: &Program, returns: &Type, output: Output) -> Output {
+    match (&output, program.text_enum(returns)) {
+        (Output::Ok(json), Some(sum)) if from_json(program, returns, json).is_err() => {
+            let last = sum.variants.last().expect("a text enum has a value");
+            Output::Ok(Json::String(last.name.clone()))
+        }
+        _ => output,
+    }
+}
+
 pub fn state_json(program: &Program, state: &[Value]) -> Json {
     assert_eq!(
         state.len(),
@@ -239,7 +282,8 @@ pub fn initial_state(program: &Program) -> Vec<Value> {
         .state
         .iter()
         .map(|field| {
-            Value::zero(&field.ty).expect("the checker admits only state fields with a zero value")
+            Value::zero(program, &field.ty)
+                .expect("the checker admits only state fields with a zero value")
         })
         .collect()
 }

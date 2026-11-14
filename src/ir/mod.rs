@@ -101,7 +101,14 @@ fn outcome_variants(inner: &Type, unknown: bool) -> Vec<Variant> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sum {
     pub name: String,
+    pub kind: SumKind,
     pub variants: Vec<Variant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SumKind {
+    Tagged,
+    Text,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +145,23 @@ impl Program {
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
         self.handlers.iter().find(|handler| handler.name == name)
+    }
+
+    pub fn text_enum(&self, ty: &Type) -> Option<&Sum> {
+        match ty {
+            Type::Sum(sum) if self.sums[*sum].kind == SumKind::Text => {
+                let found = &self.sums[*sum];
+                assert!(
+                    found
+                        .variants
+                        .iter()
+                        .all(|variant| variant.fields.is_empty()),
+                    "a text enum's values carry no fields"
+                );
+                Some(found)
+            }
+            _ => None,
+        }
     }
 
     pub fn dispatch_class(&self, tool: &str) -> EffectClass {

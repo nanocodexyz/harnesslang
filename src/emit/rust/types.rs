@@ -46,6 +46,23 @@ pub fn camel(name: &str) -> String {
     out
 }
 
+pub fn variant_ident(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        return camel(name);
+    }
+    let mut out = String::from("X_");
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.push(character);
+        } else {
+            write!(out, "_{:x}_", u32::from(character)).expect("writing to a string succeeds");
+        }
+    }
+    out
+}
+
 pub fn constant(name: &str) -> String {
     ident(name).to_uppercase()
 }
@@ -110,11 +127,23 @@ impl<'p> Types<'p> {
         matches!(ty, Type::U64 | Type::Bool)
     }
 
-    pub fn returns(ty: &Type) -> &'static str {
+    pub fn returns(&self, ty: &Type) -> String {
+        if let Some(sum) = self.program.text_enum(ty) {
+            let values: Vec<String> = sum
+                .variants
+                .iter()
+                .map(|value| format!("{:?}", value.name))
+                .collect();
+            return format!(
+                "Returns::Values {{ name: {:?}, values: &[{}] }}",
+                sum.name,
+                values.join(", ")
+            );
+        }
         match ty {
-            Type::U64 => "Returns::U64",
-            Type::Bool => "Returns::Bool",
-            Type::Text => "Returns::Text",
+            Type::U64 => "Returns::U64".to_owned(),
+            Type::Bool => "Returns::Bool".to_owned(),
+            Type::Text => "Returns::Text".to_owned(),
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
         }
     }
@@ -141,7 +170,12 @@ impl<'p> Types<'p> {
         };
         variants
             .into_iter()
-            .map(|variant| (format!("{prefix}::{}", camel(&variant.name)), variant))
+            .map(|variant| {
+                (
+                    format!("{prefix}::{}", variant_ident(&variant.name)),
+                    variant,
+                )
+            })
             .collect()
     }
 

@@ -106,11 +106,17 @@ on prompt(input: text) -> outcome
   the trap is a typed failure of the handler, never a wrapped value.
 - Sum types: `type name = variant(type, ...) | ...`. Variants carry only what
   that case has.
+- Text enums: `type name = "value" | ...`, a sum of fieldless values lowered as
+  `ir::Sum` with `SumKind::Text`, written in the journal as the text. Matched
+  by value, exhaustively; a text literal is a value where the enum is
+  expected.
 - `list<T, N>`: a list with capacity `N`, a named constant. `push` onto a full
   list fails the handler with `bound(name)`, naming the list.
-- State fields start at zero (`0`, `false`, empty text, an empty list), so
-  they are `u64`, `bool`, `text` or lists. A tool returns `u64`, `bool` or
-  `text`. In a pattern, `_` ignores a field.
+- State fields start at zero (`0`, `false`, empty text, a text enum's first
+  value, an empty list), so they are `u64`, `bool`, `text`, text enums or
+  lists. A tool returns `u64`, `bool`, `text` or a text enum; every backend
+  records a result that does not fit as the call's failure before it is
+  journaled. In a pattern, `_` ignores a field.
 - Builtins every program has:
   - `call = call(id: text, tool: text, input: text)`, with fields `id`, `tool`, `input`
   - `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's
@@ -450,6 +456,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md), not built yet |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
