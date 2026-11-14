@@ -212,15 +212,15 @@ impl SimWorld<'_> {
             ));
         }
         if let Some(WaitLimit { limit, scope }) = self.target.limits.wait_ms {
-            let measured = match scope {
-                WaitScope::Run => waited,
-                WaitScope::Step => slept,
+            let (measured, what) = match scope {
+                WaitScope::Run => (waited, format!("one run of turn {turn} waited")),
+                WaitScope::Step => (slept, format!("wait {id} waited")),
             };
             if measured > limit.value {
                 self.parking.faults.push(fault(
                     Invariant::WallLimit,
                     format!(
-                        "wait {id} brought {measured} ms, over {}'s limit of {} {}",
+                        "{what} {measured} ms by the end of wait {id}, over {}'s limit of {} {}",
                         self.target.target.name(),
                         limit.value,
                         limit.unit

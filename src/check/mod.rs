@@ -11,7 +11,7 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 4] = ["dispatch", "now", "random", "len"];
+pub const BUILTIN_FUNCTIONS: [&str; 6] = ["dispatch", "now", "random", "len", "wait", "suspend"];
 pub const WILDCARD: &str = "_";
 pub const EVENT_CANCEL: &str = "cancel";
 pub const EVENT_STEER: &str = "steer";

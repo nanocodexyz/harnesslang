@@ -1,0 +1,20 @@
+harness over_wait
+
+const polls_max: u64 = 4
+const poll_ms: u64 = 600000
+
+type outcome = done(u64)
+
+tool status(job: text) -> text effect none
+
+on watch(job: text) -> outcome {
+  let started = now()
+  loop poll below polls_max {
+    let woke = wait(poll_ms)
+    match status(job) {
+      ok(_) => {}
+      failed(_) => {}
+    }
+  }
+  return done(started)
+}

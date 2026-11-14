@@ -1239,7 +1239,7 @@ impl Checker<'_> {
     }
 }
 
-const EFFECT_BUILTINS: [&str; 3] = ["dispatch", "now", "random"];
+const EFFECT_BUILTINS: [&str; 5] = ["dispatch", "now", "random", "wait", "suspend"];
 
 fn parallel_body<'b>(
     at: Position,

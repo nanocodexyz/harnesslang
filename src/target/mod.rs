@@ -410,19 +410,23 @@ pub fn check_waits(program: &Program, model: &Model) -> Vec<String> {
     for handler in &program.handlers {
         let waited = &handler.worst.wait_ms;
         let over = match scope {
-            WaitScope::Run if waited.total > limit.value => Some(format!(
-                "worst case {} milliseconds of waits; loops: {}",
-                waited.total,
-                waited.describe_loops()
+            WaitScope::Run if waited.total > limit.value => Some((
+                format!("worst case {} milliseconds of waits", waited.total),
+                format!("; loops: {}", waited.describe_loops()),
             )),
             WaitScope::Run => None,
             WaitScope::Step => longest_wait(program, handler)
                 .filter(|(_, value)| *value > limit.value)
-                .map(|(name, value)| format!("wait({name}) waits {value} milliseconds")),
+                .map(|(name, value)| {
+                    (
+                        format!("wait({name}) of {value} milliseconds"),
+                        String::new(),
+                    )
+                }),
         };
-        if let Some(over) = over {
+        if let Some((what, loops)) = over {
             errors.push(format!(
-                "handler '{}': {over}, which exceeds {}'s limit of {} {}",
+                "handler '{}': {what} exceeds {}'s limit of {} {}{loops}",
                 handler.name,
                 model.target.name(),
                 limit.value,
