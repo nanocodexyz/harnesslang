@@ -40,6 +40,9 @@ pub fn jsonl_open(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
 }
 
 pub fn jsonl_open_tail(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
+    if program::HOLDS_BLOBS {
+        return jsonl_open(disk);
+    }
     disk.sync().map_err(OpenError::Io)?;
     let length = disk.length().map_err(OpenError::Io)?;
     let mut offset = length - length.min(PAGE_BYTES);
@@ -455,6 +458,11 @@ impl<'d> JsonlJournal<'d> {
     }
 
     fn advance(&mut self, turn: u64, mut flushed: Vec<Record>) {
+        if program::HOLDS_BLOBS {
+            assert_eq!(self.start, Start::Beginning, "a journal of blobs is read whole, so every turn finds the blobs before it");
+            self.records.extend(flushed);
+            return;
+        }
         let checkpoint = flushed.pop().expect("a finished turn flushed its records");
         let Record::Checkpoint { revision, .. } = &checkpoint else {
             panic!(

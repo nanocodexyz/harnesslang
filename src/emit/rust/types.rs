@@ -99,7 +99,7 @@ impl<'p> Types<'p> {
             Type::List { element, .. } => format!("Vec<{}>", self.rust(element)),
             Type::Known(inner) => format!("Known<{}>", self.rust(inner)),
             Type::Maybe(inner) => format!("Maybe<{}>", self.rust(inner)),
-            Type::Blob(_) => unimplemented!("blobs in the generated Rust"),
+            Type::Blob(_) => "Blob".to_owned(),
         }
     }
 
@@ -120,6 +120,7 @@ impl<'p> Types<'p> {
             Type::U64 => "parse_u64".to_owned(),
             Type::Bool => "parse_bool".to_owned(),
             Type::Text => "parse_text".to_owned(),
+            Type::Blob(_) => "parse_blob".to_owned(),
             _ => format!("parse_{}", self.index(ty)),
         }
     }
@@ -145,6 +146,11 @@ impl<'p> Types<'p> {
             Type::U64 => "Returns::U64".to_owned(),
             Type::Bool => "Returns::Bool".to_owned(),
             Type::Text => "Returns::Text".to_owned(),
+            Type::Blob(bytes) => format!(
+                "Returns::Blob {{ name: {:?}, bytes: {} }}",
+                bytes.name,
+                constant(&bytes.name)
+            ),
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
         }
     }
@@ -155,7 +161,7 @@ impl<'p> Types<'p> {
             self.emitted += 1;
             let ty = self.table[index].clone();
             self.emit_to_json(out, index, &ty);
-            if !matches!(ty, Type::U64 | Type::Bool | Type::Text) {
+            if !matches!(ty, Type::U64 | Type::Bool | Type::Text | Type::Blob(_)) {
                 self.emit_from_json(out, index, &ty);
             }
         }
@@ -186,6 +192,7 @@ impl<'p> Types<'p> {
             Type::U64 => "Json::Number(*value)".to_owned(),
             Type::Bool => "Json::Bool(*value)".to_owned(),
             Type::Text => "Json::String(value.clone())".to_owned(),
+            Type::Blob(_) => "blob_json(value)".to_owned(),
             Type::List { element, .. } => {
                 format!(
                     "Json::Array(value.iter().map({}).collect())",
