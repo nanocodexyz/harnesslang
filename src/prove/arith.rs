@@ -282,6 +282,7 @@ impl<'a> Prover<'a> {
             self.bind(&mut state, *param, None);
         }
         for invariant in &program.invariants {
+            self.assume_in_range(&mut state, &invariant.condition);
             state = self.assume(state, &invariant.condition, true);
         }
         state

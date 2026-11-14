@@ -293,12 +293,77 @@ impl Prover<'_> {
         Err(first_failure.and_then(|goal| self.counterexample(state, &goal)))
     }
 
+    fn range_goals(&self, state: &State, expr: &Expr, out: &mut Vec<(Option<Linear>, String)>) {
+        let (op, left, right) = match expr {
+            Expr::Binary {
+                op, left, right, ..
+            } => (*op, left, right),
+            Expr::Not(operand) => return self.range_goals(state, operand, out),
+            _ => return,
+        };
+        self.range_goals(state, left, out);
+        self.range_goals(state, right, out);
+        let text = self.names.expr(expr);
+        let operands = self
+            .linear_of(state, left)
+            .zip(self.linear_of(state, right));
+        let goal = match op {
+            BinaryOp::Add => operands.and_then(|(left, right)| left.add(&right)?.plus(-U64_MAX)),
+            BinaryOp::Subtract => operands.and_then(|(left, right)| right.subtract(&left)),
+            BinaryOp::Multiply => operands.and_then(|(left, right)| {
+                let scaled = match (left.as_constant(), right.as_constant()) {
+                    (Some(factor), _) => right.scale(factor),
+                    (_, Some(factor)) => left.scale(factor),
+                    _ => None,
+                };
+                scaled?.plus(-U64_MAX)
+            }),
+            _ => return,
+        };
+        let what = match op {
+            BinaryOp::Subtract => "underflow",
+            _ => "overflow",
+        };
+        out.push((goal, format!("u64 {what} in '{text}'")));
+    }
+
+    pub(super) fn assume_in_range(&self, state: &mut State, condition: &Expr) {
+        let mut goals = Vec::new();
+        self.range_goals(state, condition, &mut goals);
+        state
+            .facts
+            .extend(goals.into_iter().filter_map(|(goal, _)| goal));
+    }
+
+    fn in_range(&mut self, state: &State, condition: &Expr) -> Result<(), String> {
+        let mut goals = Vec::new();
+        self.range_goals(state, condition, &mut goals);
+        for (goal, what) in goals {
+            if !goal.is_some_and(|goal| self.proves(&state.facts, &goal)) {
+                return Err(what);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn invariants_hold(&mut self, state: &State, when: &str, property: &'static str) {
         if self.quiet > 0 {
             return;
         }
         let program = self.program;
         for invariant in &program.invariants {
+            if let Err(what) = self.in_range(state, &invariant.condition) {
+                let text = self.names.expr(&invariant.condition);
+                self.report(
+                    property,
+                    format!(
+                        "invariant '{}' ({text}) may trap with {what} {when}",
+                        invariant.name
+                    ),
+                    None,
+                );
+                continue;
+            }
             match self.holds(state, &invariant.condition) {
                 Ok(()) => *self.proved.entry(property).or_insert(0) += 1,
                 Err(counterexample) => {

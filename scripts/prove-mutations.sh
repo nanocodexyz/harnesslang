@@ -129,5 +129,6 @@ expect_error examples/invalid/invariant_unsupported.hl "handler 'arm': invariant
 expect_error examples/invalid/coefficient_overflow.hl "handler 'double': no_overflow: u64 overflow in '((((x - y) * half) * half) + z) + ((((x - y) * half) * half) + z)' is possible; path: entry"
 expect_error examples/invalid/and_overflow.hl "handler 'take': no_overflow: u64 overflow in 'total + value' is possible; path: match measure(what): ok; counterexample: total = 5000000, value = 18446744073704551616"
 expect_error examples/invalid/loop_sum_lower.hl "handler 'add': no_overflow: u64 underflow in 'total - step_sum' is possible; path: entry; counterexample: total = 28"
+expect_error examples/invalid/invariant_underflow.hl "handler 'earn': invariant_preserved: invariant 'close' ((spent - earned) <= gap_max) may trap with u64 underflow in 'spent - earned' when the handler returns; path: entry"
 echo "prove: every prover invalid example fails with its expected error"
 echo "prove-mutations: every mutation is caught"
