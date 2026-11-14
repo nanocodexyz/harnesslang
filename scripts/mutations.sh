@@ -74,7 +74,7 @@ rust timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-post
 rust nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js flush_after_dispatch examples/agent.hl vercel backend_equal
 js bound_message examples/agent.hl cloudflare,vercel backend_equal
-js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic
+js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic|liveness
 rust default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
 rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
