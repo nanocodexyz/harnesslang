@@ -401,6 +401,7 @@ examples/agent.hl: proved for cloudflare
 target cloudflare: runs in a Durable Object; journal: the object's SQLite; flush: OutputGate; atomic unit: Event; who else may run: AlarmAfterReset
   limit memory: 134217728 bytes per isolate (developers.cloudflare.com/durable-objects/platform/limits)
   limit outbound requests: 10000 outbound requests per invocation (developers.cloudflare.com/workers/platform/limits (Workers Paid default))
+  limit concurrent requests: 6 requests waiting for response headers per invocation (developers.cloudflare.com/workers/platform/limits (simultaneous open connections; relaxed to the wait for headers on 2026-04-09); a seventh fetch is queued by the runtime)
   fact: an outbound fetch or a response leaves only after the event's earlier writes commit (blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it)
   fact: writes with no await between them commit together, and none commits while the event runs synchronously (developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields)
   fact: a flush is committed once storage.sync() resolves; an awaited microtask commits nothing (developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit)
@@ -492,7 +493,7 @@ Keywords: `harness` `const` `type` `tool` `model` `state` `on` `let` `push` `if`
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `fn` `in` `known` `maybe` `reply`
+Contextual words: `below` `calls` `fn` `in` `known` `maybe` `parallel` `reply`
 
 Builtin functions, whose names declarations may not take:
 
@@ -561,7 +562,7 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
-           | "for" name "in" expr block
+           | "for" name "in" expr [ "parallel" ] block
            | "return" expr
            | name "=" expr
            | name "(" [ expr { "," expr } ] ")" ;
@@ -1494,13 +1495,13 @@ in a row.
 
 The planted bug `model_failure_unrecorded` writes no record for a failed
 call, as a harness that treats provider errors as transient might. A rerun
-asks the model again, and replaying the journal from nothing finds the call
-missing:
+asks the model again, and replaying the journal from nothing finds a model
+reply where the program runs a tool:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
-FAIL invariant=replay_equal seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: replaying the journal failed: Corrupt("replay of turn 3 needs seq 23, which the journal does not record")
-replay: hl sim --target native-jsonl --seeds 1..2 --mutation model_failure_unrecorded examples/claude_agent.hl
+FAIL invariant=liveness seed=2 target=native-jsonl profile=lying mutation=model_failure_unrecorded: turn 1: replay of turn 1 diverged at seq 2: the journal records a model reply, the program runs 'Bash' (1/2)
+replay: hl sim --target native-jsonl --seeds 2..3 --mutation model_failure_unrecorded examples/claude_agent.hl
 ```
 
 The checker's reply errors:
@@ -1569,6 +1570,7 @@ on show(said: reply) -> u64 { return 1 }
 | `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas; a text enum's arms are its values, `"value" => { }` |
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
 | `for x in list { }` | runs the body once per element of the list as it was when the loop started |
+| `for call in list parallel { }` | dispatches every call of the list at once, then runs the arms in list order; see [Parallel tool calls](#parallel-tool-calls) |
 | `return e` | finish the turn with `e`, of the handler's result type |
 | `f(a, ...)` | run [fn](#fn) `f`'s body here |
 
@@ -1710,6 +1712,193 @@ points above, never less.
 | Before acknowledging | `status` and checkpoint written and synced | committed | committed, fenced | committed before the response leaves | committed at the step's end |
 | What a crash can do to the journal | lose the unsynced tail or tear the last line: each line's CRC-32 drops a torn tail, and the file is synced on open before it is trusted | nothing partial | nothing partial; a second owner may start after a lease expires | nothing partial; a reset object resumes from its alarm | a step retried after it ran |
 
+### Parallel tool calls
+
+`for call in requested parallel { ... }` runs a reply's tool calls at once, as
+nanocode runs the calls of a reply that its tools allow in parallel. Its body
+is one `match dispatch(call)` on the item it walks, whose arms only push
+values that run no effect. A turn runs it in three steps:
+
+1. In list order, each call takes the next sequence number and appends its
+   `call` record (a call the journal already holds is replayed). Nothing is
+   dispatched yet.
+2. The calls are dispatched in groups, in list order. Consecutive none and
+   idempotent calls form one group, dispatched at once; an external call is
+   a group of its own, as nanocode runs writers exclusively. Before the first
+   external call runs, one flush makes every `call` record of the batch
+   durable (durability point 1, once for the whole batch). Each group's
+   results are appended in list order, whatever order they completed in.
+3. The arms run in list order with each call's result.
+
+So the journal holds, per sequence number, exactly what the plain `for`
+writes: the same `call` and `result` records, the calls of a batch
+ahead of its results. A crash in the middle of a batch leaves each call as a
+crash leaves a plain one: a none or idempotent call runs again, and an
+external call whose record is durable is reported `unknown`, even one the
+batch had not dispatched yet. A push that finds its list full traps after
+every call of the batch ran, where the plain `for` would trap after the
+calls before it.
+
+Each target dispatches a group with its platform's own concurrency, at most
+as many calls at once as its model allows: native Rust starts one thread per
+call with `std::thread::scope` when the host offers `ConcurrentTools` (and
+calls them one by one otherwise), bounded by the list's capacity; Cloudflare
+runs at most `CLOUDFLARE_CONNECTIONS_WAITING_MAX` fetches at once inside the
+object's event, so none waits in the runtime's own queue; Vercel runs a group
+inside one step, which documents no concurrency limit. The simulator
+completes a group's calls in a random order and crashes between them.
+
+```hl docs/snippets/parallel.hl
+harness readers
+
+const calls_max: u64 = 8
+const context_max: u64 = 64
+
+tool Read(path: text) -> text effect none
+tool Grep(pattern: text) -> text effect none
+tool Edit(path: text, change: text) -> text effect external
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> text
+  requires len(context) + 2 + calls_max <= context_max
+{
+  push context user(question)
+  let reply = think(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => {
+      for call in requested parallel {
+        match dispatch(call) {
+          ok(output) => { push context result(call, output) }
+          failed(error) => { push context error(call, error) }
+          unknown => { push context unknown(call) }
+        }
+      }
+      return "ran the calls"
+    }
+  }
+}
+```
+
+Its worst case is the plain loop's, since the records are the same:
+
+```console
+$ hl check docs/snippets/parallel.hl | grep -E 'handler ask: worst|proved for'
+  handler ask: worst case 9 effects, 20 journal records, 9 outbound requests
+docs/snippets/parallel.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+$ hl sim --target cloudflare --seeds 0..200 docs/snippets/parallel.hl
+ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1462 crashes=958 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=1799 unknown=362
+```
+
+Anything else in the body is an error: a statement before the match, a match
+on something other than the item's dispatch, an arm that does more than push,
+and a parallel for inside another.
+
+```console
+$ hl check docs/snippets/errors/parallel-statement.hl
+docs/snippets/errors/parallel-statement.hl:11:9: error: the body of a parallel for is only a match on dispatch(call): found a let
+$ hl check docs/snippets/errors/parallel-dispatch.hl
+docs/snippets/errors/parallel-dispatch.hl:13:11: error: a parallel for matches on dispatch(call), the item it walks
+$ hl check docs/snippets/errors/parallel-arm.hl
+docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for only push: found a return
+$ hl check docs/snippets/errors/parallel-nested.hl
+docs/snippets/errors/parallel-nested.hl:11:5: error: a parallel for cannot be nested in another parallel for
+```
+
+```hl docs/snippets/errors/parallel-statement.hl
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    let name = call.tool
+    match dispatch(call) {
+      ok(output) => { push notes output }
+      failed(error) => { push notes error }
+      unknown => { push notes "lost" }
+    }
+  }
+  return 0
+}
+```
+
+```hl docs/snippets/errors/parallel-dispatch.hl
+harness readers
+
+const calls_max: u64 = 8
+
+tool Read(path: text) -> text effect none
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    match Read(call.input) {
+      ok(body) => { push notes body }
+      failed(error) => { push notes error }
+    }
+  }
+  return 0
+}
+```
+
+```hl docs/snippets/errors/parallel-arm.hl
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    match dispatch(call) {
+      ok(output) => { return 1 }
+      failed(error) => { push notes error }
+      unknown => { push notes "lost" }
+    }
+  }
+  return 0
+}
+```
+
+```hl docs/snippets/errors/parallel-nested.hl
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    for again in requested parallel {
+      match dispatch(again) {
+        ok(output) => { push notes output }
+        failed(error) => { push notes error }
+        unknown => { push notes "lost" }
+      }
+    }
+  }
+  return 0
+}
+```
+
 ### Traps
 
 A turn ends `failed` without running further when `requires` is false
@@ -1776,6 +1965,7 @@ The compiler's own bounds:
 | constraints per prover step | `PROOF_CONSTRAINTS_MAX` = 4,096 | policy; same |
 | nesting of a journal's JSON | `JSON_DEPTH_MAX` = 128 | policy |
 | Cloudflare outbound requests per invocation | `CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX` = 10,000 | Workers Paid default, developers.cloudflare.com/workers/platform/limits |
+| Cloudflare requests of a parallel for in flight | `CLOUDFLARE_CONNECTIONS_WAITING_MAX` = 6 | simultaneous open connections waiting for response headers, developers.cloudflare.com/workers/platform/limits |
 | Cloudflare isolate memory | `CLOUDFLARE_ISOLATE_MEMORY_BYTES_MAX` = 134,217,728 | developers.cloudflare.com/durable-objects/platform/limits; reported, not checked |
 | Vercel Function duration, seconds | `VERCEL_FUNCTION_DURATION_SECONDS_MAX` = 800 | Pro and Enterprise, vercel.com/docs/functions/limitations; reported, not checked |
 | Vercel step attempts | `VERCEL_STEP_ATTEMPTS_MAX` = 4 | `maxRetries` 3 by default, workflow-sdk.dev |

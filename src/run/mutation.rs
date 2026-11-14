@@ -17,10 +17,13 @@ pub enum Mutation {
     RecoverySkipped,
     EnumUnchecked,
     ModelFailureUnrecorded,
+    BatchFlushAfterDispatch,
+    ResultsInCompletionOrder,
+    BatchPushesReversed,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 18] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -36,6 +39,9 @@ impl Mutation {
         Self::RecoverySkipped,
         Self::EnumUnchecked,
         Self::ModelFailureUnrecorded,
+        Self::BatchFlushAfterDispatch,
+        Self::ResultsInCompletionOrder,
+        Self::BatchPushesReversed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -55,6 +61,9 @@ impl Mutation {
             Self::RecoverySkipped => "recovery_skipped",
             Self::EnumUnchecked => "enum_unchecked",
             Self::ModelFailureUnrecorded => "model_failure_unrecorded",
+            Self::BatchFlushAfterDispatch => "batch_flush_after_dispatch",
+            Self::ResultsInCompletionOrder => "results_in_completion_order",
+            Self::BatchPushesReversed => "batch_pushes_reversed",
         }
     }
 
@@ -101,7 +110,17 @@ impl Mutation {
                 Target::Cloudflare,
             ],
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
-            Self::CheckpointHashOrder | Self::EnumUnchecked | Self::ModelFailureUnrecorded => all,
+            Self::CheckpointHashOrder
+            | Self::EnumUnchecked
+            | Self::ModelFailureUnrecorded
+            | Self::ResultsInCompletionOrder
+            | Self::BatchPushesReversed => all,
+            Self::BatchFlushAfterDispatch => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Vercel,
+            ],
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

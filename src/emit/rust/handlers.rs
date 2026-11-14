@@ -120,12 +120,58 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.depth -= 1;
                 self.line("}");
             }
+            Stmt::Parallel(parallel) => self.parallel(parallel),
             Stmt::Effect { site, args, result } => self.effect(*site, args, *result),
             Stmt::Finish { value } => {
                 let value = self.expr(value);
                 self.line(&format!("return Ok({value});"));
             }
         }
+    }
+
+    fn parallel(&mut self, parallel: &ir::Parallel) {
+        let list = self.expr(&parallel.list);
+        let item = self.local(parallel.item);
+        let result = self.local(parallel.result);
+        let items = format!("items_{}", self.depth);
+        let answers = format!("answers_{}", self.depth);
+        let call = super::types::sum_name(self.program, ir::CALL);
+        let site = &self.handler.sites[parallel.site];
+        assert_eq!(site.kind, SiteKind::Dispatch, "a parallel for dispatches");
+        let Type::Maybe(inner) = &site.result else {
+            panic!("a dispatch yields maybe, found {:?}", site.result);
+        };
+        let returns = self.types.returns(inner);
+        let decode = self.types.from_json(inner);
+        self.line("{");
+        self.depth += 1;
+        self.line(&format!("let {items} = {list};"));
+        self.line(&format!(
+            "assert!({items}.len() as u64 <= {}, \"a list holds at most its capacity\");",
+            constant(&parallel.bound.name)
+        ));
+        self.line(&format!(
+            "let calls: Vec<Call> = {items}.iter().map(|item| {{"
+        ));
+        self.line(&format!(
+            "    let {call}::Call(_, tool, input) = item.clone();"
+        ));
+        self.line("    let effect = dispatch_class(&tool);");
+        self.line("    Call { tool, effect, input: Json::String(input) }");
+        self.line("}).collect();");
+        self.line(&format!(
+            "let {answers} = engine.parallel(calls, {returns}, CONCURRENT_REQUESTS_MAX)?;"
+        ));
+        self.line(&format!(
+            "for ({item}, answer) in {items}.into_iter().zip({answers}) {{"
+        ));
+        self.depth += 1;
+        self.line(&format!("let {result} = maybe(engine, answer, {decode})?;"));
+        self.block(&parallel.body);
+        self.depth -= 1;
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
     }
 
     fn push(&mut self, field: ir::FieldId, value: &Expr) {

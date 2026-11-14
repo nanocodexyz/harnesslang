@@ -1,0 +1,19 @@
+harness readers
+
+const calls_max: u64 = 8
+
+tool Read(path: text) -> text effect none
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    match Read(call.input) {
+      ok(body) => { push notes body }
+      failed(error) => { push notes error }
+    }
+  }
+  return 0
+}
