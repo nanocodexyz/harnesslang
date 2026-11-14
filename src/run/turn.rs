@@ -277,7 +277,9 @@ fn recover(
             Recovered::Unknown
         };
         let recovered = match recovered {
-            Recovered::Unknown if mutation == Mutation::RecoverTrustsLost => {
+            Recovered::Unknown
+                if mutation == Mutation::RecoverTrustsLost && program.recoverable(&call.tool) =>
+            {
                 Recovered::NotDispatched
             }
             recovered => recovered,
@@ -344,6 +346,11 @@ fn lost_jobs(
     if mutation == Mutation::JobLostDropped {
         return Vec::new();
     }
+    let lost = if mutation == Mutation::JobLostAll {
+        open
+    } else {
+        lost
+    };
     lost.iter()
         .filter(|key| session.jobs.contains_key(*key))
         .map(|key| lost_delivery(key))

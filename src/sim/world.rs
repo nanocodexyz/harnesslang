@@ -81,6 +81,7 @@ pub struct Dispatched {
     pub values: Vec<Returned>,
     pub first: Option<Output>,
     pub recovered: u64,
+    pub claimed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +94,8 @@ pub struct Returned {
 
 impl Dispatched {
     pub fn returned(&mut self, program: &Program, request: &ToolRequest<'_>, output: &Output) {
-        if self.first.is_none() {
+        let external = program.dispatch_class(request.tool) == EffectClass::External;
+        if external && self.first.is_none() {
             self.first = Some(output.clone());
         }
         let expected = if journal::job_started(output).is_some() {
@@ -540,7 +542,9 @@ impl<'a> SimWorld<'a> {
         let waited = std::mem::take(&mut self.parking.run_waited_ms);
         self.inbox.load(&records, true);
         self.nested = true;
+        let outer = std::mem::replace(&mut self.run_epoch, epoch);
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
+        self.run_epoch = outer;
         self.nested = false;
         self.inbox.unload();
         (self.run_effects, self.run_outbound) = counted;
@@ -802,6 +806,9 @@ impl World for SimWorld<'_> {
             {
                 self.inbox.noted(*turn, &delivery.id, *at);
             }
+            if matches!(record, Record::Event { .. }) {
+                self.jobs.drained(self.stats.runs);
+            }
             if let Record::Status { turn, .. } = record {
                 let checkpointed = records.iter().any(|other| {
                     matches!(other, Record::Checkpoint { revision, .. } if revision == turn)
@@ -873,6 +880,7 @@ impl World for SimWorld<'_> {
                 ("effect", Json::text(request.effect.name())),
                 ("input", request.input.clone()),
                 ("admitted", request.admitted.map_or(Json::Null, Json::text)),
+                ("job", Json::Bool(request.job)),
                 ("output", journal::output_json(&output)),
             ]
         });
@@ -1168,7 +1176,6 @@ impl World for SimWorld<'_> {
         let mut arrived = self.inbox.arrived(turn);
         if self.program.events.jobs.is_some() {
             arrived.extend(self.jobs.arrived(self.clock));
-            self.jobs.drained(self.stats.runs);
         }
         self.record("inbox", || {
             vec![
@@ -1296,6 +1303,13 @@ impl SimWorld<'_> {
     fn tool_output(&mut self, request: &ToolRequest<'_>) -> Output {
         let call = journal::call_id(request.turn, request.seq);
         let external = self.program.dispatch_class(request.tool) == EffectClass::External;
+        let claimed = self.dispatched.get(&call).map_or(0, |entry| entry.claimed);
+        if external && claimed > self.run_epoch {
+            return Output::Failed(format!(
+                "{call} was claimed by the owner of epoch {claimed}; the host refuses it from epoch {}",
+                self.run_epoch
+            ));
+        }
         let entry = self.dispatched.entry(call).or_default();
         entry.tool = request.tool.to_owned();
         if external {
@@ -1374,6 +1388,7 @@ impl SimWorld<'_> {
         let answer = if rng.chance(crate::sim::jobs::RECOVER_UNKNOWN_PPM) {
             Recovered::Unknown
         } else if entry.external == 0 {
+            entry.claimed = entry.claimed.max(self.run_epoch);
             Recovered::NotDispatched
         } else {
             entry

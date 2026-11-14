@@ -670,9 +670,11 @@ impl<'a> Engine<'a> {
         }
         let position = self.seq;
         let mut answers = Vec::with_capacity(arrived.len());
+        let mut recorded_lost = false;
         for (index, delivery) in arrived.into_iter().enumerate() {
             let answer = self.admit_event(position, &delivery);
             if index < lost {
+                recorded_lost |= answer == Answer::Recorded;
                 if answer == Answer::Full {
                     self.lost.push(delivery);
                 }
@@ -680,9 +682,10 @@ impl<'a> Engine<'a> {
             }
             answers.push((delivery.id, answer));
         }
-        let recorded = answers
-            .iter()
-            .any(|(_, answer)| *answer == Answer::Recorded);
+        let recorded = recorded_lost
+            || answers
+                .iter()
+                .any(|(_, answer)| *answer == Answer::Recorded);
         let early = self.mutation == Mutation::EventAckEarly;
         if early {
             self.answer(position, &answers);
@@ -758,6 +761,9 @@ impl<'a> Engine<'a> {
                 if !self.jobs.contains_key(&job.key) {
                     return Answer::Duplicate;
                 }
+                if !self.job_recorded(&job.key) {
+                    return Answer::Full;
+                }
                 if job_count(&self.events) >= bound.value {
                     return Answer::Full;
                 }
@@ -816,6 +822,17 @@ impl<'a> Engine<'a> {
 
     fn flushes_to_interrupt(&self, interrupts: ir::Interrupts) -> bool {
         interrupts.any() && inbound::of(self.target.target).drain != Drain::AfterRun
+    }
+
+    fn job_recorded(&self, key: &str) -> bool {
+        let prefix = format!("{}{}", self.turn, ir::SPAWN_KEY_SEPARATOR);
+        let Some(seq) = key
+            .strip_prefix(&prefix)
+            .and_then(|seq| seq.parse::<u64>().ok())
+        else {
+            return true;
+        };
+        matches!(self.sites.get(&seq), Some(SiteLog::Done(..)))
     }
 
     fn job_room(&self, tool: &str) -> bool {
@@ -1154,7 +1171,6 @@ impl<'a> Engine<'a> {
                 cancel: all.cancel || one.cancel,
                 steer: all.steer || one.steer,
             });
-        let preempted: Vec<bool> = interrupts.iter().map(|one| self.preempted(*one)).collect();
         if (external || gate || self.flushes_to_interrupt(interrupting)) && !late {
             self.flush()?;
             assert!(
@@ -1187,6 +1203,7 @@ impl<'a> Engine<'a> {
                 "a fresh external step starts at its first attempt"
             );
         }
+        let preempted: Vec<bool> = interrupts.iter().map(|one| self.preempted(*one)).collect();
         let completed = self.batch_dispatch(group, &preempted)?;
         let replayed = !matches!(self.sites.get(&self.seq), Some(SiteLog::Open(_)));
         let before = self.events.len();
@@ -1209,6 +1226,9 @@ impl<'a> Engine<'a> {
                 && arrived
                     .iter()
                     .any(|inbound| inbound.interrupts(interrupts[position]));
+            if interrupted {
+                self.jobs.remove(&ir::spawn_key(self.turn, waiting.seq));
+            }
             let output = match interrupted {
                 false => output,
                 true if waiting.call.effect.may_be_unknown() => {
@@ -2006,7 +2026,10 @@ impl<'a> Engine<'a> {
     fn retried(&mut self, seq: u64, call: &Call) -> Result<Retried, Halt> {
         let recovered = self.ask_recover(seq, call);
         let recovered = match recovered {
-            Recovered::Unknown if self.mutation == Mutation::RecoverTrustsLost => {
+            Recovered::Unknown
+                if self.mutation == Mutation::RecoverTrustsLost
+                    && self.program.recoverable(&call.tool) =>
+            {
                 Recovered::NotDispatched
             }
             recovered => recovered,
@@ -2068,10 +2091,10 @@ impl<'a> Engine<'a> {
             job: room,
         });
         match recovered {
-            Recovered::Reply(output) => {
-                let output = self.checked(&call.tool, &returns, output);
+            Recovered::Reply(output) if job_started(&output).is_some() => {
                 Recovered::Reply(self.job_output(&call.tool, seq, room, output))
             }
+            Recovered::Reply(output) => Recovered::Reply(self.checked(&call.tool, &returns, output)),
             other => other,
         }
     }
@@ -2170,6 +2193,9 @@ impl<'a> Engine<'a> {
         let interrupted = self.drain_interrupting(interrupts)?
             && !preempted
             && self.mutation != Mutation::InterruptIgnored;
+        if interrupted {
+            self.jobs.remove(&ir::spawn_key(self.turn, seq));
+        }
         let output = if interrupted {
             if call.effect.may_be_unknown() {
                 if self.mutation == Mutation::InterruptReruns {
