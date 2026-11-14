@@ -301,9 +301,16 @@ async function side(lines, requestText, host) {
   return encodeJson(sideAnswerJson(answer));
 }
 
+async function fork(lines, at, origin) {
+  const records = lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false)));
+  const forked = await forkEntry({ target: VERCEL_TARGET, mutation: "none" }, records, at, origin);
+  if (forked.refused !== undefined) return { refused: forked.refused };
+  return { lines: forked.records.map((record) => encodeLine(record, false)) };
+}
+
 async function session(platform) {
-  const lines = [];
-  const folded = fold([]);
+  const lines = (platform.entry ?? []).slice();
+  const folded = fold(lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false))));
   for (let index = 0; index < platform.turnsMax; index++) {
     const requestText = PROGRAM.idle === null ? await platform.request(index) : await idleOrRequest(platform, lines, folded, index);
     await driveTurn(platform, lines, folded, requestText);
@@ -486,7 +493,7 @@ const WORKFLOW_BINDING = [
   "  return harness.side(lines, request, host());",
   "}",
   "",
-  "export async function harnessSession(sessionId, turnsMax) {",
+  "export async function harnessSession(sessionId, turnsMax, entry) {",
   "  \"use workflow\";",
   "  const inboxes = new Map();",
   "  const suspended = new Map();",
@@ -506,6 +513,7 @@ const WORKFLOW_BINDING = [
   "  };",
   "  return harness.session({",
   "    turnsMax,",
+  "    entry: entry ?? [],",
   "    async request() {",
   "      return nextPrompt();",
   "    },",
@@ -556,6 +564,7 @@ const harness = {
   runtime,
   session,
   side,
+  fork,
   runStep,
   platformRandom,
   processCells: () => new ProcessCells(),

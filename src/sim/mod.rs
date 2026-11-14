@@ -252,11 +252,13 @@ fn run_seed_unguarded(
             world.stats.entry_states += 1;
         }
     }
+    let mut entry_lines = Vec::new();
     if strict == strict::Mode::Off
         && let Some(entry) = fork::forked_entry(program, &world.target, seed)
     {
         for record in &entry {
             world.seed_entry(record);
+            entry_lines.push(Json::String(crate::run::journal::to_json(record).encode()));
         }
     }
     world.trace = trace;
@@ -270,6 +272,9 @@ fn run_seed_unguarded(
         ];
         if !scope.is_empty() {
             fields.push(("scope", Json::text(scope)));
+        }
+        if !entry_lines.is_empty() {
+            fields.push(("entry", Json::Array(entry_lines.clone())));
         }
         fields
     });

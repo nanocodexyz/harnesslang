@@ -110,7 +110,9 @@ rust job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,serv
 js interrupt_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 js recover_reply_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 js job_unopened docs/snippets/in_flight.hl cloudflare,vercel backend_equal
-rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal"
+rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust fork_entry_ignored docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js fork_hook_skipped docs/snippets/fork.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 

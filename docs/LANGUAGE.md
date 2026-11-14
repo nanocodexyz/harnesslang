@@ -4192,7 +4192,12 @@ Every target's load takes such a journal and starts turn 1 from `P`. A turn
 that is neither `0` nor a finished turn is the call's `failed("no finished
 turn N to fork from")` and never reaches the host. The same function, a
 `fork_entry` over a session's records, a turn or `latest` and the origin,
-lets a host fork a session it holds without a tool call.
+lets a host fork a session it holds without a tool call: the interpreter's
+`run::fork::fork_entry`, the generated Rust's `fork_entry(start, records, at,
+origin)`, which returns the two records or `ForkRefused`, and Vercel's
+`harness.fork(lines, at, origin)`. Vercel's `harnessSession` takes the
+forked lines as its third argument, and a Durable Object loads the two rows a
+host wrote before the first turn.
 
 `on forked(origin: text, discarded: u64) { ... }` shapes the state a fork
 starts from: it may assign, push, clear and keep, but runs no effect and does
@@ -4295,7 +4300,10 @@ The simulator's model forks at an earlier turn and, a quarter of the time
 (`FORK_TURN_PAST_PPM` = 250000 per million), at one not finished yet. The
 host writes the child's two records from the input and runs up to
 `FORK_CHILD_TURNS_MAX` (2) turns of the harness over them, with faults and
-every invariant, as a spawned child is run. `fork_state_equal` requires the
+every invariant, as a spawned child is run. A quarter of the seeds of a
+harness with a fork tool (`FORKED_ENTRY_PPM` = 250000) start from a forked
+entry themselves, so every backend's load of one is checked in the
+differential runs. `fork_state_equal` requires the
 records to equal the hook applied to the state after turn `N` of the
 parent's durable journal up to the call, with `N`, `D` and the key in the
 `forked` record. `fork_live_state`, a runtime that forks from the running
@@ -4303,7 +4311,7 @@ turn's state, and `fork_hook_skipped`, one that skips the hook, are caught:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 docs/snippets/fork.hl
-ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=973 runs=2954 crashes=1981 power_losses=218 torn_writes=309 takeovers=0 fenced=0 dispatches=1027 unknown=301 forks=312
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=978 runs=2975 crashes=1997 power_losses=233 torn_writes=316 takeovers=0 fenced=0 dispatches=1030 unknown=300 forks=315
 $ hl sim --target native-jsonl --seeds 0..200 --mutation fork_live_state docs/snippets/fork.hl
 FAIL invariant=fork_state_equal seed=0 target=native-jsonl profile=errors mutation=fork_live_state: fork rewind at turn 4 seq 2 starts the child with 'context' = 20 entries in its entry checkpoint, where the hook over the parent's durable journal gives 13 entries
 replay: hl sim --target native-jsonl --seeds 0..1 --mutation fork_live_state docs/snippets/fork.hl

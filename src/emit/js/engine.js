@@ -13,7 +13,7 @@ const SIDE_REFUSED = "the checker refuses this effect in a side handler";
 
 function spawnOutput(tool, scope, turn, seq, output) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
-  if (output.tag !== "ok" || declared === undefined || !declared.spawn) return output;
+  if (output.tag !== "ok" || declared === undefined || (!declared.spawn && declared.fork === undefined)) return output;
   const key = String(turn) + SPAWN_KEY_SEPARATOR + String(seq);
   return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };
 }
@@ -65,6 +65,25 @@ class Engine {
     this.discovered = new Map();
     this.blobs = new Blobs();
     this.snapshot = null;
+    this.forkBase = null;
+  }
+
+  async forkCall(seq, call) {
+    const at = forkOf(call.tool);
+    if (at === null || !isObject(call.input)) return call;
+    assert(this.forkBase !== null, "a live turn of a program with fork tools keeps the journal a fork reads");
+    const selected = forkSelect(this.forkBase, forkRequested(at, call.input));
+    if (selected.missing !== undefined) return call;
+    const key = String(this.turn) + SPAWN_KEY_SEPARATOR + String(seq);
+    const origin = this.mode.scope === ROOT_SCOPE || this.mode.scope === undefined ? key : this.mode.scope + SPAWN_SCOPE_SEPARATOR + key;
+    const payload = await forkPayload({ target: this.target, mutation: "none" }, this.forkBase, selected, origin);
+    return { ...call, input: forkInput(selected, origin, payload) };
+  }
+
+  forkRefused(call) {
+    const at = forkOf(call.tool);
+    if (at === null || !isObject(call.input) || call.input[FORK_STATE] !== undefined) return null;
+    return forkMissing(forkRequested(at, call.input) ?? 0);
   }
 
   async sideQuestion(seq) {
@@ -359,11 +378,12 @@ class Engine {
     if (logged !== undefined) return this.recorded(siteId, seq, call, args, logged);
     this.requireLive(seq);
     await this.sideQuestion(seq);
+    const filled = await this.forkCall(seq, call);
     if (site.kind !== "model") {
-      this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
-      this.sites.set(seq, { kind: "open", call });
+      this.append({ kind: "call", turn: this.turn, seq, tool: filled.tool, effect: filled.effect, input: filled.input });
+      this.sites.set(seq, { kind: "open", call: filled });
     }
-    return this.execute(siteId, seq, call, args);
+    return this.execute(siteId, seq, filled, args);
   }
 
   async recorded(siteId, seq, call, args, logged) {
@@ -371,7 +391,7 @@ class Engine {
     switch (logged.kind) {
       case "done":
         this.same(seq, logged.call, call);
-        return this.settle(site, call, logged.output);
+        return this.settle(site, logged.call, logged.output);
       case "reply":
         if (site.kind !== "model") throw this.diverged(seq, "a model reply", call.tool);
         if (logged.mode !== site.mode) {
@@ -380,11 +400,11 @@ class Engine {
         return this.reply(logged.response);
       case "unknown":
         this.same(seq, logged.call, call);
-        if (!reportsUnknown(site.result)) return this.reopen(siteId, seq, call, args);
+        if (!reportsUnknown(site.result)) return this.reopen(siteId, seq, logged.call, args);
         return variant(VARIANT_UNKNOWN, []);
       case "open":
         this.same(seq, logged.call, call);
-        return this.reopen(siteId, seq, call, args);
+        return this.reopen(siteId, seq, logged.call, args);
       default:
         throw new Panic(`unknown site log ${logged.kind}`);
     }
@@ -812,7 +832,8 @@ class Engine {
     } else {
       const returns = site.result.known ?? site.result.maybe ?? (reportsUnknown(site.result) ? dispatchedReturns(call.tool) : undefined);
       assert(returns !== undefined, "a tool site yields known or maybe");
-      const gate = site.kind === "dispatch" ? this.gate(call) : { admitted: null };
+      const forkRefused = this.forkRefused(call);
+      const gate = forkRefused !== null ? { refused: forkRefused } : site.kind === "dispatch" ? this.gate(call) : { admitted: null };
       if (gate.refused !== undefined) {
         output = { tag: "failed", error: gate.refused };
       } else {
@@ -947,7 +968,9 @@ class Engine {
 
   same(seq, recorded, call) {
     if (recorded.tool !== call.tool) throw this.diverged(seq, recorded.tool, call.tool);
-    if (recorded.effect !== call.effect || !jsonEqual(recorded.input, call.input)) {
+    const at = forkOf(recorded.tool);
+    const input = at === null ? recorded.input : forkRequestOf(at, recorded.input);
+    if (recorded.effect !== call.effect || !jsonEqual(input, call.input)) {
       throw new Corrupt(`replay of turn ${this.turn} diverged at seq ${seq}: tool '${call.tool}' was recorded with another class or input`);
     }
   }
@@ -1216,6 +1239,7 @@ async function runTurn(setup, world, epoch, records, request) {
   assert(typeof scope === "string", "a turn request's scope is text");
   const engine = new Engine(setup, handler, { live: true, world, epoch, scope }, request.turn, state, log);
   if (PROGRAM.sides.length > 0) engine.snapshot = stateFromJson(stateJson(state));
+  if (programForks()) engine.forkBase = session;
   engine.nextCell = nextCell(session);
   engine.blobs = blobs;
   engine.jobs = new Map(session.jobs);
@@ -1350,6 +1374,100 @@ class SideWorld {
   async hold() {
     throw new Panic(SIDE_REFUSED + ": hold");
   }
+}
+
+
+const FORKED_HOST_KEY = "forked";
+const FORK_TURN = "turn";
+const FORK_ORIGIN = "origin";
+const FORK_DISCARDED = "discarded";
+const FORK_STATE = "state";
+const ENTRY_REVISION = 0;
+
+function forkOf(tool) {
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  return declared === undefined || declared.fork === undefined ? null : declared.fork;
+}
+
+function programForks() {
+  return PROGRAM.tools.some((tool) => tool.fork !== undefined);
+}
+
+function forkMissing(turn) {
+  return "no finished turn " + String(turn) + " to fork from";
+}
+
+function forkSelect(session, at) {
+  const turn = at === null ? lastFinished(session) : at;
+  const log = session.turns.get(turn);
+  const finished = log !== undefined && log.finished !== null;
+  if (turn !== ENTRY_REVISION && !finished) return { missing: turn };
+  let discarded = 0;
+  for (const [later, laterLog] of session.turns) {
+    if (later > turn && laterLog.finished !== null) discarded += 1;
+  }
+  return { turn, discarded };
+}
+
+function forkRequested(at, input) {
+  if (at !== "turn") return null;
+  const turn = isObject(input) ? input[FORK_TURN] : undefined;
+  if (typeof turn !== "bigint" || turn > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(turn);
+}
+
+function forkRequestOf(at, input) {
+  if (!isObject(input) || input[FORK_STATE] === undefined) return input;
+  if (at === "latest") return object([]);
+  return object([[FORK_TURN, input[FORK_TURN] ?? null]]);
+}
+
+async function runForked(setup, state, origin, discarded) {
+  if (PROGRAM.forked === undefined) return state;
+  const scratch = new SideWorld(null);
+  const engine = new Engine(setup, PROGRAM.forked, { live: true, world: scratch, epoch: 0, scope: ROOT_SCOPE }, SIDE_TURN, state, newTurnLog(PROGRAM.forked.name, null));
+  const ran = await engine.run([origin, BigInt(discarded)]);
+  assert(ran.suspended === undefined && ran.finish.outcome === "completed", "on forked runs to its end");
+  return ran.state;
+}
+
+async function forkPayload(setup, session, selected, origin) {
+  const before = await stateBefore(setup, session, selected.turn + 1);
+  const state = await runForked({ target: setup.target, mutation: "none" }, before, origin, selected.discarded);
+  return encodeJson(stateJson(state));
+}
+
+function forkInput(selected, origin, payload) {
+  return object([
+    [FORK_DISCARDED, BigInt(selected.discarded)],
+    [FORK_ORIGIN, origin],
+    [FORK_STATE, payload],
+    [FORK_TURN, BigInt(selected.turn)],
+  ]);
+}
+
+function forkRecords(input) {
+  const number = (key) => {
+    const value = input[key];
+    if (typeof value !== "bigint") throw new DecodeError("a fork's input lacks '" + key + "'");
+    return value;
+  };
+  const turn = number(FORK_TURN);
+  const discarded = number(FORK_DISCARDED);
+  if (typeof input[FORK_ORIGIN] !== "string") throw new DecodeError("a fork's input lacks '" + FORK_ORIGIN + "'");
+  if (typeof input[FORK_STATE] !== "string") throw new DecodeError("a fork's input lacks '" + FORK_STATE + "'");
+  return [
+    { kind: "host", key: FORKED_HOST_KEY, value: object([[FORK_DISCARDED, discarded], [FORK_ORIGIN, input[FORK_ORIGIN]], [FORK_TURN, turn]]) },
+    { kind: "checkpoint", revision: ENTRY_REVISION, state: PROGRAM.name, payload: input[FORK_STATE] },
+  ];
+}
+
+async function forkEntry(setup, records, at, origin) {
+  const session = fold(records);
+  const selected = forkSelect(session, at);
+  if (selected.missing !== undefined) return { refused: forkMissing(selected.missing) };
+  const payload = await forkPayload(setup, session, selected, origin);
+  return { records: forkRecords(forkInput(selected, origin, payload)) };
 }
 
 function sideNamed(name) {

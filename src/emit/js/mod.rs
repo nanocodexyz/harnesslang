@@ -63,7 +63,13 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
             .expect("writing to a string succeeds");
     }
     out.push_str(ENGINE);
-    for (index, handler) in program.handlers.iter().chain(&program.sides).enumerate() {
+    for (index, handler) in program
+        .handlers
+        .iter()
+        .chain(&program.sides)
+        .chain(&program.forked)
+        .enumerate()
+    {
         out.push_str(&handler_function(program, index, handler));
     }
     out.push_str(adapter);
@@ -231,10 +237,10 @@ fn program_literal(program: &Program) -> String {
         let finds = tool
             .finds
             .map_or_else(String::new, |listing| format!(", finds: {listing}"));
-        let spawns = if tool.spawn.is_some() {
-            ", spawn: true"
-        } else {
-            ""
+        let spawns = match (tool.spawn.is_some(), tool.fork) {
+            (true, _) => ", spawn: true".to_owned(),
+            (false, Some(at)) => format!(", fork: {}", js_string(at.name())),
+            (false, None) => String::new(),
         };
         let attaches = tool.attaches.as_ref().map_or_else(String::new, |bytes| {
             format!(", attaches: {}", type_literal(&Type::Blob(bytes.clone())))
@@ -321,6 +327,14 @@ fn program_literal(program: &Program) -> String {
         ));
     }
     out.push_str("  ],\n");
+    if let Some(forked) = &program.forked {
+        out.push_str("  forked:\n");
+        out.push_str(&handler_literal(
+            program,
+            program.handlers.len() + program.sides.len(),
+            forked,
+        ));
+    }
     match &program.idle {
         Some(idle) => writeln!(
             out,
