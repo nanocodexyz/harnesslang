@@ -22,7 +22,7 @@ pub fn forked_entry(
     target: &crate::target::Model,
     seed: u64,
 ) -> Option<[Record; 2]> {
-    if !program.forks() {
+    if !program.forks() && program.forked.is_none() {
         return None;
     }
     let mut rng = Rng::derive(seed, "forked entry");

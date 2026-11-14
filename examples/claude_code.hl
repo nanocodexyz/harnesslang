@@ -416,3 +416,11 @@ on idle refresh() at refresh_due bound cache_refreshes -> kept {
     rejected(error) => { return lapsed("a prompt cache refresh failed; refreshing stops until the next request: " ++ error) }
   }
 }
+
+on forked(origin: text, discarded: u64) {
+  refresh_due = 0
+  requested_ms = 0
+  if discarded > 0 and len(context) + 1 < context_entries_max {
+    push context user("This conversation was explicitly rewound into a new session. External effects from discarded turns may still exist; reconcile their current state before repeating any action. Historical tool calls must not be replayed.")
+  }
+}

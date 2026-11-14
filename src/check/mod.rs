@@ -1242,12 +1242,6 @@ fn hooks(
                 ),
             );
         }
-        if hook.kind == HookKind::Forked && !program.forks() {
-            return error(
-                hook.at,
-                "'on forked' shapes the state a fork starts from, but the harness declares no fork tool",
-            );
-        }
         hooks.insert(hook.kind, hook.clone());
     }
     Ok(hooks)
