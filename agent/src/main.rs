@@ -1,5 +1,6 @@
 mod anthropic;
 mod json;
+mod stream;
 mod tools;
 
 include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
@@ -115,6 +116,12 @@ fn to_json(value: &Value) -> Json {
 }
 
 impl Agent {
+    fn stream_file(&self, request: &ModelRequest<'_>) -> PathBuf {
+        self.workspace
+            .state
+            .join(format!("stream-{}-{}.sse", request.turn, request.seq))
+    }
+
     fn record_model(&mut self, used: Usage, outcome: &str) {
         self.ledger.append(Value::object([
             ("kind", Value::text("model")),
@@ -162,8 +169,9 @@ impl Host for Agent {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        let call = harness::call_id(request.turn, request.seq);
         let context = to_value(&(request.context)());
-        let body = match self.client.body(&context) {
+        let body = match self.client.body(&context, request.mode) {
             Ok(body) => body,
             Err(error) => {
                 return to_json(&anthropic::transient(
@@ -172,17 +180,39 @@ impl Host for Agent {
                 ));
             }
         };
-        eprintln!(
-            "hl-agent: {} model {}",
-            harness::call_id(request.turn, request.seq),
-            self.client.model
-        );
-        let (reply, used) = match self.client.send(&body) {
+        let partial = self.stream_file(request);
+        if let Ok(cut) = std::fs::metadata(&partial) {
+            eprintln!(
+                "hl-agent: {call} a crash cut the previous stream of this call after {} bytes; requesting it again",
+                cut.len()
+            );
+            self.ledger.append(Value::object([
+                ("kind", Value::text("stream_discarded")),
+                ("at_ms", Value::number(now_ms())),
+                ("call", Value::text(&call)),
+                ("bytes", Value::number(cut.len())),
+            ]));
+        }
+        if let Err(error) = std::fs::write(&partial, "") {
+            return to_json(&anthropic::transient(
+                &format!("{}: {error}", partial.display()),
+                0,
+            ));
+        }
+        let mode = request
+            .mode
+            .map(|mode| format!(" mode {mode}"))
+            .unwrap_or_default();
+        eprintln!("hl-agent: {call} model {}{mode}", self.client.model);
+        let (reply, used) = match self.client.send(&body, &partial) {
             Ok((status, text, retry_after_ms)) => {
-                anthropic::interpret(status, &text, retry_after_ms)
+                anthropic::interpret_stream(status, &text, retry_after_ms)
             }
             Err(error) => (anthropic::transient(&error, 0), Usage::default()),
         };
+        if let Err(error) = std::fs::remove_file(&partial) {
+            eprintln!("hl-agent: {}: {error}", partial.display());
+        }
         let outcome = match &reply {
             Value::Object(entries) if entries.len() == 1 => entries[0].0.clone(),
             _ => "reply".to_owned(),

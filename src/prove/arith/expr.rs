@@ -37,7 +37,7 @@ impl Prover<'_> {
                 self.value(state, operand);
                 None
             }
-            Expr::Construct { fields, .. } => {
+            Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
                 for field in fields {
                     self.value(state, field);
                 }

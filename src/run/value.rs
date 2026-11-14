@@ -302,22 +302,43 @@ pub enum Input {
 }
 
 pub fn tool_input(program: &Program, tool: &str, raw: &str) -> Input {
-    let Some(params) = program.input_params(tool) else {
+    let (Some(params), Some(defaults)) = (program.input_params(tool), program.input_defaults(tool))
+    else {
         return Input::Untyped;
     };
-    match typed_input(program, params, raw) {
+    match typed_input(program, params, defaults, raw) {
         Ok(input) => Input::Typed(input),
         Err(error) => Input::Invalid(format!("input of {tool}: {error}")),
     }
 }
 
-fn typed_input(program: &Program, params: &[ir::Field], raw: &str) -> Result<Json, String> {
-    let Ok(Json::Object(fields)) = crate::run::json::decode(raw) else {
+fn typed_input(
+    program: &Program,
+    params: &[ir::Field],
+    defaults: &[Option<ir::Literal>],
+    raw: &str,
+) -> Result<Json, String> {
+    let Ok(Json::Object(mut fields)) = crate::run::json::decode(raw) else {
         return Err("not a JSON object".to_owned());
     };
+    for (param, default) in params.iter().zip(defaults) {
+        if let Some(default) = default
+            && !fields.contains_key(&param.name)
+        {
+            fields.insert(param.name.clone(), literal_json(default));
+        }
+    }
     let input = Json::Object(fields);
     input_fits(program, params, &input)?;
     Ok(input)
+}
+
+pub fn literal_json(literal: &ir::Literal) -> Json {
+    match literal {
+        ir::Literal::U64(value) => Json::Number(*value),
+        ir::Literal::Bool(value) => Json::Bool(*value),
+        ir::Literal::Text(value) => Json::text(value),
+    }
 }
 
 pub fn input_fits(program: &Program, params: &[ir::Field], input: &Json) -> Result<(), String> {

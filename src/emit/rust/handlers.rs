@@ -272,9 +272,13 @@ impl<'a, 'p> Body<'a, 'p> {
             Durability::Cell => panic!("only a cell site has cell durability"),
         };
         let maybe = matches!(site.result, Type::Maybe(_));
+        let mode = match site.mode {
+            Some(mode) => format!("Some({:?})", self.program.mode_name(mode)),
+            None => "None".to_owned(),
+        };
         let (kind, run, decode) = self.site_call(site.kind, &site.result, args);
         self.line(&format!(
-            "let site = Site {{ kind: Kind::{kind}, durability: {durability}, maybe: {maybe} }};"
+            "let site = Site {{ kind: Kind::{kind}, durability: {durability}, maybe: {maybe}, mode: {mode} }};"
         ));
         self.line(&format!("let answer = engine.effect(site, call, {run})?;"));
         self.line(&decode);
@@ -455,6 +459,7 @@ impl<'a, 'p> Body<'a, 'p> {
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
             Expr::Construct { ty, .. } => ty.clone(),
+            Expr::TextBuiltin { op, .. } => op.result(),
             Expr::Binary { op, .. } => match op {
                 BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => Type::U64,
                 BinaryOp::Concat => Type::Text,
@@ -514,6 +519,10 @@ impl<'a, 'p> Body<'a, 'p> {
             ),
             Expr::With { list, entry } => {
                 format!("with_entry({}, {})", self.expr(list), self.expr(entry))
+            }
+            Expr::TextBuiltin { op, args } => {
+                let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
+                format!("text_{}({})", op.name(), args.join(", "))
             }
             Expr::Cancelled => "engine.cancelled()".to_owned(),
         }

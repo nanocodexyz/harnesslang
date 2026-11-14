@@ -130,6 +130,7 @@ fn reads_local(value: &Expr) -> bool {
         | Expr::Len(operand)
         | Expr::TextLen(operand)
         | Expr::Truncate { text: operand, .. } => reads_local(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_local),
         Expr::Cancelled => false,
     }
 }
@@ -154,6 +155,7 @@ fn reads_events(value: &Expr) -> bool {
         | Expr::Len(operand)
         | Expr::TextLen(operand)
         | Expr::Truncate { text: operand, .. } => reads_events(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_events),
     }
 }
 
@@ -416,6 +418,10 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
         }
         Expr::Not(operand) | Expr::Len(operand) | Expr::TextLen(operand) => {
             expr(program, handler, operand);
+        }
+        Expr::TextBuiltin { op, args } => {
+            assert_eq!(args.len(), op.arity(), "a text builtin takes its arity");
+            args.iter().for_each(|arg| expr(program, handler, arg));
         }
     }
 }

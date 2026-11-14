@@ -97,6 +97,10 @@ impl<'a> Names<'a> {
             Expr::With { list, entry } => {
                 format!("{} with {}", self.operand(list), self.operand(entry))
             }
+            Expr::TextBuiltin { op, args } => {
+                let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
+                format!("{}({})", op.name(), args.join(", "))
+            }
             Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
         }
     }

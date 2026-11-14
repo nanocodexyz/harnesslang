@@ -1,0 +1,38 @@
+harness summarizer
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = summary(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply modes text_only
+
+state {
+  context: list<entry, context_max>
+}
+
+on summarize(conversation: text) -> outcome
+  requires len(context) + 1 <= context_max
+{
+  push context user(conversation)
+  match think(context) {
+    failed(error) => { return stopped(error) }
+    ok(reply) => {
+      match reply {
+        answer(words) => { return summary(words) }
+        calls(_) => {
+          match think(context) mode text_only {
+            failed(error) => { return stopped(error) }
+            ok(forced) => {
+              match forced {
+                answer(words) => { return summary(words) }
+                calls(_) => { return stopped("the summary called a tool") }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

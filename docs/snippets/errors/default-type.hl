@@ -1,0 +1,5 @@
+harness notes
+
+tool bash(command: text, background: bool = "no") -> text effect external
+
+on ping() -> u64 { return 1 }

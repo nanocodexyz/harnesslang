@@ -52,13 +52,15 @@ pub enum Mutation {
     WaitUnjournaled,
     WaitRerunSkips,
     WaitOversleeps,
+    DefaultUnfilled,
+    ModeDropped,
     RetryAfterUnjournaled,
     TruncateUncut,
     UsageUnchecked,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 53] = [
+    pub const ALL: [Self; 55] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -109,6 +111,8 @@ impl Mutation {
         Self::WaitUnjournaled,
         Self::WaitRerunSkips,
         Self::WaitOversleeps,
+        Self::DefaultUnfilled,
+        Self::ModeDropped,
         Self::RetryAfterUnjournaled,
         Self::TruncateUncut,
         Self::UsageUnchecked,
@@ -166,6 +170,8 @@ impl Mutation {
             Self::WaitUnjournaled => "wait_unjournaled",
             Self::WaitRerunSkips => "wait_rerun_skips",
             Self::WaitOversleeps => "wait_oversleeps",
+            Self::DefaultUnfilled => "default_unfilled",
+            Self::ModeDropped => "mode_dropped",
             Self::RetryAfterUnjournaled => "retry_after_unjournaled",
             Self::TruncateUncut => "truncate_uncut",
             Self::UsageUnchecked => "usage_unchecked",
@@ -234,6 +240,8 @@ impl Mutation {
             | Self::WaitUnjournaled
             | Self::WaitRerunSkips
             | Self::WaitOversleeps
+            | Self::DefaultUnfilled
+            | Self::ModeDropped
             | Self::RetryAfterUnjournaled
             | Self::TruncateUncut
             | Self::UsageUnchecked => all,

@@ -527,13 +527,16 @@ function recordJson(record) {
         ["output", outputJson(record.output)],
         ["seq", BigInt(record.seq)],
       ])]]);
-    case "model":
-      return object([["model", object([
+    case "model": {
+      const entries = [
         ["call_id", callId(record.turn, record.seq)],
         ["response", record.response],
         ["seq", BigInt(record.seq)],
         ["turn", turn],
-      ])]]);
+      ];
+      if (record.mode !== null) entries.push([MODEL_MODE, record.mode]);
+      return object([["model", object(entries)]]);
+    }
     case "recovery":
       return object([["recovery", object([
         ["attempt", BigInt(record.attempt)],
@@ -717,10 +720,16 @@ function recordFrom(json) {
       return { kind: "nested_result", turn, seq, nested, output };
     }
     case "model": {
-      fields.exact(["call_id", "response", "seq", "turn"]);
+      let mode = null;
+      if (Object.hasOwn(fields.map, MODEL_MODE)) {
+        fields.exact(["call_id", MODEL_MODE, "response", "seq", "turn"]);
+        mode = fields.text(MODEL_MODE);
+      } else {
+        fields.exact(["call_id", "response", "seq", "turn"]);
+      }
       const [turn, seq, nested] = fields.call();
       if (nested !== null) throw new DecodeError("a model reply has a nested call id");
-      return { kind: "model", turn, seq, response: fields.get("response") };
+      return { kind: "model", turn, seq, response: fields.get("response"), mode };
     }
     case "cell":
       return cellFrom(fields);
@@ -902,7 +911,7 @@ function applyRecord(session, record) {
     }
     case "model": {
       const log = runningLog(session, record.turn, "a model reply");
-      nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response });
+      nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response, mode: record.mode });
       return;
     }
     case "nested_call":
@@ -1218,6 +1227,15 @@ function dispatchClass(tool) {
   return found === null ? "external" : PROGRAM.listings[found.listing].effect;
 }
 
+const MODEL_MODE = "mode";
+
+function inputDefaults(tool) {
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  if (declared !== undefined) return declared.defaults;
+  const found = listed(tool);
+  return found === null ? null : PROGRAM.listings[found.listing].defaults;
+}
+
 function inputParams(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.params;
@@ -1248,6 +1266,12 @@ function toolInput(tool, raw) {
     input = decodeJson(raw);
   } catch (error) {
     if (!(error instanceof DecodeError)) throw error;
+  }
+  if (isObject(input)) {
+    const defaults = inputDefaults(tool);
+    params.forEach((param, index) => {
+      if (defaults[index] !== null && !Object.hasOwn(input, param.name)) input[param.name] = defaults[index];
+    });
   }
   const error = isObject(input) ? inputFits(params, input) : "not a JSON object";
   if (error !== null) return { kind: "invalid", error: `input of ${tool}: ${error}` };
@@ -1315,6 +1339,26 @@ function multiply(left, right) {
   const result = left * right;
   if (result > U64_MAX) throw new Trap("u64 overflow in '*'");
   return result;
+}
+
+const TEXT_WHITESPACE = /^[ \t\n\f\r]+|[ \t\n\f\r]+$/g;
+
+function text_contains(subject, separator) {
+  return subject.includes(separator);
+}
+
+function text_before(subject, separator) {
+  const at = subject.indexOf(separator);
+  return at < 0 ? subject : subject.slice(0, at);
+}
+
+function text_after(subject, separator) {
+  const at = subject.indexOf(separator);
+  return at < 0 ? "" : subject.slice(at + separator.length);
+}
+
+function text_trim(subject) {
+  return subject.replace(TEXT_WHITESPACE, "");
 }
 
 function both(left, right) {

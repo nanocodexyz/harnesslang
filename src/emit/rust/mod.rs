@@ -470,17 +470,36 @@ fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
     let declared = program
         .tools
         .iter()
-        .map(|tool| (tool.name.as_str(), &tool.params));
+        .map(|tool| (tool.name.as_str(), &tool.params, &tool.defaults));
     let families = program
         .listings
         .iter()
-        .map(|listing| (listing.name.as_str(), &listing.params));
-    for (index, (name, params)) in declared.chain(families).enumerate() {
+        .map(|listing| (listing.name.as_str(), &listing.params, &listing.defaults));
+    for (index, (name, params, defaults)) in declared.chain(families).enumerate() {
         let names: Vec<String> = params
             .iter()
             .map(|param| format!("{:?}", param.name))
             .collect();
         let mut checks = String::new();
+        for (param, default) in params.iter().zip(defaults) {
+            if let Some(default) = default {
+                let value = match default {
+                    ir::Literal::U64(value) => format!("Json::Number({value})"),
+                    ir::Literal::Bool(value) => format!("Json::Bool({value})"),
+                    ir::Literal::Text(value) => format!("Json::String(String::from({value:?}))"),
+                };
+                writeln!(
+                    checks,
+                    "    input_default(input, {:?}, {value});",
+                    param.name
+                )
+                .expect("writing to a string succeeds");
+            }
+        }
+        checks.push_str(
+            "    let fields = input_fields(input)?;
+",
+        );
         for param in params {
             writeln!(
                 checks,
@@ -492,7 +511,7 @@ fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
         }
         writeln!(
             out,
-            "fn input_{index}(input: &Json) -> Result<(), String> {{\n    let fields = input_fields(input)?;\n{checks}    input_extra(fields, &[{}])\n}}\n",
+            "fn input_{index}(input: &mut Json) -> Result<(), String> {{\n{checks}    input_extra(fields, &[{}])\n}}\n",
             names.join(", ")
         )
         .expect("writing to a string succeeds");
@@ -504,7 +523,7 @@ fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
     }
     writeln!(
         out,
-        "pub fn tool_input(tool: &str, raw: &str) -> ToolInput {{\n    let check: fn(&Json) -> Result<(), String> = match tool {{\n{arms}        _ => match listed(tool) {{\n{listed}            _ => return ToolInput::Untyped,\n        }},\n    }};\n    typed_input(tool, raw, check)\n}}\n"
+        "pub fn tool_input(tool: &str, raw: &str) -> ToolInput {{\n    let check: fn(&mut Json) -> Result<(), String> = match tool {{\n{arms}        _ => match listed(tool) {{\n{listed}            _ => return ToolInput::Untyped,\n        }},\n    }};\n    typed_input(tool, raw, check)\n}}\n"
     )
     .expect("writing to a string succeeds");
 }

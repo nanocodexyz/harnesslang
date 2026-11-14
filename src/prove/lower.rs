@@ -255,7 +255,9 @@ fn arithmetic(value: &Expr) -> bool {
         | Expr::Truncate { text: operand, .. } => arithmetic(operand),
         Expr::With { list, entry } => arithmetic(list) || arithmetic(entry),
         Expr::Member { base, .. } => arithmetic(base),
-        Expr::Construct { fields, .. } => fields.iter().any(arithmetic),
+        Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
+            fields.iter().any(arithmetic)
+        }
         Expr::U64(_)
         | Expr::Bool(_)
         | Expr::Text(_)

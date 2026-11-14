@@ -46,10 +46,11 @@ pub enum Invariant {
     ResumeMatched,
     WaitUntil,
     WallLimit,
+    ModeSent,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -81,6 +82,7 @@ impl Invariant {
         Self::ResumeMatched,
         Self::WaitUntil,
         Self::WallLimit,
+        Self::ModeSent,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -116,6 +118,7 @@ impl Invariant {
             Self::ResumeMatched => "resume_matched",
             Self::WaitUntil => "wait_until",
             Self::WallLimit => "wall_limit",
+            Self::ModeSent => "mode_sent",
         }
     }
 }
@@ -504,6 +507,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     enum_valid(world, records)?;
     nested_enum_valid(world, records)?;
     let refused = tool_admitted(world, records)?;
+    mode_sent(world, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()
@@ -712,6 +716,57 @@ fn admitted_fingerprint<'a>(
         .1
         .as_ref()?
         .get(name)
+}
+
+fn mode_named(mode: Option<&str>) -> String {
+    mode.map_or_else(|| "no mode".to_owned(), |mode| format!("mode {mode}"))
+}
+
+fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    for record in records {
+        let Record::Model {
+            turn,
+            seq,
+            response,
+            mode,
+        } = record
+        else {
+            continue;
+        };
+        let answered: Vec<&Option<String>> = world
+            .model_modes
+            .get(&(*turn, *seq))
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter(|(_, reply)| reply == response)
+            .map(|(sent, _)| sent)
+            .collect();
+        let Some(sent) = answered
+            .iter()
+            .find(|sent| **sent == mode)
+            .or(answered.last())
+        else {
+            return violation(
+                Invariant::ModeSent,
+                format!(
+                    "model call {} is journaled with a reply no request returned",
+                    call_id(*turn, *seq)
+                ),
+            );
+        };
+        if *sent != mode {
+            return violation(
+                Invariant::ModeSent,
+                format!(
+                    "model call {} is journaled with {} but its reply answered a request sent with {}",
+                    call_id(*turn, *seq),
+                    mode_named(mode.as_deref()),
+                    mode_named(sent.as_deref())
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn tool_admitted(world: &SimWorld<'_>, records: &[Record]) -> Result<BTreeSet<String>, Violation> {

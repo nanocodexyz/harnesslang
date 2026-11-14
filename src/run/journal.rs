@@ -78,6 +78,7 @@ pub enum Record {
         turn: u64,
         seq: u64,
         response: Json,
+        mode: Option<String>,
     },
     NestedCall {
         turn: u64,
@@ -275,15 +276,19 @@ pub fn to_json(record: &Record) -> Json {
             turn,
             seq,
             response,
-        } => (
-            "model",
-            Json::object([
-                ("call_id", Json::String(call_id(*turn, *seq))),
-                ("response", response.clone()),
-                ("seq", Json::Number(*seq)),
-                ("turn", turn_text(*turn)),
-            ]),
-        ),
+            mode,
+        } => {
+            let mut fields = BTreeMap::from([
+                ("call_id".to_owned(), Json::String(call_id(*turn, *seq))),
+                ("response".to_owned(), response.clone()),
+                ("seq".to_owned(), Json::Number(*seq)),
+                ("turn".to_owned(), turn_text(*turn)),
+            ]);
+            if let Some(mode) = mode {
+                fields.insert(MODEL_MODE.to_owned(), Json::text(mode));
+            }
+            ("model", Json::Object(fields))
+        }
         Record::Recovery {
             turn,
             attempt,
@@ -400,6 +405,8 @@ fn recovery_ids(turn: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Json {
     Json::Array(keyed.into_iter().map(|(_, id)| Json::String(id)).collect())
 }
 
+pub const MODEL_MODE: &str = "mode";
+
 struct Fields<'a> {
     tag: &'a str,
     map: &'a BTreeMap<String, Json>,
@@ -500,12 +507,19 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
         }
         "cell" => cell_from(&fields),
         "model" => {
-            fields.exact(&["call_id", "response", "seq", "turn"])?;
+            let mode = if fields.map.contains_key(MODEL_MODE) {
+                fields.exact(&["call_id", MODEL_MODE, "response", "seq", "turn"])?;
+                Some(fields.text(MODEL_MODE)?.to_owned())
+            } else {
+                fields.exact(&["call_id", "response", "seq", "turn"])?;
+                None
+            };
             let (turn, seq) = top_level(fields.call()?)?;
             Ok(Record::Model {
                 turn,
                 seq,
                 response: fields.get("response")?.clone(),
+                mode,
             })
         }
         "recovery" => {

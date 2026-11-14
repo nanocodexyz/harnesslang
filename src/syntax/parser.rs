@@ -265,13 +265,14 @@ impl<'a> Parser<'a> {
     fn tool(&mut self) -> Parsed<Tool> {
         self.word("tool")?;
         let name = self.name("a tool name")?;
-        let params = self.params()?;
+        let (params, defaults) = self.tool_params()?;
         self.symbol(Symbol::Arrow)?;
         let returns = self.type_expr()?;
         let effect = self.effect_class()?;
         Ok(Tool {
             name,
             params,
+            defaults,
             returns,
             effect,
         })
@@ -306,12 +307,13 @@ impl<'a> Parser<'a> {
         self.symbol(Symbol::Comma)?;
         let bound = self.bound("the tools one listing may hold")?;
         self.symbol(Symbol::RightParen)?;
-        let params = self.params()?;
+        let (params, defaults) = self.tool_params()?;
         let effect = self.effect_class()?;
         Ok(Listing {
             name,
             bound,
             params,
+            defaults,
             effect,
         })
     }
@@ -366,10 +368,20 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let mut modes = Vec::new();
+        if self.is_word("modes") {
+            self.advance();
+            modes.push(self.name("a model call mode")?);
+            while self.is_symbol(Symbol::Comma) {
+                self.advance();
+                modes.push(self.name("a model call mode")?);
+            }
+        }
         Ok(Model {
             name,
             calls,
             reply,
+            modes,
             window,
         })
     }
@@ -461,6 +473,34 @@ impl<'a> Parser<'a> {
             }
             self.symbol(Symbol::RightParen)?;
             return Ok(params);
+        }
+    }
+
+    fn tool_params(&mut self) -> Parsed<(Vec<Param>, Vec<Option<Expr>>)> {
+        self.symbol(Symbol::LeftParen)?;
+        let mut params = Vec::new();
+        let mut defaults = Vec::new();
+        if self.is_symbol(Symbol::RightParen) {
+            self.advance();
+            return Ok((params, defaults));
+        }
+        loop {
+            let name = self.name("a parameter name")?;
+            self.symbol(Symbol::Colon)?;
+            let ty = self.type_expr()?;
+            params.push(Param { name, ty });
+            defaults.push(if self.is_symbol(Symbol::Assign) {
+                self.advance();
+                Some(self.expr()?)
+            } else {
+                None
+            });
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+                continue;
+            }
+            self.symbol(Symbol::RightParen)?;
+            return Ok((params, defaults));
         }
     }
 
@@ -860,7 +900,13 @@ impl<'a> Parser<'a> {
                     self.word("most")?;
                     args.push(Expr::Name(self.bound("the most a wait sleeps")?));
                 }
-                Ok(Expr::Call { callee, args })
+                let mode = if self.is_word("mode") && matches!(self.peek_second(), Token::Name(_)) {
+                    self.advance();
+                    Some(self.name("a model call mode")?)
+                } else {
+                    None
+                };
+                Ok(Expr::Call { callee, args, mode })
             }
             _ => Err(self.unexpected("an expression")),
         }

@@ -637,7 +637,7 @@ impl Checker<'_> {
                 entry: right,
                 ..
             } => self.effect_in(left).or_else(|| self.effect_in(right)),
-            ast::Expr::Call { callee, args } => {
+            ast::Expr::Call { callee, args, .. } => {
                 let effect = self.globals.tools.contains_key(&callee.text)
                     || self.globals.model.as_deref() == Some(callee.text.as_str())
                     || EFFECT_BUILTINS.contains(&callee.text.as_str());
@@ -824,6 +824,7 @@ impl Checker<'_> {
             class,
             result: result.clone(),
             durability: Durability::of_site(kind, class),
+            mode: None,
         });
         let local = self.temporary(site, result.clone());
         out.push(Stmt::Effect {
@@ -832,6 +833,24 @@ impl Checker<'_> {
             result: local,
         });
         (Expr::Local(local), result)
+    }
+
+    fn mode(&self, callee: &ast::Name, mode: &ast::Name) -> Checked<ir::ModeId> {
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("a model name is bound only with a model");
+        model
+            .modes
+            .iter()
+            .position(|declared| *declared == mode.text)
+            .ok_or_else(|| {
+                crate::syntax::Diagnostic::new(
+                    mode.at,
+                    format!("model '{}' declares no mode '{}'", callee.text, mode.text),
+                )
+            })
     }
 
     fn wait(
@@ -981,10 +1000,21 @@ impl Checker<'_> {
         &mut self,
         callee: &ast::Name,
         args: &[ast::Expr],
+        mode: Option<&ast::Name>,
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
         let at = callee.at;
+        let is_model = self.globals.model.as_deref() == Some(callee.text.as_str());
+        if let Some(mode) = mode.filter(|_| !is_model) {
+            return error(
+                mode.at,
+                format!(
+                    "'mode {}' follows a call of '{}': only a model call takes a mode",
+                    mode.text, callee.text
+                ),
+            );
+        }
         if let Some(&tool_id) = self.globals.tools.get(&callee.text) {
             let tool = &self.program.tools[tool_id];
             let wanted: Vec<Type> = tool.params.iter().map(|param| param.ty.clone()).collect();
@@ -1059,13 +1089,24 @@ impl Checker<'_> {
                 .as_ref()
                 .expect("a model name is bound only with a model")
                 .result();
-            return Ok(self.site(
+            let mode = mode.map(|mode| self.mode(callee, mode)).transpose()?;
+            let called = self.site(
                 SiteKind::Model,
                 SiteClass::Fixed(EffectClass::Idempotent),
                 result,
                 vec![value],
                 out,
-            ));
+            );
+            self.sites
+                .last_mut()
+                .expect("a model call just added its site")
+                .mode = mode;
+            return Ok(called);
+        }
+        if let Some(op) = ir::TextOp::parse(&callee.text) {
+            let wanted = vec![Type::Text; op.arity()];
+            let args = self.args(at, op.name(), args, &wanted, out)?;
+            return Ok((Expr::TextBuiltin { op, args }, op.result()));
         }
         match callee.text.as_str() {
             "len" => {
@@ -1242,7 +1283,9 @@ impl Checker<'_> {
                     ),
                 }
             }
-            ast::Expr::Call { callee, args } => self.call(callee, args, expected, out),
+            ast::Expr::Call { callee, args, mode } => {
+                self.call(callee, args, mode.as_ref(), expected, out)
+            }
             ast::Expr::Binary {
                 at,
                 op,
@@ -1388,7 +1431,7 @@ fn parallel_body<'b>(
     };
     let dispatches_item = matches!(
         subject,
-        ast::Expr::Call { callee, args }
+        ast::Expr::Call { callee, args, mode: None }
             if callee.text == "dispatch"
                 && matches!(args.as_slice(), [ast::Expr::Name(item)] if item.text == name.text)
     );

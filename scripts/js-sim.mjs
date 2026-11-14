@@ -256,6 +256,7 @@ class Seed {
     same("model call turn", event.turn, request.turn);
     same("model call seq", event.seq, request.seq);
     same("model calls_max", event.calls_max, request.calls_max);
+    same("model mode", event.mode ?? null, request.mode);
     same("model context crc", event.context_crc, BigInt(rt.crc32(rt.encodeJson(request.context))));
     return event.response;
   }
@@ -356,7 +357,7 @@ class Seed {
       }
       if (url === MODEL_URL) {
         fetchCheck(null);
-        const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, context: body.context });
+        const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, context: body.context });
         return new Response(rt.encodeJson(response), { status: HTTP_OK });
       }
       throw new Error(`unexpected fetch of ${url}`);

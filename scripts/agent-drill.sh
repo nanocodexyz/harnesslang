@@ -168,11 +168,22 @@ if set(effects) - {f"step{index}" for index in range(1, steps + 1)}:
 if open(f"{out}/ws/done.txt").read().strip() != "done":
     sys.exit("agent-drill: done.txt is wrong")
 unknown = 0
+replies = set()
 for line in open(f"{out}/journal/journal.jsonl"):
     record = json.loads(line)["record"]
     if "recovery" in record:
         unknown += len(record["recovery"].get("unknown", []))
-print(f"agent-drill: external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
+    if "model" in record:
+        replies.add(record["model"]["call_id"])
+discarded = [json.loads(line) for line in open(f"{out}/journal/usage.jsonl")]
+discarded = [record["call"] for record in discarded if record.get("kind") == "stream_discarded"]
+unanswered = sorted(set(discarded) - replies)
+if unanswered:
+    sys.exit(f"agent-drill: streams cut by a kill were not requested again to a journaled reply: {unanswered}")
+leftover = [name for name in os.listdir(f"{out}/journal/state") if name.endswith(".sse")]
+if leftover:
+    sys.exit(f"agent-drill: partial streams left after the turn finished: {leftover}")
+print(f"agent-drill: external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
 EOF
 finished=1
 echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool)"

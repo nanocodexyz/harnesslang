@@ -552,6 +552,7 @@ pub enum Record {
         turn: u64,
         seq: u64,
         response: Json,
+        mode: Option<String>,
     },
     NestedCall {
         turn: u64,
@@ -719,12 +720,19 @@ fn record_body(record: &Record) -> Json {
             turn,
             seq,
             response,
-        } => Json::object(vec![
-            ("call_id", Json::String(call_id(*turn, *seq))),
-            ("response", response.clone()),
-            ("seq", Json::Number(*seq)),
-            ("turn", turn_text(*turn)),
-        ]),
+            mode,
+        } => {
+            let mut fields = vec![
+                ("call_id", Json::String(call_id(*turn, *seq))),
+                ("response", response.clone()),
+                ("seq", Json::Number(*seq)),
+                ("turn", turn_text(*turn)),
+            ];
+            if let Some(mode) = mode {
+                fields.push((MODEL_MODE, Json::text(mode)));
+            }
+            Json::object(fields)
+        }
         Record::Recovery {
             turn,
             attempt,
@@ -918,12 +926,19 @@ pub fn record_from(json: &Json) -> Result<Record, String> {
         }
         "cell" => cell_from(&fields),
         "model" => {
-            fields.exact(&["call_id", "response", "seq", "turn"])?;
+            let mode = if fields.map.contains_key(MODEL_MODE) {
+                fields.exact(&["call_id", MODEL_MODE, "response", "seq", "turn"])?;
+                Some(fields.text(MODEL_MODE)?.to_owned())
+            } else {
+                fields.exact(&["call_id", "response", "seq", "turn"])?;
+                None
+            };
             let (turn, seq) = top_level(fields.call()?)?;
             Ok(Record::Model {
                 turn,
                 seq,
                 response: fields.get("response")?.clone(),
+                mode,
             })
         }
         "recovery" => recovery_from(&fields),
@@ -1158,8 +1173,10 @@ pub enum SiteLog {
     Open(Call),
     Done(Call, Output),
     Unknown(Call),
-    Reply(Json),
+    Reply(Json, Option<String>),
 }
+
+pub const MODEL_MODE: &str = "mode";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finished {
@@ -1538,9 +1555,10 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
             turn,
             seq,
             response,
+            mode,
         } => {
             let log = running(session, *turn, "a model reply")?;
-            next_site(log, *turn, *seq, SiteLog::Reply(response.clone()))?;
+            next_site(log, *turn, *seq, SiteLog::Reply(response.clone(), mode.clone()))?;
         }
         Record::NestedCall {
             turn,

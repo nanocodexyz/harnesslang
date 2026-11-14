@@ -29,7 +29,9 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
         | Expr::Local(_)
         | Expr::Cancelled => false,
         Expr::Member { base, .. } => reads(base, quantities),
-        Expr::Construct { fields, .. } => fields.iter().any(|field| reads(field, quantities)),
+        Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
+            fields.iter().any(|field| reads(field, quantities))
+        }
         Expr::Binary { left, right, .. }
         | Expr::With {
             list: left,
