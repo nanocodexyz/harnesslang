@@ -224,6 +224,43 @@ impl World for Driver {
         harness::output_from(field(&event, "output")).unwrap_or_else(|error| fail(&error))
     }
 
+    fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+        let event = self.events.next("batch");
+        expect(&event, "limit", &limit.map_or(Json::Null, Json::Number));
+        let Some(Json::Array(order)) = event.get("order") else {
+            fail(&format!("batch event {} has no order", event.encode()));
+        };
+        let order: Vec<usize> = order
+            .iter()
+            .map(|index| index.as_u64().unwrap_or_else(|| fail("a batch order holds numbers")) as usize)
+            .collect();
+        if order.len() != requests.len() {
+            fail(&format!("the interpreter's batch has {} calls, the generated code's {}", order.len(), requests.len()));
+        }
+        let width = harness::batch_width(requests.len(), limit);
+        let mut outputs: Vec<Option<Output>> = vec![None; requests.len()];
+        let mut started = 0;
+        let mut completed = Vec::with_capacity(requests.len());
+        while started < width {
+            self.hook(Point::BeforeRun(harness::Kind::Dispatch, requests[started].effect))?;
+            outputs[started] = Some(self.tool(&requests[started]));
+            started += 1;
+        }
+        for index in order {
+            let Some(output) = outputs.get_mut(index).and_then(Option::take) else {
+                fail(&format!("batch call {index} completes before it started"));
+            };
+            self.hook(Point::AfterRun(harness::Kind::Dispatch, requests[index].effect))?;
+            completed.push((index, output));
+            if started < requests.len() {
+                self.hook(Point::BeforeRun(harness::Kind::Dispatch, requests[started].effect))?;
+                outputs[started] = Some(self.tool(&requests[started]));
+                started += 1;
+            }
+        }
+        Ok(completed)
+    }
+
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         let event = self.events.next("model");
         expect(&event, "turn", &Json::Number(request.turn));

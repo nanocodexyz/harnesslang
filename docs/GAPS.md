@@ -53,18 +53,6 @@ Smallest addition: inbound events declared on the harness, `on cancel` and
 a read returns the events recorded before the current sequence number, so
 replay stays deterministic and a read costs no record when nothing arrived.
 
-## 5. Parallel tool calls
-
-nanocode runs a reply's tool calls concurrently when the tools allow it
-(`supports_parallel_tool_calls` in `tool-host`, writers marked exclusive in
-`code_mode_policy.rs`). `for call in requested` dispatches one at a time.
-Smallest addition: `for call in requested parallel { ... }` whose body may
-only dispatch and push; sequence numbers are assigned in list order before
-any dispatch, every call record of the batch is flushed in one durability
-point before the first external dispatch, and results are appended in list
-order, so the journal equals the sequential one. Code mode's `parallel`
-bound (CODE_MODE.md) is the same idea for nested calls.
-
 ## 6. Typed tool input and dynamic tool lists
 
 A model call's input is one `text`, and `dispatch` finds the tool by name

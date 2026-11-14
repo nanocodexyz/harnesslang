@@ -243,6 +243,21 @@ fn run_seed_unguarded(
             ))),
         };
     }
+    if result.is_ok()
+        && profile == "clean"
+        && program.has_parallel()
+        && let Ok(records) = &records
+    {
+        result = sequential_twin(
+            program,
+            target,
+            mutation,
+            strict,
+            seed,
+            records,
+            &world.acks,
+        );
+    }
     let mut stats = world.stats.clone();
     stats.unknown = records.map_or(0, |records| unknown_count(&records));
     let journal = world.medium.bytes();
@@ -270,6 +285,34 @@ fn run_seed_unguarded(
         result,
     };
     (run, world.trace.take())
+}
+
+fn sequential_twin(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    strict: strict::Mode,
+    seed: u64,
+    records: &[Record],
+    acks: &[Finish],
+) -> Result<(), Violation> {
+    let twin = program.sequential();
+    assert!(
+        !twin.has_parallel(),
+        "the sequential twin runs one call at a time"
+    );
+    let (run, _) = run_seed_unguarded(&twin, target, mutation, strict, seed, None);
+    if invariants::trapped_in_body(&run.acks) {
+        return Ok(());
+    }
+    let checksum = target == Target::NativeJsonl && mutation != Mutation::JsonlNoChecksum;
+    let sequential =
+        crate::run::journal::decode_lines(&run.journal, checksum).map_err(|error| {
+            liveness(format!(
+                "the sequential twin's journal cannot be read: {error}"
+            ))
+        })?;
+    invariants::sequential_equal(records, acks, &sequential.records, &run.acks)
 }
 
 fn unknown_count(records: &[Record]) -> u64 {

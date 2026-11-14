@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::Program;
-use crate::run::journal::{Output, Record, call_id};
+use crate::run::engine::Finish;
+use crate::run::journal::{self, Output, Record, call_id};
 use crate::run::json::Json;
 use crate::run::session;
 use crate::run::turn;
@@ -22,10 +23,11 @@ pub enum Invariant {
     NoTrap,
     InvariantKept,
     WorstCase,
+    SequentialEqual,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -38,6 +40,7 @@ impl Invariant {
         Self::NoTrap,
         Self::InvariantKept,
         Self::WorstCase,
+        Self::SequentialEqual,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -54,6 +57,7 @@ impl Invariant {
             Self::NoTrap => "no_trap",
             Self::InvariantKept => "invariant_kept",
             Self::WorstCase => "worst_case",
+            Self::SequentialEqual => "sequential_equal",
         }
     }
 }
@@ -80,6 +84,7 @@ pub struct Calls {
 fn seq_unique(records: &[Record]) -> Result<Calls, Violation> {
     let mut calls = Calls::default();
     let mut last: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut last_result: BTreeMap<u64, u64> = BTreeMap::new();
     let mut open: BTreeSet<String> = BTreeSet::new();
     for record in records {
         match record {
@@ -102,6 +107,15 @@ fn seq_unique(records: &[Record]) -> Result<Calls, Violation> {
                     return violation(
                         Invariant::SeqUnique,
                         format!("result for {id}, which has no open call"),
+                    );
+                }
+                let previous = last_result.insert(*turn, *seq).unwrap_or(0);
+                if *seq <= previous {
+                    return violation(
+                        Invariant::SequentialEqual,
+                        format!(
+                            "turn {turn} records the result of seq {seq} after the result of seq {previous}, where one call at a time records them in order"
+                        ),
                     );
                 }
                 calls.results.entry(id).or_default().push(output.clone());
@@ -277,6 +291,70 @@ fn enum_valid(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation>
         }
     }
     Ok(())
+}
+
+fn canonical_key(record: &Record) -> (u64, u8, u64, u8) {
+    match record {
+        Record::Admitted { turn, .. } => (*turn, 0, 0, 0),
+        Record::Recovery { turn, attempt, .. } => {
+            (*turn, 1, 0, u8::try_from(*attempt).unwrap_or(u8::MAX))
+        }
+        Record::Call { turn, seq, .. } => (*turn, 2, *seq, 0),
+        Record::Result { turn, seq, .. } | Record::Model { turn, seq, .. } => (*turn, 2, *seq, 1),
+        Record::Status { turn, .. } => (*turn, 3, 0, 0),
+        Record::Checkpoint { revision, .. } => (*revision, 4, 0, 0),
+    }
+}
+
+pub fn sequential_equal(
+    journal: &[Record],
+    acks: &[Finish],
+    sequential: &[Record],
+    sequential_acks: &[Finish],
+) -> Result<(), Violation> {
+    let mut canonical = journal.to_vec();
+    canonical.sort_by_key(canonical_key);
+    if acks != sequential_acks {
+        return violation(
+            Invariant::SequentialEqual,
+            format!(
+                "on a clean run the turns finish {acks:?}, where one call at a time finishes {sequential_acks:?}"
+            ),
+        );
+    }
+    let differs = canonical
+        .iter()
+        .zip(sequential)
+        .position(|(left, right)| left != right);
+    let at = match differs {
+        Some(at) => at,
+        None if canonical.len() == sequential.len() => return Ok(()),
+        None => canonical.len().min(sequential.len()),
+    };
+    let shown = |records: &[Record]| {
+        records.get(at).map_or_else(
+            || "nothing".to_owned(),
+            |record| journal::to_json(record).encode(),
+        )
+    };
+    violation(
+        Invariant::SequentialEqual,
+        format!(
+            "on a clean run the journal, read per sequence number, has {} at record {at}, where one call at a time writes {}",
+            shown(&canonical),
+            shown(sequential)
+        ),
+    )
+}
+
+pub fn trapped_in_body(acks: &[Finish]) -> bool {
+    acks.iter().any(|finish| {
+        finish
+            .result
+            .get("trap")
+            .and_then(Json::as_str)
+            .is_some_and(|trap| !trap.starts_with("requires(") && !trap.starts_with("model reply"))
+    })
 }
 
 fn finish_once(world: &SimWorld<'_>, calls: &Calls, turns: u64) -> Result<(), Violation> {
