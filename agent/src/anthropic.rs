@@ -295,12 +295,20 @@ impl Client {
             last.insert("cache_control", ephemeral());
         }
         let refresh = mode == Some(MODE_REFRESH);
-        let kept = if refresh { kept_request(context)? } else { context.clone() };
+        let kept = if refresh {
+            kept_request(context)?
+        } else {
+            context.clone()
+        };
         let mut body = Value::object([
             ("model", Value::text(&self.model)),
             (
                 "max_tokens",
-                Value::number(if refresh { REFRESH_MAX_TOKENS } else { self.max_tokens }),
+                Value::number(if refresh {
+                    REFRESH_MAX_TOKENS
+                } else {
+                    self.max_tokens
+                }),
             ),
             ("system", self.system.clone()),
             ("tools", tools),

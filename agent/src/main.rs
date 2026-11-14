@@ -120,7 +120,10 @@ fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
         };
         let now = now_ms();
         if due > now {
-            eprintln!("hl-agent: idle {} ms until the prompt cache refresh due at {due}", due - now);
+            eprintln!(
+                "hl-agent: idle {} ms until the prompt cache refresh due at {due}",
+                due - now
+            );
             std::thread::sleep(std::time::Duration::from_millis(due - now));
         }
         let request = TurnRequest {
@@ -132,7 +135,9 @@ fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
                 refreshed += 1;
                 eprintln!("hl-agent: idle turn {turn}: {}", finish.result.encode());
             }
-            Ok((_, Ran::NotDue(not_due))) => eprintln!("hl-agent: idle turn {turn} is not due: {not_due:?}"),
+            Ok((_, Ran::NotDue(not_due))) => {
+                eprintln!("hl-agent: idle turn {turn} is not due: {not_due:?}")
+            }
             Ok((_, other)) => {
                 eprintln!("hl-agent: idle turn {turn} ended {other:?}");
                 return;
