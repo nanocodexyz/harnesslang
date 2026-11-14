@@ -116,9 +116,14 @@ journal protocol, so djs fits it as nanocode uses it:
     start(cell_id, script) -> Step
     resume(cell_id, input: Input) -> Step
     Step = Call { id, name, input } | Timeout { id, delay_ms } | Clock
-         | Monotonic | Random | Bytes { length } | Done { output } | Threw { error }
-    Input = Result { id, encoded, success } | Timer { id } | Clock { value }
-          | Monotonic { value } | Random { value } | Bytes { data }
+         | Monotonic | Random | Bytes { length } | Idle | Done { output } | Threw { error }
+    Input = Issued | Refused { error } | Result { id, encoded, success } | Timer { id }
+          | Clock { value } | Monotonic { value } | Random { value } | Bytes { data }
+
+After a Call or Timeout step the runner answers Issued and the script runs
+on (a Promise.all issues several calls this way); Idle means the script
+awaits, answered with the next Result or Timer; Refused answers a
+setTimeout past timers or timer_ms, which throws in the script.
 
 Each step is one `JournalEntry` (`code-mode-engine/src/journal.rs`); the
 runner journals it, answers it from the journal on replay or runs it live.
@@ -324,7 +329,8 @@ them with the property each must fail with.
 | `cell_recovery_reports_failed` (a plain failure instead of the unknown outcome) | jsonl, sqlite, postgres, cloudflare | `unknown_nested_reported` |
 | `cell_replay_ignores_journal` (rerun the script live) | all | `nested_external_once` |
 | `cell_rerun_after_finish` | all | `cell_finishes_once` |
-| `timeout_rides` (C2 removed) | jsonl, sqlite, postgres, vercel | `header_before_wait` |
+| `timeout_rides` (C2 removed) | jsonl, sqlite, postgres (Cloudflare's event and Vercel's sleep flush before every wait) | `header_before_wait` |
+| `nested_idempotent_reported_unknown` | all | `nested_known` |
 | `divergence_dispatches` (dispatch the divergent call) | all | `cell_replay_equal` |
 | `nested_ids_restart` (ids from 1 on every run) | all | `seq_unique` |
 | `cell_limit_unchecked` | all | `cell_bounded` |
