@@ -60,7 +60,12 @@ deny_dispatches docs/snippets/hooks.hl --twice denied_unrun
 spawn_key_unscoped docs/snippets/spawn.hl --twice child_scoped
 truncate_uncut docs/snippets/recovery.hl --twice checkpoint_compacted
 usage_unchecked docs/snippets/recovery.hl --twice replay_equal
-retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent"
+retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent
+notice_dropped docs/snippets/catalog.hl --twice checkpoint_compacted
+search_unchecked docs/snippets/catalog.hl --twice search_listed
+discovery_unchecked docs/snippets/catalog.hl --twice tool_admitted
+blob_unjournaled docs/snippets/images.hl --twice blob_journaled
+blobs_unevicted docs/snippets/images.hl --twice checkpoint_compacted"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
@@ -80,7 +85,9 @@ rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postg
 rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
 js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
-js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal"
+js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal
+rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 

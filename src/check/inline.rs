@@ -397,7 +397,7 @@ impl<'a> Inliner<'a> {
                 self.expr(walk, value)?;
                 Ok(statement.clone())
             }
-            Stmt::Clear { list, .. } => {
+            Stmt::Clear { list, .. } | Stmt::KeepBlobs { list, .. } => {
                 walk.reference(&self.declared, list)?;
                 Ok(statement.clone())
             }

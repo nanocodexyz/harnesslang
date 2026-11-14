@@ -71,6 +71,13 @@ impl<'a, 'p> Body<'a, 'p> {
 
     fn statement(&mut self, statement: &Stmt) {
         match statement {
+            Stmt::KeepBlobs { field, count } => {
+                let field = self.field(*field);
+                self.line(&format!(
+                    "keep_blobs(&mut state.{field}, {});",
+                    constant(&count.name)
+                ));
+            }
             Stmt::Let { local, value } => {
                 let annotation = match value {
                     Expr::Construct {
@@ -170,11 +177,19 @@ impl<'a, 'p> Body<'a, 'p> {
         let call = super::types::sum_name(self.program, ir::CALL);
         let site = &self.handler.sites[parallel.site];
         assert_eq!(site.kind, SiteKind::Dispatch, "a parallel for dispatches");
-        let Type::Maybe(inner) = &site.result else {
-            panic!("a dispatch yields maybe, found {:?}", site.result);
+        let (returns, decode) = match &site.result {
+            Type::Maybe(inner) => (
+                format!("|_| {}", self.types.returns(inner)),
+                format!("maybe(engine, answer, {})?", self.types.from_json(inner)),
+            ),
+            other if other.reports_unknown(self.program) => (
+                "dispatched_returns".to_owned(),
+                format!(
+                    "dispatched(engine, answer, {{ let {call}::Call(_, tool, _) = &{item}; blob_bound(tool).is_some() }})?"
+                ),
+            ),
+            other => panic!("a dispatch yields maybe or dispatched, found {other:?}"),
         };
-        let returns = self.types.returns(inner);
-        let decode = self.types.from_json(inner);
         self.line("{");
         self.depth += 1;
         self.line(&format!("let {items} = {list};"));
@@ -199,7 +214,7 @@ impl<'a, 'p> Body<'a, 'p> {
             "for ({item}, answer) in {items}.into_iter().zip({answers}) {{"
         ));
         self.depth += 1;
-        self.line(&format!("let {result} = maybe(engine, answer, {decode})?;"));
+        self.line(&format!("let {result} = {decode};"));
         self.block(&parallel.body);
         self.depth -= 1;
         self.line("}");
@@ -278,7 +293,7 @@ impl<'a, 'p> Body<'a, 'p> {
             Durability::FlushBeforeRunWhenExternal => "Durability::FlushBeforeRunWhenExternal",
             Durability::Cell => panic!("only a cell site has cell durability"),
         };
-        let maybe = matches!(site.result, Type::Maybe(_));
+        let maybe = site.result.reports_unknown(self.program);
         let mode = match site.mode {
             Some(mode) => format!("Some({:?})", self.program.mode_name(mode)),
             None => "None".to_owned(),
@@ -346,6 +361,15 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.line("let effect = dispatch_class(&tool);");
                 self.line("let input = match tool_input(&tool, &raw) { ToolInput::Typed(input) => input, ToolInput::Untyped | ToolInput::Invalid(_) => Json::String(raw) };");
                 self.line("let call = Call { tool, effect, input };");
+                if !matches!(result, Type::Maybe(_)) && result.reports_unknown(self.program) {
+                    self.line("let blob_capable = blob_bound(&call.tool).is_some();");
+                    self.line("let returns = dispatched_returns(&call.tool);");
+                    return (
+                        "Dispatch",
+                        "Run::Tool(returns)".to_owned(),
+                        "dispatched(engine, answer, blob_capable)?".to_owned(),
+                    );
+                }
                 let run = format!("Run::Tool({})", returns(self.types, result));
                 ("Dispatch", run, decode(self.types))
             }
@@ -475,7 +499,10 @@ impl<'a, 'p> Body<'a, 'p> {
         match expr {
             Expr::U64(_) | Expr::Constant(_) | Expr::Len(_) | Expr::TextLen(_) => Type::U64,
             Expr::Bool(_) | Expr::Not(_) | Expr::Cancelled => Type::Bool,
-            Expr::Text(_) | Expr::Member { .. } | Expr::Truncate { .. } => Type::Text,
+            Expr::Text(_)
+            | Expr::Member { .. }
+            | Expr::Truncate { .. }
+            | Expr::ListingNotice(_) => Type::Text,
             Expr::With { list, .. } => self.type_of(list),
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
@@ -491,6 +518,7 @@ impl<'a, 'p> Body<'a, 'p> {
 
     pub fn expr(&mut self, expr: &Expr) -> String {
         match expr {
+            Expr::ListingNotice(listing) => format!("engine.listing_notice({listing})"),
             Expr::U64(value) => format!("{value}_u64"),
             Expr::Bool(value) => value.to_string(),
             Expr::Text(value) => format!("String::from({value:?})"),

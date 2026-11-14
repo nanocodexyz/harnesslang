@@ -68,7 +68,7 @@ fn contains_list(ty: &Type) -> bool {
     match ty {
         Type::List { .. } => true,
         Type::Known(inner) | Type::Maybe(inner) => contains_list(inner),
-        Type::U64 | Type::Bool | Type::Text | Type::Sum(_) => false,
+        Type::U64 | Type::Bool | Type::Text | Type::Sum(_) | Type::Blob(_) => false,
     }
 }
 
@@ -80,6 +80,8 @@ pub fn generate(program: &Program, ty: &Type, rng: &mut Rng, edges: Option<&Edge
         }),
         Type::Bool => Value::Bool(rng.draw() & 1 == 1),
         Type::Text => Value::Text(SimWorld::generated_text(rng)),
+        Type::Blob(_) => panic!("the simulator draws no blob: blobs come from tools"),
+        Type::List { element, .. } if element.holds_blob(program) => Value::List(Vec::new()),
         Type::List { element, capacity } => {
             let length = rng.below(capacity.value.min(ARGUMENT_LIST_LENGTH_MAX) + 1);
             Value::List(
@@ -90,7 +92,7 @@ pub fn generate(program: &Program, ty: &Type, rng: &mut Rng, edges: Option<&Edge
         }
         Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => {
             let variants = ty.variants(program).expect("a sum has variants");
-            let variant = rng.pick(variants.len());
+            let variant = crate::sim::strict::blobless(program, &variants, rng);
             let fields = variants[variant]
                 .fields
                 .iter()

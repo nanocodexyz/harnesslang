@@ -48,6 +48,9 @@ pub const VERCEL_STEP_ATTEMPTS_MAX: u64 = 4;
 pub const MILLISECONDS_PER_SECOND: u64 = 1000;
 pub const CLOUDFLARE_ALARM_WALL_SECONDS_MAX: u64 = 15 * 60;
 pub const BLOCK_DEVICE_SECTOR_BYTES: usize = 512;
+pub const CLOUDFLARE_SQL_ROW_BYTES_MAX: u64 = 2_000_000;
+pub const SQLITE_LENGTH_BYTES_MAX: u64 = 1_000_000_000;
+pub const POSTGRES_FIELD_BYTES_MAX: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flush {
@@ -154,6 +157,7 @@ pub struct Limits {
     pub outbound_requests_per_invocation: Option<Limit>,
     pub duration_per_invocation: Option<Limit>,
     pub concurrent_requests: Option<Limit>,
+    pub record_bytes: Option<Limit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +191,7 @@ const NO_LIMITS: Limits = Limits {
     outbound_requests_per_invocation: None,
     duration_per_invocation: None,
     concurrent_requests: None,
+    record_bytes: None,
 };
 
 const CLOUDFLARE_LIMITS: Limits = Limits {
@@ -214,6 +219,29 @@ const CLOUDFLARE_LIMITS: Limits = Limits {
         unit: "requests waiting for response headers per invocation",
         source: "developers.cloudflare.com/workers/platform/limits (simultaneous open connections; relaxed to the wait for headers on 2026-04-09); a seventh fetch is queued by the runtime",
     }),
+    record_bytes: Some(Limit {
+        value: CLOUDFLARE_SQL_ROW_BYTES_MAX,
+        unit: "bytes per journal row",
+        source: "developers.cloudflare.com/durable-objects/platform/limits (SQLite-backed objects: maximum string, BLOB or table row size, 2 MB); a record is one row's text",
+    }),
+};
+
+const SQLITE_LIMITS: Limits = Limits {
+    record_bytes: Some(Limit {
+        value: SQLITE_LENGTH_BYTES_MAX,
+        unit: "bytes per journal row",
+        source: "sqlite.org/limits.html (SQLITE_MAX_LENGTH, the default length of a string or BLOB); a record is one row's text",
+    }),
+    ..NO_LIMITS
+};
+
+const POSTGRES_LIMITS: Limits = Limits {
+    record_bytes: Some(Limit {
+        value: POSTGRES_FIELD_BYTES_MAX,
+        unit: "bytes per journal row",
+        source: "postgresql.org/docs/current/limits.html (field size, 1 GB); a record is one row's text",
+    }),
+    ..NO_LIMITS
 };
 
 const CLOUDFLARE_FACTS: &[Fact] = &[
@@ -314,6 +342,7 @@ const VERCEL_LIMITS: Limits = Limits {
         source: "vercel.com/docs/functions/limitations (Pro and Enterprise, fluid compute)",
     }),
     concurrent_requests: None,
+    record_bytes: None,
 };
 
 pub const fn model(target: Target) -> Model {
@@ -340,7 +369,7 @@ pub const fn model(target: Target) -> Model {
             others: Others::Nobody,
             recovery: Recovery::AtLoad,
             gate_before_outbound: false,
-            limits: NO_LIMITS,
+            limits: SQLITE_LIMITS,
             cells: CellPlacement::HostProcess,
             facts: &[],
         },
@@ -353,7 +382,7 @@ pub const fn model(target: Target) -> Model {
             others: Others::SecondOwnerAfterLease,
             recovery: Recovery::AtLoad,
             gate_before_outbound: false,
-            limits: NO_LIMITS,
+            limits: POSTGRES_LIMITS,
             cells: CellPlacement::LeaseHolder,
             facts: &[],
         },
@@ -429,8 +458,52 @@ pub fn check_waits(program: &Program, model: &Model) -> Vec<String> {
     errors
 }
 
+pub fn blob_record_bytes(bytes: u64) -> Option<u64> {
+    use crate::run::blob;
+    use crate::run::journal::{self, Output, Record};
+    use crate::run::json::Json;
+    let digest = "0".repeat(blob::DIGEST_HEX_LEN);
+    let empty = Record::Result {
+        turn: u64::MAX,
+        seq: u64::MAX,
+        output: Output::Ok(Json::object([
+            (blob::BLOB_KEY, Json::text(&digest)),
+            (blob::DATA_KEY, Json::text("")),
+        ])),
+    };
+    let around = journal::to_json(&empty).encode().len() as u64;
+    blob::base64_len(bytes)?.checked_add(around)
+}
+
+fn check_blobs(program: &Program, model: &Model) -> Vec<String> {
+    let Some(limit) = model.limits.record_bytes else {
+        return Vec::new();
+    };
+    let mut errors = Vec::new();
+    for tool in &program.tools {
+        let crate::ir::Type::Blob(bytes) = &tool.returns else {
+            continue;
+        };
+        let record = blob_record_bytes(bytes.value);
+        if record.is_none_or(|record| record > limit.value) {
+            errors.push(format!(
+                "tool '{}': a result record of blob<{}> ({} bytes) holds up to {} bytes, over {}'s limit of {} {}",
+                tool.name,
+                bytes.name,
+                bytes.value,
+                record.map_or_else(|| "more than u64".to_owned(), |record| record.to_string()),
+                model.target.name(),
+                limit.value,
+                limit.unit
+            ));
+        }
+    }
+    errors
+}
+
 pub fn check_limits(program: &Program, model: &Model) -> Vec<String> {
     let mut errors = check_waits(program, model);
+    errors.extend(check_blobs(program, model));
     let Some(limit) = model.limits.outbound_requests_per_invocation else {
         return errors;
     };

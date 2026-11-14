@@ -1,3 +1,4 @@
+mod blobs;
 mod handlers;
 mod sql;
 mod types;
@@ -13,6 +14,7 @@ use types::{Types, camel, constant, ident, sum_name, variant_ident};
 
 const RUNTIME_JOURNAL: &str = include_str!("runtime/journal.rs");
 const RUNTIME_ENGINE: &str = include_str!("runtime/engine.rs");
+const RUNTIME_BLOB: &str = include_str!("runtime/blob.rs");
 const RUNTIME_CELL: &str = include_str!("runtime/cell.rs");
 const RUNTIME_JSONL: &str = include_str!("runtime/jsonl.rs");
 const SHARED_CELL_JOURNAL: &str = include_str!("../../run/cell_journal.rs");
@@ -39,6 +41,7 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     let mut out = String::from(LINTS);
     out.push_str(RUNTIME_JOURNAL);
     out.push_str(RUNTIME_ENGINE);
+    out.push_str(RUNTIME_BLOB);
     out.push_str(&shared_source(SHARED_CELL_JOURNAL));
     out.push_str(RUNTIME_CELL);
     match target {
@@ -204,6 +207,7 @@ fn generate(program: &Program, target: Target) -> String {
     state(&mut out, program, &mut types);
     arguments(&mut out, program, &mut types);
     dispatch(&mut out, program);
+    blobs::emit(&mut out, program);
     codes(&mut out, program);
     inputs(&mut out, program, &mut types);
     for handler in &program.handlers {

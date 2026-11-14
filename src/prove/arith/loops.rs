@@ -27,6 +27,7 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
         | Expr::Text(_)
         | Expr::Constant(_)
         | Expr::Local(_)
+        | Expr::ListingNotice(_)
         | Expr::Cancelled => false,
         Expr::Member { base, .. } => reads(base, quantities),
         Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {

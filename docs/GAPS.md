@@ -13,28 +13,25 @@ accounting and truncation, summarizing compaction, recovery by stop reason,
 retry and backoff) are closed by a model's `window`, the `attempt` and `stop`
 builtins, `len` and `truncate_middle` on text, `keep ... after`, `with` and
 `wait(e) at most c` (LANGUAGE.md); `examples/claude_code.hl` keeps their
-behaviour, short of the backoff's jitter, which needs a remainder operator. Gaps 5 (hooks around every tool and lifecycle event) and 7 (subagents) are closed by `before tool`, `after tool`, the lifecycle hooks, `spawn` and `join` (LANGUAGE.md). Numbers 9 to 11 are what
+behaviour, short of the backoff's jitter, which needs a remainder operator.
+Gap 6 (tool catalogs that change within a turn) is closed by `name(context)`
+listing notices and `finds` tool search, and the images and structured
+results of gap 8 by `blob<N>`, `text or blob<N>` tools and `keep L blobs
+last N` ([Listing notices and tool search](LANGUAGE.md#listing-notices-and-tool-search),
+[Blobs](LANGUAGE.md#blobs)); what is left of gap 8 is the prompt cache's
+lifetime. Gaps 5 (hooks around every tool and lifecycle event) and 7
+(subagents) are closed by `before tool`, `after tool`, the lifecycle hooks,
+`spawn` and `join` (LANGUAGE.md). Numbers 9 to 11 are what
 porting nanocode's Claude Code prompt and tools as `examples/claude_code.hl`
 left out.
 
-## 6. Tool catalogs that change within a turn
+## 8. Prompt cache lifetime
 
-`refresh_dynamic_tools` reads the tool list again every round
-(`agent.rs:6225-6278`), a notice tells the model what changed
-(`agent.rs:4774-4825`), and tool search discovers deferred tools from the
-model's own search results (`agent.rs:1537-1558`, `8478-8520`). A listing's
-read admits tools for the rest of the turn, but nothing reports to the model
-what a later read added or removed, and a tool named inside a search result
-would have to be parsed out of text. Smallest addition: a built-in notice entry
-that a listing read appends when its fingerprints changed, and a search tool
-whose results are names the listing must hold, checked at run time.
-
-## 8. Images, structured results and cache control
-
-Tool results are blocks (text, images, structured results, metadata;
-`agent.rs:106-157`, `2022-2060`), images are inlined and evicted to stay in the
-window (`agent/images.rs:14-225`), and the prompt cache's lifetime is tracked
-and refreshed (`agent/keep.rs:24-177`). A tool returns `u64`, `bool`, `text`
-or a text enum. Smallest addition: an opaque `blob` type journaled by its
-digest, which a tool returns and a list holds, with `keep last N` bounding how
-many stay.
+The prompt cache's lifetime is tracked and kept warm: after a reply the
+backend keeps its request and, while the session idles, sends it again
+before the cache's lifetime (five minutes, or an hour) runs out, a bounded
+number of times (`agent/keep.rs:24-177`). A harness has no notion of time
+passing between turns and no effect that runs while no turn does. Smallest
+addition: a `keep` timer on the model whose refreshes are model calls the
+journal records under the session rather than a turn, bounded by a named
+count, so the worst case counts them and replay skips them.

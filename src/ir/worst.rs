@@ -31,6 +31,7 @@ pub struct WorstCase {
     pub records: Cost,
     pub requests: Cost,
     pub wait_ms: Cost,
+    pub blob_bytes: Cost,
     pub spawns: Cost,
     pub family: Option<Family>,
 }
@@ -77,15 +78,16 @@ pub struct Overflow {
     pub loops: Vec<Factor>,
 }
 
-pub const MEASURES: [&str; 5] = [
+pub const MEASURES: [&str; 6] = [
     "effects",
     "journal records",
     "outbound requests",
     "milliseconds of waits",
+    "blob bytes",
     "child sessions",
 ];
 
-type Costs = [Cost; 5];
+type Costs = [Cost; MEASURES.len()];
 
 #[derive(Clone, Debug)]
 struct Paths {
@@ -147,10 +149,15 @@ impl Cost {
 }
 
 fn zero() -> Costs {
+    std::array::from_fn(|_| Cost::default())
+}
+
+fn costs(effects: u64, records: u64, requests: u64, wait_ms: u64) -> Costs {
     [
-        Cost::default(),
-        Cost::default(),
-        Cost::default(),
+        Cost::of(effects),
+        Cost::of(records),
+        Cost::of(requests),
+        Cost::of(wait_ms),
         Cost::default(),
         Cost::default(),
     ]
@@ -183,9 +190,8 @@ fn repeated(costs: Costs, factor: &Factor, count: u64) -> Result<Costs, Overflow
 }
 
 fn widest(left: Costs, right: Costs) -> Costs {
-    let [a, b, c, d, e] = left;
-    let [v, w, x, y, z] = right;
-    [a.or(v), b.or(w), c.or(x), d.or(y), e.or(z)]
+    let mut right = right.into_iter();
+    left.map(|cost| cost.or(right.next().expect("both sides hold every measure")))
 }
 
 fn either(left: Option<Costs>, right: Option<Costs>) -> Option<Costs> {
@@ -281,13 +287,18 @@ fn cell_cost(program: &Program, code: &Code) -> Result<Costs, Overflow> {
             nested.checked_add(EFFECT_RECORDS + CELL_HEADER_RECORDS + CELL_FINISH_RECORDS)
         })
         .ok_or_else(|| overflow(1))?;
-    Ok([
-        Cost::of(effects),
-        Cost::of(records),
-        Cost::of(calls),
-        Cost::of(0),
-        Cost::of(0),
-    ])
+    Ok(costs(effects, records, calls, 0))
+}
+
+fn blob_bytes(program: &Program, kind: SiteKind) -> u64 {
+    match kind {
+        SiteKind::Tool(tool) => match &program.tools[tool].returns {
+            crate::ir::Type::Blob(bytes) => bytes.value,
+            _ => 0,
+        },
+        SiteKind::Dispatch => program.blobs.as_ref().map_or(0, |blobs| blobs.bytes.value),
+        _ => 0,
+    }
 }
 
 fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
@@ -297,13 +308,10 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
         _ => false,
     };
     let plain = |records| {
-        [
-            Cost::of(1),
-            Cost::of(records),
-            Cost::of(u64::from(kind.outbound())),
-            Cost::of(0),
-            Cost::of(u64::from(spawns)),
-        ]
+        let mut plain = costs(1, records, u64::from(kind.outbound()), 0);
+        plain[4] = Cost::of(blob_bytes(program, kind));
+        plain[5] = Cost::of(u64::from(spawns));
+        plain
     };
     match kind {
         SiteKind::Cell(code) => cell_cost(program, &program.codes[code]),
@@ -322,14 +330,9 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
         | SiteKind::Suspend
         | SiteKind::Deny => Ok(plain(EFFECT_RECORDS)),
         SiteKind::Wait(constant) => {
-            let [effects, records, requests, _, spawned] = plain(EFFECT_RECORDS);
-            Ok([
-                effects,
-                records,
-                requests,
-                Cost::of(program.constants[constant].value),
-                spawned,
-            ])
+            let mut waited = plain(EFFECT_RECORDS);
+            waited[3] = Cost::of(program.constants[constant].value);
+            Ok(waited)
         }
     }
 }
@@ -353,17 +356,12 @@ fn statement_cost(
         | Stmt::Assign { .. }
         | Stmt::Push { .. }
         | Stmt::Take { .. }
+        | Stmt::KeepBlobs { .. }
         | Stmt::Shrink { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {
             through: None,
-            ended: Some([
-                Cost::of(0),
-                Cost::of(FINISH_RECORDS),
-                Cost::of(0),
-                Cost::of(0),
-                Cost::of(0),
-            ]),
+            ended: Some(costs(0, FINISH_RECORDS, 0, 0)),
         }),
         Stmt::If {
             then, otherwise, ..
@@ -405,14 +403,8 @@ pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overfl
     let body = block(program, handler, &handler.body)?;
     let longest =
         either(body.through, body.ended).expect("a block keeps a path through it or ending in it");
-    let admission = [
-        Cost::of(0),
-        Cost::of(ADMISSION_RECORDS),
-        Cost::of(0),
-        Cost::of(0),
-        Cost::of(0),
-    ];
-    let [effects, records, requests, wait_ms, spawns] = combine(admission, longest)?;
+    let admission = costs(0, ADMISSION_RECORDS, 0, 0);
+    let [effects, records, requests, wait_ms, blob_bytes, spawns] = combine(admission, longest)?;
     let family = family(
         program,
         [effects.total, records.total, requests.total],
@@ -423,6 +415,7 @@ pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overfl
         records,
         requests,
         wait_ms,
+        blob_bytes,
         spawns,
         family,
     })

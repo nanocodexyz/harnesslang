@@ -126,6 +126,7 @@ impl Walk<'_> {
             | Stmt::Assign { .. }
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
+            | Stmt::KeepBlobs { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. } => true,
         }

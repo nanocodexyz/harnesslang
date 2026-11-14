@@ -144,7 +144,9 @@ pub struct Tool {
     pub params: Vec<Param>,
     pub defaults: Vec<Option<Expr>>,
     pub returns: TypeExpr,
+    pub attaches: Option<TypeExpr>,
     pub effect: EffectClass,
+    pub finds: Option<Name>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,13 +225,20 @@ pub enum TypeExpr {
         at: Position,
         inner: Box<TypeExpr>,
     },
+    Blob {
+        at: Position,
+        bytes: Name,
+    },
 }
 
 impl TypeExpr {
     pub fn at(&self) -> Position {
         match self {
             Self::Named(name) => name.at,
-            Self::List { at, .. } | Self::Known { at, .. } | Self::Maybe { at, .. } => *at,
+            Self::List { at, .. }
+            | Self::Known { at, .. }
+            | Self::Maybe { at, .. }
+            | Self::Blob { at, .. } => *at,
         }
     }
 }
@@ -265,6 +274,11 @@ pub enum Stmt {
         list: Name,
         count: Expr,
         first: Option<Expr>,
+    },
+    KeepBlobs {
+        at: Position,
+        list: Name,
+        count: Name,
     },
     If {
         at: Position,

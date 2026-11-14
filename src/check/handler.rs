@@ -45,6 +45,15 @@ pub fn check(
     let mut params = Vec::new();
     for param in &definition.params {
         let ty = resolve(program, globals, &param.ty)?;
+        if ty.holds_blob(program) {
+            return error(
+                param.ty.at(),
+                format!(
+                    "parameter '{}' of handler '{}' cannot hold a blob: a blob comes from a tool",
+                    param.name.text, definition.name.text
+                ),
+            );
+        }
         params.push(checker.declare(&param.name, ty)?);
     }
     let requires = match &definition.requires {
@@ -380,6 +389,22 @@ impl Checker<'_> {
                 };
                 out.push(Stmt::Shrink { field, kept });
                 self.compaction(ast::HookKind::PostCompact, compacts, *keep_at, out)?;
+                Ok(false)
+            }
+            ast::Stmt::KeepBlobs { at, list, count } => {
+                let (field, element) = self.list_field(list, "keep the blobs of")?;
+                if self.program.blobs.is_none() || element != Type::Sum(ir::ENTRY) {
+                    return error(
+                        *at,
+                        format!(
+                            "'keep {} blobs' keeps the newest blobs of a context: it needs a list<entry, _> and a tool that returns a blob",
+                            list.text
+                        ),
+                    );
+                }
+                let count =
+                    super::bound(self.program, self.globals, count, "the blobs a keep leaves")?;
+                out.push(Stmt::KeepBlobs { field, count });
                 Ok(false)
             }
             ast::Stmt::If {
@@ -806,7 +831,8 @@ impl Checker<'_> {
                 ),
             );
         }
-        if missing.contains(&ir::OUTCOME_VARIANTS[ir::UNKNOWN]) && matches!(ty, Type::Maybe(_)) {
+        if missing.contains(&ir::OUTCOME_VARIANTS[ir::UNKNOWN]) && ty.reports_unknown(self.program)
+        {
             return error(
                 at,
                 format!(
@@ -907,6 +933,74 @@ impl Checker<'_> {
             result: local,
         });
         (Expr::Local(local), result)
+    }
+
+    fn listing_read(
+        &mut self,
+        at: Position,
+        callee: &ast::Name,
+        listing: ir::ListingId,
+        args: &[ast::Expr],
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
+        let notified = match args {
+            [] => None,
+            [ast::Expr::Name(list)] => {
+                let (field, element) = self.list_field(list, "append a notice to")?;
+                let Some(notice) = self
+                    .program
+                    .notice
+                    .filter(|_| element == Type::Sum(ir::ENTRY))
+                else {
+                    return error(
+                        list.at,
+                        format!(
+                            "listing '{}' appends its notice to a list<entry, _>, and '{}' is not one",
+                            callee.text, list.text
+                        ),
+                    );
+                };
+                Some((field, notice))
+            }
+            _ => {
+                return error(
+                    at,
+                    format!(
+                        "listing '{}' takes 0 argument(s), or the context to append its notice to, found {}",
+                        callee.text,
+                        args.len()
+                    ),
+                );
+            }
+        };
+        let read = self.site(
+            SiteKind::Listing(listing),
+            SiteClass::Fixed(EffectClass::None),
+            Type::Known(Box::new(Type::U64)),
+            Vec::new(),
+            out,
+        );
+        if let Some((field, notice)) = notified {
+            let text = Expr::ListingNotice(listing);
+            out.push(Stmt::If {
+                condition: Expr::Binary {
+                    op: BinaryOp::NotEqual,
+                    operand: Type::Text,
+                    left: Box::new(text.clone()),
+                    right: Box::new(Expr::Text(String::new())),
+                },
+                then: vec![Stmt::Push {
+                    field,
+                    value: Expr::Construct {
+                        ty: Type::Sum(ir::ENTRY),
+                        variant: notice,
+                        fields: vec![text],
+                    },
+                }],
+                otherwise: Vec::new(),
+            });
+        }
+        Ok(read)
     }
 
     fn mode(&self, callee: &ast::Name, mode: &ast::Name) -> Checked<ir::ModeId> {
@@ -1091,6 +1185,15 @@ impl Checker<'_> {
         }
         if let Some(&tool_id) = self.globals.tools.get(&callee.text) {
             let tool = &self.program.tools[tool_id];
+            if tool.attaches.is_some() {
+                return error(
+                    at,
+                    format!(
+                        "tool '{}' returns text or a blob: call it through dispatch, whose blob arm takes the blob",
+                        callee.text
+                    ),
+                );
+            }
             if tool.spawn.is_some() {
                 self.plain_spawn(callee)?;
             }
@@ -1127,14 +1230,7 @@ impl Checker<'_> {
             ));
         }
         if let Some(&listing) = self.globals.listings.get(&callee.text) {
-            self.args(at, &format!("listing '{}'", callee.text), args, &[], out)?;
-            return Ok(self.site(
-                SiteKind::Listing(listing),
-                SiteClass::Fixed(EffectClass::None),
-                Type::Known(Box::new(Type::U64)),
-                Vec::new(),
-                out,
-            ));
+            return self.listing_read(at, callee, listing, args, out);
         }
         if self.globals.model.as_deref() == Some(callee.text.as_str()) {
             let [context] = args else {
@@ -1205,13 +1301,8 @@ impl Checker<'_> {
             "dispatch" => {
                 self.plain_dispatch(at)?;
                 let args = self.args(at, "dispatch", args, &[Type::Sum(ir::CALL)], out)?;
-                Ok(self.site(
-                    SiteKind::Dispatch,
-                    SiteClass::Dispatched,
-                    Type::Maybe(Box::new(Type::Text)),
-                    args,
-                    out,
-                ))
+                let result = self.program.dispatch_result();
+                Ok(self.site(SiteKind::Dispatch, SiteClass::Dispatched, result, args, out))
             }
             "wait" => self.wait(at, args, out),
             JOIN => self.join(at, args, out),
@@ -1549,7 +1640,7 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         ast::Stmt::Assign { .. } => "an assignment".to_owned(),
         ast::Stmt::Push { .. } => "a push".to_owned(),
         ast::Stmt::Clear { .. } => "a clear".to_owned(),
-        ast::Stmt::Keep { .. } => "a keep".to_owned(),
+        ast::Stmt::Keep { .. } | ast::Stmt::KeepBlobs { .. } => "a keep".to_owned(),
         ast::Stmt::If { .. } => "an if".to_owned(),
         ast::Stmt::Match { .. } => "a match".to_owned(),
         ast::Stmt::Loop { .. } => "a loop".to_owned(),
@@ -1600,6 +1691,7 @@ pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
         ast::Stmt::Push { at, .. }
         | ast::Stmt::Clear { at, .. }
         | ast::Stmt::Keep { at, .. }
+        | ast::Stmt::KeepBlobs { at, .. }
         | ast::Stmt::If { at, .. }
         | ast::Stmt::Match { at, .. }
         | ast::Stmt::Loop { at, .. }

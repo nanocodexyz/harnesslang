@@ -52,6 +52,12 @@ pub const STOP_FAULT_PPM: u64 = 60_000;
 pub const STOP_FAULTS: [&str; 4] = ["max_tokens", "refusal", "context_exceeded", "pause"];
 pub const USAGE_EDGE_PPM: u64 = 10_000;
 pub const LONG_TEXT_PPM: u64 = 20_000;
+pub const BLOB_INVALID_PPM: u64 = 50_000;
+pub const BLOB_ATTACHED_PPM: u64 = 250_000;
+pub const BLOB_OVER_PPM: u64 = 20_000;
+pub const BLOB_WHOLE_PPM: u64 = 10_000;
+pub const BLOB_SHORT_BYTES_MAX: u64 = 4;
+pub const FOUND_TOOLS_MAX: u64 = 3;
 pub const LONG_TEXT_PIECES: [&str; 6] = [
     "alpha ",
     "beta\n",
@@ -83,8 +89,12 @@ pub struct Returned {
 
 impl Dispatched {
     pub fn returned(&mut self, program: &Program, request: &ToolRequest<'_>, output: &Output) {
-        let expected =
-            value::checked_output(program, request.tool, request.returns, output.clone());
+        let expected = crate::run::blob::expected(value::checked_output(
+            program,
+            request.tool,
+            request.returns,
+            output.clone(),
+        ));
         if program.dispatch_class(request.tool) == EffectClass::External {
             self.outputs.push(expected.clone());
         }
@@ -568,8 +578,49 @@ impl<'a> SimWorld<'a> {
                 }
                 Json::String(sum.variants[rng.pick(sum.variants.len())].name.clone())
             }
+            Type::Blob(bytes) => Self::blob_value(rng, bytes.value),
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
         }
+    }
+
+    pub fn blob_value(rng: &mut Rng, bytes_max: u64) -> Json {
+        if rng.chance(BLOB_INVALID_PPM) {
+            return crate::run::blob::host_blob(&Self::generated_text(rng));
+        }
+        let length = if rng.chance(BLOB_OVER_PPM) {
+            bytes_max + 1
+        } else if rng.chance(BLOB_WHOLE_PPM) {
+            bytes_max
+        } else {
+            rng.below(bytes_max.min(BLOB_SHORT_BYTES_MAX) + 1)
+        };
+        let word = WORDS[rng.pick(WORDS.len())].as_bytes();
+        let length = usize::try_from(length).expect("a blob's length fits usize");
+        let bytes: Vec<u8> = word.iter().copied().cycle().take(length).collect();
+        crate::run::blob::host_blob(&crate::run::blob::base64_encode(&bytes))
+    }
+
+    fn found_text(&self, rng: &mut Rng, listing: ir::ListingId) -> String {
+        let listed = &self.listings[listing];
+        let count = rng.below(FOUND_TOOLS_MAX + 1);
+        let mut lines = Vec::new();
+        for _ in 0..count {
+            let unlisted = !self.greedy && rng.chance(UNLISTED_TOOL_PPM);
+            let name = if listed.is_empty() || unlisted {
+                WORDS[rng.pick(WORDS.len())]
+            } else {
+                listed
+                    .keys()
+                    .nth(rng.pick(listed.len()))
+                    .expect("a pick below the length names a key")
+            };
+            lines.push(format!(
+                "{}{}{name}",
+                self.program.listings[listing].name,
+                ir::LISTED_TOOL_SEPARATOR
+            ));
+        }
+        lines.join(&ir::SEARCH_SEPARATOR.to_string())
     }
 
     fn count_effect(&mut self, outbound: bool) {
@@ -1148,6 +1199,15 @@ impl SimWorld<'_> {
                 request.tool,
                 Self::generated_text(&mut rng)
             ))
+        } else if let Some(listing) = self.program.search_of(request.tool) {
+            Output::Ok(Json::String(self.found_text(&mut rng, listing)))
+        } else if let Some(bytes) = self
+            .program
+            .tool(request.tool)
+            .and_then(|(_, tool)| tool.attaches.as_ref())
+            .filter(|_| rng.chance(BLOB_ATTACHED_PPM))
+        {
+            Output::Ok(Self::blob_value(&mut rng, bytes.value))
         } else {
             Output::Ok(Self::tool_value(
                 self.program,

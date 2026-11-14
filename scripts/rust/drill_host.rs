@@ -82,6 +82,7 @@ impl Host for Drill {
             Returns::Values { values, .. } => {
                 Json::String(values[(self.rng.draw() % values.len() as u64) as usize].to_owned())
             }
+            Returns::Blob { .. } => harness::host_blob_bytes(format!("{}-{id}", request.tool).as_bytes()),
         })
     }
 
