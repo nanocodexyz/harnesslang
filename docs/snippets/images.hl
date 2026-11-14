@@ -10,7 +10,7 @@ const shots_max: u64 = 2
 type outcome = done(text) | exhausted
 
 tool screenshot(url: text) -> blob<image_bytes_max> effect idempotent
-tool read(path: text) -> text effect none
+tool read(path: text) -> text or blob<image_bytes_max> effect none
 
 model think calls calls_max
 

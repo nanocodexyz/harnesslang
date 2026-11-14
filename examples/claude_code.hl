@@ -20,14 +20,20 @@ const throttled_wait_ms: u64 = 180000
 const bash_timeout_ms: u64 = 120000
 const read_offset_first: u64 = 1
 const read_limit_whole: u64 = 0
+const image_bytes_max: u64 = 1048576
+const images_kept: u64 = 100
+const mcp_tools_max: u64 = 64
+const tool_search_results_default: u64 = 5
 
 type outcome = completed(text) | failed(text) | exhausted
 type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
 
 tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
-tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text effect none
+tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text or blob<image_bytes_max> effect none
 tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool = false) -> text effect external
 tool Write(file_path: text, content: text) -> text effect external
+tool ToolSearch(query: text, max_results: u64 = tool_search_results_default) -> text effect none finds mcp
+tools from listing(mcp, mcp_tools_max) (arguments: text) effect external
 
 model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only
 
@@ -207,6 +213,7 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
         pending_units = pending_units + len(cut)
         push context error(call, cut)
       }
+      blob(image) => { push context attached(call, image) }
       unknown => { push context unknown(call) }
     }
   }
@@ -230,7 +237,8 @@ on prompt(input: text, rounds: u64) -> outcome
   compact_pending = false
   round_entries = 0
   loop round below rounds_max {
-    if len(context) + 4 + calls_per_round_max > context_entries_max {
+    keep context blobs last images_kept
+    if len(context) + 5 + calls_per_round_max > context_entries_max {
       compact_pending = true
     }
     if context_tokens * 4 + pending_units >= (context_window_tokens - compaction_reserved_tokens) * 4 {
@@ -239,10 +247,14 @@ on prompt(input: text, rounds: u64) -> outcome
     if compact_pending {
       compact()
     } else {
-      if len(context) + 4 + calls_per_round_max > context_entries_max {
+      if len(context) + 5 + calls_per_round_max > context_entries_max {
         return failed("the context has no room for a round after compaction")
       }
       if round >= rounds { return exhausted }
+      match mcp(context) {
+        ok(_) => {}
+        failed(_) => {}
+      }
       match messages(context) {
         throttled(error, after_ms) => { back_off(error, after_ms, throttled_attempts_max, true) }
         transient(error, after_ms) => { back_off(error, after_ms, attempts_max, false) }

@@ -743,7 +743,7 @@ fn blob_journaled(program: &Program, records: &[Record]) -> Result<(), Violation
             Record::Result {
                 turn,
                 seq,
-                output: Output::Ok(json),
+                output: Output::Ok(json @ Json::Object(_)),
             } => {
                 let id = call_id(*turn, *seq);
                 let blob = tools
