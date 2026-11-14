@@ -24,11 +24,12 @@ pub enum Invariant {
     NoTrap,
     InvariantKept,
     WorstCase,
+    CheckpointCompacted,
     SequentialEqual,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -42,6 +43,7 @@ impl Invariant {
         Self::NoTrap,
         Self::InvariantKept,
         Self::WorstCase,
+        Self::CheckpointCompacted,
         Self::SequentialEqual,
     ];
 
@@ -60,6 +62,7 @@ impl Invariant {
             Self::NoTrap => "no_trap",
             Self::InvariantKept => "invariant_kept",
             Self::WorstCase => "worst_case",
+            Self::CheckpointCompacted => "checkpoint_compacted",
             Self::SequentialEqual => "sequential_equal",
         }
     }
@@ -167,7 +170,63 @@ pub fn check(
     let calls = safety(world, records)?;
     finish_once(world, &calls, turns)?;
     idempotent_known(&calls, records)?;
+    checkpoint_compacted(program, world, records)?;
     liveness_and_replay(program, world, turns, records)
+}
+
+pub fn checkpoint_compacted(
+    program: &Program,
+    world: &SimWorld<'_>,
+    records: &[Record],
+) -> Result<(), Violation> {
+    let Ok(session) = session::fold(records) else {
+        return Ok(());
+    };
+    let Ok(mut state) = turn::entry_state(program, &session) else {
+        return Ok(());
+    };
+    for (turn, log) in &session.turns {
+        if log.finished.is_none() {
+            continue;
+        }
+        let Ok((replayed, retired)) =
+            turn::replay_retiring(program, &world.target, *turn, log, state)
+        else {
+            return Ok(());
+        };
+        state = replayed;
+        if let Some(payload) = session.checkpoints.get(turn)
+            && let Ok(held) = crate::run::json::decode(payload)
+        {
+            let expected = value::state_json(program, &state);
+            if held != expected {
+                return violation(
+                    Invariant::CheckpointCompacted,
+                    format!(
+                        "checkpoint {turn} holds {} where replaying the journal to turn {turn} gives {}: a checkpoint must hold the lists as clear and keep left them",
+                        field_difference(program, &held, &expected, true),
+                        field_difference(program, &held, &expected, false)
+                    ),
+                );
+            }
+        }
+        if retired == 0 {
+            continue;
+        }
+        let unsealed = world
+            .finish_flushes
+            .iter()
+            .any(|flush| flush.turn == *turn && !flush.checkpointed);
+        if unsealed {
+            return violation(
+                Invariant::CheckpointCompacted,
+                format!(
+                    "turn {turn} retired {retired} list entries but flushed its status without its checkpoint, so the next load replays the retired prefix from an earlier checkpoint"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violation> {
@@ -295,6 +354,26 @@ fn enum_valid(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation>
         }
     }
     Ok(())
+}
+
+fn field_difference(program: &Program, held: &Json, expected: &Json, first: bool) -> String {
+    let differing = program
+        .state
+        .iter()
+        .find(|field| held.get(&field.name) != expected.get(&field.name));
+    let Some(field) = differing else {
+        return if first {
+            held.encode()
+        } else {
+            expected.encode()
+        };
+    };
+    let value = if first { held } else { expected }.get(&field.name);
+    match value {
+        Some(Json::Array(items)) => format!("{} entries of {}", items.len(), field.name),
+        Some(other) => format!("{} = {}", field.name, other.encode()),
+        None => format!("no {}", field.name),
+    }
 }
 
 type Admissions = BTreeMap<(u64, ListingId), BTreeMap<u64, Option<BTreeMap<String, String>>>>;

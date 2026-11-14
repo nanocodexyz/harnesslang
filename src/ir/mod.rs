@@ -363,6 +363,10 @@ pub enum Stmt {
         field: FieldId,
         value: Expr,
     },
+    Shrink {
+        field: FieldId,
+        kept: Kept,
+    },
     If {
         condition: Expr,
         then: Vec<Stmt>,
@@ -393,6 +397,12 @@ pub enum Stmt {
     Finish {
         value: Expr,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum Kept {
+    Nothing,
+    Last(Expr),
 }
 
 #[derive(Clone, Debug)]
@@ -475,6 +485,7 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
         Stmt::Let { .. }
         | Stmt::Assign { .. }
         | Stmt::Push { .. }
+        | Stmt::Shrink { .. }
         | Stmt::Effect { .. }
         | Stmt::Finish { .. } => statement.clone(),
     }
@@ -491,6 +502,7 @@ pub fn has_parallel(statements: &[Stmt]) -> bool {
         Stmt::Let { .. }
         | Stmt::Assign { .. }
         | Stmt::Push { .. }
+        | Stmt::Shrink { .. }
         | Stmt::Effect { .. }
         | Stmt::Finish { .. } => false,
     })

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::effect::EffectClass;
 use crate::ir::{
-    self, BinaryOp, Expr, Handler, Parallel, Program, Site, SiteClass, SiteKind, Stmt, Type,
+    self, BinaryOp, Expr, Handler, Kept, Parallel, Program, Site, SiteClass, SiteKind, Stmt, Type,
 };
 use crate::run::journal::{Outcome, Output, Record, call_id};
 use crate::run::json::Json;
@@ -197,6 +197,8 @@ pub struct Engine<'a> {
     attempts: u64,
     buffer: Vec<Record>,
     acknowledged: bool,
+    retired: u64,
+    unretired: BTreeMap<usize, Vec<Value>>,
     admitted: BTreeMap<ir::ListingId, BTreeMap<String, String>>,
 }
 
@@ -208,6 +210,7 @@ enum Flow {
 pub struct Ran {
     pub finish: Finish,
     pub state: Vec<Value>,
+    pub retired: u64,
 }
 
 impl<'a> Engine<'a> {
@@ -242,6 +245,8 @@ impl<'a> Engine<'a> {
             attempts: log.attempts,
             buffer: Vec::new(),
             acknowledged: false,
+            retired: 0,
+            unretired: BTreeMap::new(),
             admitted: BTreeMap::new(),
         }
     }
@@ -286,6 +291,7 @@ impl<'a> Engine<'a> {
         Ok(Ran {
             finish,
             state: self.state,
+            retired: self.retired,
         })
     }
 
@@ -311,16 +317,14 @@ impl<'a> Engine<'a> {
             outcome,
             result,
         });
-        let payload = if self.mutation == Mutation::CheckpointHashOrder {
-            value::state_text_hashed(self.program, &self.state)
-        } else {
-            value::state_json(self.program, &self.state).encode()
-        };
-        self.append(Record::Checkpoint {
-            revision: self.turn,
-            state: self.program.name.clone(),
-            payload,
-        });
+        if self.mutation != Mutation::SealSkipped || self.retired == 0 {
+            let payload = self.checkpoint_payload();
+            self.append(Record::Checkpoint {
+                revision: self.turn,
+                state: self.program.name.clone(),
+                payload,
+            });
+        }
         if self.mutation == Mutation::FinishBeforeFlush {
             self.acknowledge(&finish);
         }
@@ -332,6 +336,20 @@ impl<'a> Engine<'a> {
         self.hook(Point::BeforeAcknowledge).map_err(halt_exit)?;
         self.acknowledge(&finish);
         Ok(finish)
+    }
+
+    fn checkpoint_payload(&self) -> String {
+        if self.mutation == Mutation::CheckpointHashOrder {
+            return value::state_text_hashed(self.program, &self.state);
+        }
+        let mut state = self.state.clone();
+        for (field, unretired) in &self.unretired {
+            let Value::List(items) = &mut state[*field] else {
+                panic!("only a list field retires entries");
+            };
+            items.splice(0..0, unretired.iter().cloned());
+        }
+        value::state_json(self.program, &state).encode()
     }
 
     fn acknowledge(&mut self, finish: &Finish) {
@@ -383,6 +401,7 @@ impl<'a> Engine<'a> {
                 self.state[*field] = self.eval(value)?;
             }
             Stmt::Push { field, value } => self.push(*field, value)?,
+            Stmt::Shrink { field, kept } => self.shrink(*field, kept)?,
             Stmt::If {
                 condition,
                 then,
@@ -697,6 +716,33 @@ impl<'a> Engine<'a> {
             )));
         }
         items.push(value);
+        Ok(())
+    }
+
+    fn shrink(&mut self, field: usize, kept: &Kept) -> Result<(), Halt> {
+        let count = match kept {
+            Kept::Nothing => 0,
+            Kept::Last(count) => self.eval(count)?.as_u64(),
+        };
+        let Value::List(items) = &mut self.state[field] else {
+            panic!("the checker clears and keeps only lists");
+        };
+        let length = items.len() as u64;
+        if count >= length {
+            return Ok(());
+        }
+        let dropped = usize::try_from(length - count).expect("a list's length fits usize");
+        let retired: Vec<Value> = items.drain(..dropped).collect();
+        assert_eq!(
+            items.len() as u64,
+            count,
+            "keep leaves exactly the last count entries"
+        );
+        assert!(!retired.is_empty(), "a shrink that runs retires an entry");
+        self.retired += retired.len() as u64;
+        if self.mutation == Mutation::RetireSkipped {
+            self.unretired.entry(field).or_default().extend(retired);
+        }
         Ok(())
     }
 

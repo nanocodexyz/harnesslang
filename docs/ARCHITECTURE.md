@@ -160,7 +160,8 @@ does (`native_call_admitted`); both refusals are recorded failures.
 
 ### Statements
 
-`let`, assignment to a state field, `push list value`, `if` / `else`, `match`
+`let`, assignment to a state field, `push list value`, `clear list`,
+`keep list last n` (drop all but the last `n` entries), `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
 `for call in list parallel` (one `match dispatch(call)` whose arms only push:
 every call record is appended before any dispatch, none and idempotent calls
@@ -245,8 +246,8 @@ fields, and per handler its locals and effect sites. Types are explicit: `u64`,
 with its named capacity, and `known`/`maybe` with fixed variants `ok`,
 `failed`, `unknown`.
 
-A handler is a tree of statements: `Let`, `Assign` and `Push` on state
-fields, `If`, `Match` with one arm per variant in variant order, `Loop` and
+A handler is a tree of statements: `Let`, `Assign`, `Push` and `Shrink`
+(`clear` and `keep`, which carry what they keep) on state fields, `If`, `Match` with one arm per variant in variant order, `Loop` and
 `For` with their named bound, `Parallel` (a `For` over calls whose one
 dispatch site runs as a batch, with its push-only arms), `Effect` and `Finish`. Expressions are pure:
 lowering hoists every effect out of the expression it appears in into an
@@ -405,7 +406,8 @@ How:
   each operation against each state.
 - **Arithmetic** is abstract interpretation over linear integer constraints.
   Every `u64` field, list length and local is a variable in `[0, max]`;
-  assignments add equalities, linear comparisons in conditions add facts, and
+  assignments add equalities, `clear` sets a length to 0 and `keep` to
+  `min(len, n)` (the join of the two cases), linear comparisons in conditions add facts, and
   `requires` and the invariants are assumed at entry. An obligation holds
   when its negation and the facts have no solution, decided by Fourier-Motzkin
   elimination with integer tightening. A loop's body is first run once with
@@ -489,6 +491,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `checkpoint_compacted` | every checkpoint holds the state that replaying the journal reaches at its turn, so a list `clear` or `keep` shrank is short in it (`retire_skipped` writes the dropped entries back), and a turn that dropped entries flushes its checkpoint with its status, so the next load never replays the dropped prefix (`seal_skipped` leaves it out) |
 | `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |

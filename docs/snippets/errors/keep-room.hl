@@ -1,0 +1,13 @@
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on note(line: text) -> u64 {
+  keep lines last lines_max
+  push lines line
+  return len(lines)
+}

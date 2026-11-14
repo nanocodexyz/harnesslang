@@ -1,0 +1,53 @@
+harness compaction
+
+const rounds_max: u64 = 4
+const calls_max: u64 = 2
+const history_max: u64 = 24
+const kept_max: u64 = 8
+
+type outcome = completed(text) | failed(text) | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+state {
+  history: list<entry, history_max>
+}
+
+on prompt(input: text) -> outcome {
+  if len(history) + 1 + rounds_max * (1 + calls_max) > history_max {
+    keep history last history_max - 1
+    push history user("Summarize the conversation so far.")
+    let summary = infer(history)
+    keep history last kept_max
+    match summary {
+      answer(_) => { push history assistant(summary) }
+      calls(_) => { return failed("the summary asked for tools") }
+    }
+  }
+  push history user(input)
+  loop round below rounds_max {
+    let reply = infer(history)
+    push history assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push history result(call, output) }
+            failed(error) => { push history error(call, error) }
+            unknown => { push history unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on forget() -> u64 {
+  clear history
+  return 0
+}
