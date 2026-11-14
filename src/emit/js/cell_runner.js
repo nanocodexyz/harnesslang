@@ -341,7 +341,7 @@ class CellRunner {
     assert(call !== undefined, "a started call was issued");
     call.phase = "running";
     this.changed(id);
-    if (this.live) await this.settle(id);
+    if (this.live) await this.settle(id, true);
   }
 
   recordId(id) {
@@ -358,7 +358,7 @@ class CellRunner {
       this.idShift = last;
     }
     const open = [...this.calls.entries()].filter(([, call]) => call.phase === "running" && call.output === null).map(([id]) => id).sort((left, right) => left - right);
-    for (const id of open) await this.settle(id);
+    for (const id of open) await this.settle(id, false);
   }
 
   setOutput(id, output) {
@@ -371,7 +371,7 @@ class CellRunner {
     this.setOutput(id, [encodeJson(unknownOutcome()), false]);
   }
 
-  async settle(id) {
+  async settle(id, started) {
     const call = this.calls.get(id);
     if (call.refused !== null) {
       this.setOutput(id, cellRefusal(call.refused));
@@ -381,6 +381,7 @@ class CellRunner {
     const logged = this.consult ? this.site.nested.get(nestedKey(this.site.seq, this.recordId(id))) : undefined;
     if (logged === undefined) {
       if (call.tool.effect === "external") await this.dispatch(id, true);
+      else if (!started && this.site.mutation === "nested_idempotent_reported_unknown") this.unknown(id);
       return;
     }
     switch (logged.kind) {

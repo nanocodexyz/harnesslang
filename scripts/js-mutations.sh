@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-seeds="${JS_MUTATION_SEEDS:-0..300}"
+seeds="${JS_MUTATION_SEEDS:-0..1000}"
 file="${JS_MUTATION_FILE:-examples/code_agent.hl}"
 hl=target/release/hl
 out=output/js-mutations
@@ -25,32 +25,49 @@ mutations=(
   "cell_limit_unchecked vercel cell_bounded"
   "vercel_nested_retry_redispatches vercel nested_external_once"
   "cell_gate_releases_early cloudflare nested_external_once"
+  "nested_idempotent_reported_unknown cloudflare nested_known"
+  "nested_idempotent_reported_unknown vercel nested_known"
 )
 
 for target in cloudflare vercel; do
   "$hl" emit --target "$target" "$file" > "$out/$target.mjs"
-  "$hl" sim --target "$target" --seeds "$seeds" --trace "$out/$target.trace" "$file" > "$out/$target.sim.log"
+  "$hl" sim --target "$target" --seeds "$seeds" --trace "$out/$target-none.trace" "$file" > "$out/$target-none.sim.log"
 done
+
+check() {
+  local mutation=$1 target=$2 expected=$3
+  local mutated="$out/$mutation-$target"
+  "$hl" sim --target "$target" --seeds "$seeds" --mutation "$mutation" --trace "$mutated.trace" "$file" > "$mutated.sim.log" 2>&1 || true
+  if node scripts/js-sim.mjs --target "$target" --module "$out/$target.mjs" --trace "$mutated.trace" --mutation "$mutation" > "$mutated.log" 2>&1; then
+    echo "js-mutations: $mutation survived on $target against the mutated interpreter" >&2
+    return 1
+  fi
+  local line
+  line=$(grep -m1 '^FAIL' "$mutated.log" || true)
+  if [[ "$line" != *"invariant=$expected "* ]]; then
+    echo "js-mutations: $mutation on $target failed for another reason than $expected:" >&2
+    tail -n 3 "$mutated.log" >&2
+    return 1
+  fi
+  if node scripts/js-sim.mjs --target "$target" --module "$out/$target.mjs" --trace "$out/$target-none.trace" --mutation "$mutation" > "$mutated.clean.log" 2>&1; then
+    echo "js-mutations: $mutation survived on $target against the clean interpreter" >&2
+    return 1
+  fi
+  local clean
+  clean=$(grep -m1 '^FAIL' "$mutated.clean.log" | cut -d: -f1 || true)
+  echo "${line%%:*} | clean trace: ${clean#FAIL }"
+}
 
 failed=0
 pids=()
 for entry in "${mutations[@]}"; do
   read -r mutation target expected <<< "$entry"
-  (
-    log="$out/$mutation-$target.log"
-    if node scripts/js-sim.mjs --target "$target" --module "$out/$target.mjs" --trace "$out/$target.trace" --mutation "$mutation" > "$log" 2>&1; then
-      echo "js-mutations: $mutation survived on $target" >&2
-      exit 1
-    fi
-    line=$(grep -m1 '^FAIL' "$log" || true)
-    if [[ "$line" != *"invariant=$expected "* ]]; then
-      echo "js-mutations: $mutation on $target failed for another reason than $expected:" >&2
-      tail -n 3 "$log" >&2
-      exit 1
-    fi
-    echo "${line:0:200}"
-  ) &
+  check "$mutation" "$target" "$expected" &
   pids+=($!)
+  if [ "${#pids[@]}" -ge "${JS_MUTATION_JOBS:-2}" ]; then
+    wait "${pids[0]}" || failed=1
+    pids=("${pids[@]:1}")
+  fi
 done
 for pid in "${pids[@]}"; do
   wait "$pid" || failed=1
@@ -59,4 +76,4 @@ if [ "$failed" -ne 0 ]; then
   echo "js-mutations: a mutation was not caught as expected" >&2
   exit 1
 fi
-echo "js-mutations: every cell mutation of the generated JavaScript is caught with its invariant"
+echo "js-mutations: every cell mutation of the generated JavaScript is caught with its invariant, against the mutated and the clean interpreter"
