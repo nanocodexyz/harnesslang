@@ -15,7 +15,26 @@ pub const HTTP_CONFLICT: u16 = 409;
 pub const HTTP_TOO_LARGE: u16 = 413;
 pub const HTTP_TOO_MANY: u16 = 429;
 pub const HTTP_SERVER_ERROR_MIN: u16 = 500;
+pub const EFFORT: &str = "high";
 pub const PROMPT_TOO_LONG: &str = "prompt is too long";
+
+pub fn adaptive_thinking(model: &str) -> bool {
+    matches!(
+        model,
+        "claude-opus-5-5"
+            | "claude-sonnet-5-5"
+            | "claude-haiku-5-5"
+            | "claude-fable-5-5"
+            | "claude-fable-5-2"
+            | "claude-mythos-5-2"
+            | "claude-fable-5-1"
+            | "claude-mythos-5-1"
+            | "claude-opus-5"
+            | "claude-sonnet-5"
+            | "claude-opus-4-6"
+            | "claude-sonnet-4-6"
+    )
+}
 
 pub fn model_max_tokens(model: &str) -> Option<u64> {
     match model {
@@ -108,44 +127,38 @@ impl Transcript {
         Ok(())
     }
 
+    fn content(&mut self, content: &str) -> Result<(), String> {
+        let blocks = Value::decode(content)
+            .map_err(|error| format!("a reply's content is not JSON: {error}"))?;
+        for block in blocks.as_array().ok_or("a reply's content is not a list")? {
+            let empty_text = block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty);
+            if !empty_text {
+                self.push("assistant", block.clone());
+            }
+        }
+        Ok(())
+    }
+
     fn reply(&mut self, reply: &Value) -> Result<(), String> {
         let (name, payload) = tagged(reply)?;
         match (name, payload) {
-            ("answer", Some(Value::Array(fields))) => self.text(
-                "assistant",
-                fields.first().and_then(Value::as_str).unwrap_or(""),
-            ),
+            ("answer", Some(Value::Array(fields))) => self.content(
+                fields
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or("an answer has no content")?,
+            )?,
+            ("calls", Some(Value::Array(fields))) => self.content(
+                fields
+                    .get(1)
+                    .and_then(Value::as_str)
+                    .ok_or("calls have no content")?,
+            )?,
             ("truncated", Some(Value::String(text))) => self.text("assistant", text),
-            ("calls", Some(Value::Array(fields))) => {
-                self.text(
-                    "assistant",
-                    fields.get(1).and_then(Value::as_str).unwrap_or(""),
-                );
-                for call in fields
-                    .first()
-                    .and_then(Value::as_array)
-                    .ok_or("calls without a list")?
-                {
-                    let tool = call
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .ok_or("a call has no tool")?;
-                    let input = call
-                        .get("input")
-                        .and_then(Value::as_str)
-                        .ok_or("a call has no input")?;
-                    let input = Value::decode(input).unwrap_or_else(|_| Value::Object(Vec::new()));
-                    self.push(
-                        "assistant",
-                        Value::object([
-                            ("type", Value::text("tool_use")),
-                            ("id", call.get("id").cloned().ok_or("a call has no id")?),
-                            ("name", Value::text(tool)),
-                            ("input", tools::without_defaults(tool, input)),
-                        ]),
-                    );
-                }
-            }
             ("paused" | "context_full" | "refused" | "rejected", _) => {}
             (other, _) => return Err(format!("context holds an unknown reply {other}")),
         }
@@ -225,13 +238,32 @@ impl Client {
         {
             last.insert("cache_control", ephemeral());
         }
-        Ok(Value::object([
+        let mut body = Value::object([
             ("model", Value::text(&self.model)),
             ("max_tokens", Value::number(self.max_tokens)),
             ("system", self.system.clone()),
             ("tools", tools),
             ("messages", Value::Array(messages(context)?)),
-        ]))
+        ]);
+        if adaptive_thinking(&self.model) {
+            body.insert(
+                "thinking",
+                Value::object([
+                    ("type", Value::text("adaptive")),
+                    ("display", Value::text("summarized")),
+                ]),
+            );
+            body.insert(
+                "output_config",
+                Value::object([("effort", Value::text(EFFORT))]),
+            );
+        } else {
+            body.insert(
+                "thinking",
+                Value::object([("type", Value::text("disabled"))]),
+            );
+        }
+        Ok(body)
     }
 
     pub fn send(&self, body: &Value) -> Result<(u16, String), String> {
@@ -384,17 +416,19 @@ pub fn interpret(status: u16, body: &str) -> Answer {
         }
     }
     let tokens = Value::number(used.context());
+    let raw = Value::String(Value::Array(content.to_vec()).encode());
     let reply = match value.get("stop_reason").and_then(Value::as_str) {
         Some("tool_use") if !calls.is_empty() => Value::object([(
             "calls",
-            Value::Array(vec![Value::Array(calls), Value::String(text), tokens]),
+            Value::Array(vec![Value::Array(calls), raw, tokens]),
         )]),
-        Some("end_turn" | "stop_sequence") if calls.is_empty() => {
-            Value::object([("answer", Value::Array(vec![Value::String(text), tokens]))])
-        }
+        Some("end_turn" | "stop_sequence") if calls.is_empty() => Value::object([(
+            "answer",
+            Value::Array(vec![Value::String(text), raw, tokens]),
+        )]),
         Some("end_turn" | "stop_sequence") => Value::object([(
             "calls",
-            Value::Array(vec![Value::Array(calls), Value::String(text), tokens]),
+            Value::Array(vec![Value::Array(calls), raw, tokens]),
         )]),
         Some("max_tokens") => Value::object([("truncated", Value::String(text))]),
         Some("pause_turn") => Value::text("paused"),

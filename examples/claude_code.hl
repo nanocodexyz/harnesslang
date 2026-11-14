@@ -9,7 +9,7 @@ const continuations_max: u64 = 3
 const throttled_attempts_max: u64 = 10
 
 type outcome = completed(text) | failed(text) | exhausted
-type claude_reply = answer(text, u64)
+type claude_reply = answer(text, text, u64)
   | calls(list<call, calls_per_round_max>, text, u64)
   | truncated(text)
   | paused
@@ -58,7 +58,7 @@ fn compact() {
     failed(error) => { return failed("compaction failed: " ++ error) }
     ok(summary) => {
       match summary {
-        answer(words, _) => {
+        answer(words, _, _) => {
           clear context
           context_tokens = 0
           push context user("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" ++ words ++ "\n" ++ "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.")
@@ -101,7 +101,7 @@ on prompt(input: text, rounds: u64) -> outcome
         throttled = 0
         push context assistant(reply)
         match reply {
-          answer(words, tokens) => {
+          answer(words, _, tokens) => {
             context_tokens = tokens
             return completed(words)
           }

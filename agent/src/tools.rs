@@ -90,23 +90,6 @@ pub fn with_defaults(tool: &str, mut input: Value) -> Value {
     input
 }
 
-pub fn without_defaults(tool: &str, input: Value) -> Value {
-    let Value::Object(entries) = input else {
-        return input;
-    };
-    let fields = optional_fields(tool);
-    Value::Object(
-        entries
-            .into_iter()
-            .filter(|(key, value)| {
-                !fields
-                    .iter()
-                    .any(|field| field.name == key && field.default == *value)
-            })
-            .collect(),
-    )
-}
-
 pub fn unavailable(name: &str, offered: &[&str]) -> String {
     let hint = match name {
         "Grep" => ". Grep is not available in this session \u{2014} search file contents with `grep` via the Bash tool instead.".to_owned(),
