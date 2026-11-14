@@ -46,6 +46,7 @@ pub struct Stats {
     pub unknown: u64,
 }
 
+#[derive(Clone)]
 pub struct SimWorld<'a> {
     pub program: &'a Program,
     pub target: target::Model,
