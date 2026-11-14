@@ -135,6 +135,36 @@ def paired(rows, agents):
     ]
 
 
+def interval(values):
+    count = len(values)
+    centre = sum(values) / count
+    if count < 2:
+        return centre, float("nan"), float("nan")
+    spread = math.sqrt(sum((value - centre) ** 2 for value in values) / (count - 1) / count)
+    return centre, centre - WILSON_Z_95 * spread, centre + WILSON_Z_95 * spread
+
+
+def differences(rows, agents):
+    if len(agents) != 2:
+        return []
+    first, second = agents
+    by_key = {(row["source"], row["task"], row["attempt"], row["agent"]): row for row in rows}
+    pairs = [(by_key[key[:3] + (first,)], row) for key, row in by_key.items() if key[3] == second and key[:3] + (first,) in by_key]
+    if not pairs:
+        return []
+    measures = (
+        ("cost ($)", lambda row: row["cost"], "%.4f"),
+        ("wall (s)", lambda row: (row.get("agent_result") or {}).get("wall_ms", 0) / 1000, "%.1f"),
+        ("requests", lambda row: (row.get("meter") or {}).get("requests", 0), "%.2f"),
+        ("prompt tokens", lambda row: sum((row.get("meter") or {}).get(key, 0) for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens")), "%.0f"),
+    )
+    lines = ["Paired by task and attempt (%d pairs), %s minus %s, mean with its 95%% normal interval:" % (len(pairs), second, first)]
+    for name, measure, form in measures:
+        centre, low, high = interval([measure(other) - measure(base) for base, other in pairs])
+        lines.append(("- %s: " + form + " (" + form + " to " + form + ")") % (name, centre, low, high))
+    return lines
+
+
 def main():
     out = sys.argv[1]
     rows = load(out)
@@ -147,6 +177,8 @@ def main():
     print("\n".join(per_task(rows, agents)))
     print()
     print("\n".join(paired(rows, agents)))
+    print()
+    print("\n".join(differences(rows, agents)))
     for agent in agents:
         dropped = [row["id"] for row in rows if row["agent"] == agent and (row.get("meter") or {}).get("statuses", {}).get("0")]
         print("%s rows with a request the upstream connection dropped: %d %s" % (agent, len(dropped), " ".join(dropped)))
