@@ -1091,7 +1091,12 @@ impl<'a> Engine<'a> {
             .into_iter()
             .map(|(position, output)| {
                 let tool = &group[position].call.tool;
-                (position, self.checked(tool, &returned[position], output))
+                let seq = group[position].seq;
+                let output = self.checked(tool, &returned[position], output);
+                (
+                    position,
+                    spawn_output(self.program, self.mutation, self.turn, seq, tool, output),
+                )
             })
             .collect();
         Ok(checked)
@@ -1207,30 +1212,18 @@ impl<'a> Engine<'a> {
                 effect: EffectClass::None,
                 input: Json::Null,
             },
-            SiteKind::Dispatch => {
+            SiteKind::Dispatch => self.dispatched_call(&args[0]),
+            SiteKind::Deny => {
                 let (_, fields) = args[0].as_variant();
-                let tool = fields[ir::CALL_TOOL].as_text().to_owned();
-                let raw = fields[ir::CALL_INPUT].as_text();
-                let dropped = self.mutation == Mutation::ListedClassDropped
-                    && self.program.listed(&tool).is_some();
-                let effect = if dropped {
-                    EffectClass::None
-                } else {
-                    self.program.dispatch_class(&tool)
-                };
-                let input = match value::tool_input(self.program, &tool, raw) {
-                    value::Input::Typed(_) if self.mutation == Mutation::DefaultUnfilled => {
-                        crate::run::json::decode(raw).expect("typed input decoded once already")
-                    }
-                    value::Input::Typed(input) => input,
-                    value::Input::Untyped | value::Input::Invalid(_) => {
-                        Json::String(raw.to_owned())
-                    }
-                };
                 Call {
-                    tool,
-                    effect,
-                    input,
+                    tool: ir::DENY_TOOL.to_owned(),
+                    effect: EffectClass::None,
+                    input: deny_input(
+                        fields[ir::CALL_ID].as_text(),
+                        fields[ir::CALL_TOOL].as_text(),
+                        fields[ir::CALL_INPUT].as_text(),
+                        args[1].as_text(),
+                    ),
                 }
             }
             SiteKind::Model => {
@@ -1270,6 +1263,31 @@ impl<'a> Engine<'a> {
                 effect: EffectClass::None,
                 input: Json::object([(SUSPEND_KEY, Json::String(args[0].as_text().to_owned()))]),
             },
+        }
+    }
+
+    fn dispatched_call(&self, call: &Value) -> Call {
+        let (_, fields) = call.as_variant();
+        let tool = fields[ir::CALL_TOOL].as_text().to_owned();
+        let raw = fields[ir::CALL_INPUT].as_text();
+        let dropped =
+            self.mutation == Mutation::ListedClassDropped && self.program.listed(&tool).is_some();
+        let effect = if dropped {
+            EffectClass::None
+        } else {
+            self.program.dispatch_class(&tool)
+        };
+        let input = match value::tool_input(self.program, &tool, raw) {
+            value::Input::Typed(_) if self.mutation == Mutation::DefaultUnfilled => {
+                crate::run::json::decode(raw).expect("typed input decoded once already")
+            }
+            value::Input::Typed(input) => input,
+            value::Input::Untyped | value::Input::Invalid(_) => Json::String(raw.to_owned()),
+        };
+        Call {
+            tool,
+            effect,
+            input,
         }
     }
 
@@ -1807,6 +1825,26 @@ impl<'a> Engine<'a> {
             }
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
             SiteKind::Random => Output::Ok(Json::Number(world.random())),
+            SiteKind::Deny => {
+                if self.mutation == Mutation::DenyDispatches {
+                    let denied = self.dispatched_call(&args[0]);
+                    let Mode::Live { world, .. } = &mut self.mode else {
+                        unreachable!("replay never runs an effect");
+                    };
+                    let ran = world.tool(&ToolRequest {
+                        turn: self.turn,
+                        seq,
+                        tool: &denied.tool,
+                        effect: denied.effect,
+                        input: &denied.input,
+                        returns: &Type::Text,
+                        admitted: None,
+                        nested: None,
+                    });
+                    drop(ran);
+                }
+                Output::Failed(args[1].as_text().to_owned())
+            }
             SiteKind::Cell(_) => unreachable!("a cell site runs through the cell runner"),
             SiteKind::Suspend => unreachable!("a suspend ends the run before it would run"),
             SiteKind::Wait(_) => {
@@ -1848,7 +1886,15 @@ impl<'a> Engine<'a> {
                             admitted: admitted.as_deref(),
                             nested: None,
                         });
-                        self.checked(&call.tool, &returns, output)
+                        let output = self.checked(&call.tool, &returns, output);
+                        spawn_output(
+                            self.program,
+                            self.mutation,
+                            self.turn,
+                            seq,
+                            &call.tool,
+                            output,
+                        )
                     }
                 }
             }
@@ -2185,6 +2231,39 @@ fn halt_stop(halt: Halt) -> Stop {
 pub const WAIT_MS: &str = "ms";
 pub const WAIT_UNTIL: &str = "until";
 pub const SUSPEND_KEY: &str = "key";
+
+pub const DENY_ID: &str = "id";
+pub const DENY_CALL_TOOL: &str = "tool";
+pub const DENY_CALL_INPUT: &str = "input";
+pub const DENY_REASON: &str = "reason";
+
+pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
+    Json::object([
+        (DENY_ID, Json::String(id.to_owned())),
+        (DENY_CALL_INPUT, Json::String(input.to_owned())),
+        (DENY_REASON, Json::String(reason.to_owned())),
+        (DENY_CALL_TOOL, Json::String(tool.to_owned())),
+    ])
+}
+
+pub fn spawn_output(
+    program: &Program,
+    mutation: Mutation,
+    turn: u64,
+    seq: u64,
+    tool: &str,
+    output: Output,
+) -> Output {
+    if !matches!(output, Output::Ok(_)) || program.spawn_of(tool).is_none() {
+        return output;
+    }
+    let key = if mutation == Mutation::SpawnKeyUnscoped {
+        seq.to_string()
+    } else {
+        ir::spawn_key(turn, seq)
+    };
+    Output::Ok(Json::String(key))
+}
 
 pub fn wait_ms(input: &Json) -> Option<u64> {
     input.get(WAIT_MS).and_then(Json::as_u64)

@@ -26,6 +26,78 @@ pub enum Item {
     Function(Function),
     Handler(Handler),
     Event(Event),
+    Hook(Hook),
+    Spawn(Spawn),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HookKind {
+    BeforeTool,
+    AfterTool,
+    SessionStart,
+    PromptSubmit,
+    PreCompact,
+    PostCompact,
+    Stop,
+    SubagentStart,
+    SubagentStop,
+}
+
+impl HookKind {
+    pub const ALL: [Self; 9] = [
+        Self::BeforeTool,
+        Self::AfterTool,
+        Self::SessionStart,
+        Self::PromptSubmit,
+        Self::PreCompact,
+        Self::PostCompact,
+        Self::Stop,
+        Self::SubagentStart,
+        Self::SubagentStop,
+    ];
+
+    pub const fn words(self) -> (&'static str, &'static str) {
+        match self {
+            Self::BeforeTool => ("before", "tool"),
+            Self::AfterTool => ("after", "tool"),
+            Self::SessionStart => ("session", "start"),
+            Self::PromptSubmit => ("prompt", "submit"),
+            Self::PreCompact => ("pre", "compact"),
+            Self::PostCompact => ("post", "compact"),
+            Self::Stop => ("stop", ""),
+            Self::SubagentStart => ("subagent", "start"),
+            Self::SubagentStop => ("subagent", "stop"),
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self.words() {
+            (first, "") => format!("on {first}"),
+            (first, second) if matches!(self, Self::BeforeTool | Self::AfterTool) => {
+                format!("{first} {second}")
+            }
+            (first, second) => format!("on {first} {second}"),
+        }
+    }
+
+    pub const fn denies(self) -> bool {
+        matches!(self, Self::BeforeTool | Self::AfterTool)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Hook {
+    pub kind: HookKind,
+    pub at: Position,
+    pub params: Vec<Param>,
+    pub body: Block,
+}
+
+#[derive(Clone, Debug)]
+pub struct Spawn {
+    pub name: Name,
+    pub handler: Name,
+    pub file: Name,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +206,7 @@ pub struct Handler {
     pub returns: TypeExpr,
     pub requires: Option<Expr>,
     pub body: Block,
+    pub ends_session: bool,
 }
 
 #[derive(Clone, Debug)]

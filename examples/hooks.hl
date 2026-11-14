@@ -3,15 +3,21 @@ harness hooks
 const rounds_max: u64 = 16
 const calls_per_round_max: u64 = 8
 const context_entries_max: u64 = 1024
+const compact_kept: u64 = 64
 const turns_max: u64 = 1000000
 
 type mode = "default" | "plan" | "ask"
 type decision = "continue" | "block" | "stop"
-type outcome = completed(text) | stopped(text) | exhausted
+type tool_decision = "allow" | "update" | "deny"
+type outcome = completed(text) | stopped(text) | exhausted | ended(text)
 
 tool Read(file_path: text) -> text effect none
 tool Bash(command: text) -> text effect external
+tool pre_tool_use(name: text, input: text) -> tool_decision effect idempotent
+tool updated_input(name: text, input: text) -> text effect idempotent
+tool post_tool_use(name: text, output: text) -> text effect idempotent
 tool stop_hook(last_assistant_message: text) -> decision effect idempotent
+tool lifecycle_hook(event: text, detail: text) -> text effect idempotent
 
 model messages calls calls_per_round_max
 
@@ -26,26 +32,105 @@ state {
 invariant turns_bounded: turns <= turns_max
 invariant context_bounded: len(context) <= context_entries_max
 
-fn run_call(call: call) {
-  match dispatch(call) {
-    ok(output) => { push context result(call, output) }
-    failed(error) => { push context error(call, error) }
-    unknown => { push context unknown(call) }
+before tool(c: call) {
+  match permission {
+    "default" => {}
+    "plan" => {
+      if c.tool != "Read" {
+        deny("Plan mode runs only Read; tool was not executed")
+      }
+    }
+    "ask" => {
+      if c.tool != "Read" {
+        let verdict = suspend(c.id)
+        if verdict != "allow" {
+          deny("Denied: " ++ verdict ++ "; tool was not executed")
+        }
+      }
+    }
+  }
+  match pre_tool_use(c.tool, c.input) {
+    ok(verdict) => {
+      match verdict {
+        "allow" => {}
+        "update" => {
+          match updated_input(c.tool, c.input) {
+            ok(updated) => { allow(updated) }
+            failed(error) => { deny("PreToolUse hook failed: " ++ error ++ "; tool was not executed") }
+          }
+        }
+        "deny" => { deny("Tool blocked by host: PreToolUse denied it; tool was not executed") }
+      }
+    }
+    failed(error) => { deny("PreToolUse hook failed: " ++ error ++ "; tool was not executed") }
   }
 }
 
-on set_mode(next: mode) -> mode {
+after tool(c: call, outcome: maybe<text>) {
+  match outcome {
+    ok(output) => {
+      match post_tool_use(c.tool, output) {
+        ok(_) => {}
+        failed(error) => {
+          deny(output ++ " PostToolUse hook failed: " ++ error ++ ". The tool already returned the preceding result; this does not undo its effects. Reconcile that result before retrying.")
+        }
+      }
+    }
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on session start {
+  match lifecycle_hook("SessionStart", "startup") {
+    ok(added) => { push context user(added) }
+    failed(_) => {}
+  }
+}
+
+on prompt submit(input: text) {
+  match lifecycle_hook("UserPromptSubmit", input) {
+    ok(added) => { push context user(added) }
+    failed(_) => {}
+  }
+}
+
+on pre compact {
+  let noted = lifecycle_hook("PreCompact", "auto")
+}
+
+on post compact {
+  let noted = lifecycle_hook("PostCompact", "auto")
+}
+
+on stop {
+  let noted = lifecycle_hook("Stop", "turn finished")
+}
+
+on session end(reason: text) -> outcome
+  requires len(context) + 1 <= context_entries_max
+{
+  let noted = lifecycle_hook("SessionEnd", reason)
+  return ended(reason)
+}
+
+on set_mode(next: mode) -> mode
+  requires len(context) + 1 <= context_entries_max
+{
   permission = next
   return next
 }
 
 on prompt(input: text) -> outcome
   requires turns < turns_max
-    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
+    and len(context) + 3 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
 {
   push context user(input)
   turns = turns + 1
   loop round below rounds_max {
+    if len(context) + 1 + (1 + calls_per_round_max) > context_entries_max {
+      keep context last compact_kept
+    }
     let reply = messages(context)
     push context assistant(reply)
     match reply {
@@ -69,27 +154,10 @@ on prompt(input: text) -> outcome
       }
       calls(requested) => {
         for call in requested {
-          match permission {
-            "default" => { run_call(call) }
-            "plan" => {
-              if call.tool == "Read" {
-                run_call(call)
-              } else {
-                push context error(call, "Plan mode runs only Read.")
-              }
-            }
-            "ask" => {
-              if call.tool == "Read" {
-                run_call(call)
-              } else {
-                let verdict = suspend(call.id)
-                if verdict == "allow" {
-                  run_call(call)
-                } else {
-                  push context error(call, "Denied: " ++ verdict)
-                }
-              }
-            }
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
           }
         }
       }

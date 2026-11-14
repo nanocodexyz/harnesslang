@@ -3,6 +3,8 @@ mod inline;
 
 pub use inline::STATEMENTS_PER_HANDLER_MAX;
 
+pub type Loader<'l> = dyn FnMut(&str) -> Result<ir::Program, String> + 'l;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{self, Bound, Sum, SumKind, Type, Variant};
@@ -11,7 +13,7 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 11] = [
+pub const BUILTIN_FUNCTIONS: [&str; 14] = [
     "dispatch",
     "now",
     "random",
@@ -23,7 +25,13 @@ pub const BUILTIN_FUNCTIONS: [&str; 11] = [
     "after",
     "trim",
     "truncate_middle",
+    "deny",
+    "allow",
+    "join",
 ];
+pub const DENY: &str = "deny";
+pub const ALLOW: &str = "allow";
+pub const JOIN: &str = "join";
 pub const WILDCARD: &str = "_";
 pub const EVENT_CANCEL: &str = "cancel";
 pub const EVENT_STEER: &str = "steer";
@@ -40,6 +48,7 @@ pub struct Globals {
     listings: BTreeMap<String, ir::ListingId>,
     fields: BTreeMap<String, ir::FieldId>,
     model: Option<String>,
+    hooks: BTreeMap<ast::HookKind, ast::Hook>,
 }
 
 impl Globals {
@@ -58,6 +67,14 @@ fn error<T>(at: Position, message: impl Into<String>) -> Checked<T> {
 }
 
 pub fn check(source: &ast::Program) -> Checked<ir::Program> {
+    check_with(source, &mut |file: &str| {
+        Err(format!(
+            "this check reads no other file, so it cannot load \"{file}\""
+        ))
+    })
+}
+
+pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::Program> {
     let mut program = ir::Program {
         name: source.name.text.clone(),
         constants: Vec::new(),
@@ -82,17 +99,21 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         listings: BTreeMap::new(),
         fields: BTreeMap::new(),
         model: None,
+        hooks: BTreeMap::new(),
     };
     let mut values: BTreeMap<String, Position> = BTreeMap::new();
     constants(source, &mut program, &mut globals, &mut values)?;
     model(source, &mut program, &mut globals, &mut values)?;
     sums(source, &mut program, &mut globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
+    spawns(source, &mut program, &mut globals, &mut values, load)?;
     codes(source, &mut program, &mut globals, &mut values)?;
     listings(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
     events(source, &mut program, &globals, &mut values)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
+    globals.hooks = hooks(&expanded, &program, &globals)?;
+    let expanded = session_end(&expanded).unwrap_or(expanded);
     invariants(&expanded, &mut program, &globals)?;
     handlers(&expanded, &mut program, &globals)?;
     program.cuts = program.find_cuts();
@@ -843,10 +864,163 @@ fn tools(
             returns,
             attaches,
             effect: tool.effect,
+            spawn: None,
             finds: None,
         });
     }
     Ok(())
+}
+
+fn spawns(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &mut Globals,
+    values: &mut BTreeMap<String, Position>,
+    load: &mut Loader<'_>,
+) -> Checked<()> {
+    let variants = variant_names(program);
+    for item in &source.items {
+        let Item::Spawn(spawn) = item else { continue };
+        claim(values, &spawn.name, "spawn tool")?;
+        if variants.contains(&spawn.name.text) {
+            return error(
+                spawn.name.at,
+                format!("spawn tool '{}' has the name of a variant", spawn.name.text),
+            );
+        }
+        let child = load(&spawn.file.text).map_err(|message| {
+            Diagnostic::new(
+                spawn.file.at,
+                format!(
+                    "spawn tool '{}' cannot check \"{}\": {message}",
+                    spawn.name.text, spawn.file.text
+                ),
+            )
+        })?;
+        if let Some((grandchild, _)) = child.spawns().next() {
+            return error(
+                spawn.file.at,
+                format!(
+                    "harness '{}' declares spawn tool '{}': a spawned harness spawns no child of its own, so a parent's worst case holds every session it can start",
+                    child.name, grandchild.name
+                ),
+            );
+        }
+        let Some(handler) = child.handler(&spawn.handler.text) else {
+            return error(
+                spawn.handler.at,
+                format!(
+                    "harness '{}' has no handler '{}'",
+                    child.name, spawn.handler.text
+                ),
+            );
+        };
+        let mut params = Vec::with_capacity(handler.params.len());
+        for local in &handler.params {
+            let field = &handler.locals[*local];
+            if !matches!(field.ty, Type::U64 | Type::Bool | Type::Text) {
+                return error(
+                    spawn.handler.at,
+                    format!(
+                        "handler '{}' of harness '{}' takes '{}' of type {}: a spawned handler takes u64, bool or text, which its parent's tool input carries",
+                        spawn.handler.text,
+                        child.name,
+                        field.name,
+                        field.ty.name(&child)
+                    ),
+                );
+            }
+            params.push(field.clone());
+        }
+        globals
+            .tools
+            .insert(spawn.name.text.clone(), program.tools.len());
+        program.tools.push(ir::Tool {
+            name: spawn.name.text.clone(),
+            defaults: vec![None; params.len()],
+            params,
+            returns: Type::Text,
+            attaches: None,
+            effect: crate::effect::EffectClass::External,
+            finds: None,
+            spawn: Some(ir::Spawn {
+                file: spawn.file.text.clone(),
+                handler: spawn.handler.text.clone(),
+                program: Box::new(child),
+            }),
+        });
+    }
+    Ok(())
+}
+
+fn hooks(
+    source: &ast::Program,
+    program: &ir::Program,
+    globals: &Globals,
+) -> Checked<BTreeMap<ast::HookKind, ast::Hook>> {
+    use ast::HookKind;
+    let mut hooks: BTreeMap<HookKind, ast::Hook> = BTreeMap::new();
+    for item in &source.items {
+        let Item::Hook(hook) = item else { continue };
+        if let Some(previous) = hooks.get(&hook.kind) {
+            return error(
+                hook.at,
+                format!(
+                    "'{}' is already declared at {}",
+                    hook.kind.describe(),
+                    previous.at
+                ),
+            );
+        }
+        let call = Type::Sum(ir::CALL);
+        let outcome = Type::Maybe(Box::new(Type::Text));
+        let wanted: Option<Vec<Type>> = match hook.kind {
+            HookKind::BeforeTool => Some(vec![call]),
+            HookKind::AfterTool => Some(vec![call, outcome]),
+            HookKind::SessionStart
+            | HookKind::PreCompact
+            | HookKind::PostCompact
+            | HookKind::Stop => Some(Vec::new()),
+            HookKind::PromptSubmit => None,
+            HookKind::SubagentStart => Some(vec![Type::Text]),
+            HookKind::SubagentStop => Some(vec![Type::Text, Type::Text]),
+        };
+        let mut found = Vec::with_capacity(hook.params.len());
+        for param in &hook.params {
+            found.push(resolve(program, globals, &param.ty)?);
+        }
+        let shape = match hook.kind {
+            HookKind::BeforeTool => "(c: call)",
+            HookKind::AfterTool => "(c: call, outcome: maybe<text>)",
+            HookKind::PromptSubmit => "(p: T), naming a parameter of the handlers it runs in",
+            HookKind::SubagentStart => "(agent: text)",
+            HookKind::SubagentStop => "(agent: text, result: text)",
+            HookKind::SessionStart
+            | HookKind::PreCompact
+            | HookKind::PostCompact
+            | HookKind::Stop => "no parameters",
+        };
+        let fits = match &wanted {
+            Some(wanted) => *wanted == found,
+            None => found.len() == 1,
+        };
+        if !fits {
+            return error(hook.at, format!("'{}' takes {shape}", hook.kind.describe()));
+        }
+        if matches!(hook.kind, HookKind::SubagentStart | HookKind::SubagentStop)
+            && program.spawns().next().is_none()
+        {
+            return error(
+                hook.at,
+                format!(
+                    "'{}' runs around spawned sessions, but the harness declares no spawn tool",
+                    hook.kind.describe()
+                ),
+            );
+        }
+        hooks.insert(hook.kind, hook.clone());
+    }
+    Ok(hooks)
 }
 
 fn params(
@@ -1232,7 +1406,88 @@ fn state(
             });
         }
     }
+    let starts = source
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Hook(hook) if hook.kind == ast::HookKind::SessionStart));
+    let ends = source
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Handler(handler) if handler.ends_session));
+    let decides = source.items.iter().any(|item| {
+        matches!(item, Item::Hook(hook) if matches!(hook.kind, ast::HookKind::BeforeTool | ast::HookKind::AfterTool))
+    });
+    for (hidden, ty, wanted) in [
+        (ir::SESSION_STARTED_FIELD, Type::Bool, starts),
+        (ir::SESSION_ENDED_FIELD, Type::Bool, ends),
+        (ir::HOOK_DECIDED_FIELD, Type::Bool, decides),
+        (ir::HOOK_DENIED_FIELD, Type::Bool, decides),
+        (ir::HOOK_REASON_FIELD, Type::Text, decides),
+        (ir::HOOK_INPUT_FIELD, Type::Text, decides),
+    ] {
+        if !wanted {
+            continue;
+        }
+        globals
+            .fields
+            .insert(hidden.to_owned(), program.state.len());
+        program.state.push(ir::Field {
+            name: hidden.to_owned(),
+            ty,
+        });
+    }
     Ok(())
+}
+
+fn session_end(source: &ast::Program) -> Option<ast::Program> {
+    let Some(ending) = source.items.iter().find_map(|item| match item {
+        Item::Handler(handler) if handler.ends_session => Some(handler),
+        _ => None,
+    }) else {
+        return None;
+    };
+    let at = ending.name.at;
+    let ended = ast::Name {
+        text: ir::SESSION_ENDED_FIELD.to_owned(),
+        at,
+    };
+    let open = ast::Expr::Not {
+        at,
+        operand: Box::new(ast::Expr::Name(ended.clone())),
+    };
+    let items = source
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Handler(handler) => {
+                let mut handler = handler.clone();
+                handler.requires = Some(match handler.requires.take() {
+                    Some(requires) => ast::Expr::Binary {
+                        at,
+                        op: ast::BinaryOp::And,
+                        left: Box::new(requires),
+                        right: Box::new(open.clone()),
+                    },
+                    None => open.clone(),
+                });
+                if handler.ends_session {
+                    handler.body.statements.insert(
+                        0,
+                        ast::Stmt::Assign {
+                            name: ended.clone(),
+                            value: ast::Expr::Bool(true, at),
+                        },
+                    );
+                }
+                Item::Handler(handler)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    Some(ast::Program {
+        name: source.name.clone(),
+        items,
+    })
 }
 
 fn events(
@@ -1373,6 +1628,7 @@ fn invariants(source: &ast::Program, program: &mut ir::Program, globals: &Global
 }
 
 fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let mut used = BTreeSet::new();
     let mut names: BTreeMap<String, Position> = BTreeMap::new();
     for item in &source.items {
         let Item::Handler(definition) = item else {
@@ -1387,8 +1643,36 @@ fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
                 ),
             );
         }
-        let checked = handler::check(program, globals, definition)?;
+        let (checked, ran) = handler::check(program, globals, definition)?;
+        used.extend(ran);
         program.handlers.push(checked);
+    }
+    if let Some(hook) = globals
+        .hooks
+        .values()
+        .find(|hook| !used.contains(&hook.kind))
+    {
+        let reason = match hook.kind {
+            ast::HookKind::BeforeTool | ast::HookKind::AfterTool => {
+                "no handler dispatches a call".to_owned()
+            }
+            ast::HookKind::PromptSubmit => format!(
+                "no handler takes '{}'",
+                hook.params
+                    .first()
+                    .map_or("", |param| param.name.text.as_str())
+            ),
+            ast::HookKind::PreCompact | ast::HookKind::PostCompact => {
+                "no handler keeps or clears a list of entries".to_owned()
+            }
+            ast::HookKind::SubagentStart => "no handler matches on a spawn's result".to_owned(),
+            ast::HookKind::SubagentStop => "no handler joins a spawned session".to_owned(),
+            ast::HookKind::SessionStart | ast::HookKind::Stop => "no handler runs it".to_owned(),
+        };
+        return error(
+            hook.at,
+            format!("'{}' runs nowhere: {reason}", hook.kind.describe()),
+        );
     }
     if program.handlers.is_empty() {
         return error(

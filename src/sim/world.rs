@@ -39,6 +39,8 @@ pub const LISTED_PRESENT_PPM: u64 = 500_000;
 pub const LISTING_CHANGE_PPM: u64 = 100_000;
 pub const INPUT_INVALID_PPM: u64 = 100_000;
 pub const DEFAULT_OMITTED_PPM: u64 = 500_000;
+pub const CHILD_NAMED_PPM: u64 = 500_000;
+pub const CHILD_SESSIONS_PER_SEED_MAX: usize = 16;
 pub const INVALID_INPUT_KINDS: u64 = 3;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const MODEL_THROTTLED_PPM: u64 = 100_000;
@@ -132,6 +134,14 @@ pub struct Stats {
     pub suspensions: u64,
     pub events: Option<u64>,
     pub entry_states: u64,
+    pub children: u64,
+    pub joined: u64,
+    pub child_crashes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Child {
+    pub result: Result<String, Violation>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -169,6 +179,9 @@ pub struct SimWorld<'a> {
     cell_codes: BTreeMap<u64, usize>,
     pub inbox: Inbox,
     pub parking: crate::sim::park::Parking,
+    pub children: BTreeMap<String, Child>,
+    pub denied_ran: Vec<String>,
+    denying: bool,
     pub edges: Option<Edges>,
     pub greedy: bool,
     pub worst_faults: Vec<String>,
@@ -232,6 +245,9 @@ impl<'a> SimWorld<'a> {
             cell_codes: BTreeMap::new(),
             inbox: Inbox::default(),
             parking: crate::sim::park::Parking::default(),
+            children: BTreeMap::new(),
+            denied_ran: Vec::new(),
+            denying: false,
             edges: None,
             greedy: false,
             worst_faults: Vec::new(),
@@ -355,6 +371,7 @@ impl<'a> SimWorld<'a> {
         self.current = Some(request.clone());
         self.parking.pending = None;
         self.parking.suspensions = 0;
+        self.parking.unmatched = 0;
         self.inbox.schedule(program, self.seed, request.turn);
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
@@ -376,6 +393,7 @@ impl<'a> SimWorld<'a> {
 
     pub fn begin_run(&mut self) -> Result<(Vec<Record>, u64), String> {
         self.stats.runs += 1;
+        self.denying = false;
         self.run_effects = 0;
         self.run_outbound = 0;
         self.parking.run_waited_ms = 0;
@@ -701,6 +719,11 @@ impl<'a> SimWorld<'a> {
 impl World for SimWorld<'_> {
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
         self.inbox.hook();
+        match point {
+            Point::BeforeRun(ir::SiteKind::Deny, _) => self.denying = true,
+            Point::AfterRun(ir::SiteKind::Deny, _) => self.denying = false,
+            _ => {}
+        }
         let record = |answer: Json| {
             move || {
                 let mut fields = trace::point_fields(point);
@@ -715,7 +738,9 @@ impl World for SimWorld<'_> {
         let lease = self.target.target == Target::ServerPostgres && !self.lease_spent;
         if lease && self.armed && self.rng.chance(self.profile.lease_ppm) {
             self.record("hook", record(Json::text("owner")));
+            let denying = std::mem::replace(&mut self.denying, false);
             self.second_owner();
+            self.denying = denying;
             return Ok(());
         }
         let result = if self.fault(self.profile.crash_ppm) {
@@ -772,6 +797,13 @@ impl World for SimWorld<'_> {
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
         self.count_effect(true);
+        if self.denying {
+            self.denied_ran.push(format!(
+                "call {} was denied by its before tool block, yet the host ran {} for it",
+                journal::call_id(request.turn, request.seq),
+                request.tool
+            ));
+        }
         let output = match request.nested {
             Some(_) => self.nested_output(request),
             None => self.tool_output(request),
@@ -1184,11 +1216,44 @@ impl SimWorld<'_> {
                 self.edges.as_ref(),
             ))
         };
+        let output = self.spawn_child(request, output);
         self.dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
             .expect("inserted above")
             .returned(self.program, request, &output);
         output
+    }
+
+    fn spawn_child(&mut self, request: &ToolRequest<'_>, output: Output) -> Output {
+        let Some(spawn) = self.program.spawn_of(request.tool) else {
+            return output;
+        };
+        if !matches!(output, Output::Ok(_)) {
+            return output;
+        }
+        let key = crate::ir::spawn_key(request.turn, request.seq);
+        if !self.children.contains_key(&key) && self.children.len() >= CHILD_SESSIONS_PER_SEED_MAX {
+            return Output::Failed(format!(
+                "{} refused: the host holds child_sessions_per_seed_max ({CHILD_SESSIONS_PER_SEED_MAX}) child sessions",
+                request.tool
+            ));
+        }
+        if !self.children.contains_key(&key) {
+            let seed = Rng::derive_keyed(self.seed, "child", &[request.turn, request.seq]).draw();
+            let (result, stats) = crate::sim::run_child(
+                &spawn.program,
+                self.target.target,
+                self.mutation,
+                seed,
+                &spawn.handler,
+                request.input,
+            );
+            crate::sim::add(&mut self.stats, &stats);
+            self.stats.child_crashes += stats.crashes;
+            self.stats.children += 1;
+            self.children.insert(key.clone(), Child { result });
+        }
+        Output::Ok(Json::String(key))
     }
 
     fn completion_order(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Vec<usize> {
@@ -1643,6 +1708,18 @@ impl SimWorld<'_> {
             .iter()
             .map(|param| (param.name.clone(), self.param_value(rng, &param.ty)))
             .collect();
+        if !self.children.is_empty() {
+            for param in params.iter().filter(|param| param.ty == Type::Text) {
+                if rng.chance(CHILD_NAMED_PPM) {
+                    let key = self
+                        .children
+                        .keys()
+                        .nth(rng.pick(self.children.len()))
+                        .expect("a pick is below the children's count");
+                    fields.insert(param.name.clone(), Json::String(key.clone()));
+                }
+            }
+        }
         let defaults = self
             .program
             .input_defaults(tool)
