@@ -17,10 +17,12 @@ pub enum Mutation {
     RecoverySkipped,
     EnumUnchecked,
     ModelFailureUnrecorded,
+    RetireSkipped,
+    SealSkipped,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -36,6 +38,8 @@ impl Mutation {
         Self::RecoverySkipped,
         Self::EnumUnchecked,
         Self::ModelFailureUnrecorded,
+        Self::RetireSkipped,
+        Self::SealSkipped,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -55,6 +59,8 @@ impl Mutation {
             Self::RecoverySkipped => "recovery_skipped",
             Self::EnumUnchecked => "enum_unchecked",
             Self::ModelFailureUnrecorded => "model_failure_unrecorded",
+            Self::RetireSkipped => "retire_skipped",
+            Self::SealSkipped => "seal_skipped",
         }
     }
 
@@ -101,7 +107,11 @@ impl Mutation {
                 Target::Cloudflare,
             ],
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
-            Self::CheckpointHashOrder | Self::EnumUnchecked | Self::ModelFailureUnrecorded => all,
+            Self::CheckpointHashOrder
+            | Self::EnumUnchecked
+            | Self::ModelFailureUnrecorded
+            | Self::RetireSkipped
+            | Self::SealSkipped => all,
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

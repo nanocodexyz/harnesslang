@@ -1,5 +1,5 @@
 use crate::ir::{
-    self, Durability, Expr, Handler, Program, SiteClass, SiteKind, Stmt, SumKind, Type,
+    self, Durability, Expr, Handler, Kept, Program, SiteClass, SiteKind, Stmt, SumKind, Type,
 };
 
 pub fn program(program: &Program) {
@@ -133,6 +133,15 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     "assignments target state fields"
                 );
                 expr(handler, value);
+            }
+            Stmt::Shrink { field, kept } => {
+                assert!(
+                    matches!(program.state[*field].ty, Type::List { .. }),
+                    "clear and keep target a list field"
+                );
+                if let Kept::Last(count) = kept {
+                    expr(handler, count);
+                }
             }
             Stmt::If {
                 condition,

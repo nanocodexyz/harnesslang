@@ -321,6 +321,10 @@ pub enum Stmt {
         field: FieldId,
         value: Expr,
     },
+    Shrink {
+        field: FieldId,
+        kept: Kept,
+    },
     If {
         condition: Expr,
         then: Vec<Stmt>,
@@ -350,6 +354,12 @@ pub enum Stmt {
     Finish {
         value: Expr,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum Kept {
+    Nothing,
+    Last(Expr),
 }
 
 #[derive(Clone, Debug)]

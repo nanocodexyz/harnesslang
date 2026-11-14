@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::effect::EffectClass;
-use crate::ir::{self, BinaryOp, Durability, Expr, Handler, Program, SiteKind, Stmt, Type};
+use crate::ir::{self, BinaryOp, Durability, Expr, Handler, Kept, Program, SiteKind, Stmt, Type};
 
 use super::types::{Types, constant, ident, variant_ident};
 
@@ -82,6 +82,14 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.line(&format!("state.{field} = {value};"));
             }
             Stmt::Push { field, value } => self.push(*field, value),
+            Stmt::Shrink { field, kept } => {
+                let count = match kept {
+                    Kept::Nothing => "0_u64".to_owned(),
+                    Kept::Last(count) => self.expr(count),
+                };
+                let field = self.field(*field);
+                self.line(&format!("keep_last(&mut state.{field}, {count});"));
+            }
             Stmt::If {
                 condition,
                 then,

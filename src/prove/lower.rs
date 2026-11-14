@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::effect::EffectClass;
-use crate::ir::{BinaryOp, Expr, Handler, Program, SiteId, SiteKind, Stmt, Type};
+use crate::ir::{BinaryOp, Expr, Handler, Kept, Program, SiteId, SiteKind, Stmt, Type};
 use crate::prove::Mutation;
 use crate::prove::text::Names;
 use crate::run::mutation::Mutation as RunMutation;
@@ -191,6 +191,7 @@ impl Lowering<'_> {
                 Stmt::Let { .. }
                 | Stmt::Assign { .. }
                 | Stmt::Push { .. }
+                | Stmt::Shrink { .. }
                 | Stmt::Finish { .. } => {}
             }
         }
@@ -275,6 +276,11 @@ impl Lowering<'_> {
                 self.arithmetic_trap(value, ops);
                 let name = &self.program.state[*field].name;
                 ops.push(self.trap(format!("push onto {name}")));
+            }
+            Stmt::Shrink { kept, .. } => {
+                if let Kept::Last(count) = kept {
+                    self.arithmetic_trap(count, ops);
+                }
             }
             Stmt::If {
                 condition,

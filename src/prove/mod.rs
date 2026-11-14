@@ -156,7 +156,11 @@ fn repeat_assignments(statements: &mut Vec<Stmt>) {
                     .for_each(|arm| repeat_assignments(&mut arm.body));
             }
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => repeat_assignments(body),
-            Stmt::Let { .. } | Stmt::Push { .. } | Stmt::Effect { .. } | Stmt::Finish { .. } => {}
+            Stmt::Let { .. }
+            | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
+            | Stmt::Effect { .. }
+            | Stmt::Finish { .. } => {}
         }
         out.push(statement);
     }

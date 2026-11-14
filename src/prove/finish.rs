@@ -121,9 +121,11 @@ impl Walk<'_> {
                 self.branch(label, body);
                 true
             }
-            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Effect { .. } => {
-                true
-            }
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
+            | Stmt::Effect { .. } => true,
         }
     }
 }

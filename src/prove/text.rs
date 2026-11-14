@@ -103,7 +103,11 @@ fn collect<'a>(statements: &'a [Stmt], effects: &mut BTreeMap<LocalId, (SiteId, 
             }
             Stmt::Match { arms, .. } => arms.iter().for_each(|arm| collect(&arm.body, effects)),
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => collect(body, effects),
-            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Finish { .. } => {}
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
+            | Stmt::Finish { .. } => {}
         }
     }
 }

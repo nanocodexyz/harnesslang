@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
 
-use crate::ir::{Expr, LocalId, Stmt, Type};
-use crate::prove::arith::{LoopKind, Prover, Quantity, State, U64_MAX, capacity, quantity_name};
+use crate::ir::{Expr, Kept, LocalId, Stmt, Type};
+use crate::prove::arith::loops::finite;
+use crate::prove::arith::{
+    LoopKind, Prover, Quantity, ShrinkBound, State, U64_MAX, capacity, quantity_name,
+};
 use crate::prove::linear::{self, Linear, Var};
 
 impl Prover<'_> {
@@ -27,6 +30,10 @@ impl Prover<'_> {
             Stmt::Push { field, value } => {
                 self.value(&mut state, value);
                 self.push(&mut state, *field);
+                Some(self.compact(state))
+            }
+            Stmt::Shrink { field, kept } => {
+                let state = self.shrink(state, *field, kept);
                 Some(self.compact(state))
             }
             Stmt::If {
@@ -161,6 +168,76 @@ impl Prover<'_> {
         let grown = length.plus(1);
         let var = self.fresh_equal(state, &format!("len({name})"), cap, grown);
         state.env.insert(quantity, var);
+    }
+
+    fn shrink(&mut self, mut state: State, field: usize, kept: &Kept) -> State {
+        let program = self.program;
+        let name = program.state[field].name.clone();
+        let quantity = Quantity::FieldLen(field);
+        let cap = capacity(&program.state[field].ty).expect("clear and keep target a list");
+        let length = Linear::var(state.env[&quantity]);
+        let label = format!("len({name})");
+        let (statement, count) = match kept {
+            Kept::Nothing => (format!("clear {name}"), Some(Linear::constant(0))),
+            Kept::Last(count) => (
+                format!("keep {name} last {}", self.names.expr(count)),
+                self.value(&mut state, count),
+            ),
+        };
+        let Some(count) = count else {
+            let var = self.fresh(&mut state, &label, cap);
+            state.facts.extend(Linear::var(var).subtract(&length));
+            state.env.insert(quantity, var);
+            self.measure_shrink(statement, cap, &state, None, &length, var);
+            return state;
+        };
+        let mut short = state.clone();
+        short.facts.extend(length.subtract(&count));
+        let mut long = state;
+        long.facts
+            .extend(count.plus(1).and_then(|bound| bound.subtract(&length)));
+        let var = self.fresh_equal(&mut long, &label, cap, Some(count.clone()));
+        long.env.insert(quantity, var);
+        let dropped = length.subtract(&count);
+        let joined = self
+            .join(Some(short), Some(long.clone()))
+            .expect("a join of two states is a state");
+        let kept_var = joined.env[&quantity];
+        let long = Some((&long, dropped));
+        self.measure_shrink(statement, cap, &joined, long, &length, kept_var);
+        joined
+    }
+
+    fn measure_shrink(
+        &mut self,
+        statement: String,
+        capacity: i128,
+        after: &State,
+        long: Option<(&State, Option<Linear>)>,
+        length: &Linear,
+        kept: Var,
+    ) {
+        if self.quiet > 0 || !linear::feasible(&after.facts, &mut self.budget).unwrap_or(true) {
+            return;
+        }
+        let left = finite(self.extent(after, &Linear::var(kept), true));
+        let dropped = match long {
+            Some((long, Some(dropped))) => {
+                if linear::feasible(&long.facts, &mut self.budget).unwrap_or(true) {
+                    finite(self.extent(long, &dropped, true))
+                } else {
+                    Some(0)
+                }
+            }
+            Some((_, None)) | None => finite(self.extent(after, length, true)),
+        };
+        let bound = self.shrinks.entry(statement).or_insert(ShrinkBound {
+            capacity,
+            left,
+            dropped,
+        });
+        bound.left = bound.left.zip(left).map(|(a, b)| a.max(b));
+        bound.dropped = bound.dropped.zip(dropped).map(|(a, b)| a.max(b));
     }
 
     pub(super) fn compact(&mut self, mut state: State) -> State {
