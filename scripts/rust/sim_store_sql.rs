@@ -1,4 +1,4 @@
-use crate::harness::{self, Json, Record, Sql, SqlError, SqlJournal, SqlValue, Statement, Stop};
+use crate::harness::{self, Json, Record, Sql, SqlError, SqlJournal, SqlValue, Start, Statement, Stop};
 use crate::{Driver, fail, text};
 
 pub struct State {
@@ -26,14 +26,14 @@ impl Default for State {
     }
 }
 
-pub fn open(driver: &mut Driver, epoch: u64, bytes: &[u8]) -> (Vec<Record>, u64) {
+pub fn open(driver: &mut Driver, epoch: u64, bytes: &[u8], _turn: u64) -> (Start, Vec<Record>, u64) {
     let text = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| fail("rows are not utf-8"));
     driver.store.rows = text.lines().map(str::to_owned).collect();
     driver.store.epoch = epoch;
     let mut journal = driver.store.journal.clone();
     let opened = harness::sql_open(driver, &mut journal).unwrap_or_else(|error| fail(&error.to_string()));
     driver.store.journal = journal;
-    (opened.records, opened.epoch)
+    (Start::Beginning, opened.records, opened.epoch)
 }
 
 pub fn flush(driver: &mut Driver, epoch: u64, records: &[Record]) -> Result<(), Stop> {

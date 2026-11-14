@@ -6,8 +6,8 @@ use std::io::Write;
 
 use harness::program::{self, Arguments};
 use harness::{
-    Disk, EffectClass, FileDisk, Finish, Host, Json, ModelRequest, Output, Ran, Record, Returns,
-    RunError, ToolRequest, TurnRequest, call_id,
+    Disk, EffectClass, FileDisk, Finish, Host, Json, JsonlJournal, ModelRequest, Output, Ran,
+    Record, Returns, RunError, Start, ToolRequest, TurnRequest, call_id,
 };
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -149,19 +149,33 @@ fn run(journal: &str, ledger: &str, acks: &str, seed: u64, turns: u64) {
         clock: 0,
     };
     append_synced(&mut drill.ledger, &format!("{RUN_MARKER}\n"));
+    let first = acknowledged_last(acks) + 1;
     let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
-    let bytes = disk.contents().expect("the journal reads");
-    let dropped = harness::decode_checksummed_lines(&bytes).dropped_bytes;
-    if dropped > 0 {
-        eprintln!("dropped {dropped} torn bytes");
+    let mut session = JsonlJournal::open(&mut disk).unwrap_or_else(|error| panic!("{error}"));
+    if session.dropped_bytes > 0 {
+        eprintln!("dropped {} torn bytes", session.dropped_bytes);
     }
-    for turn in 1..=turns {
-        match harness::run_jsonl(&mut drill, &mut disk, &request(seed, turn)) {
-            Ok(Ran::Finished(_) | Ran::AlreadyFinished(_)) => {}
+    for turn in first..=turns {
+        session = match session.run(&mut drill, &request(seed, turn)) {
+            Ok((session, Ran::Finished(_) | Ran::AlreadyFinished(_))) => session,
             Err(RunError::Open(error)) => panic!("turn {turn}: {error}"),
             Err(RunError::Exit(exit)) => panic!("turn {turn}: {exit:?}"),
-        }
+        };
     }
+}
+
+fn acknowledged_last(acks: &str) -> u64 {
+    let text = std::fs::read_to_string(acks).unwrap_or_default();
+    let mut last = 0;
+    for line in text.lines() {
+        let turn = line
+            .split(' ')
+            .next()
+            .and_then(|turn| turn.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("ack line {line:?} does not start with its turn"));
+        last = last.max(turn);
+    }
+    last
 }
 
 struct Logged {
@@ -390,6 +404,7 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
     check_external(&calls, &runs);
     check_other(&calls, &runs);
     let acks_count = check_acks(&calls, acks, turns);
+    let tail = check_tail(journal, &session);
     let dispatches: usize = runs.iter().map(Vec::len).sum();
     let unrecorded = runs
         .iter()
@@ -403,7 +418,7 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
         })
         .count();
     println!(
-        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={dispatches} other_dispatches_lost_in_a_kill={unrecorded} acks={acks_count} torn_bytes_dropped={}",
+        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={dispatches} other_dispatches_lost_in_a_kill={unrecorded} acks={acks_count} {tail} torn_bytes_dropped={}",
         runs.len(),
         opened.records.len(),
         calls.external.len(),
@@ -413,11 +428,86 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
     );
 }
 
+fn check_tail(journal: &str, whole: &harness::Session) -> String {
+    let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
+    let tail = harness::jsonl_open_tail(&mut disk).expect("the journal's tail reads");
+    assert_eq!(tail.dropped_bytes, 0, "the whole open already dropped the torn tail");
+    let Start::Checkpoint(revision) = tail.start else {
+        assert!(
+            whole.turns.len() <= 1,
+            "a journal of finished turns has a trusted checkpoint"
+        );
+        return "tail_from=beginning".to_owned();
+    };
+    let session = harness::fold_from(tail.start, &tail.records)
+        .unwrap_or_else(|error| panic!("the tail folds: {error}"));
+    for (turn, log) in &session.turns {
+        assert_eq!(
+            whole.turns.get(turn),
+            Some(log),
+            "the tail folds turn {turn} as the whole journal does"
+        );
+    }
+    assert_eq!(
+        session.turns.first_key_value().map(|(turn, _)| *turn),
+        Some(revision + 1),
+        "the tail holds the turn after its checkpoint"
+    );
+    assert_eq!(
+        session.turns.last_key_value().map(|(turn, _)| *turn),
+        whole.turns.last_key_value().map(|(turn, _)| *turn),
+        "the tail reaches the last turn"
+    );
+    assert_eq!(
+        session.checkpoints.get(&revision),
+        whole.checkpoints.get(&revision),
+        "the tail starts at the whole journal's checkpoint"
+    );
+    let older = harness::jsonl_open_for(&mut disk, revision).expect("the journal reads for an older turn");
+    assert_eq!(older.start, Start::Beginning, "an older turn reads the whole journal");
+    format!("tail_from={revision} tail_records={}", tail.records.len())
+}
+
+fn open_timing(journal: &str, repeats: u64) {
+    assert!(repeats > 0, "an open is timed at least once");
+    for mode in ["whole", "tail"] {
+        let started = std::time::Instant::now();
+        let mut bytes_read = 0;
+        let mut records = 0;
+        for _ in 0..repeats {
+            let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
+            let opened = match mode {
+                "whole" => harness::jsonl_open(&mut disk),
+                _ => harness::jsonl_open_tail(&mut disk),
+            }
+            .expect("the journal reads");
+            let session =
+                harness::fold_from(opened.start, &opened.records).expect("the journal folds");
+            let next = match session.turns.last_key_value() {
+                Some((turn, log)) if log.finished.is_none() => *turn,
+                Some((turn, _)) => turn + 1,
+                None => session.start.first_turn(),
+            };
+            harness::state_before(&session, next).expect("the state before the next turn replays");
+            bytes_read = disk.bytes_read;
+            records = opened.records.len();
+        }
+        println!(
+            "open mode={mode} records={records} bytes_read={bytes_read} ms_per_open={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0 / repeats as f64
+        );
+    }
+}
+
 struct PerRecord(FileDisk);
 
 impl Disk for PerRecord {
-    fn contents(&mut self) -> std::io::Result<Vec<u8>> {
-        self.0.contents()
+    fn length(&mut self) -> std::io::Result<u64> {
+        self.0.length()
+    }
+
+    fn read_at(&mut self, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
+        self.0.read_at(offset, length)
     }
 
     fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -484,6 +574,7 @@ fn bench(journal: &str, ledger: &str, acks: &str, turns: u64, mode: &str) {
 
 fn main() {
     harness::self_check();
+    harness::jsonl_self_check();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let number = |text: &str| -> u64 {
         text.parse()
@@ -502,9 +593,10 @@ fn main() {
         ["bench", journal, ledger, acks, turns, mode] => {
             bench(journal, ledger, acks, number(turns), mode)
         }
+        ["open", journal, repeats] => open_timing(journal, number(repeats)),
         _ => {
             eprintln!(
-                "usage: drill_host run JOURNAL LEDGER ACKS SEED TURNS | verify JOURNAL LEDGER ACKS TURNS | bench JOURNAL LEDGER ACKS TURNS group|per-record"
+                "usage: drill_host run JOURNAL LEDGER ACKS SEED TURNS | verify JOURNAL LEDGER ACKS TURNS | bench JOURNAL LEDGER ACKS TURNS group|per-record | open JOURNAL REPEATS"
             );
             std::process::exit(2);
         }
