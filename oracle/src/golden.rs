@@ -163,7 +163,10 @@ impl Inputs for Respond<'_> {
         let (encoded, success) = if self.case.unknown.contains(&id) {
             (cells::unknown_outcome(), false)
         } else if self.case.failed.contains(&id) {
-            (json!({ "error": format!("{name} failed") }).to_string(), false)
+            (
+                json!({ "error": format!("{name} failed") }).to_string(),
+                false,
+            )
         } else {
             (json!(format!("{name}:{input}")).to_string(), true)
         };

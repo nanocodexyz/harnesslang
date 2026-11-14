@@ -119,7 +119,9 @@ fn poll_event(host: &mut EmbeddedHost) -> Result<Option<RuntimeEvent>, String> {
             Poll::Pending => {}
         }
     }
-    Err(format!("djs woke {WAKES_PER_EVENT_MAX} times without an event"))
+    Err(format!(
+        "djs woke {WAKES_PER_EVENT_MAX} times without an event"
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,7 +191,10 @@ fn open_calls(entries: &[JournalEntry]) -> BTreeSet<u64> {
                 assert!(open.insert(*id), "djs journals each nested call id once");
             }
             JournalEntry::Result { id, .. } => {
-                assert!(open.remove(id), "djs journals a result only for an open call");
+                assert!(
+                    open.remove(id),
+                    "djs journals a result only for an open call"
+                );
             }
             _ => {}
         }
@@ -201,7 +206,10 @@ impl Driver {
     fn event(&mut self, event: RuntimeEvent) -> Option<Terminal> {
         match event {
             RuntimeEvent::ToolCall { id, .. } => {
-                assert!(self.issued.insert(id), "djs issues each nested call id once");
+                assert!(
+                    self.issued.insert(id),
+                    "djs issues each nested call id once"
+                );
             }
             RuntimeEvent::Content {
                 content: ToolOutputContent::InputText { text },
@@ -286,7 +294,9 @@ fn drive(driver: &mut Driver, cell_id: u64, inputs: &mut dyn Inputs) -> Result<T
             } => {
                 assert!(open.contains(&id), "inputs deliver only open calls");
                 permits = 0;
-                driver.host.send_tool_result(cell_id, id, encoded, success)?;
+                driver
+                    .host
+                    .send_tool_result(cell_id, id, encoded, success)?;
             }
             Next::Fire if permits < PERMITS_PER_TIMER_MAX => {
                 permits += 1;
