@@ -141,7 +141,7 @@ fn flags(args: &[String]) -> Option<Flags> {
     Some(flags)
 }
 
-fn worst_lines(handler: &ir::Handler) -> String {
+fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
     let worst = &handler.worst;
     let measures = [
         ("effects", &worst.effects),
@@ -156,6 +156,17 @@ fn worst_lines(handler: &ir::Handler) -> String {
         lines.push(format!("    {name}: {}", cost.describe_loops()));
     }
     lines.push("    plus one recovery record per restart".to_owned());
+    let events = &program.events;
+    if events.any() {
+        let steers = events.steers.as_ref().map_or_else(String::new, |bound| {
+            format!(", {} ({}) steer(s)", bound.name, bound.value)
+        });
+        lines.push(format!(
+            "    plus at most {} event record(s) per turn ({} cancel{steers})",
+            events.records_max(),
+            u64::from(events.cancel)
+        ));
+    }
     lines.join("\n")
 }
 
@@ -181,7 +192,7 @@ fn check_command(args: &[String]) -> ExitCode {
         program.handlers.len()
     );
     for handler in &program.handlers {
-        println!("{}", worst_lines(handler));
+        println!("{}", worst_lines(&program, handler));
     }
     let proved_targets = flags
         .target
@@ -203,6 +214,9 @@ fn check_command(args: &[String]) -> ExitCode {
     println!("{}", target::describe(&model));
     if !program.codes.is_empty() {
         println!("{}", target::describe_cells(&model));
+    }
+    if program.events.any() {
+        println!("{}", target::inbound::describe(target));
     }
     if let Some(limit) = model.limits.memory {
         println!(

@@ -6,9 +6,9 @@ use crate::effect::EffectClass;
 use crate::ir::Program;
 use crate::run::cell::{CellEvent, Input, Step, Wait};
 use crate::run::engine::{
-    Exit, Finish, ListingRequest, ModelRequest, Point, Stop, ToolRequest, World,
+    Answer, Exit, Finish, ListingRequest, ModelRequest, Point, Read, Stop, ToolRequest, World,
 };
-use crate::run::journal::{self, Output, Record};
+use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::turn::{Ran, TurnRequest, run_turn};
@@ -567,6 +567,18 @@ impl World for Run<'_, '_> {
 
     fn observe(&mut self, event: &CellEvent) {
         World::observe(&mut self.state.sim, event);
+    }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        World::inbox(&mut self.state.sim, turn)
+    }
+
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]) {
+        World::answer(&mut self.state.sim, turn, position, answers);
+    }
+
+    fn read(&mut self, read: &Read) {
+        World::read(&mut self.state.sim, read);
     }
 }
 

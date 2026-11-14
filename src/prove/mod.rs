@@ -181,6 +181,7 @@ fn repeat_assignments(statements: &mut Vec<Stmt>) {
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
             | Stmt::Effect { .. }
+            | Stmt::Take { .. }
             | Stmt::Finish { .. } => {}
         }
         out.push(statement);

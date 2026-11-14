@@ -13,6 +13,11 @@ pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "m
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
 pub const BUILTIN_FUNCTIONS: [&str; 4] = ["dispatch", "now", "random", "len"];
 pub const WILDCARD: &str = "_";
+pub const EVENT_CANCEL: &str = "cancel";
+pub const EVENT_STEER: &str = "steer";
+pub const STEER_PARAMETER: &str = "message";
+pub const CANCELLED_READ: &str = "cancelled";
+pub const STEERS_READ: &str = "steers";
 
 pub struct Globals {
     constants: BTreeMap<String, ir::ConstId>,
@@ -51,6 +56,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         state: Vec::new(),
         invariants: Vec::new(),
         handlers: Vec::new(),
+        events: ir::Events::default(),
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -69,6 +75,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
     codes(source, &mut program, &mut globals, &mut values)?;
     listings(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
+    events(source, &mut program, &globals, &mut values)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
     invariants(&expanded, &mut program, &globals)?;
     handlers(&expanded, &mut program, &globals)?;
@@ -903,6 +910,102 @@ fn state(
             });
         }
     }
+    Ok(())
+}
+
+fn events(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &Globals,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    for item in &source.items {
+        let Item::Event(event) = item else { continue };
+        match event.name.text.as_str() {
+            EVENT_CANCEL => cancel_event(event, program, values)?,
+            EVENT_STEER => steer_event(event, program, globals)?,
+            other => {
+                return error(
+                    event.name.at,
+                    format!(
+                        "unknown event '{other}': a harness takes '{EVENT_CANCEL}' and '{EVENT_STEER}'"
+                    ),
+                );
+            }
+        }
+    }
+    if program.events.cancel && variant_names(program).contains(CANCELLED_READ) {
+        let at = source
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Type(definition) => match &definition.body {
+                    TypeBody::Variants(variants) => variants
+                        .iter()
+                        .find(|variant| variant.name.text == CANCELLED_READ)
+                        .map(|variant| variant.name.at),
+                    TypeBody::Values(_) => None,
+                },
+                _ => None,
+            })
+            .expect("a variant name comes from a type definition");
+        return error(
+            at,
+            format!("variant '{CANCELLED_READ}' hides the cancel event's read: rename it"),
+        );
+    }
+    Ok(())
+}
+
+fn cancel_event(
+    event: &ast::Event,
+    program: &mut ir::Program,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    if !event.params.is_empty() || event.bound.is_some() {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_CANCEL}' carries nothing: write 'on {EVENT_CANCEL}'"),
+        );
+    }
+    if program.events.cancel {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_CANCEL}' is already declared"),
+        );
+    }
+    let read = ast::Name {
+        text: CANCELLED_READ.to_owned(),
+        at: event.name.at,
+    };
+    claim(values, &read, "the cancel event's read")?;
+    program.events.cancel = true;
+    Ok(())
+}
+
+fn steer_event(event: &ast::Event, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let shape = format!("on {EVENT_STEER}({STEER_PARAMETER}: text) bound N");
+    let one_text = match event.params.as_slice() {
+        [param] => {
+            param.name.text == STEER_PARAMETER
+                && matches!(&param.ty, TypeExpr::Named(name) if name.text == "text")
+        }
+        _ => false,
+    };
+    let Some(limit) = event.bound.as_ref().filter(|_| one_text) else {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_STEER}' carries one text: write '{shape}'"),
+        );
+    };
+    if program.events.steers.is_some() {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_STEER}' is already declared"),
+        );
+    }
+    let bound = bound(program, globals, limit, "the steers one turn records")?;
+    program.events.steers = Some(bound);
     Ok(())
 }
 

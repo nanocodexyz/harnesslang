@@ -5,14 +5,16 @@ use crate::ir::{self, Program, Type};
 use crate::run::cell::{CellEngine, CellEvent, Input, Step, Wait};
 use crate::run::cell_journal::Entry;
 use crate::run::engine::{
-    Finish, ListingRequest, ModelRequest, Point, Stop, ToolRequest, World, batch_width, run_batch,
+    Answer, Finish, ListingRequest, ModelRequest, Point, Read, Stop, ToolRequest, World,
+    batch_width, run_batch,
 };
-use crate::run::journal::{self, Output, Record};
+use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value;
 use crate::sim::cell::{CELL_CALL_PPM, DIVERGENCE_PPM, Plan, SimEngine};
+use crate::sim::events::{self, Inbox};
 use crate::sim::faults::{PowerLoss, Profile, SECTOR_PERSISTED_PPM};
 use crate::sim::invariants::{Invariant, Violation};
 use crate::sim::rng::Rng;
@@ -98,6 +100,7 @@ pub struct Stats {
     pub nested: u64,
     pub divergences: u64,
     pub waits: u64,
+    pub events: Option<u64>,
     pub entry_states: u64,
 }
 
@@ -134,6 +137,7 @@ pub struct SimWorld<'a> {
     cell_calls: BTreeMap<u64, BTreeSet<u64>>,
     cell_timers: BTreeMap<u64, BTreeSet<u64>>,
     cell_codes: BTreeMap<u64, usize>,
+    pub inbox: Inbox,
     pub edges: Option<Edges>,
     pub greedy: bool,
     pub worst_faults: Vec<String>,
@@ -194,6 +198,7 @@ impl<'a> SimWorld<'a> {
             cell_calls: BTreeMap::new(),
             cell_timers: BTreeMap::new(),
             cell_codes: BTreeMap::new(),
+            inbox: Inbox::default(),
             edges: None,
             greedy: false,
             worst_faults: Vec::new(),
@@ -313,6 +318,7 @@ impl<'a> SimWorld<'a> {
             ]
         });
         self.current = Some(request.clone());
+        self.inbox.schedule(program, self.seed, request.turn);
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
         self.armed = faults;
@@ -349,6 +355,7 @@ impl<'a> SimWorld<'a> {
                 return Err(error);
             }
         };
+        self.inbox.load(&records, false);
         let epoch = match &mut self.medium {
             Medium::Rows(rows) if self.target.target == Target::ServerPostgres => rows.take_over(),
             Medium::Rows(rows) => rows.epoch,
@@ -437,9 +444,11 @@ impl<'a> SimWorld<'a> {
         };
         let counted = (self.run_effects, self.run_outbound);
         (self.run_effects, self.run_outbound) = (0, 0);
+        self.inbox.load(&records, true);
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
+        self.inbox.unload();
         (self.run_effects, self.run_outbound) = counted;
         if let Some(trace) = &mut self.trace {
             trace.exit(&ran);
@@ -538,6 +547,7 @@ impl<'a> SimWorld<'a> {
 
 impl World for SimWorld<'_> {
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
+        self.inbox.hook();
         let record = |answer: Json| {
             move || {
                 let mut fields = trace::point_fields(point);
@@ -844,6 +854,32 @@ impl World for SimWorld<'_> {
             ]
         });
         self.check_acknowledge(finish);
+    }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        let arrived = self.inbox.arrived(turn);
+        self.record("inbox", || {
+            vec![
+                ("turn", Json::Number(turn)),
+                ("answer", events::deliveries_json(&arrived)),
+            ]
+        });
+        arrived
+    }
+
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]) {
+        self.record("answer", || {
+            vec![
+                ("turn", Json::Number(turn)),
+                ("position", Json::Number(position)),
+                ("answers", events::answers_json(answers)),
+            ]
+        });
+        self.inbox.answer(turn, position, answers);
+    }
+
+    fn read(&mut self, read: &Read) {
+        self.inbox.read(read);
     }
 }
 

@@ -259,6 +259,14 @@ impl<H: Host> World for SqlWorld<'_, H> {
     }
 
     fn observe(&mut self, _event: &CellEvent) {}
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        self.host.inbox(turn)
+    }
+
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]) {
+        self.host.answer(turn, position, answers)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

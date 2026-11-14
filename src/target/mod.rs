@@ -1,3 +1,4 @@
+pub mod inbound;
 pub mod medium;
 
 use crate::ir::Program;
@@ -113,6 +114,7 @@ pub struct Limit {
 pub enum About {
     Journal,
     Cells,
+    Inbound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -97,6 +97,7 @@ fn record_turn(record: &Record) -> Option<String> {
         Record::Call { call_id, .. } | Record::Result { call_id, .. } => {
             call_id.split_once('/').map(|(turn, _)| turn.to_owned())
         }
+        Record::Event { turn, .. } => turn.clone(),
         _ => None,
     }
 }

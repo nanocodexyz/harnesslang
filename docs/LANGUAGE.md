@@ -493,7 +493,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `parallel` `reply` `tools`
+Contextual words: `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `parallel` `reply` `take` `tools`
 
 Builtin functions, whose names declarations may not take:
 
@@ -539,7 +539,7 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | code | model | state | invariant | function | handler ;
+item       = const | type | tool | listing | code | model | state | invariant | function | handler | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
@@ -552,6 +552,7 @@ state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
+event      = "on" name [ params "bound" bound ] ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
 bound      = name ;
 type_expr  = "list" "<" type_expr "," bound ">"
@@ -580,6 +581,7 @@ sum        = product { ( "+" | "-" | "++" ) product } ;
 product    = postfix { "*" postfix } ;
 postfix    = primary { "." name } ;
 primary    = number | text | "true" | "false" | "(" expr ")"
+           | "take" name
            | name [ "(" [ expr { "," expr } ] ")" ] ;
 ```
 
@@ -809,11 +811,11 @@ rerun sends it again:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=listing_unchecked: listed call 2/54 (mcp__beta) ran as Some("beta-v37") while listing mcp admitted None in turn 2: a tool that changed since admission must be refused
+FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=listing_unchecked: listed call 4/62 (mcp__theta) ran as Some("theta-v61") while listing mcp admitted None in turn 4: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=input_unchecked: call 1/7 (steer_waiting) ran with input "{\"eta-51\":true}", which does not fit its declared input: not a JSON object
+FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=input_unchecked: call 1/48 (apply_patch) ran with input "zeta-7", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
-FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 1/18 (mcp__beta) was dispatched 4 times
+FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 1/14 (mcp__eta) was dispatched 2 times
 ```
 
 The checker's listing errors:
@@ -965,6 +967,159 @@ on ping() -> u64
   return 1
 }
 ```
+
+### on (events)
+
+`on cancel` and `on steer(message: text) bound N` declare the events a running
+turn takes from outside it: a person cancelling the turn, or steering it with
+one more message, as nanocode's turn inbox delivers them. A handler reads them
+with two expressions, and a read writes no record and takes no sequence
+number:
+
+- `cancelled` is `true` once a cancel is recorded for this turn. With `on cancel`
+  declared, nothing else may be named `cancelled`: not a variant, a field, a
+  constant or a local.
+- `take steers` is a `list<text, N>` of the steers recorded since the turn's last
+  `take`, oldest first. Like an effect, it runs before the statement it
+  appears in.
+
+Both belong in a handler's body (or a fn it calls): not in `requires`, which
+runs before the turn takes anything, and not in an invariant. `bound` names
+the most steers one turn records; the steer's one parameter is
+`message: text`, and the cancel carries nothing.
+
+How the runtime records them:
+
+- When an event reaches a running turn, the runtime appends one `event` record,
+  nanocode-turnlog's `Event`: `{"event":{"at":S,"event":{"steer":{"id":I,"message":M}},"seq":N,"turn":T}}`
+  (a cancel is `{"cancel":{"id":I}}`). `at` is the sequence number of the
+  effect the event arrived during, and `seq` numbers it within the session:
+  (turn - 1) times the events one turn records at most, plus its place in the
+  turn, so it increases as nanocode's fold requires and is known from the
+  turn alone. The sender's `id` makes a delivery sent again a duplicate.
+- A read between effects `s` and `s + 1` returns the events recorded with
+  `at <= s`: those recorded before the next sequence number. Events enter only
+  while an effect runs, never between a read and the next effect, so every
+  read at one place sees the same events, and replaying the journal shows
+  each read exactly what it saw. A turn re-run after a crash takes no new
+  events at the effects it replays.
+- The sender is answered only once the record is durable: `recorded`,
+  `duplicate` (already recorded, or a second cancel), `full` (the turn holds
+  its `bound` of steers), `undeclared` (the harness takes no such event) or
+  `finished` (the turn ended before taking it). A turn records at most one
+  cancel and `N` steers, so `hl check` reports them beside the worst case.
+- Where they come in: native and server targets drain a `std::sync::mpsc`
+  channel the host's HTTP endpoint fills (`Inbox::channel` in the generated
+  code), after every effect the turn runs, and flush before answering; on
+  Postgres only the lease owner's endpoint takes them. Cloudflare takes
+  `POST /event` on the session's Durable Object while the turn awaits a tool
+  or the model, and answers after `storage.sync()`. Vercel takes `resumeHook`
+  payloads on the turn's events hook; the workflow function records them at
+  each step boundary and answers them with a step. `hl check --target T`
+  prints each target's path with the platform facts it rests on.
+
+```hl docs/snippets/events.hl
+harness worker
+
+const steps_max: u64 = 8
+const steers_max: u64 = 4
+const notes_max: u64 = 64
+
+type outcome = done(text) | stopped
+
+tool work(task: text) -> text effect external
+
+on cancel
+on steer(message: text) bound steers_max
+
+state {
+  notes: list<text, notes_max>
+}
+
+invariant notes_bounded: len(notes) <= notes_max
+
+on run(task: text) -> outcome
+  requires len(notes) + steps_max * (1 + steers_max) <= notes_max
+{
+  loop step below steps_max {
+    for steer in take steers {
+      push notes steer
+    }
+    match work(task) {
+      ok(output) => { push notes output }
+      failed(error) => { push notes error }
+      unknown => { return stopped }
+    }
+    if cancelled { return stopped }
+  }
+  return done(task)
+}
+```
+
+```console
+$ hl check docs/snippets/events.hl
+docs/snippets/events.hl: harness worker: 1 tool(s), 1 state field(s), 1 handler(s)
+  handler run: worst case 8 effects, 19 journal records, 8 outbound requests
+    effects: step below steps_max (8)
+    journal records: step below steps_max (8)
+    outbound requests: step below steps_max (8)
+    plus one recovery record per restart
+    plus at most 5 event record(s) per turn (1 cancel, steers_max (4) steer(s))
+...
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/events.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1338 crashes=834 power_losses=135 torn_writes=185 takeovers=0 fenced=0 dispatches=1410 unknown=362 events=177
+$ hl check docs/snippets/errors/event-steer-shape.hl
+docs/snippets/errors/event-steer-shape.hl:5:4: error: event 'steer' carries one text: write 'on steer(message: text) bound N'
+$ hl check docs/snippets/errors/event-cancelled-variant.hl
+docs/snippets/errors/event-cancelled-variant.hl:3:23: error: variant 'cancelled' hides the cancel event's read: rename it
+$ hl check docs/snippets/errors/event-requires.hl
+docs/snippets/errors/event-requires.hl:6:16: error: 'cancelled' reads the turn's events, so it belongs in a handler's body
+```
+
+```hl docs/snippets/errors/event-steer-shape.hl
+harness worker
+
+const steers_max: u64 = 4
+
+on steer(note: text) bound steers_max
+
+on run() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/event-cancelled-variant.hl
+harness worker
+
+type outcome = done | cancelled
+
+on cancel
+
+on run() -> outcome { return done }
+```
+
+```hl docs/snippets/errors/event-requires.hl
+harness worker
+
+on cancel
+
+on run() -> u64
+  requires not cancelled
+{
+  return 1
+}
+```
+
+The simulator sends events to half the turns of a harness that declares any
+(`EVENT_TURN_PPM` = 500000 per million): a cancel in `CANCEL_PPM` = 400000 per
+million of them and up to `N` + 1 steers, so `full` is reached, each arriving
+at one of the first `ARRIVAL_HOOKS_MAX` = 48 hooks of the turn, so during a
+tool call, at a flush or after a crash, and sent again until answered. Its
+invariants: `event_before_read` (a read never sees an event recorded after it),
+`event_replay_equal` (a replayed read sees exactly what its journal holds, and
+no event is recorded at an earlier place than one before it), `event_once` (no
+event is recorded twice) and `event_kept` (every event is answered, and one
+answered as delivered is in the journal). Their mutations are
+`event_read_unstamped`, `event_drain_on_replay`, `event_redelivered` and
+`event_ack_early`, and `batch_drains_replayed` for a parallel for (below).
 
 ### fn
 
@@ -1683,13 +1838,13 @@ any other round and the worst case counts it.
 
 The planted bug `model_failure_unrecorded` writes no record for a failed
 call, as a harness that treats provider errors as transient might. A rerun
-asks the model again, and the journal it leaves records a sequence number
-the turn has already passed:
+asks the model again, and replaying the journal from nothing takes another
+path, past the sequence numbers the journal records:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
-FAIL invariant=seq_unique seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: turn 3 records seq 1 after seq 9
-replay: hl sim --target native-jsonl --seeds 1..2 --mutation model_failure_unrecorded examples/claude_agent.hl
+FAIL invariant=replay_equal seed=0 target=native-jsonl profile=errors mutation=model_failure_unrecorded: replaying the journal failed: Corrupt("replay of turn 4 needs seq 45, which the journal does not record")
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation model_failure_unrecorded examples/claude_agent.hl
 ```
 
 The checker's reply errors:
@@ -2111,6 +2266,16 @@ runs at most `CLOUDFLARE_CONNECTIONS_WAITING_MAX` fetches at once inside the
 object's event, so none waits in the runtime's own queue; Vercel runs a group
 inside one step, which documents no concurrency limit. The simulator
 completes a group's calls in a random order and crashes between them.
+
+Events that arrive while a group runs are recorded at the batch's last
+sequence number, once the group's calls return and before their results,
+so a read after the batch sees them. The body only pushes, so no read falls
+inside a batch: check `cancelled` before and after it. A re-run can find
+a batch whose last call the journal already holds while earlier none calls
+still run again, when recovery reported its external calls `unknown`. Then
+the batch records no events, since reads after it replay, and the next
+effect takes them (`batch_drains_replayed` records them anyway, and
+`event_replay_equal` catches it).
 
 ```hl docs/snippets/parallel.hl
 harness readers

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::effect::EffectClass;
 use crate::run::cell_journal::{CellLog, CellUpdate};
-use crate::run::journal::{Outcome, Output, Record};
+use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record};
 use crate::run::json::Json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +28,12 @@ pub struct Finished {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recorded {
+    pub at: u64,
+    pub delivery: Delivery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnLog {
     pub handler: String,
     pub arguments: Json,
@@ -36,6 +42,7 @@ pub struct TurnLog {
     pub finished: Option<Finished>,
     pub nested: BTreeMap<(u64, u64), SiteLog>,
     pub cells: BTreeMap<u64, CellLog>,
+    pub events: Vec<Recorded>,
 }
 
 impl TurnLog {
@@ -48,6 +55,7 @@ impl TurnLog {
             finished: None,
             nested: BTreeMap::new(),
             cells: BTreeMap::new(),
+            events: Vec::new(),
         }
     }
 
@@ -70,6 +78,10 @@ impl TurnLog {
             })
             .collect()
     }
+
+    pub fn recorded(&self, id: &str) -> bool {
+        self.events.iter().any(|event| event.delivery.id == id)
+    }
 }
 
 pub const ENTRY_REVISION: u64 = 0;
@@ -79,6 +91,7 @@ pub struct Session {
     pub turns: BTreeMap<u64, TurnLog>,
     pub checkpoints: BTreeMap<u64, String>,
     pub cell_origins: BTreeMap<u64, (u64, u64)>,
+    pub last_event: u64,
 }
 
 impl Session {
@@ -208,6 +221,49 @@ fn next_site(log: &mut TurnLog, turn: u64, seq: u64, site: SiteLog) -> Result<()
         return Err(format!("turn {turn} records seq {seq} after seq {last}"));
     }
     log.sites.insert(seq, site);
+    Ok(())
+}
+
+fn event(
+    session: &mut Session,
+    turn: u64,
+    seq: u64,
+    at: u64,
+    delivery: &Delivery,
+) -> Result<(), String> {
+    if seq <= session.last_event {
+        return Err(format!(
+            "event {seq} of turn {turn} follows event {}",
+            session.last_event
+        ));
+    }
+    let log = running(session, turn, "an event")?;
+    if let Some(last) = log.events.last()
+        && at < last.at
+    {
+        return Err(format!(
+            "event {seq} of turn {turn} is at seq {at}, before the event at seq {}",
+            last.at
+        ));
+    }
+    if log.recorded(&delivery.id) {
+        return Err(format!(
+            "event '{}' of turn {turn} is recorded twice",
+            delivery.id
+        ));
+    }
+    let cancelled = log
+        .events
+        .iter()
+        .any(|event| event.delivery.inbound == Inbound::Cancel);
+    if cancelled && delivery.inbound == Inbound::Cancel {
+        return Err(format!("turn {turn} records a second cancel"));
+    }
+    log.events.push(Recorded {
+        at,
+        delivery: delivery.clone(),
+    });
+    session.last_event = seq;
     Ok(())
 }
 
@@ -362,6 +418,12 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
                 last: *last,
             });
         }
+        Record::Event {
+            turn,
+            seq,
+            at,
+            delivery,
+        } => event(session, *turn, *seq, *at, delivery)?,
         Record::Checkpoint {
             revision, payload, ..
         } => {

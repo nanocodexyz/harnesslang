@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::check::{BUILTIN_FUNCTIONS, Checked, Globals, WILDCARD, claim, error, variant_names};
+use crate::check::{
+    BUILTIN_FUNCTIONS, CANCELLED_READ, Checked, Globals, WILDCARD, claim, error, variant_names,
+};
 use crate::ir;
 use crate::syntax::Position;
 use crate::syntax::ast::{self, Arm, Block, Expr, Function, Item, Name, Pattern, Stmt};
@@ -127,7 +129,7 @@ pub fn expand(
     let variants = variant_names(program);
     let mut inliner = Inliner {
         functions: BTreeMap::new(),
-        declared: declared(globals, &variants),
+        declared: declared(globals, &variants, program),
         expanded: BTreeMap::new(),
         called: BTreeSet::new(),
         stack: Vec::new(),
@@ -175,8 +177,15 @@ pub fn expand(
     })
 }
 
-fn declared(globals: &Globals, variants: &BTreeSet<String>) -> BTreeSet<String> {
+fn declared(
+    globals: &Globals,
+    variants: &BTreeSet<String>,
+    program: &ir::Program,
+) -> BTreeSet<String> {
     let mut names = variants.clone();
+    if program.events.cancel {
+        names.insert(CANCELLED_READ.to_owned());
+    }
     names.extend(globals.fields.keys().cloned());
     names.extend(globals.constants.keys().cloned());
     names.extend(globals.tools.keys().cloned());
@@ -491,6 +500,7 @@ impl<'a> Inliner<'a> {
                     pending.push(left);
                 }
                 Expr::Not { operand, .. } => pending.push(operand),
+                Expr::Take { .. } => {}
             }
         }
         Ok(())

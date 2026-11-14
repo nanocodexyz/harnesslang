@@ -1,0 +1,7 @@
+harness worker
+
+type outcome = done | cancelled
+
+on cancel
+
+on run() -> outcome { return done }

@@ -262,6 +262,19 @@ class Seed {
     return this.cursor.next("now", "now").answer;
   }
 
+  inbox(turn) {
+    const event = this.cursor.next("inbox", `turn ${turn}`);
+    same("inbox turn", event.turn, BigInt(turn));
+    return event.answer.map((json) => rt.deliveryFrom(json));
+  }
+
+  answered(turn, position, answers) {
+    const event = this.cursor.next("answer", `turn ${turn}`);
+    same("answer turn", event.turn, BigInt(turn));
+    same("answer position", event.position, BigInt(position));
+    same("event answers", event.answers, answers.map(([id, answer]) => ({ answer, id })));
+  }
+
   random() {
     return this.cursor.next("random", "random").answer;
   }
@@ -425,6 +438,8 @@ async function cloudflareSeed(seed) {
   const simulation = {
     mutation: values.mutation,
     hook: (point) => seed.hook(point),
+    inbox: (turn) => seed.inbox(turn),
+    answer: (turn, position, answers) => seed.answered(turn, position, answers),
     tools: (world, requests, limit) => seed.tools(world, requests, limit),
     gate: (records) => {
       const bytes = storage.pendingBytes();
@@ -489,6 +504,32 @@ class SimWorkflow {
     this.stepIndex = 0;
     this.statusLive = false;
     this.slept = new Set();
+    this.lastInbox = null;
+  }
+
+  async inbox(turn, live) {
+    const index = this.stepIndex;
+    const log = this.state.log;
+    const name = `inbox ${turn}`;
+    if (index < log.length && log[index].name === name) {
+      this.stepIndex += 1;
+      this.lastInbox = { entry: log[index], live: false };
+      return log[index].deliveries;
+    }
+    if (!live) return [];
+    if (index < log.length) throw differ(`workflow step ${index} on replay`, log[index].name, name);
+    this.stepIndex += 1;
+    const entry = { name, output: { lines: [] }, deliveries: this.seed.inbox(turn) };
+    log.push(entry);
+    this.lastInbox = { entry, live: true };
+    return entry.deliveries;
+  }
+
+  async record(lines) {
+    const { entry, live } = this.lastInbox;
+    if (!live) return;
+    this.seed.flushed(lines.map((line) => line + "\n").join(""));
+    entry.output.lines.push(...lines);
   }
 
   async request(index) {
@@ -539,6 +580,7 @@ class SimWorkflow {
       host: this.state.host,
       mutation: values.mutation,
       acknowledge: async (finish) => seed.acknowledged(finish, (turn) => statusIn(this.state.lines(), turn)),
+      answer: async (turn, position, answers) => seed.answered(turn, position, answers),
     };
     const output = await harness.runStep(input, context);
     if (input.kind === "run" && output.wait === undefined) {

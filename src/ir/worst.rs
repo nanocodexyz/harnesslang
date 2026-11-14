@@ -272,9 +272,11 @@ fn statement_cost(
     statement: &Stmt,
 ) -> Result<Paths, Overflow> {
     match statement {
-        Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Shrink { .. } => {
-            Ok(continuing(zero()))
-        }
+        Stmt::Let { .. }
+        | Stmt::Assign { .. }
+        | Stmt::Push { .. }
+        | Stmt::Take { .. }
+        | Stmt::Shrink { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {
             through: None,

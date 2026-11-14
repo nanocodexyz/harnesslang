@@ -35,6 +35,27 @@ pub enum Output {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inbound {
+    Cancel,
+    Steer(String),
+}
+
+impl Inbound {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Steer(_) => "steer",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub id: String,
+    pub inbound: Inbound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     Admitted {
         turn: u64,
@@ -95,6 +116,12 @@ pub enum Record {
         state: String,
         payload: String,
     },
+    Event {
+        turn: u64,
+        seq: u64,
+        at: u64,
+        delivery: Delivery,
+    },
 }
 
 impl Record {
@@ -107,7 +134,8 @@ impl Record {
             | Self::Recovery { turn, .. }
             | Self::Status { turn, .. }
             | Self::NestedCall { turn, .. }
-            | Self::NestedResult { turn, .. } => Some(*turn),
+            | Self::NestedResult { turn, .. }
+            | Self::Event { turn, .. } => Some(*turn),
             Self::Checkpoint { .. } | Self::Cell { .. } => None,
         }
     }
@@ -144,6 +172,38 @@ fn parse_call_id(text: &str) -> Result<(u64, u64), String> {
         .parse()
         .map_err(|_| format!("call id {text:?} has no sequence number"))?;
     Ok((turn, seq))
+}
+
+pub fn delivery_json(delivery: &Delivery) -> Json {
+    let id = Json::text(&delivery.id);
+    let fields = match &delivery.inbound {
+        Inbound::Cancel => Json::object([("id", id)]),
+        Inbound::Steer(message) => Json::object([
+            ("id", id),
+            (crate::check::STEER_PARAMETER, Json::text(message)),
+        ]),
+    };
+    Json::object([(delivery.inbound.name(), fields)])
+}
+
+pub fn delivery_from(json: &Json) -> Result<Delivery, String> {
+    let Some((name, Json::Object(map))) = json.tagged() else {
+        return Err(format!("event {} is not a tagged object", json.encode()));
+    };
+    let fields = Fields { tag: name, map };
+    let id = fields.text("id")?.to_owned();
+    let inbound = match name {
+        "cancel" => {
+            fields.exact(&["id"])?;
+            Inbound::Cancel
+        }
+        "steer" => {
+            fields.exact(&["id", crate::check::STEER_PARAMETER])?;
+            Inbound::Steer(fields.text(crate::check::STEER_PARAMETER)?.to_owned())
+        }
+        other => return Err(format!("unknown event '{other}'")),
+    };
+    Ok(Delivery { id, inbound })
 }
 
 fn turn_text(turn: u64) -> Json {
@@ -298,6 +358,20 @@ pub fn to_json(record: &Record) -> Json {
                 ("payload", Json::String(payload.clone())),
                 ("revision", Json::Number(*revision)),
                 ("state", Json::text(state)),
+            ]),
+        ),
+        Record::Event {
+            turn,
+            seq,
+            at,
+            delivery,
+        } => (
+            "event",
+            Json::object([
+                ("at", Json::Number(*at)),
+                ("event", delivery_json(delivery)),
+                ("seq", Json::Number(*seq)),
+                ("turn", turn_text(*turn)),
             ]),
         ),
     };
@@ -478,6 +552,15 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
             Ok(record)
         }
         "status" => status_from(&fields),
+        "event" => {
+            fields.exact(&["at", "event", "seq", "turn"])?;
+            Ok(Record::Event {
+                turn: fields.turn()?,
+                seq: fields.number("seq")?,
+                at: fields.number("at")?,
+                delivery: delivery_from(fields.get("event")?)?,
+            })
+        }
         "checkpoint" => {
             fields.exact(&["payload", "revision", "state"])?;
             let payload = fields.text("payload")?.to_owned();

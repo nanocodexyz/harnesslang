@@ -511,9 +511,38 @@ function recordJson(record) {
         ["revision", BigInt(record.revision)],
         ["state", record.state],
       ])]]);
+    case "event":
+      return object([["event", object([
+        ["at", BigInt(record.at)],
+        ["event", deliveryJson(record.delivery)],
+        ["seq", BigInt(record.seq)],
+        ["turn", turn],
+      ])]]);
     default:
       throw new Panic(`unknown record kind ${record.kind}`);
   }
+}
+
+function deliveryJson(delivery) {
+  const fields = [["id", delivery.id]];
+  if (delivery.kind === "steer") fields.push(["message", delivery.message]);
+  return object([[delivery.kind, object(fields)]]);
+}
+
+function deliveryFrom(json) {
+  const pair = tagged(json);
+  if (pair === null || !isObject(pair[1])) throw new DecodeError(`event ${encodeJson(json)} is not a tagged object`);
+  const fields = new Fields(pair[0], pair[1]);
+  const id = fields.text("id");
+  if (pair[0] === "cancel") {
+    fields.exact(["id"]);
+    return { id, kind: "cancel" };
+  }
+  if (pair[0] === "steer") {
+    fields.exact(["id", "message"]);
+    return { id, kind: "steer", message: fields.text("message") };
+  }
+  throw new DecodeError(`unknown event '${pair[0]}'`);
 }
 
 function smallNumber(value, what) {
@@ -636,6 +665,9 @@ function recordFrom(json) {
     case "checkpoint":
       fields.exact(["payload", "revision", "state"]);
       return { kind: "checkpoint", payload: fields.text("payload"), revision: fields.number("revision"), state: fields.text("state") };
+    case "event":
+      fields.exact(["at", "event", "seq", "turn"]);
+      return { kind: "event", turn: fields.turn(), seq: fields.number("seq"), at: fields.number("at"), delivery: deliveryFrom(fields.get("event")) };
     default:
       throw new DecodeError(`unknown record '${pair[0]}'`);
   }
@@ -751,7 +783,7 @@ function decodeLines(text, checksum) {
 }
 
 function newTurnLog(handler, args) {
-  return { handler, arguments: args, sites: new Map(), lastSeq: 0, attempts: 0, finished: null, nested: new Map(), lastNested: new Map(), cells: new Map() };
+  return { handler, arguments: args, sites: new Map(), lastSeq: 0, attempts: 0, finished: null, nested: new Map(), lastNested: new Map(), cells: new Map(), events: [] };
 }
 
 function runningLog(session, turn, what) {
@@ -770,7 +802,7 @@ function nextSite(log, turn, seq, site) {
 }
 
 function fold(records) {
-  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map() };
+  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map(), lastEvent: 0 };
   for (const record of records) {
     applyRecord(session, record);
   }
@@ -824,6 +856,9 @@ function applyRecord(session, record) {
       log.finished = { outcome: record.outcome, result: record.result, last: record.last };
       return;
     }
+    case "event":
+      applyEvent(session, record);
+      return;
     case "checkpoint": {
       const log = session.turns.get(record.revision);
       if (log === undefined || log.finished === null) {
@@ -834,6 +869,68 @@ function applyRecord(session, record) {
     }
     default:
       throw new Panic(`unknown record kind ${record.kind}`);
+  }
+}
+
+function applyEvent(session, record) {
+  if (record.seq <= session.lastEvent) {
+    throw new Corrupt(`event ${record.seq} of turn ${record.turn} follows event ${session.lastEvent}`);
+  }
+  const log = runningLog(session, record.turn, "an event");
+  const last = log.events.at(-1);
+  if (last !== undefined && record.at < last.at) {
+    throw new Corrupt(`event ${record.seq} of turn ${record.turn} is at seq ${record.at}, before the event at seq ${last.at}`);
+  }
+  if (log.events.some((event) => event.delivery.id === record.delivery.id)) {
+    throw new Corrupt(`event '${record.delivery.id}' of turn ${record.turn} is recorded twice`);
+  }
+  const cancelled = log.events.some((event) => event.delivery.kind === "cancel");
+  if (cancelled && record.delivery.kind === "cancel") throw new Corrupt(`turn ${record.turn} records a second cancel`);
+  log.events.push({ at: record.at, delivery: record.delivery });
+  session.lastEvent = record.seq;
+}
+
+function eventsTaken() {
+  return PROGRAM.events.cancel || PROGRAM.events.steers !== null;
+}
+
+function eventSeq(turn, index) {
+  assert(index >= 1, "an event's index in its turn counts from 1");
+  const seq = BigInt(turn - 1) * PROGRAM.events.recordsMax + BigInt(index);
+  return seq > BigInt(Number.MAX_SAFE_INTEGER) ? null : Number(seq);
+}
+
+function steerCount(events) {
+  return events.filter((event) => event.delivery.kind === "steer").length;
+}
+
+function admitEvent(turn, events, position, delivery) {
+  if (events.some((event) => event.delivery.id === delivery.id)) return { answer: "duplicate", record: null };
+  if (delivery.kind === "cancel") {
+    if (!PROGRAM.events.cancel) return { answer: "undeclared", record: null };
+    if (events.some((event) => event.delivery.kind === "cancel")) return { answer: "duplicate", record: null };
+  } else {
+    if (PROGRAM.events.steers === null) return { answer: "undeclared", record: null };
+    if (BigInt(steerCount(events)) >= PROGRAM.events.steers.max) return { answer: "full", record: null };
+  }
+  const seq = eventSeq(turn, events.length + 1);
+  if (seq === null) return { answer: "full", record: null };
+  events.push({ at: position, delivery });
+  return { answer: "recorded", record: { kind: "event", turn, seq, at: position, delivery } };
+}
+
+function closingAnswers(events, arrived) {
+  return arrived.map((delivery) => [delivery.id, events.some((event) => event.delivery.id === delivery.id) ? "duplicate" : "finished"]);
+}
+
+function checkEvents(turn, log) {
+  for (const event of log.events) {
+    const taken = event.delivery.kind === "cancel" ? PROGRAM.events.cancel : PROGRAM.events.steers !== null;
+    if (!taken) throw new Corrupt(`turn ${turn} records a ${event.delivery.kind} event, which the program does not take`);
+  }
+  const steers = steerCount(log.events);
+  if (PROGRAM.events.steers !== null && BigInt(steers) > PROGRAM.events.steers.max) {
+    throw new Corrupt(`turn ${turn} records ${steers} steers, more than ${PROGRAM.events.steers.name} (${PROGRAM.events.steers.max})`);
   }
 }
 

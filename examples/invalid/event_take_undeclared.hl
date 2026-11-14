@@ -1,0 +1,8 @@
+harness worker
+
+on cancel
+
+on run() -> u64 {
+  let steers = take steers
+  return len(steers)
+}

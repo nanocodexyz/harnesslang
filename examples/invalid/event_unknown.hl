@@ -1,0 +1,5 @@
+harness worker
+
+on pause
+
+on run() -> u64 { return 1 }
