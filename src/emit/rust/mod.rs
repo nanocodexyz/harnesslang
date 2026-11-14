@@ -1,0 +1,320 @@
+mod handlers;
+mod sql;
+mod types;
+
+use std::fmt::Write;
+
+use crate::effect::EffectClass;
+use crate::ir::{self, Program};
+use crate::target::Target;
+
+use handlers::Body;
+use types::{Types, camel, constant, ident, sum_name};
+
+const RUNTIME_JOURNAL: &str = include_str!("runtime/journal.rs");
+const RUNTIME_ENGINE: &str = include_str!("runtime/engine.rs");
+const RUNTIME_JSONL: &str = include_str!("runtime/jsonl.rs");
+const LINTS: &str = "#![allow(dead_code, unused_variables, unused_parens, unreachable_code, unused_comparisons, clippy::all)]\n";
+
+pub const TARGETS: [Target; 3] = [
+    Target::NativeJsonl,
+    Target::NativeSqlite,
+    Target::ServerPostgres,
+];
+
+pub fn emit(program: &Program, target: Target) -> Result<String, String> {
+    if !TARGETS.contains(&target) {
+        return Err(format!(
+            "the Rust backend emits {}, not {}",
+            TARGETS.map(Target::name).join(", "),
+            target.name()
+        ));
+    }
+    check_names(program)?;
+    let mut out = String::from(LINTS);
+    out.push_str(RUNTIME_JOURNAL);
+    out.push_str(RUNTIME_ENGINE);
+    match target {
+        Target::NativeJsonl => out.push_str(RUNTIME_JSONL),
+        Target::NativeSqlite | Target::ServerPostgres => out.push_str(&sql::store(target)?),
+        Target::Cloudflare | Target::Vercel => unreachable!("refused above"),
+    }
+    out.push_str("\npub mod program {\n    use super::*;\n\n");
+    out.push_str(&generate(program, target));
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn check_names(program: &Program) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for sum in &program.sums {
+        let mut variants = std::collections::BTreeSet::new();
+        for variant in &sum.variants {
+            if !variants.insert(camel(&variant.name)) {
+                return Err(format!(
+                    "type '{}': variants map to the same Rust name {}",
+                    sum.name,
+                    camel(&variant.name)
+                ));
+            }
+        }
+        if !seen.insert(camel(&sum.name)) {
+            return Err(format!(
+                "type '{}' maps to a Rust name already taken",
+                sum.name
+            ));
+        }
+    }
+    let mut constants = std::collections::BTreeSet::new();
+    for item in &program.constants {
+        if !constants.insert(constant(&item.name)) {
+            return Err(format!(
+                "constant '{}' maps to a Rust name already taken",
+                item.name
+            ));
+        }
+    }
+    let mut handlers = std::collections::BTreeSet::new();
+    for handler in &program.handlers {
+        if !handlers.insert(camel(&handler.name)) {
+            return Err(format!(
+                "handler '{}' maps to a Rust name already taken",
+                handler.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn generate(program: &Program, target: Target) -> String {
+    let mut types = Types::new(program);
+    let mut out = String::new();
+    let line = |out: &mut String, text: String| {
+        out.push_str(&text);
+        out.push('\n');
+    };
+    line(
+        &mut out,
+        format!("pub const HARNESS_NAME: &str = {:?};", program.name),
+    );
+    line(
+        &mut out,
+        format!("pub const TARGET: &str = {:?};", target.name()),
+    );
+    if let Some(model) = &program.model {
+        line(
+            &mut out,
+            format!("pub const MODEL_NAME: &str = {:?};", model.name),
+        );
+    }
+    for item in &program.constants {
+        line(
+            &mut out,
+            format!("pub const {}: u64 = {};", constant(&item.name), item.value),
+        );
+    }
+    out.push('\n');
+    for (id, sum) in program.sums.iter().enumerate() {
+        sum_definition(&mut out, &types, id, sum);
+    }
+    state(&mut out, program, &mut types);
+    arguments(&mut out, program, &mut types);
+    dispatch(&mut out, program);
+    for handler in &program.handlers {
+        handler_function(&mut out, program, handler, &mut types);
+    }
+    types.emit_codecs(&mut out);
+    out
+}
+
+fn sum_definition(out: &mut String, types: &Types<'_>, id: ir::SumId, sum: &ir::Sum) {
+    let program_variants: Vec<String> = sum
+        .variants
+        .iter()
+        .map(|variant| {
+            if variant.fields.is_empty() {
+                camel(&variant.name)
+            } else {
+                let fields: Vec<String> = variant
+                    .fields
+                    .iter()
+                    .map(|field| types.rust(field))
+                    .collect();
+                format!("{}({})", camel(&variant.name), fields.join(", "))
+            }
+        })
+        .collect();
+    writeln!(
+        out,
+        "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum {} {{\n    {},\n}}\n",
+        sum_name(types.program(), id),
+        program_variants.join(",\n    ")
+    )
+    .expect("writing to a string succeeds");
+}
+
+fn state(out: &mut String, program: &Program, types: &mut Types<'_>) {
+    let mut fields = String::new();
+    let mut to_json = Vec::new();
+    let mut from_json = String::new();
+    for field in &program.state {
+        let name = ident(&field.name);
+        writeln!(fields, "    pub {name}: {},", types.rust(&field.ty))
+            .expect("writing to a string succeeds");
+        to_json.push(format!(
+            "({:?}, {}(&state.{name}))",
+            field.name,
+            types.to_json(&field.ty)
+        ));
+        writeln!(
+            from_json,
+            "        {name}: {}(map.get({:?}).ok_or_else(|| {:?}.to_owned())?)?,",
+            types.from_json(&field.ty),
+            field.name,
+            format!("state lacks field '{}'", field.name)
+        )
+        .expect("writing to a string succeeds");
+    }
+    let count = program.state.len();
+    writeln!(
+        out,
+        "#[derive(Clone, Debug, Default, PartialEq, Eq)]\npub struct State {{\n{fields}}}\n\npub fn state_json(state: &State) -> Json {{\n    Json::object(vec![{}])\n}}\n\npub fn state_from_json(json: &Json) -> Result<State, String> {{\n    let Json::Object(map) = json else {{\n        return Err(\"state is not an object\".to_owned());\n    }};\n    if map.len() != {count} {{\n        return Err(format!(\"state has {{}} fields, the program has {count}\", map.len()));\n    }}\n    Ok(State {{\n{from_json}    }})\n}}\n",
+        to_json.join(", ")
+    )
+    .expect("writing to a string succeeds");
+}
+
+fn arguments(out: &mut String, program: &Program, types: &mut Types<'_>) {
+    let mut variants = String::new();
+    let mut names = String::new();
+    let mut to_json = String::new();
+    let mut decode = String::new();
+    let mut run = String::new();
+    for handler in &program.handlers {
+        let variant = camel(&handler.name);
+        let params: Vec<&ir::Field> = handler
+            .params
+            .iter()
+            .map(|local| &handler.locals[*local])
+            .collect();
+        let bindings: Vec<String> = (0..params.len()).map(|index| format!("p{index}")).collect();
+        let pattern = if params.is_empty() {
+            format!("Arguments::{variant}")
+        } else {
+            format!("Arguments::{variant}({})", bindings.join(", "))
+        };
+        let rust: Vec<String> = params.iter().map(|param| types.rust(&param.ty)).collect();
+        if params.is_empty() {
+            writeln!(variants, "    {variant},").expect("writing to a string succeeds");
+        } else {
+            writeln!(variants, "    {variant}({}),", rust.join(", "))
+                .expect("writing to a string succeeds");
+        }
+        writeln!(names, "        {pattern} => {:?},", handler.name)
+            .expect("writing to a string succeeds");
+        let entries: Vec<String> = params
+            .iter()
+            .zip(&bindings)
+            .map(|(param, binding)| {
+                format!(
+                    "({:?}, {}({binding}))",
+                    param.name,
+                    types.to_json(&param.ty)
+                )
+            })
+            .collect();
+        writeln!(
+            to_json,
+            "        {pattern} => Json::object(vec![{}]),",
+            entries.join(", ")
+        )
+        .expect("writing to a string succeeds");
+        let parsed: Vec<String> = params
+            .iter()
+            .map(|param| {
+                format!(
+                    "{}(json.get({:?}).ok_or_else(|| ArgumentsError::Invalid({:?}.to_owned()))?).map_err(ArgumentsError::Invalid)?",
+                    types.from_json(&param.ty),
+                    param.name,
+                    format!("arguments lack '{}'", param.name)
+                )
+            })
+            .collect();
+        let value = if params.is_empty() {
+            format!("Arguments::{variant}")
+        } else {
+            format!("Arguments::{variant}({})", parsed.join(", "))
+        };
+        writeln!(decode, "        {:?} => Ok({value}),", handler.name)
+            .expect("writing to a string succeeds");
+        let clones: Vec<String> = bindings
+            .iter()
+            .map(|binding| format!("{binding}.clone()"))
+            .collect();
+        let call_args = if clones.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", clones.join(", "))
+        };
+        writeln!(
+            run,
+            "        {pattern} => Ok({}(&handler_{}(engine, state{call_args})?)),",
+            types.to_json(&handler.returns),
+            ident(&handler.name)
+        )
+        .expect("writing to a string succeeds");
+    }
+    writeln!(
+        out,
+        "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum Arguments {{\n{variants}}}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub enum ArgumentsError {{\n    NoHandler,\n    Invalid(String),\n}}\n\npub fn handler_name(arguments: &Arguments) -> &'static str {{\n    match arguments {{\n{names}    }}\n}}\n\npub fn arguments_json(arguments: &Arguments) -> Json {{\n    match arguments {{\n{to_json}    }}\n}}\n\npub fn decode_arguments(handler: &str, json: &Json) -> Result<Arguments, ArgumentsError> {{\n    match handler {{\n{decode}        _ => Err(ArgumentsError::NoHandler),\n    }}\n}}\n\npub fn run_body(engine: &mut Engine<'_>, state: &mut State, arguments: &Arguments) -> Result<Json, Halt> {{\n    match arguments {{\n{run}    }}\n}}\n"
+    )
+    .expect("writing to a string succeeds");
+}
+
+fn dispatch(out: &mut String, program: &Program) {
+    let mut arms = String::new();
+    for tool in &program.tools {
+        writeln!(
+            arms,
+            "        {:?} => EffectClass::{:?},",
+            tool.name, tool.effect
+        )
+        .expect("writing to a string succeeds");
+    }
+    writeln!(
+        out,
+        "pub fn dispatch_class(tool: &str) -> EffectClass {{\n    match tool {{\n{arms}        _ => EffectClass::{:?},\n    }}\n}}\n",
+        EffectClass::undeclared()
+    )
+    .expect("writing to a string succeeds");
+}
+
+fn handler_function<'p>(
+    out: &mut String,
+    program: &'p Program,
+    handler: &'p ir::Handler,
+    types: &mut Types<'p>,
+) {
+    let returns = types.rust(&handler.returns);
+    let mut body = Body::new(program, handler, types);
+    let params: Vec<String> = handler
+        .params
+        .iter()
+        .map(|local| {
+            format!(
+                ", {}: {}",
+                body.local(*local),
+                body.types.rust(&handler.locals[*local].ty)
+            )
+        })
+        .collect();
+    body.emit();
+    writeln!(
+        out,
+        "pub fn handler_{}(engine: &mut Engine<'_>, state: &mut State{}) -> Result<{returns}, Halt> {{\n{}}}\n",
+        ident(&handler.name),
+        params.concat(),
+        body.out
+    )
+    .expect("writing to a string succeeds");
+}

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+seeds="${RUST_DIFF_SEEDS:-0..2000}"
+targets="${RUST_DIFF_TARGETS:-native-jsonl native-sqlite server-postgres}"
+files="${RUST_DIFF_FILES:-examples/agent.hl examples/minimal.hl examples/reviewer.hl}"
+opt="${RUST_DIFF_OPT:-2}"
+plant="${RUST_DIFF_PLANT:-none}"
+hl=target/release/hl
+out=output/rust-diff/$plant
+mkdir -p "$out"
+
+[ -x "$hl" ] || cargo build --release --locked
+
+plant_expression() {
+  case "$1" in
+    none) echo 's/^$//' ;;
+    flush_after_dispatch) echo 's/if site.durability.flushes(call.effect) {/if site.durability.flushes(call.effect) \&\& false {/' ;;
+    bound_message) echo 's/format!("bound({name})")/format!("bound {name}")/' ;;
+    double_fsync) echo 's/^    disk.sync().map_err(|_| Stop::Crash)?;$/    disk.sync().map_err(|_| Stop::Crash)?;\n    disk.sync().map_err(|_| Stop::Crash)?;/' ;;
+    batch_seq_from_zero) echo 's/("seq", Json::Number(head + 1 + index as u64))/("seq", Json::Number(head + index as u64))/' ;;
+    recovery_skipped) echo 's/SiteLog::Open(call) if call.effect.may_be_unknown() => Some(\*seq),/SiteLog::Open(call) if false => Some(*seq),/' ;;
+    *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
+  esac
+}
+
+store_of() {
+  case "$1" in
+    native-jsonl) echo jsonl ;;
+    *) echo sql ;;
+  esac
+}
+
+build() {
+  local file=$1 target=$2 dir=$3
+  mkdir -p "$dir"
+  "$hl" emit --target "$target" "$file" | sed "$(plant_expression "$plant")" > "$dir/harness.rs.new"
+  if [ "$plant" != none ] && cmp -s <("$hl" emit --target "$target" "$file") "$dir/harness.rs.new"; then
+    echo "rust-diff: plant $plant changes nothing in $file for $target" >&2
+    return 1
+  fi
+  cp scripts/rust/sim_driver.rs "$dir/sim_driver.rs"
+  cp "scripts/rust/sim_store_$(store_of "$target").rs" "$dir/store.rs"
+  mv "$dir/harness.rs.new" "$dir/harness.rs"
+  local key
+  key=$(cat "$dir/harness.rs" "$dir/sim_driver.rs" "$dir/store.rs" | cksum | cut -d' ' -f1)-$opt
+  if [ -x "$dir/driver" ] && [ "$(cat "$dir/key" 2>/dev/null)" = "$key" ]; then
+    return
+  fi
+  local started ended
+  started=$(date +%s%N)
+  rustc --edition 2024 -C opt-level="$opt" -o "$dir/driver" "$dir/sim_driver.rs" 2> "$dir/rustc.log" || {
+    cat "$dir/rustc.log" >&2
+    return 1
+  }
+  ended=$(date +%s%N)
+  echo "$key" > "$dir/key"
+  echo "compiled $file for $target: $(wc -l < "$dir/harness.rs") lines, $(( (ended - started) / 1000000 )) ms, opt-level $opt"
+}
+
+diff_one() {
+  local file=$1 target=$2
+  local name
+  name=$(basename "$file" .hl)
+  local dir="$out/$target-$name"
+  build "$file" "$target" "$dir"
+  local fifo="$dir/trace"
+  rm -f "$fifo"
+  mkfifo "$fifo"
+  "$dir/driver" "$fifo" > "$dir/driver.log" 2>&1 &
+  local driver=$!
+  local status=0
+  local started ended
+  started=$(date +%s%N)
+  "$hl" sim --target "$target" --seeds "$seeds" --trace "$fifo" "$file" > "$dir/sim.log" 2>&1 || status=$?
+  wait "$driver" || status=1
+  ended=$(date +%s%N)
+  rm -f "$fifo"
+  if [ "$status" -ne 0 ] || ! grep -q '^ok backend=rust' "$dir/driver.log"; then
+    echo "rust-diff: $file on $target failed:" >&2
+    cat "$dir/sim.log" "$dir/driver.log" >&2
+    return 1
+  fi
+  echo "$(cat "$dir/driver.log") wall_ms=$(( (ended - started) / 1000000 ))"
+}
+
+pids=()
+for target in $targets; do
+  (
+    for file in $files; do
+      diff_one "$file" "$target"
+    done
+  ) > "$out/$target.log" 2>&1 &
+  pids+=($!)
+done
+failed=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || failed=1
+done
+for target in $targets; do
+  cat "$out/$target.log"
+done
+if [ "$failed" -ne 0 ]; then
+  echo "rust-diff: a differential run failed" >&2
+  exit 1
+fi
+echo "rust-diff: generated Rust matches the interpreter on seeds $seeds of every example and target"
