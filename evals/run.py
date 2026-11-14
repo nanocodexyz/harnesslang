@@ -25,6 +25,7 @@ METER_READY_ATTEMPTS = 50
 METER_READY_SLEEP_SEC = 0.1
 RUN_SHELL = 'if command -v bash >/dev/null 2>&1; then exec bash "$1"; else exec sh "$1"; fi'
 AGENTS = ("nanocode", "hl-agent")
+CONTAINER_RUN_DIGITS = 12
 PACKAGE_FILES = ("instruction.md", "README.md", "task.toml")
 PACKAGE_DIRECTORIES = ("environment", "solution", "steps", "tests")
 
@@ -212,7 +213,7 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
     os.makedirs(journal)
     os.chmod(journal, 0o777)
     config = task_config(row["dir"])
-    name = "nanoeval-" + row["id"]
+    name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
     result = {"id": row["id"], "source": row["source"], "task": row["task"], "agent": row["agent"], "attempt": row["attempt"], "model": args.model}
     try:
         image = image_for(row, config, env, lock)
