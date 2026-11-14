@@ -797,6 +797,7 @@ fn main() {
         arguments: Arguments::Prompt(instruction, options.rounds),
     };
     let ran = run_turn(&mut agent, &mut disk, &request);
+    agent.jobs.stop_all();
     if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
         keep_warm(&mut agent, &mut disk, options.keep_warm);
     }
