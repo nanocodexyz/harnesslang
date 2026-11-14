@@ -4945,3 +4945,161 @@ updates run one cell at a time, so the checker refuses a parallel for:
 $ hl check examples/invalid/code_parallel_for.hl
 examples/invalid/code_parallel_for.hl:39:7: error: a parallel for dispatches tool calls at once, but code 'exec' makes a dispatch able to run a cell, which runs one at a time with its journal: use a sequential for
 ```
+
+### Cells across calls
+
+A cell may outlive the call that started it, as nanocode's `exec` and `wait`
+do: `waits NAME` in a `code` declaration (a field like the others, once)
+adds a second tool the model calls with nanocode's parameters, `cell_id: text`
+and `terminate: bool` (default `false`). `docs/snippets/code_wait.hl` names it
+`wait`, nanocode's name:
+
+```hl docs/snippets/code_wait.hl
+harness worker
+
+const steps_max: u64 = 6
+const calls_max: u64 = 3
+const entries_max: u64 = 256
+const cell_calls_max: u64 = 4
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 60000
+const cell_journal_bytes_max: u64 = 1048576
+const cell_yield_ms: u64 = 10000
+
+type outcome = done(text) | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+code exec {
+  tools read, bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+  waits wait
+}
+
+model infer calls calls_max
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+- A site of the code tool goes live with a deadline `yield_ms` after its clock.
+  When the cell waits with no nested call running and its next timer fires after
+  that deadline, the site returns at once instead of sleeping: its result is
+  `ok("Script running with cell ID N")`, nanocode's text, and the cell stays
+  unfinished, its journal written so far. Nothing runs between sites.
+- A site of the wait tool replays that cell from its journal, as a rerun after a
+  crash does, and runs it on with a deadline of its own: it ends as an `exec`
+  site's cell ends, or returns "Script running" again. A timer whose time passed
+  fires at once. `terminate: true` finishes the cell without running it and
+  returns `ok("Script terminated")`. An id that is not a cell this turn started
+  and left running gets `failed("exec cell ID not found")`.
+- When the turn ends, by any return or a trap, every cell it left running gets
+  its finished update before the turn's status, as nanocode's Codex terminates
+  a turn's cells when the turn completes.
+
+The wait tool's call record has effect `none`, like the code tool's, and a crash
+before its result reruns it, replaying the cell again. The model reaches it
+through `dispatch`; a handler cannot call it, and with `waits wait` a handler's
+`wait(c)` stays the sleep of Waits:
+
+```console
+$ hl check docs/snippets/errors/wait-direct.hl
+docs/snippets/errors/wait-direct.hl:27:9: error: wait tool 'collect' of code 'exec' is called by the model, through dispatch: a handler cannot call it
+```
+
+```hl docs/snippets/errors/wait-direct.hl
+harness worker
+
+const calls_max: u64 = 2
+const cell_calls_max: u64 = 4
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 60000
+const cell_journal_bytes_max: u64 = 1048576
+const cell_yield_ms: u64 = 10000
+
+tool read(path: text) -> text effect none
+
+code exec {
+  tools read
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+  waits collect
+}
+
+model infer calls calls_max
+
+on run(cell: text) -> text {
+  match collect(cell) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}
+```
+
+A wait site counts as a cell site in the worst case (the cell's work over
+several sites is counted at each), so `hl check` counts as before:
+
+```console
+$ hl check docs/snippets/code_wait.hl | sed -n 1,3p
+docs/snippets/code_wait.hl: harness worker: 2 tool(s), 1 state field(s), 1 handler(s)
+  handler prompt: worst case 132 effects, 441 journal records, 78 outbound requests
+    effects: step below steps_max (6) x call below calls_max (3)
+```
+
+The simulator's cells sleep past `yield_ms` sometimes, and after a reply whose
+cell yielded its model calls the wait tool with that id, now and then with
+`terminate` or a wrong id; `yields` counts the cells that returned "Script
+running". `cell_settled_at_turn_end` requires every cell to have its one
+finished update before its turn's status in every durable journal, and the
+prover proves the same of the plan, where a cell site may leave its cell
+running and a wait site may finish it. The planted bug `cell_leaks` skips the
+stops at the turn's end:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/code_wait.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=2059 crashes=1555 power_losses=98 torn_writes=138 takeovers=0 fenced=0 dispatches=1678 unknown=367 cells=401 nested=479 divergences=5 waits=68 yields=30
+$ hl sim --target native-jsonl --seeds 0..200 --mutation cell_leaks docs/snippets/code_wait.hl
+FAIL invariant=cell_settled_at_turn_end seed=29 target=native-jsonl profile=async mutation=cell_leaks: cell 1 of turn 1 has no finished update before the turn's status
+replay: hl sim --target native-jsonl --seeds 29..30 --mutation cell_leaks docs/snippets/code_wait.hl
+$ hl prove --target native-jsonl --mutation cell_leaks docs/snippets/code_wait.hl 2>&1 | grep -m 1 -o 'cell_settled_at_turn_end: [^;]*'
+cell_settled_at_turn_end: dispatch(call): the turn's status is appended while its cell is still running
+```

@@ -504,6 +504,7 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.jobs_died += more.jobs_died;
     total.idle_turns += more.idle_turns;
     total.idle_refused += more.idle_refused;
+    total.yields += more.yields;
 }
 
 pub struct Placement<'a> {
@@ -735,7 +736,12 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                 format!(" side_questions={}", stats.side_questions)
             } else {
                 String::new()
-            } + &in_flight_stats(&stats),
+            } + &in_flight_stats(&stats)
+                + &if stats.yields > 0 {
+                    format!(" yields={}", stats.yields)
+                } else {
+                    String::new()
+                },
         ),
     }
 }

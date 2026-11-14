@@ -541,6 +541,22 @@ impl CellLog {
     }
 }
 
+impl CellLog {
+    pub fn stopped(&self, session: &str) -> CellUpdate {
+        assert!(!self.finished, "only a running cell is stopped");
+        CellUpdate {
+            session_id: session.to_owned(),
+            cell_id: self.cell,
+            seq: self.next_seq,
+            header: None,
+            entries_from: self.entries.len() as u64,
+            entries: Vec::new(),
+            calls: Vec::new(),
+            finished: true,
+        }
+    }
+}
+
 pub fn nested_call_id(origin: &str, id: u64) -> String {
     format!("{origin}{NESTED_ID_INFIX}{id}")
 }

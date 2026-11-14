@@ -1455,10 +1455,51 @@ fn codes(
         }
         globals.codes.insert(code.name.text.clone(), id);
     }
+    let mut waits: BTreeMap<String, Position> = BTreeMap::new();
     for code in declared {
         let checked = code_tool(program, globals, code)?;
+        if let Some(name) = code
+            .fields
+            .iter()
+            .find(|field| field.key.text == WAITS_FIELD)
+        {
+            wait_tool(globals, values, &mut waits, &name.value)?;
+        }
         program.codes.push(checked);
     }
+    Ok(())
+}
+
+pub const WAITS_FIELD: &str = "waits";
+
+fn wait_tool(
+    globals: &Globals,
+    values: &mut BTreeMap<String, Position>,
+    waits: &mut BTreeMap<String, Position>,
+    name: &ast::Name,
+) -> Checked<()> {
+    if let Some(previous) = waits.get(&name.text) {
+        return error(
+            name.at,
+            format!(
+                "wait tool '{}' is already declared at {previous}",
+                name.text
+            ),
+        );
+    }
+    if globals.effect(&name.text) {
+        return error(
+            name.at,
+            format!(
+                "wait tool '{}' has the name of another tool, code tool, listing or model",
+                name.text
+            ),
+        );
+    }
+    if name.text != ir::WAIT_TOOL {
+        claim(values, name, "wait tool")?;
+    }
+    waits.insert(name.text.clone(), name.at);
     Ok(())
 }
 
@@ -1484,12 +1525,23 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         );
     }
     let mut limits: BTreeMap<&str, Bound> = BTreeMap::new();
+    let mut waits = None;
     for field in &code.fields {
+        if field.key.text == WAITS_FIELD {
+            if waits.is_some() {
+                return error(
+                    field.key.at,
+                    format!("code '{name}' gives '{WAITS_FIELD}' twice"),
+                );
+            }
+            waits = Some(ir::Waits::new(field.value.text.clone()));
+            continue;
+        }
         let Some(key) = CODE_FIELDS.iter().find(|key| **key == field.key.text) else {
             return error(
                 field.key.at,
                 format!(
-                    "code '{name}' has no field '{}'; its fields are tools, {}",
+                    "code '{name}' has no field '{}'; its fields are tools, {}, {WAITS_FIELD}",
                     field.key.text,
                     CODE_FIELDS.join(", ")
                 ),
@@ -1516,6 +1568,7 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         timer_ms: take(CODE_FIELDS[3])?,
         journal_bytes: take(CODE_FIELDS[4])?,
         yield_ms: take(CODE_FIELDS[5])?,
+        waits,
     };
     code_bounds(code, &checked)?;
     Ok(checked)

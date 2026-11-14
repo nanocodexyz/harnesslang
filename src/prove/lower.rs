@@ -125,6 +125,11 @@ pub enum Op {
         what: String,
     },
     CloseCell(SiteId, CodeId),
+    CellYields(SiteId),
+    CellLeftRunning(SiteId),
+    ResumeCell(SiteId),
+    StopCells,
+    CloseWait(SiteId, CodeId),
     Acknowledge,
     Choice(Vec<Arm>),
     Repeat {
@@ -394,7 +399,11 @@ impl Lowering<'_> {
     }
 
     fn finish(&self) -> Vec<Op> {
-        let mut ops = vec![Op::Append(Record::Status), Op::Append(Record::Checkpoint)];
+        let mut ops = Vec::new();
+        if self.program.cells_yield() && self.run_mutation() != RunMutation::CellLeaks {
+            ops.push(Op::StopCells);
+        }
+        ops.extend([Op::Append(Record::Status), Op::Append(Record::Checkpoint)]);
         if self.run_mutation() == RunMutation::FinishBeforeFlush {
             self.acknowledge(&mut ops);
             ops.push(Op::Flush(Point::Finish));
@@ -884,6 +893,10 @@ impl Lowering<'_> {
         for (code, declared) in self.program.codes.iter().enumerate() {
             let label = format!("{what} resolves to code tool {}", declared.name);
             arms.push(arm(label, Entry::Plain, self.cell(site, code, &what)));
+            if let Some(waits) = &declared.waits {
+                let label = format!("{what} resolves to wait tool {}", waits.name);
+                arms.push(arm(label, Entry::Plain, self.wait_cell(site, code, &what)));
+            }
         }
         vec![Op::Choice(arms)]
     }
@@ -1291,26 +1304,76 @@ impl Lowering<'_> {
         } else {
             Vec::new()
         };
+        let mut arms = vec![
+            arm(format!("{what} starts a cell"), Entry::Live, fresh),
+            arm(
+                format!("{what} reopened without a durable header: its cell starts again"),
+                Entry::Reopened(Slot::Site(site)),
+                restarted,
+            ),
+            arm(
+                format!("{what} resumed from its durable header: its cell is replayed"),
+                Entry::CellResumed(site),
+                body,
+            ),
+            arm(
+                format!("{what} replayed from its recorded result"),
+                Entry::CellRecorded(site),
+                recorded,
+            ),
+        ];
+        if self.program.codes[code].waits.is_some() {
+            arms.push(arm(
+                format!("{what} replayed from its recorded result, its cell still running"),
+                Entry::CellRecorded(site),
+                vec![Op::CellLeftRunning(site)],
+            ));
+        }
+        vec![Op::Choice(arms), Op::CloseCell(site, code)]
+    }
+
+    fn wait_cell(&self, site: SiteId, code: CodeId, what: &str) -> Vec<Op> {
+        let result = Op::Append(Record::Result(Slot::Site(site)));
+        let mut continued = vec![Op::ResumeCell(site)];
+        continued.extend(self.cell_body(site, code, what));
+        let inner = vec![Op::Choice(vec![
+            arm(
+                format!("{what} names no running cell"),
+                Entry::Plain,
+                vec![result.clone()],
+            ),
+            arm(
+                format!("{what} terminates a running cell"),
+                Entry::Plain,
+                vec![
+                    Op::ResumeCell(site),
+                    Op::Append(Record::CellFinished(site)),
+                    result,
+                ],
+            ),
+            arm(
+                format!("{what} replays a running cell and runs it on"),
+                Entry::Plain,
+                continued,
+            ),
+        ])];
+        let mut fresh = vec![Op::Append(Record::Call(Slot::Site(site)))];
+        fresh.extend(inner.iter().cloned());
         vec![
             Op::Choice(vec![
-                arm(format!("{what} starts a cell"), Entry::Live, fresh),
+                arm(format!("{what} waits on a cell"), Entry::Live, fresh),
                 arm(
-                    format!("{what} reopened without a durable header: its cell starts again"),
+                    format!("{what} reopened after a crash left its call open"),
                     Entry::Reopened(Slot::Site(site)),
-                    restarted,
-                ),
-                arm(
-                    format!("{what} resumed from its durable header: its cell is replayed"),
-                    Entry::CellResumed(site),
-                    body,
+                    inner,
                 ),
                 arm(
                     format!("{what} replayed from its recorded result"),
                     Entry::CellRecorded(site),
-                    recorded,
+                    Vec::new(),
                 ),
             ]),
-            Op::CloseCell(site, code),
+            Op::CloseWait(site, code),
         ]
     }
 
@@ -1338,6 +1401,28 @@ impl Lowering<'_> {
         } else {
             vec![Op::Append(Record::CellFinished(site))]
         };
+        let mut ends = vec![
+            arm(
+                format!("the cell of {what} returns or throws"),
+                Entry::CellRunning(site),
+                finished,
+            ),
+            arm(
+                format!("the cell of {what} was stopped"),
+                Entry::CellStopped(site),
+                Vec::new(),
+            ),
+        ];
+        if let Some(waits) = &declared.waits {
+            ends.push(arm(
+                format!(
+                    "the cell of {what} would wait past {} = {} ms and stays running for {}",
+                    declared.yield_ms.name, declared.yield_ms.value, waits.name
+                ),
+                Entry::CellRunning(site),
+                vec![Op::CellYields(site)],
+            ));
+        }
         vec![
             waits,
             Op::Repeat {
@@ -1349,18 +1434,7 @@ impl Lowering<'_> {
                 every_iteration: false,
                 body: step,
             },
-            Op::Choice(vec![
-                arm(
-                    format!("the cell of {what} returns or throws"),
-                    Entry::CellRunning(site),
-                    finished,
-                ),
-                arm(
-                    format!("the cell of {what} was stopped"),
-                    Entry::CellStopped(site),
-                    Vec::new(),
-                ),
-            ]),
+            Op::Choice(ends),
             Op::Append(Record::Result(Slot::Site(site))),
         ]
     }

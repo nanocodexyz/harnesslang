@@ -6,7 +6,7 @@ use crate::ir::{
 };
 use crate::run::blob::Blobs;
 use crate::run::cell::{self, CellEvent, CellHost, CellOutcome, CellPoint, Input, Step, Wait};
-use crate::run::cell_journal::{CellLog, divergence_text};
+use crate::run::cell_journal::{CellLog, CellUpdate, divergence_text};
 use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, call_id, job_started};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
@@ -471,7 +471,64 @@ impl<'a> Engine<'a> {
 
     pub fn append(&mut self, record: Record) {
         if matches!(self.mode, Mode::Live { .. }) {
+            if self.program.cells_yield()
+                && let Record::Cell {
+                    cell,
+                    fresh,
+                    update,
+                    ..
+                } = &record
+            {
+                self.fold_cell(*cell, *fresh, update);
+            }
             self.buffer.push(record);
+        }
+    }
+
+    fn fold_cell(&mut self, cell: u64, fresh: bool, update: &CellUpdate) {
+        if fresh {
+            let header = update
+                .header
+                .as_ref()
+                .expect("a fresh update has its header");
+            let (_, seq, _) = crate::run::journal::parse_any_call_id(&header.origin_call_id)
+                .expect("a cell's origin is a call id");
+            let log = CellLog::start(update).expect("a cell's first update starts its log");
+            self.cells.insert(seq, log);
+            return;
+        }
+        let log = self
+            .cells
+            .values_mut()
+            .find(|log| log.cell == cell)
+            .expect("an update follows its cell's header");
+        log.apply(update).expect("a cell's updates fold in order");
+    }
+
+    fn stop_cell(&mut self, origin: u64) {
+        let session = self.program.name.clone();
+        let log = &self.cells[&origin];
+        let update = log.stopped(&session);
+        self.append(Record::Cell {
+            cell: log.cell,
+            fresh: false,
+            session,
+            update,
+        });
+    }
+
+    fn stop_cells(&mut self) {
+        if !self.program.cells_yield() || self.mutation == Mutation::CellLeaks {
+            return;
+        }
+        let running: Vec<u64> = self
+            .cells
+            .iter()
+            .filter(|(_, log)| !log.finished)
+            .map(|(seq, _)| *seq)
+            .collect();
+        for origin in running {
+            self.stop_cell(origin);
         }
     }
 
@@ -560,6 +617,7 @@ impl<'a> Engine<'a> {
             outcome,
             result: result.clone(),
         };
+        self.stop_cells();
         self.append(Record::Status {
             turn: self.turn,
             last: self.seq,
@@ -1566,6 +1624,11 @@ impl<'a> Engine<'a> {
         self.seq += 1;
         let seq = self.seq;
         let call = self.resolve(site, &args);
+        if site.kind == SiteKind::Dispatch
+            && let Some((code, _)) = self.program.waits(&call.tool)
+        {
+            return self.wait_cell_site(code, seq, call);
+        }
         let cell = match site.kind {
             SiteKind::Cell(code) => Some(code),
             SiteKind::Dispatch => self.program.code(&call.tool).map(|(code, _)| code),
@@ -1941,11 +2004,131 @@ impl<'a> Engine<'a> {
                 None => cell::Cell::Fresh(fresh),
             },
             nested: &nested,
+            header_buffered: false,
         };
         if existing.is_none() {
             self.next_cell += 1;
         }
         cell::run(site, self).map_err(Halt::from)
+    }
+
+    fn wait_cell_site(
+        &mut self,
+        code: crate::ir::CodeId,
+        seq: u64,
+        call: Call,
+    ) -> Result<Value, Halt> {
+        let rerun = match self.sites.get(&seq).cloned() {
+            Some(SiteLog::Done(recorded, output)) => {
+                self.same(seq, &recorded, &call)?;
+                return self.decode_cell(&output);
+            }
+            Some(SiteLog::Unknown(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                return Ok(Value::Variant(ir::UNKNOWN, Vec::new()));
+            }
+            Some(SiteLog::Reply(..)) => {
+                return Err(self.diverged(seq, "a model reply", &call.tool));
+            }
+            Some(SiteLog::Open(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                self.require_live(seq)?;
+                true
+            }
+            None => {
+                self.require_live(seq)?;
+                self.append(Record::Call {
+                    turn: self.turn,
+                    seq,
+                    tool: call.tool.clone(),
+                    effect: call.effect,
+                    input: call.input.clone(),
+                });
+                self.sites.insert(seq, SiteLog::Open(call.clone()));
+                false
+            }
+        };
+        let output = self.collect_cell(code, seq, &call, rerun)?;
+        self.append(Record::Result {
+            turn: self.turn,
+            seq,
+            output: output.clone(),
+        });
+        self.sites.insert(seq, SiteLog::Done(call, output.clone()));
+        self.decode_cell(&output)
+    }
+
+    fn waited_cell(&self, code: crate::ir::CodeId, seq: u64, id: &str) -> Option<(u64, CellLog)> {
+        let name = &self.program.codes[code].name;
+        self.cells
+            .range(..seq)
+            .find(|(origin, log)| {
+                log.cell.to_string() == id
+                    && matches!(self.sites.get(origin), Some(SiteLog::Done(call, _)) if call.tool == *name)
+            })
+            .map(|(origin, log)| (*origin, log.clone()))
+    }
+
+    fn collect_cell(
+        &mut self,
+        code: crate::ir::CodeId,
+        seq: u64,
+        call: &Call,
+        rerun: bool,
+    ) -> Result<Output, Halt> {
+        let input = match &call.input {
+            Json::String(raw) => match value::tool_input(self.program, &call.tool, raw) {
+                value::Input::Invalid(error) => return Ok(Output::Failed(error)),
+                value::Input::Typed(_) | value::Input::Untyped => {
+                    panic!("a wait call keeps its raw input only when it does not fit")
+                }
+            },
+            typed => typed.clone(),
+        };
+        let id = input
+            .get(ir::WAIT_CELL_ID)
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        let terminate = input.get(ir::WAIT_TERMINATE) == Some(&Json::Bool(true));
+        let Some((origin, log)) = self.waited_cell(code, seq, id) else {
+            return Ok(Output::Failed(cell::NOT_FOUND_TEXT.to_owned()));
+        };
+        if log.finished {
+            if !rerun {
+                return Ok(Output::Failed(cell::NOT_FOUND_TEXT.to_owned()));
+            }
+            if terminate {
+                return Ok(Output::Ok(Json::text(cell::TERMINATED_TEXT)));
+            }
+            return Ok(CellOutcome::Unknown(divergence_text(
+                log.cell,
+                "it finished but its result was lost with the journal's tail",
+            ))
+            .output());
+        }
+        if terminate {
+            self.stop_cell(origin);
+            return Ok(Output::Ok(Json::text(cell::TERMINATED_TEXT)));
+        }
+        let nested = self.nested.clone();
+        let session = self.program.name.clone();
+        let site = cell::CellSite {
+            program: self.program,
+            code,
+            target: self.target,
+            mutation: self.mutation,
+            session: &session,
+            turn: self.turn,
+            seq: origin,
+            script: &log.header.script,
+            cell: cell::Cell::Existing(&log),
+            nested: &nested,
+            header_buffered: self.buffer.iter().any(
+                |record| matches!(record, Record::Cell { cell, fresh: true, .. } if *cell == log.cell),
+            ),
+        };
+        let outcome = cell::run(site, self).map_err(Halt::from)?;
+        Ok(outcome.output())
     }
 
     fn decode_cell(&self, output: &Output) -> Result<Value, Halt> {
@@ -1956,6 +2139,7 @@ impl<'a> Engine<'a> {
             CellOutcome::Done(text) => Value::Variant(ir::OK, vec![Value::Text(text)]),
             CellOutcome::Threw(error) => Value::Variant(ir::FAILED, vec![Value::Text(error)]),
             CellOutcome::Unknown(_) => Value::Variant(ir::UNKNOWN, Vec::new()),
+            CellOutcome::Running(text) => Value::Variant(ir::OK, vec![Value::Text(text)]),
         })
     }
 
