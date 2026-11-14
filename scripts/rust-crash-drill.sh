@@ -32,8 +32,11 @@ case "$mutation" in
       'Some(SiteLog::Open(_)) => panic!("recovery turns every open nested external call unknown before the cell runs again"), ==> Some(SiteLog::Open(_)) => self.dispatch(id, false)?,'
     )
     ;;
+  cell_ids_restart_at_checkpoint)
+    plants=('CellScan::Found(cell) => return Ok(cell + 1), ==> CellScan::Found(cell) => return Ok(FIRST_CELL),')
+    ;;
   *)
-    echo "drill: unknown DRILL_MUTATION $mutation (none, flush_after_dispatch, nested_flush_after_dispatch, timeout_rides, cell_recovery_reports_failed, cell_recovery_redispatches_external)" >&2
+    echo "drill: unknown DRILL_MUTATION $mutation (none, flush_after_dispatch, nested_flush_after_dispatch, timeout_rides, cell_recovery_reports_failed, cell_recovery_redispatches_external, cell_ids_restart_at_checkpoint)" >&2
     exit 2
     ;;
 esac
