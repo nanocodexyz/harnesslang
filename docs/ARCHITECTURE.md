@@ -28,13 +28,14 @@ These come from tempoxyz/tempolang and nanocodexyz/nanocode.
 2. **The spec is the code.** One source gives an interpreter (the executable
    spec and the oracle) and generated code for each target. Generated code is
    checked against the interpreter by differential simulation, seed by seed.
-3. **Deterministic by construction.** Time, randomness, model calls, tools and
-   children go only through effects the runtime journals, so a handler
+3. **Deterministic by construction.** Time, randomness, model calls and tools
+   go only through effects the runtime journals, so a handler
    re-executed over its journal takes the same path. Recovery is replay.
 4. **Bounded by construction.** Every loop has a bound and every list a
    capacity, named for what it bounds. The checker computes each handler's
-   worst case (effects, journal records, outbound requests) and compares it
-   with the target's limits.
+   worst case (effects, journal records, outbound requests), where a `return`
+   ends its path, and checks outbound requests against the target's limit
+   where the target has one.
 5. **The target is a model.** A target is a durability model (what survives a
    crash, what is atomic, who else may run) and a place (memory, outbound
    requests, wall time). The same model drives the checker, the lowering and
@@ -46,49 +47,58 @@ These come from tempoxyz/tempolang and nanocodexyz/nanocode.
 
 ## The language
 
-A program is one harness: constants, types, tools, a model, session state and
-handlers.
+A program is one harness: constants, types, tools, a model, session state,
+invariants and handlers. This is `examples/agent.hl`:
 
-    harness agent
+```hl examples/agent.hl
+harness agent
 
-    const turn_steps_max: u64 = 64
-    const calls_per_step_max: u64 = 16
-    const context_entries_max: u64 = 4096
+const turn_steps_max: u64 = 64
+const calls_per_step_max: u64 = 16
+const context_entries_max: u64 = 4096
+const turns_max: u64 = 1000000
 
-    type outcome = completed(text) | failed(text) | exhausted
+type outcome = completed(text) | failed(text) | exhausted
 
-    tool read(path: text) -> text effect none
-    tool edit(path: text, body: text) -> text effect idempotent
-    tool bash(command: text) -> text effect external
+tool read(path: text) -> text effect none
+tool edit(path: text, body: text) -> text effect idempotent
+tool bash(command: text) -> text effect external
 
-    model infer calls calls_per_step_max
+model infer calls calls_per_step_max
 
-    state {
-      context: list<entry, context_entries_max>
-      turns: u64
-    }
+state {
+  context: list<entry, context_entries_max>
+  turns: u64
+}
 
-    on prompt(input: text) -> outcome {
-      push context user(input)
-      turns = turns + 1
-      loop step below turn_steps_max {
-        let reply = infer(context)
-        push context assistant(reply)
-        match reply {
-          answer(words) => { return completed(words) }
-          calls(requested) => {
-            for call in requested {
-              match dispatch(call) {
-                ok(output) => { push context result(call, output) }
-                failed(error) => { push context error(call, error) }
-                unknown => { push context unknown(call) }
-              }
-            }
+invariant turns_bounded: turns <= turns_max
+invariant context_bounded: len(context) <= context_entries_max
+
+on prompt(input: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+{
+  push context user(input)
+  turns = turns + 1
+  loop step below turn_steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
           }
         }
       }
-      return exhausted
     }
+  }
+  return exhausted
+}
+```
 
 ### Values and types
 
@@ -111,12 +121,13 @@ handlers.
 ### Effects
 
 An effect is anything whose result the program cannot recompute: a tool, the
-model, `now()`, `random()`, `spawn` and `wait`. Each effect site is journaled.
+model, `now()` and `random()`. Each effect site is journaled. Spawning child
+sessions and waiting on them are not in the language yet (see Next).
 
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
 | `none` | `effect none`, `now()`, `random()` | `known<T>` (`now` and `random` return `u64`) | run again |
-| `idempotent` | `effect idempotent`, the model, `spawn` | `known<T>` (the model returns `reply`) | run again with the same idempotency key |
+| `idempotent` | `effect idempotent`, the model | `known<T>` (the model returns `reply`) | run again with the same idempotency key |
 | `external` | `effect external`, `dispatch` of a tool the program does not declare | `maybe<T>` | never run again: the result is `unknown` |
 
 These are nanocode's `EffectClass` (`None`, `Idempotent`, `External`), and an
@@ -134,6 +145,9 @@ a handler is straight-line code over bounded loops, so its worst case is a
 number the checker computes.
 
 ### Code mode
+
+Not built yet: the parser has no `code` declaration and no target runs a cell.
+This is what the design adds.
 
 `code exec { tools read, edit, bash  calls cell_calls_max  parallel ...  timers ...  timer_ms ...  journal_bytes ...  yield_ms ... }`
 offers a tool through which the model writes a JavaScript cell that calls the
@@ -167,7 +181,7 @@ journal and a nanocode journal fold the same way:
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
-| `cell` | a code cell's header, entries, nested call states and finish, as nanocode's `CellJournalUpdate` | cell, session, update |
+| `cell` (code mode, not built yet) | a code cell's header, entries, nested call states and finish, as nanocode's `CellJournalUpdate` | cell, session, update |
 
 ### Durability points
 
@@ -222,13 +236,16 @@ trap ends the turn the same way with outcome `failed`. A target may flush
 more often than the IR asks (the output gate before every outbound request, a
 step boundary after every external step) but never less.
 
-A code site is `SiteKind::Cell` with class `Cell` and durability `Cell`: its
+Code mode, not built yet, adds a code site: `SiteKind::Cell` with class `Cell` and durability `Cell`: its
 own `call` record is `none`, and its nested calls follow points 1 to 3 plus
 C1 (header durable before a nested external) and C2 (header durable before a
 timer wait); see [CODE_MODE.md](CODE_MODE.md).
 
 Each handler also carries its worst case: effects, journal records and
-outbound requests, each with the chain of loops that multiplies into it.
+outbound requests, each with the chain of loops that multiplies into it. A
+`Finish` ends its path: a loop whose iteration may return counts the
+iterations before it in full and the last one up to its return, and code after
+a statement every path of which returns adds nothing.
 
 ## Targets
 
@@ -239,8 +256,15 @@ A target is a durability model and a place.
 | `native-jsonl` | a process | append-only JSONL file, one per session | write and fsync | one record (checksummed; a torn tail is dropped) | nobody | the program's own |
 | `native-sqlite` | a process | SQLite rows through a host `Sql` | one transaction | one transaction | nobody | the program's own |
 | `server-postgres` | a server pool | Postgres rows through a host `Sql` | one transaction fenced by the owner's epoch | one transaction | a second owner after a lease expires; the fence refuses its writes | the program's own |
-| `cloudflare` | a Durable Object | the object's SQLite | none: writes in one event are atomic and the output gate holds outgoing requests until they commit | one event | nobody (one object per session); an alarm restarts it after a reset | memory, outbound requests per invocation |
-| `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | outbound requests and wall time per Function |
+| `cloudflare` | a Durable Object | the object's SQLite | none: writes in one event are atomic and the output gate holds outgoing requests until they commit | one event | nobody (one object per session); an alarm restarts it after a reset | outbound requests per invocation (memory is reported, not checked) |
+| `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | none (Function duration is reported, not checked) |
+
+Vercel documents no limit on the outbound requests of a Function
+(vercel.com/docs/functions/limitations); its limits are duration, memory and
+request and response body size, none of which the checker can bound yet, since
+effect durations and text sizes are not modelled. Workflow's per-run limits on
+steps and events (vercel.com/docs/workflows/pricing) span every turn of a
+session, so they are not a per-handler bound either.
 
 What the compiler does differently per target:
 
@@ -255,15 +279,18 @@ What the compiler does differently per target:
   issued in program order inside one event; the output gate makes the fetch
   wait for the insert to commit. The alarm is armed before the first external
   effect so a reset object resumes. When a handler's worst case exceeds the
-  per-invocation request limit, the compiler splits it at a loop boundary into
-  continuations driven by the alarm.
-- **vercel**: effects become steps. An `external` effect is a step that reads
-  its attempt number and returns `unknown` on any attempt after the first,
-  since a retried step may follow a dispatch whose result was lost. Adjacent
-  `none` and `idempotent` effects with no external effect between them are
-  grouped into one step, so a turn costs fewer queue round trips.
+  per-invocation request limit, `hl check --target cloudflare` refuses it;
+  splitting it into continuations driven by the alarm is future work (see
+  Next).
+- **vercel**: a step reruns the turn over the run's records and ends at the
+  turn's next flush, returning the records it buffered; the workflow function
+  records them and starts the next step. So the `none` and `idempotent`
+  effects between two flushes share one step, and an `external` effect runs
+  in the step after the one that committed its `call`. That step reads its
+  attempt number and returns `unknown` on any attempt after the first, since
+  a retried step may follow a dispatch whose result was lost.
 
-Where a code cell runs: the host's engine in the process (native, Postgres),
+Where a code cell will run, once code mode is built: the host's engine in the process (native, Postgres),
 a dynamic Worker isolate with no network whose steps are RPC calls into the
 session's Durable Object (Cloudflare), the re-executed workflow function with
 every nested call a step (Vercel). A target whose platform cannot give that
@@ -278,9 +305,10 @@ says `cells: unsupported` and `hl check` refuses `code` there.
 - Every loop is `below` a constant and every list has a constant capacity.
 - Every handler proves (below): durability, finishing once, no overflow,
   pushes within capacity, invariants and the worst case.
-- Worst case per handler: effects, journal records and outbound requests,
-  compared with the target's limits. The message names the handler, the bound
-  and the loops that multiply into it.
+- Worst case per handler: effects, journal records and outbound requests.
+  Outbound requests are compared with the target's limit where it has one
+  (Cloudflare); the message names the handler, the bound and the loops that
+  multiply into it.
 - No ambient time, randomness or I/O: the language has none outside effects.
 
 ### Proofs
@@ -316,7 +344,7 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | `no_overflow` | every `+`, `-` and `*` on `u64`, in `requires` too, stays in range |
 | `push_bound` | every `push` finds its list below capacity |
 | `invariant_initial`, `invariant_preserved` | invariants hold in the zero state, at every `return`, and where a model reply fails to decode: the one trap left once `no_overflow` and `push_bound` hold |
-| `worst_case` | outbound requests per invocation, counted on the lowered plan, are within the target's limit |
+| `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target; outbound requests per invocation, counted on the plan, are within the target's limit |
 
 With `no_overflow` and `push_bound` proved, a turn of a proving program
 finishes `failed` only when its `requires` is false or a model reply does not
@@ -357,9 +385,12 @@ How:
   `PROOF_STEPS_PER_HANDLER_MAX` bounds the elimination steps per handler and
   `PROOF_CONSTRAINTS_MAX` the constraints per step; reaching either fails
   the obligation and says so.
-- **Worst case** is the longest path of outbound runs in the plan, loops
-  multiplied by their bounds, and it must not exceed the IR's own count,
-  which `hl check` reports: two computations of one bound, paired.
+- **Worst case** is the longest path of appended records and of outbound
+  runs in the plan, a path ending where the plan ends it (after a finish's
+  acknowledgement), loops multiplied by their bounds. Neither may exceed the
+  IR's own count, which `hl check` reports, and the records must equal it,
+  since the first run of the IR's longest path is a path of the plan: two
+  computations of one bound, paired.
 - **Counterexamples** are a solution of the prover's facts at the failing
   point, not a replay. After a join or a loop summary they can name values
   no run reaches.
@@ -387,9 +418,9 @@ simulator's lowering mutations and four of its own (`drop_flush`,
 The same script requires every example to prove and the prover's invalid
 examples under `examples/invalid/` to fail with their message: overflow in a
 loop, across a branch join and of a product, underflow, a push that can fill
-its list on an `unknown` arm, in a `for` over the list itself or after an
-early return, and invariants broken at a return, at a trap or in the zero
-state.
+its list without a `requires`, on an `unknown` arm, in a `for` over the list
+itself or after an early return, and invariants broken at a return, at a
+trap, in the zero state or stated over a `bool`.
 
 ### Deterministic simulation
 
@@ -401,8 +432,10 @@ dispatches per call, and the target's fault model:
 - for JSONL, lost unsynced writes, torn last lines and a lying cache, as
   nanocode-sim's fault profiles (`clean`, `errors`, `async`, `lying`);
 - for Postgres, a lease expiring and a second owner starting;
-- for Cloudflare, an object reset and an alarm retry;
-- for Vercel, a step retried after it ran, and a Function killed between steps.
+- for Cloudflare, a crash is an object reset, and the next run is the
+  restart its alarm would make;
+- for Vercel, a crash is a step that ran and is retried with the next
+  attempt number.
 
 Invariants, named as nanocode-sim names them:
 
@@ -415,9 +448,9 @@ Invariants, named as nanocode-sim names them:
 | `seq_unique` | journal sequence numbers are unique and increasing |
 | `liveness` | every turn finishes within its bound of restarts |
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
-| `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed |
+| `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
-| `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
+| `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md), not built yet |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
 target adapter) that the simulator must catch, as tempoxyz/zempo and
@@ -450,8 +483,9 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 - `src/`: the compiler, interpreter and simulator, one std-only crate
   - `syntax/`: lexer and parser
-  - `check/`: names, types, exhaustiveness, bounds and worst case
+  - `check/`: names, types, exhaustiveness and bounds
   - `ir/`: the lowered program: effect sites, durability points, loop bounds
+    and each handler's worst case
   - `run/`: the interpreter and the journal
   - `target/`: the target models
   - `prove/`: `hl prove`: the plan per target, the durability, finishing and
@@ -460,11 +494,17 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
 - `oracle/`: the nanocode oracle, its own workspace
-- `scripts/`: the check, mutation, prover mutation and differential scripts
+- `scripts/`: the check, docs check, mutation, prover mutation, oracle,
+  differential and crash drill scripts
 
 ## Next
 
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
-- Subagent trees as sessions spawned by `spawn`, simulated at 100K children.
+- Subagent trees as sessions spawned by a `spawn` effect and joined by `wait`,
+  simulated at 100K children.
+- Code mode, as [CODE_MODE.md](CODE_MODE.md) designs it.
+- Cloudflare continuations: split a handler whose worst case exceeds the
+  per-invocation request limit at a loop boundary into continuations driven
+  by the alarm, instead of refusing it.
 - Bound compaction, so long sessions stay within their capacities.

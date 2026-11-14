@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-docs="${DOCS_CHECK_FILES:-docs/LANGUAGE.md README.md}"
+docs="${DOCS_CHECK_FILES:-docs/LANGUAGE.md docs/ARCHITECTURE.md README.md}"
 language="${DOCS_CHECK_LANGUAGE:-docs/LANGUAGE.md}"
 snippets=docs/snippets
 scratch="${DOCS_CHECK_SCRATCH:-output/docs-check}"
