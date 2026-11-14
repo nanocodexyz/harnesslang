@@ -443,6 +443,7 @@ class SimWorkflow {
     this.turnsMax = seed.seed.turns;
     this.stepIndex = 0;
     this.statusLive = false;
+    this.slept = new Set();
   }
 
   async request(index) {
@@ -481,6 +482,13 @@ class SimWorkflow {
         return attempts;
       },
       cells: seed.cells,
+      observeWaited: async (wait, answer) => {
+        if (answer && this.slept.has(`${wait.cell}/${wait.timer}`)) return;
+        const event = seed.cursor.next("waited", `cell ${wait.cell} timer ${wait.timer}`);
+        same("waited cell", event.cell, BigInt(wait.cell));
+        same("waited timer", event.timer, BigInt(wait.timer));
+        same("waited answer", event.answer, answer);
+      },
       hook: (point) => seed.hook(point),
       host: this.state.host,
       mutation: values.mutation,
@@ -509,6 +517,7 @@ class SimWorkflow {
       return;
     }
     this.seed.wait(wait);
+    this.slept.add(`${wait.cell}/${wait.timer}`);
     log.push({ name, output: { lines: [] } });
   }
 }

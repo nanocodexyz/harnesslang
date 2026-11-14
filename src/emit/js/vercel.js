@@ -69,7 +69,9 @@ class StepWorld {
   }
 
   async waited(wait) {
-    return this.waitedTimers.some((done) => done.cell === wait.cell && done.timer === wait.timer);
+    const answer = this.waitedTimers.some((done) => done.cell === wait.cell && done.timer === wait.timer);
+    if (this.context.observeWaited !== undefined) await this.context.observeWaited(wait, answer);
+    return answer;
   }
 
   async wait(wait) {

@@ -414,6 +414,7 @@ class CellRunner {
   async dispatch(id, fresh) {
     const call = this.calls.get(id);
     const effect = call.tool.effect;
+    this.emit(false);
     if (fresh && effect === "external") {
       this.host.append({ kind: "nested_call", turn: this.site.turn, seq: this.site.seq, nested: this.recordId(id), tool: call.name, effect, input: call.input });
     }
