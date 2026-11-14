@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::effect::EffectClass;
 use crate::ir::{self, Program, Type};
 use crate::run::engine::{
-    Finish, ModelRequest, Point, Stop, ToolRequest, World, batch_width, run_batch,
+    Finish, ListingRequest, ModelRequest, Point, Stop, ToolRequest, World, batch_width, run_batch,
 };
 use crate::run::journal::{self, Output, Record};
 use crate::run::json::Json;
@@ -25,6 +25,12 @@ pub const TOOL_FAILURE_PPM: u64 = 150_000;
 pub const MODEL_FAILURE_PPM: u64 = 150_000;
 pub const TEXT_ENUM_INVALID_PPM: u64 = 100_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
+pub const LISTED_TOOL_PPM: u64 = 250_000;
+pub const UNLISTED_TOOL_PPM: u64 = 250_000;
+pub const LISTED_PRESENT_PPM: u64 = 500_000;
+pub const LISTING_CHANGE_PPM: u64 = 100_000;
+pub const INPUT_INVALID_PPM: u64 = 100_000;
+pub const INVALID_INPUT_KINDS: u64 = 3;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const WORDS: [&str; 8] = [
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
@@ -85,6 +91,8 @@ pub struct SimWorld<'a> {
     pub edges: Option<Edges>,
     pub greedy: bool,
     pub worst_faults: Vec<String>,
+    pub listings: Vec<BTreeMap<String, String>>,
+    pub executed: BTreeMap<String, Vec<Executed>>,
     run_effects: u64,
     run_outbound: u64,
     rng: Rng,
@@ -96,6 +104,15 @@ pub struct SimWorld<'a> {
     clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
     batch_calls: BTreeMap<(u64, u64), u64>,
+    listing_reads: BTreeMap<(u64, u64), u64>,
+    listing_changes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Executed {
+    pub tool: String,
+    pub input: Json,
+    pub fingerprint: Option<String>,
 }
 
 impl<'a> SimWorld<'a> {
@@ -107,7 +124,7 @@ impl<'a> SimWorld<'a> {
         faults: bool,
     ) -> Self {
         let profile = Profile::of(seed, target);
-        Self {
+        let mut world = Self {
             program,
             target: target::model(target),
             mutation,
@@ -135,7 +152,56 @@ impl<'a> SimWorld<'a> {
             clock: 0,
             model_calls: BTreeMap::new(),
             batch_calls: BTreeMap::new(),
+            listings: vec![BTreeMap::new(); program.listings.len()],
+            executed: BTreeMap::new(),
+            listing_reads: BTreeMap::new(),
+            listing_changes: 0,
+        };
+        world.change_listings(LISTED_PRESENT_PPM);
+        world
+    }
+
+    pub fn change_listings(&mut self, ppm: u64) {
+        if self.program.listings.is_empty() {
+            return;
         }
+        self.listing_changes += 1;
+        let changes = self.listing_changes;
+        let mut rng = Rng::derive_keyed(self.seed, "listing", &[changes]);
+        for listing in &mut self.listings {
+            for word in WORDS {
+                if !rng.chance(ppm) {
+                    continue;
+                }
+                if listing.contains_key(word) && rng.chance(LISTED_PRESENT_PPM) {
+                    listing.remove(word);
+                } else {
+                    listing.insert(word.to_owned(), format!("{word}-v{changes}"));
+                }
+            }
+        }
+    }
+
+    pub fn host_refusal(&mut self, request: &ToolRequest<'_>) -> Option<Output> {
+        let id = journal::call_id(request.turn, request.seq);
+        let fingerprint = match self.program.listed(request.tool) {
+            Some((listing, name)) => {
+                let current = self.listings[listing].get(name).cloned();
+                if let Some(admitted) = request.admitted
+                    && current.as_deref() != Some(admitted)
+                {
+                    return Some(Output::Failed(value::changed_since_admission(request.tool)));
+                }
+                current
+            }
+            None => None,
+        };
+        self.executed.entry(id).or_default().push(Executed {
+            tool: request.tool.to_owned(),
+            input: request.input.clone(),
+            fingerprint,
+        });
+        None
     }
 
     pub fn record(&mut self, name: &str, fields: impl FnOnce() -> Vec<(&'static str, Json)>) {
@@ -170,6 +236,7 @@ impl<'a> SimWorld<'a> {
             ]
         });
         self.current = Some(request.clone());
+        self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
         self.armed = faults;
         self.lease_spent = false;
@@ -218,6 +285,7 @@ impl<'a> SimWorld<'a> {
         );
         self.faults_left -= 1;
         self.stats.crashes += 1;
+        self.change_listings(LISTING_CHANGE_PPM);
         let power_loss = self.profile.power_loss;
         let Medium::Jsonl(file) = &mut self.medium else {
             return Stop::Crash;
@@ -449,6 +517,21 @@ impl World for SimWorld<'_> {
                 ("tool", Json::text(request.tool)),
                 ("effect", Json::text(request.effect.name())),
                 ("input", request.input.clone()),
+                ("admitted", request.admitted.map_or(Json::Null, Json::text)),
+                ("output", journal::output_json(&output)),
+            ]
+        });
+        output
+    }
+
+    fn listing(&mut self, request: &ListingRequest<'_>) -> Output {
+        self.count_effect(true);
+        let output = self.listing_output(request);
+        self.record("listing", || {
+            vec![
+                ("turn", Json::Number(request.turn)),
+                ("seq", Json::Number(request.seq)),
+                ("listing", Json::text(request.listing)),
                 ("output", journal::output_json(&output)),
             ]
         });
@@ -480,6 +563,7 @@ impl World for SimWorld<'_> {
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         self.count_effect(true);
+        self.change_listings(LISTING_CHANGE_PPM);
         let response = self.reply(request);
         let program = self.program;
         self.record("model", || {
@@ -581,17 +665,60 @@ impl SimWorld<'_> {
         }
     }
 
+    fn listing_output(&mut self, request: &ListingRequest<'_>) -> Output {
+        let count = self
+            .listing_reads
+            .entry((request.turn, request.seq))
+            .or_insert(0);
+        *count += 1;
+        let mut rng = Rng::derive_keyed(
+            self.seed,
+            "listing-read",
+            &[request.turn, request.seq, *count],
+        );
+        let listing = self
+            .program
+            .listings
+            .iter()
+            .position(|listing| listing.name == request.listing)
+            .expect("a listing request names a declared listing");
+        if !self.greedy && rng.chance(TOOL_FAILURE_PPM) {
+            return Output::Failed(format!(
+                "listing {} failed: {}",
+                request.listing,
+                Self::generated_text(&mut rng)
+            ));
+        }
+        Output::Ok(Json::Object(
+            self.listings[listing]
+                .iter()
+                .map(|(name, fingerprint)| (name.clone(), Json::text(fingerprint)))
+                .collect(),
+        ))
+    }
+
     fn tool_output(&mut self, request: &ToolRequest<'_>) -> Output {
         let call = journal::call_id(request.turn, request.seq);
+        let external = self.program.dispatch_class(request.tool) == EffectClass::External;
         let entry = self.dispatched.entry(call).or_default();
         entry.tool = request.tool.to_owned();
-        if request.effect == EffectClass::External {
+        if external {
             entry.external += 1;
         } else {
             entry.other += 1;
         }
         let count = entry.external + entry.other;
         self.stats.dispatches += 1;
+        if let Some(refused) = self.host_refusal(request) {
+            if external {
+                self.dispatched
+                    .get_mut(&journal::call_id(request.turn, request.seq))
+                    .expect("inserted above")
+                    .outputs
+                    .push(refused.clone());
+            }
+            return refused;
+        }
         let mut rng = Rng::derive_keyed(self.seed, "tool", &[request.turn, request.seq, count]);
         let output = if rng.chance(TOOL_FAILURE_PPM) {
             Output::Failed(format!(
@@ -614,7 +741,7 @@ impl SimWorld<'_> {
             .dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
             .expect("inserted above");
-        if request.effect == EffectClass::External {
+        if external {
             entry.outputs.push(expected.clone());
         }
         if checked {
@@ -726,12 +853,10 @@ impl SimWorld<'_> {
         };
         let mut calls = Vec::new();
         for index in 0..count {
-            let tool = if self.program.tools.is_empty() || rng.chance(UNDECLARED_TOOL_PPM) {
-                UNDECLARED_TOOLS[rng.pick(UNDECLARED_TOOLS.len())].to_owned()
-            } else {
-                self.program.tools[rng.pick(self.program.tools.len())]
-                    .name
-                    .clone()
+            let tool = self.drawn_tool(rng);
+            let input = match self.program.input_params(&tool) {
+                Some(params) => self.drawn_input(rng, params),
+                None => Self::generated_text(rng),
             };
             let mut fields = BTreeMap::new();
             fields.insert(
@@ -744,11 +869,73 @@ impl SimWorld<'_> {
             );
             fields.insert(
                 ir::CALL_FIELDS[ir::CALL_INPUT].to_owned(),
-                Json::String(Self::generated_text(rng)),
+                Json::String(input),
             );
             calls.push(Json::Object(fields));
         }
         Json::Array(calls)
+    }
+
+    fn drawn_tool(&self, rng: &mut Rng) -> String {
+        if !self.program.listings.is_empty() && rng.chance(LISTED_TOOL_PPM) {
+            let listing = rng.pick(self.program.listings.len());
+            let listed = &self.listings[listing];
+            let unlisted = !self.greedy && rng.chance(UNLISTED_TOOL_PPM);
+            let name = if listed.is_empty() || unlisted {
+                WORDS[rng.pick(WORDS.len())]
+            } else {
+                listed
+                    .keys()
+                    .nth(rng.pick(listed.len()))
+                    .expect("a pick below the length names a key")
+            };
+            return format!(
+                "{}{}{name}",
+                self.program.listings[listing].name,
+                ir::LISTED_TOOL_SEPARATOR
+            );
+        }
+        if self.program.tools.is_empty() || rng.chance(UNDECLARED_TOOL_PPM) {
+            return UNDECLARED_TOOLS[rng.pick(UNDECLARED_TOOLS.len())].to_owned();
+        }
+        self.program.tools[rng.pick(self.program.tools.len())]
+            .name
+            .clone()
+    }
+
+    fn drawn_input(&self, rng: &mut Rng, params: &[ir::Field]) -> String {
+        let mut fields: BTreeMap<String, Json> = params
+            .iter()
+            .map(|param| (param.name.clone(), self.param_value(rng, &param.ty)))
+            .collect();
+        if self.greedy || !rng.chance(INPUT_INVALID_PPM) {
+            return Json::Object(fields).encode();
+        }
+        match rng.below(INVALID_INPUT_KINDS) {
+            0 => Self::generated_text(rng),
+            1 if !params.is_empty() => {
+                fields.remove(&params[rng.pick(params.len())].name);
+                Json::Object(fields).encode()
+            }
+            _ => {
+                fields.insert(Self::generated_text(rng), Json::Bool(true));
+                Json::Object(fields).encode()
+            }
+        }
+    }
+
+    fn param_value(&self, rng: &mut Rng, ty: &Type) -> Json {
+        match ty {
+            Type::U64 | Type::Bool | Type::Text => {
+                Self::tool_value(self.program, rng, ty, self.edges.as_ref())
+            }
+            Type::Sum(_) if self.program.text_enum(ty).is_some() => {
+                Self::tool_value(self.program, rng, ty, self.edges.as_ref())
+            }
+            other => value::Value::zero(self.program, other).map_or(Json::Null, |zero| {
+                value::to_json(self.program, other, &zero)
+            }),
+        }
     }
 
     fn check_acknowledge(&mut self, finish: &Finish) {

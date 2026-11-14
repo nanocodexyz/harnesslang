@@ -18,6 +18,7 @@ pub enum Item {
     Const(Const),
     Type(TypeDef),
     Tool(Tool),
+    Listing(Listing),
     Model(Model),
     State(State),
     Invariant(Invariant),
@@ -61,6 +62,14 @@ pub struct Tool {
     pub name: Name,
     pub params: Vec<Param>,
     pub returns: TypeExpr,
+    pub effect: EffectClass,
+}
+
+#[derive(Clone, Debug)]
+pub struct Listing {
+    pub name: Name,
+    pub bound: Name,
+    pub params: Vec<Param>,
     pub effect: EffectClass,
 }
 

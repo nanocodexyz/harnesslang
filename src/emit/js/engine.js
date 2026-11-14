@@ -12,6 +12,7 @@ class Engine {
     this.attempts = log.attempts;
     this.buffer = [];
     this.acknowledged = false;
+    this.admitted = new Map();
   }
 
   append(record) {
@@ -103,10 +104,14 @@ class Engine {
         const input = object(tool.params.map((param, index) => [param.name, toJson(param.ty, args[index])]));
         return { tool: tool.name, effect: tool.effect, input };
       }
+      case "listing":
+        return { tool: PROGRAM.listings[site.tool].name, effect: "none", input: null };
       case "dispatch": {
         const fields = args[0].f;
         const tool = fields[CALL_TOOL];
-        return { tool, effect: dispatchClass(tool), input: fields[CALL_INPUT] };
+        const raw = fields[CALL_INPUT];
+        const typed = toolInput(tool, raw);
+        return { tool, effect: dispatchClass(tool), input: typed.kind === "typed" ? typed.input : raw };
       }
       case "model":
         assert(PROGRAM.model !== null, "the checker admits model calls only with a model");
@@ -139,6 +144,7 @@ class Engine {
     switch (logged.kind) {
       case "done":
         this.same(seq, logged.call, call);
+        this.admitListing(site, logged.output);
         return this.decode(site, logged.output);
       case "reply":
         if (site.kind !== "model") throw this.diverged(seq, "a model reply", call.tool);
@@ -271,9 +277,21 @@ class Engine {
     }
     const returns = site.result.maybe;
     assert(returns !== undefined, "a dispatch yields maybe");
-    const requests = group.map((waiting) => ({ turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns }));
-    const completed = await this.mode.world.tools(requests, CONCURRENT_REQUESTS_MAX);
-    assert(completed.length === group.length, "a batch returns one output per request");
+    const gates = group.map((waiting) => this.gate(waiting.call));
+    const sent = [];
+    for (let position = 0; position < group.length; position++) {
+      if (gates[position].refused === undefined) sent.push(position);
+    }
+    const requests = sent.map((position) => {
+      const waiting = group[position];
+      return { turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns, admitted: gates[position].admitted };
+    });
+    const batch = requests.length === 0 ? [] : await this.mode.world.tools(requests, CONCURRENT_REQUESTS_MAX);
+    assert(batch.length === sent.length, "a batch returns one output per request");
+    const completed = batch.map(([position, output]) => [sent[position], output]);
+    for (let position = 0; position < group.length; position++) {
+      if (gates[position].refused !== undefined) completed.push([position, { tag: "failed", error: gates[position].refused }]);
+    }
     const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
     for (const [position, raw] of ordered) {
       const waiting = group[position];
@@ -302,16 +320,53 @@ class Engine {
       output = { tag: "ok", value: await world.now() };
     } else if (site.kind === "random") {
       output = { tag: "ok", value: await world.random() };
+    } else if (site.kind === "listing") {
+      const listing = PROGRAM.listings[site.tool];
+      output = checkedListing(listing, await world.listing({ turn: this.turn, seq, listing: listing.name }));
     } else {
       const returns = site.result.known ?? site.result.maybe;
       assert(returns !== undefined, "a tool site yields known or maybe");
-      output = checkedOutput(call.tool, returns, await world.tool({ turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns }));
+      const gate = site.kind === "dispatch" ? this.gate(call) : { admitted: null };
+      if (gate.refused !== undefined) {
+        output = { tag: "failed", error: gate.refused };
+      } else {
+        const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted };
+        output = checkedOutput(call.tool, returns, await world.tool(request));
+      }
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));
     this.append({ kind: "result", turn: this.turn, seq, output });
     this.sites.set(seq, { kind: "done", call, output });
     if (step) await this.flush();
+    this.admitListing(site, output);
     return this.decode(site, output);
+  }
+
+  gate(call) {
+    if (typeof call.input === "string") {
+      const typed = toolInput(call.tool, call.input);
+      if (typed.kind === "invalid") return { refused: typed.error };
+    }
+    const found = listed(call.tool);
+    if (found === null) return { admitted: null };
+    const tools = this.admitted.get(found.listing);
+    const fingerprint = tools === undefined ? undefined : tools.get(found.name);
+    if (fingerprint === undefined) return { refused: notAdmitted(call.tool, PROGRAM.listings[found.listing].name, found.name) };
+    return { admitted: fingerprint };
+  }
+
+  admitListing(site, output) {
+    if (site.kind !== "listing") return;
+    if (output.tag !== "ok") {
+      this.admitted.delete(site.tool);
+      return;
+    }
+    try {
+      this.admitted.set(site.tool, admittedTools(output.value));
+    } catch (error) {
+      if (!(error instanceof DecodeError)) throw error;
+      throw new Corrupt(`turn ${this.turn} result: ${error.message}`);
+    }
   }
 
   reply(response) {
@@ -329,6 +384,14 @@ class Engine {
     if (site.result === "u64" && output.tag === "ok") {
       if (typeof output.value !== "bigint") throw corrupt(`${encodeJson(output.value)} is not u64`);
       return output.value;
+    }
+    if (site.kind === "listing" && output.tag === "ok") {
+      try {
+        return variant(VARIANT_OK, [BigInt(admittedTools(output.value).size)]);
+      } catch (error) {
+        if (!(error instanceof DecodeError)) throw error;
+        throw corrupt(error.message);
+      }
     }
     const inner = site.result.known ?? site.result.maybe;
     if (inner !== undefined && output.tag === "ok") {
@@ -464,12 +527,22 @@ function finishFromJson(json) {
 }
 
 function toolRequestJson(request) {
-  return object([
+  const entries = [
     ["effect", request.effect],
     ["input", request.input],
     ["returns", typeName(request.returns)],
     ["seq", BigInt(request.seq)],
     ["tool", request.tool],
+    ["turn", BigInt(request.turn)],
+  ];
+  if (request.admitted !== null) entries.push(["admitted", request.admitted]);
+  return object(entries);
+}
+
+function listingRequestJson(request) {
+  return object([
+    ["listing", request.listing],
+    ["seq", BigInt(request.seq)],
     ["turn", BigInt(request.turn)],
   ]);
 }
@@ -495,6 +568,9 @@ function defaultHost(config) {
   return {
     async tool(request) {
       return outputFrom(await post(config.toolsUrl, toolRequestJson(request)));
+    },
+    async listing(request) {
+      return outputFrom(await post(config.listingsUrl, listingRequestJson(request)));
     },
     async model(request) {
       return post(config.modelUrl, modelRequestJson(request));
