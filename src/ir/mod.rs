@@ -868,6 +868,10 @@ pub enum Stmt {
         field: FieldId,
         count: Bound,
     },
+    Rewrite {
+        field: FieldId,
+        arms: Vec<RewriteArm>,
+    },
     If {
         condition: Expr,
         then: Vec<Stmt>,
@@ -993,6 +997,7 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
         | Stmt::Push { .. }
         | Stmt::Shrink { .. }
         | Stmt::KeepBlobs { .. }
+        | Stmt::Rewrite { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
         | Stmt::Finish { .. } => statement.clone(),
@@ -1012,6 +1017,7 @@ pub fn has_parallel(statements: &[Stmt]) -> bool {
         | Stmt::Push { .. }
         | Stmt::Shrink { .. }
         | Stmt::KeepBlobs { .. }
+        | Stmt::Rewrite { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
         | Stmt::Finish { .. } => false,
@@ -1093,6 +1099,13 @@ fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
                 block_cuts(&parallel.body, constants, out);
             }
             Stmt::Effect { args, .. } => args.iter().for_each(|arg| expr_cuts(arg, constants, out)),
+            Stmt::Rewrite { arms, .. } => {
+                for arm in arms {
+                    if let Rewritten::Into(entry) = &arm.entry {
+                        expr_cuts(entry, constants, out);
+                    }
+                }
+            }
             Stmt::Take { .. } | Stmt::KeepBlobs { .. } => {}
         }
     }
@@ -1126,6 +1139,25 @@ impl Program {
         }
         program
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct RewriteArm {
+    pub variant: VariantId,
+    pub bindings: Vec<Option<LocalId>>,
+    pub entry: Rewritten,
+}
+
+#[derive(Clone, Debug)]
+pub enum Rewritten {
+    Kept,
+    Into(Expr),
+    Dropped,
+}
+
+pub fn rewrite_drops(arms: &[RewriteArm]) -> bool {
+    arms.iter()
+        .any(|arm| matches!(arm.entry, Rewritten::Dropped))
 }
 
 #[derive(Clone, Debug)]

@@ -748,6 +748,7 @@ fn decides(statement: &ast::Stmt) -> Checked<bool> {
         | ast::Stmt::Clear { .. }
         | ast::Stmt::Keep { .. }
         | ast::Stmt::KeepBlobs { .. }
+        | ast::Stmt::Rewrite { .. }
         | ast::Stmt::Return { .. } => Ok(false),
     }
 }

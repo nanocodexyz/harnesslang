@@ -9,10 +9,11 @@ summarizing compaction, recovery by stop reason, retry and backoff (a model's
 (`before tool`, `after tool`, the lifecycle hooks); subagents (`spawn`, `join`,
 spawn trees with `sessions at most`); tool catalogs that change within a turn
 (listing notices, `finds`); images and structured results (`blob<N>`); side
-questions (`on side`); the prompt cache's lifetime (`on idle`); and effects in
+questions (`on side`); the prompt cache's lifetime (`on idle`); effects in
 flight (`interruptible by cancel, steer`, background jobs with `jobs at most`,
-`on job` and `hold`, and recovery hooks with `external recoverable`), all in
-LANGUAGE.md. `hl-agent` runs real child sessions of `claude_code_child.hl`.
+`on job` and `hold`, and recovery hooks with `external recoverable`);
+rewriting entries already in the history (`rewrite`); and request settings held
+as session state (`settings` and `with {...}` on a model call), all in LANGUAGE.md. `hl-agent` runs real child sessions of `claude_code_child.hl`.
 
 The list below comes from a fresh read of nanocode c7679e3's Claude backend
 (`crates/backends/claude/src`) and Codex backend (`crates/backends/codex/src`),
@@ -38,14 +39,6 @@ Why not: CODE_MODE.md, Not in this spec, says it: a harnesslang turn blocks on i
 
 Smallest addition: A `waits name` clause on `code`. A site may finish with running(cell) after yield_ms, and a site of the wait tool continues that cell's journal. Every running cell is stopped at its turn's `return`, with open nested calls recorded unknown, unless the program says `detach`. Cell records are already keyed by cell, so C1 and C2 hold unchanged. cell_finish_once is extended to: exactly one `finished` per cell across all its sites. A new property, cell_settled_at_turn_end, requires each cell to be finished or detached when its turn's status is flushed, with open nested ids carried as unknown. The calls and timers bounds become per cell, summed over its sites in the worst case. The simulator yields cells and drives waits across rounds and crashes. Mutation: cell_leaks, a cell left running past its turn.
 
-## 5. Rewriting entries already in the history
-
-On provider errors the Claude loop retries once after transforming the whole pending history. It drops thinking blocks whose signatures belong to another organization (agent.rs:7563-7586). It turns refused compaction blocks into plain-text summaries (7587-7608), and strips appended tool-change blocks while resending the current tool list (7609-7643). It cuts the unfinished server turn out as evidence (2862-2884, 7688, 7975), and omits images when a continuation produced at most one token (8256). Codex repairs a rejected request by replacing images or a tool definition in history (model/run/turn.rs:120, 337, 939-945) and reconciles reasoning items after a repair (turn.rs:969). Local compaction drops the first history item on context_exceeded and retries (lifecycle.rs:530-536).
-
-Why not: A list changes only through push, clear, `keep L last n [after e]` and `keep L blobs last N` (LANGUAGE.md, Statements, clear and keep, Blobs). No statement maps or filters the entries a list already holds, such as replacing a field of every assistant(...) entry or removing entries of one variant. A provider-error recovery that edits the history is not writable. Only dropping the first entry can be approximated with keep.
-
-Smallest addition: A statement `rewrite L { pattern => entry | drop, ... }`: a pure, total map over a state list, with patterns on entry and reply variants and no effects in the arms. The prover sets the new length to at most the old one, or equal when no arm drops, and checks text bounds such as cut lengths through the arm expressions. It writes no record: state is derived and the checkpoint written with the status holds the result, so checkpoint_compacted already covers it. The simulator replays it, with the mutation rewrite_live_only (the live run rewrites but replay does not), caught by checkpoint_compacted and replay_equal.
-
 ## 7. Forking or rewinding a session at a boundary
 
 Claude forks a session, or a side conversation, from the latest boundary, a completed turn or a checkpoint (agent.rs:3190-3257, fork_point 4292-4311). Boundaries are published per round (agent.rs:4245-4265). The child's state is scrubbed: no tasks, pending continuation, previous message id or container, lifecycle_started false so SessionStart hooks run again, and auto-compaction off for side conversations. Its first record is a checkpoint under a branched policy. A rewind picks an earlier checkpoint, keeps admitted tool ids and recovery notices, and adds a notice that effects from discarded turns may still exist (agent/durable.rs:1640-1675). Codex publishes a fork snapshot before every model call (model/run/turn.rs:834-841, 922) and branches sessions (agent/driver/branch.rs:97-160).
@@ -53,14 +46,6 @@ Claude forks a session, or a side conversation, from the latest boundary, a comp
 Why not: spawn starts a fresh session of another handler, with only typed arguments (LANGUAGE.md, Spawn and join). A side question reads a snapshot but writes nothing. Nothing creates a session of the same harness that starts from another session's state at a chosen finished turn, and no hook decides what a fork keeps and resets.
 
 Smallest addition: A `fork name at latest|turn` tool, external like spawn and keyed T.S. The child's journal starts with a `forked` record and a checkpoint holding the parent's state at that turn, taken from the parent's durable journal as a side question's snapshot is. An `on forked(origin: text)` hook may assign, clear, keep and push but run no effects, and resets fields such as job handles or flags. The checker counts forks as sessions in the spawn tree's worst case. The simulator checks fork_state_equal (the child's initial state is the replay of the parent's durable journal at that turn, after the hook). Mutation: fork_live_state, which forks from the running turn's state.
-
-## 8. Request settings held as session state
-
-Claude keeps effort, thinking, fast mode and the auto-compact limit as session settings that hosts change between turns (agent.rs:8939-8997). A turn pins the effort in effect, and when the setting differs from the history it appends an effort-change message (agent.rs:7420-7442). Context-recovery compaction overrides thinking and effort for that one request (agent.rs:6383-6405). Codex appends a reasoning sampling update when the effort changes (model/run/turn.rs:906-916). It takes set_thinking, set_auto_compact_token_limit, set_fast_mode and service tier (agent/backend.rs:330-370), and picks a separate compaction effort (lifecycle.rs:118-135). The model itself is fixed per thread in both (agent.rs:8629-8647, codex agent/driver/control.rs:536-561).
-
-Why not: A model call carries at most one `mode`, a name fixed at the call site (LANGUAGE.md, model). It cannot be a state value, and modes from separate dimensions (effort by fast by text_only or refresh) do not combine, so each combination needs its own call site. Thresholds and pins can be state fields, but the request settings the host must send cannot follow them.
-
-Smallest addition: Typed model settings: `model m ... settings effort: effort_enum, fast: bool`, and `m(context) with {effort: e}`, where e is any expression of that text enum or bool and omitted settings take declared defaults. The model record journals the settings as it journals mode, and a replay whose settings differ diverges. The worst case is unchanged, since there is still one site. The simulator draws settings changes between turns through ordinary handlers and checks settings_sent, the analogue of mode_sent. Mutation: settings_dropped.
 
 ## 9. What effects in flight leave out
 

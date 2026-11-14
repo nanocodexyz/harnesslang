@@ -75,10 +75,11 @@ pub enum Mutation {
     JobLostDropped,
     JobLostAll,
     SettingsDropped,
+    RewriteLiveOnly,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 73] = [
+    pub const ALL: [Self; 74] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -152,6 +153,7 @@ impl Mutation {
         Self::JobLostDropped,
         Self::JobLostAll,
         Self::SettingsDropped,
+        Self::RewriteLiveOnly,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -229,6 +231,7 @@ impl Mutation {
             Self::JobLostDropped => "job_lost_dropped",
             Self::JobLostAll => "job_lost_all",
             Self::SettingsDropped => "settings_dropped",
+            Self::RewriteLiveOnly => "rewrite_live_only",
         }
     }
 
@@ -316,7 +319,8 @@ impl Mutation {
             | Self::RecoverTrustsLost
             | Self::JobLostDropped
             | Self::JobLostAll
-            | Self::SettingsDropped => all,
+            | Self::SettingsDropped
+            | Self::RewriteLiveOnly => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

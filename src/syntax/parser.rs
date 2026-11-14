@@ -1,8 +1,8 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
     Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
-    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Settings, Spawn, State,
-    Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
+    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, RewriteArm, Settings,
+    Spawn, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -798,6 +798,7 @@ impl<'a> Parser<'a> {
                 let value = self.expr()?;
                 Ok(Stmt::Push { at, list, value })
             }
+            "rewrite" if matches!(self.peek_second(), Token::Name(_)) => self.rewrite(),
             "clear" => {
                 self.advance();
                 let list = self.name("a list to clear")?;
@@ -926,6 +927,29 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         Ok(Stmt::Match { at, subject, arms })
+    }
+
+    fn rewrite(&mut self) -> Parsed<Stmt> {
+        let at = self.word("rewrite")?;
+        let list = self.name("a list to rewrite")?;
+        self.symbol(Symbol::LeftBrace)?;
+        let mut arms = Vec::new();
+        while !self.is_symbol(Symbol::RightBrace) {
+            let pattern = self.pattern()?;
+            self.symbol(Symbol::FatArrow)?;
+            let entry = if self.is_word("drop") {
+                self.advance();
+                None
+            } else {
+                Some(self.expr()?)
+            };
+            arms.push(RewriteArm { pattern, entry });
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+            }
+        }
+        self.advance();
+        Ok(Stmt::Rewrite { at, list, arms })
     }
 
     fn pattern(&mut self) -> Parsed<Pattern> {

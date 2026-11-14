@@ -417,6 +417,19 @@ impl<'a> Inliner<'a> {
                 self.expr(walk, value)?;
                 Ok(statement.clone())
             }
+            Stmt::Rewrite { list, arms, .. } => {
+                walk.reference(&self.declared, list)?;
+                for arm in arms {
+                    let bindings: &[Name] = match &arm.pattern {
+                        Pattern::Variant { bindings, .. } => bindings,
+                        Pattern::Value(_) => &[],
+                    };
+                    if let Some(entry) = &arm.entry {
+                        walk.scoped(bindings, |walk| self.expr(walk, entry))?;
+                    }
+                }
+                Ok(statement.clone())
+            }
             Stmt::If { .. } | Stmt::Match { .. } | Stmt::Loop { .. } | Stmt::For { .. } => {
                 self.compound(walk, statement)
             }

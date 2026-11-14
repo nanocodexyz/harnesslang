@@ -355,6 +355,7 @@ impl Checker<'_> {
             ast::Stmt::Clear { list, .. } => format!("clear '{}'", list.text),
             ast::Stmt::Keep { list, .. } => format!("keep the end of '{}'", list.text),
             ast::Stmt::KeepBlobs { list, .. } => format!("keep the blobs of '{}'", list.text),
+            ast::Stmt::Rewrite { list, .. } => format!("rewrite '{}'", list.text),
             ast::Stmt::For { parallel: true, .. } => "dispatch a parallel for".to_owned(),
             _ => return Ok(()),
         };
@@ -467,6 +468,11 @@ impl Checker<'_> {
                 };
                 out.push(Stmt::Shrink { field, kept });
                 self.compaction(ast::HookKind::PostCompact, compacts, *keep_at, out)?;
+                Ok(false)
+            }
+            ast::Stmt::Rewrite { at, list, arms } => {
+                let rewrite = self.rewrite(*at, list, arms)?;
+                out.push(rewrite);
                 Ok(false)
             }
             ast::Stmt::KeepBlobs { at, list, count } => {
@@ -792,6 +798,102 @@ impl Checker<'_> {
                 args.iter().find_map(|arg| self.effect_in(arg))
             }
         }
+    }
+
+    fn rewrite(
+        &mut self,
+        at: Position,
+        list: &ast::Name,
+        arms: &[ast::RewriteArm],
+    ) -> Checked<Stmt> {
+        let (field, element) = self.list_field(list, "rewrite")?;
+        let variants = match element.variants(self.program) {
+            Some(variants) if self.program.text_enum(&element).is_none() => variants,
+            _ => {
+                return error(
+                    at,
+                    format!(
+                        "'rewrite {}' maps the entries of a list of a sum, found a list of {}",
+                        list.text,
+                        self.type_name(&element)
+                    ),
+                );
+            }
+        };
+        let mut checked: Vec<Option<ir::RewriteArm>> = vec![None; variants.len()];
+        for arm in arms {
+            let index = self.arm_index(&element, &variants, &arm.pattern)?;
+            let name = arm.pattern.name();
+            if checked[index].is_some() {
+                return error(
+                    name.at,
+                    format!("variant '{}' is rewritten twice", name.text),
+                );
+            }
+            let fields = &variants[index].fields;
+            let ast::Pattern::Variant {
+                bindings: names, ..
+            } = &arm.pattern
+            else {
+                unreachable!("arm_index admits only variant patterns on a sum");
+            };
+            if names.len() != fields.len() {
+                return error(
+                    name.at,
+                    format!(
+                        "variant '{}' has {} field(s), the pattern binds {}",
+                        name.text,
+                        fields.len(),
+                        names.len()
+                    ),
+                );
+            }
+            let rewritten = self.scoped(|checker| {
+                let mut bindings = Vec::new();
+                for (binding, field) in names.iter().zip(fields) {
+                    bindings.push(if binding.text == WILDCARD {
+                        None
+                    } else {
+                        Some(checker.declare(binding, field.clone())?)
+                    });
+                }
+                let entry = match &arm.entry {
+                    None => ir::Rewritten::Dropped,
+                    Some(value) => {
+                        let value_at = value.at();
+                        let mut effects = Vec::new();
+                        let checked = checker.expr(value, Some(&element), &mut effects);
+                        if !effects.is_empty() {
+                            return error(
+                                value_at,
+                                "a rewrite arm runs no effect: it only maps an entry to another",
+                            );
+                        }
+                        let (value, ty) = checked?;
+                        checker.expect(value_at, &element, &ty)?;
+                        ir::Rewritten::Into(value)
+                    }
+                };
+                Ok(ir::RewriteArm {
+                    variant: index,
+                    bindings,
+                    entry,
+                })
+            })?;
+            checked[index] = Some(rewritten);
+        }
+        let arms = checked
+            .into_iter()
+            .enumerate()
+            .map(|(variant, arm)| {
+                arm.unwrap_or(ir::RewriteArm {
+                    variant,
+                    bindings: Vec::new(),
+                    entry: ir::Rewritten::Kept,
+                })
+            })
+            .collect();
+        Ok(Stmt::Rewrite { field, arms })
     }
 
     fn match_statement(
@@ -1839,6 +1941,7 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         ast::Stmt::Push { .. } => "a push".to_owned(),
         ast::Stmt::Clear { .. } => "a clear".to_owned(),
         ast::Stmt::Keep { .. } | ast::Stmt::KeepBlobs { .. } => "a keep".to_owned(),
+        ast::Stmt::Rewrite { .. } => "a rewrite".to_owned(),
         ast::Stmt::If { .. } => "an if".to_owned(),
         ast::Stmt::Match { .. } => "a match".to_owned(),
         ast::Stmt::Loop { .. } => "a loop".to_owned(),
@@ -1890,6 +1993,7 @@ pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
         | ast::Stmt::Clear { at, .. }
         | ast::Stmt::Keep { at, .. }
         | ast::Stmt::KeepBlobs { at, .. }
+        | ast::Stmt::Rewrite { at, .. }
         | ast::Stmt::If { at, .. }
         | ast::Stmt::Match { at, .. }
         | ast::Stmt::Loop { at, .. }

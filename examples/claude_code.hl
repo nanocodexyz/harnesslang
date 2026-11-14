@@ -60,6 +60,7 @@ state {
   backoff_ms: u64
   refusal_recovered: bool
   context_recovery_attempted: bool
+  tools_restated: bool
   context_tokens: u64
   pending_units: u64
   round_entries: u64
@@ -291,6 +292,19 @@ fn answered(reply: claude_reply, words: text, started: u64, opened: u64) {
   }
 }
 
+fn repair_history(error: text) {
+  if tools_restated {
+    return failed("provider rejected the request: " ++ error)
+  }
+  if not (contains(error, "tool_addition") or contains(error, "tool_removal") or contains(error, "tool_reference")) {
+    return failed("provider rejected the request: " ++ error)
+  }
+  tools_restated = true
+  rewrite context {
+    notice(_) => drop
+  }
+}
+
 fn keep_cache(started: u64, opened: u64) {
   refresh_due = 0
   if started <= opened and opened <= clock_ms_max {
@@ -315,6 +329,7 @@ on prompt(input: text, rounds: u64) -> outcome
   waited_ms = 0
   backoff_ms = retry_base_ms
   refusal_recovered = false
+  tools_restated = false
   context_recovery_attempted = false
   compact_pending = false
   round_entries = 0
@@ -341,7 +356,7 @@ on prompt(input: text, rounds: u64) -> outcome
       match messages(context) with {effort: pinned} {
         throttled(error, after_ms) => { back_off(error, after_ms, throttled_attempts_max, true) }
         transient(error, after_ms) => { back_off(error, after_ms, attempts_max, false) }
-        rejected(error) => { return failed("provider rejected the request: " ++ error) }
+        rejected(error) => { repair_history(error) }
         ok(reply, stop, input_tokens, output_tokens, cache_read, cache_write) => {
           let opened = now()
           attempts = 0

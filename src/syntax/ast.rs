@@ -296,6 +296,11 @@ pub enum Stmt {
         count: Expr,
         first: Option<Expr>,
     },
+    Rewrite {
+        at: Position,
+        list: Name,
+        arms: Vec<RewriteArm>,
+    },
     KeepBlobs {
         at: Position,
         list: Name,
@@ -345,6 +350,12 @@ pub enum Stmt {
 pub struct Arm {
     pub pattern: Pattern,
     pub body: Block,
+}
+
+#[derive(Clone, Debug)]
+pub struct RewriteArm {
+    pub pattern: Pattern,
+    pub entry: Option<Expr>,
 }
 
 #[derive(Clone, Debug)]

@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `runs` `session` `sessions` `settings` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `drop` `end` `finds` `fn` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `rewrite` `runs` `session` `sessions` `settings` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -578,6 +578,7 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | "clear" name
            | "keep" name "last" expr [ "after" expr ]
            | "keep" name "blobs" "last" bound
+           | "rewrite" name "{" { name [ "(" name { "," name } ")" ] "=>" ( expr | "drop" ) [ "," ] } "}"
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
@@ -3308,6 +3309,144 @@ changes no length, and anywhere but a model call's argument it is an error:
 $ hl check examples/invalid/with_outside_model.hl
 examples/invalid/with_outside_model.hl:13:23: error: 'with' adds an entry to the context a model call reads: it is only a model call's argument
 ```
+
+### rewrite
+
+`rewrite field { pattern => entry, pattern => drop, ... }` maps the entries a state
+list already holds, in place: each entry whose variant an arm names becomes
+that arm's entry, or leaves the list when the arm says `drop`, and an entry no
+arm names stays as it is. The list is a list of a sum, such as a context of
+`entry`; a pattern names one variant and binds its fields, as a `match` arm does;
+each variant is named at most once; and an arm's entry is an expression of the
+list's element type that runs no effect, so a rewrite is a pure, total map
+over the list. It repairs a history a provider refused, as nanocode's Claude
+loop drops the blocks the provider rejected and retries once:
+
+```hl docs/snippets/rewrite.hl
+harness repair
+
+const rounds_max: u64 = 3
+const calls_max: u64 = 4
+const context_max: u64 = 64
+const result_tokens_max: u64 = 16
+
+type outcome = answered(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  repaired: bool
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  repaired = false
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => {
+        if repaired { return stopped(error) }
+        repaired = true
+        rewrite context {
+          result(call, output) => result(call, truncate_middle(output, result_tokens_max))
+          unknown(_) => drop
+        }
+      }
+      ok(reply) => {
+        push context assistant(reply)
+        match reply {
+          answer(words) => { return answered(words) }
+          calls(requested) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return stopped("the turn ran out of rounds")
+}
+```
+
+A rewrite is not an effect: it writes no record and adds nothing to the worst
+case, and what it leaves is in the checkpoint written with the turn's status,
+as for `clear` and `keep`. The prover leaves the list's length unchanged when no
+arm drops, and otherwise sets it to at most what it was, so pushes that follow
+are proved against what the rewrite can leave; it checks every arm's entry as
+it checks a pushed value, and the cuts of `truncate_middle` in an arm count among
+the program's cuts. `hl sim` checks it with `checkpoint_compacted`: every
+checkpoint holds the state that replaying the journal reaches, and
+`rewrite_live_only` rewrites only when the turn runs past its journal, not when a
+rerun replays it:
+
+```console
+$ hl check docs/snippets/rewrite.hl | grep shrink
+  proved handler ask: shrink: rewrite context leaves at most 59 of 64 entries and drops at most 59
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/rewrite.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1736 crashes=1232 power_losses=98 torn_writes=150 takeovers=0 fenced=0 dispatches=1210 unknown=320
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation rewrite_live_only docs/snippets/rewrite.hl | head -n 1
+FAIL invariant=checkpoint_compacted seed=4 target=native-jsonl profile=async mutation=rewrite_live_only: checkpoint 2 holds 10 entries of context where replaying the journal to turn 2 gives 9 entries of context: a checkpoint must hold the lists as clear and keep left them
+$ hl check docs/snippets/errors/rewrite-effect.hl
+docs/snippets/errors/rewrite-effect.hl:16:20: error: a rewrite arm runs no effect: it only maps an entry to another
+$ hl check docs/snippets/errors/rewrite-list.hl
+docs/snippets/errors/rewrite-list.hl:10:3: error: 'rewrite lines' maps the entries of a list of a sum, found a list of text
+```
+
+```hl docs/snippets/errors/rewrite-effect.hl
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+tool summarize(text: text) -> text effect none
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on shorten() -> u64 {
+  rewrite context {
+    user(words) => user(summarize(words))
+  }
+  return len(context)
+}
+```
+
+```hl docs/snippets/errors/rewrite-list.hl
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on shorten() -> u64 {
+  rewrite lines {
+    line(words) => drop
+  }
+  return len(lines)
+}
+```
+
+`examples/claude_code.hl` repairs its history so when the provider rejects a
+request over the tool changes appended to it (an error naming
+`tool_addition`, `tool_removal` or `tool_reference`): once per turn it drops the
+listing notices from the context and asks again, as nanocode strips the
+appended tool-change blocks and sends the current tool list instead.
 
 ## Effects
 

@@ -96,6 +96,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.line(&format!("state.{field} = {value};"));
             }
             Stmt::Push { field, value } => self.push(*field, value),
+            Stmt::Rewrite { field, arms } => self.rewrite(*field, arms),
             Stmt::Shrink { field, kept } => {
                 let count = match kept {
                     Kept::Nothing => "0_u64".to_owned(),
@@ -239,6 +240,66 @@ impl<'a, 'p> Body<'a, 'p> {
         self.line(&format!(
             "    push(&mut state.{field}, value, {capacity}, {name:?})?;"
         ));
+        self.line("}");
+    }
+
+    fn rewrite(&mut self, field: ir::FieldId, arms: &[ir::RewriteArm]) {
+        let Type::List { element, .. } = &self.program.state[field].ty else {
+            panic!("the checker rewrites only lists");
+        };
+        let Type::Sum(sum) = **element else {
+            panic!("the checker rewrites only lists of a sum");
+        };
+        let variants = element
+            .variants(self.program)
+            .expect("a rewrite maps a sum");
+        let prefix = super::types::sum_name(self.program, sum);
+        let name = self.field(field);
+        self.line("{");
+        self.depth += 1;
+        self.line(&format!(
+            "let mut rewritten = Vec::with_capacity(state.{name}.len());"
+        ));
+        self.line(&format!("for item in std::mem::take(&mut state.{name}) {{"));
+        self.depth += 1;
+        self.line("match item {");
+        self.depth += 1;
+        for (arm, variant) in arms.iter().zip(&variants) {
+            let path = format!("{prefix}::{}", variant_ident(&variant.name));
+            let rest = if variant.fields.is_empty() {
+                path.clone()
+            } else {
+                format!("{path}(..)")
+            };
+            match &arm.entry {
+                ir::Rewritten::Kept => {
+                    self.line(&format!("kept @ {rest} => rewritten.push(kept),"))
+                }
+                ir::Rewritten::Dropped => self.line(&format!("{rest} => {{}}")),
+                ir::Rewritten::Into(entry) => {
+                    let bindings: Vec<String> = arm
+                        .bindings
+                        .iter()
+                        .map(|binding| {
+                            binding.map_or_else(|| "_".to_owned(), |local| self.local(local))
+                        })
+                        .collect();
+                    let pattern = if variant.fields.is_empty() {
+                        path
+                    } else {
+                        format!("{path}({})", bindings.join(", "))
+                    };
+                    let entry = self.expr(entry);
+                    self.line(&format!("{pattern} => rewritten.push({entry}),"));
+                }
+            }
+        }
+        self.depth -= 1;
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
+        self.line(&format!("state.{name} = rewritten;"));
+        self.depth -= 1;
         self.line("}");
     }
 

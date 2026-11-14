@@ -947,6 +947,7 @@ impl<'a> Engine<'a> {
             }
             Stmt::Push { field, value } => self.push(*field, value)?,
             Stmt::Shrink { field, kept } => self.shrink(*field, kept)?,
+            Stmt::Rewrite { field, arms } => self.rewrite(*field, arms)?,
             Stmt::KeepBlobs { field, count } => {
                 let attached = self
                     .program
@@ -1377,6 +1378,43 @@ impl<'a> Engine<'a> {
             )));
         }
         items.push(value);
+        Ok(())
+    }
+
+    fn rewrite(&mut self, field: usize, arms: &[ir::RewriteArm]) -> Result<(), Halt> {
+        let replaying = self.sites.range(self.seq + 1..).next().is_some();
+        if self.mutation == Mutation::RewriteLiveOnly && replaying {
+            return Ok(());
+        }
+        let Value::List(items) = std::mem::replace(&mut self.state[field], Value::List(Vec::new()))
+        else {
+            panic!("the checker rewrites only lists");
+        };
+        let length = items.len();
+        let mut rewritten = Vec::with_capacity(length);
+        for item in items {
+            let (variant, fields) = item.as_variant();
+            let arm = &arms[variant];
+            assert_eq!(arm.variant, variant, "rewrite arms are in variant order");
+            match &arm.entry {
+                ir::Rewritten::Kept => rewritten.push(item),
+                ir::Rewritten::Dropped => {}
+                ir::Rewritten::Into(entry) => {
+                    for (binding, value) in arm.bindings.iter().zip(fields) {
+                        if let Some(local) = binding {
+                            self.locals[*local] = Some(value.clone());
+                        }
+                    }
+                    rewritten.push(self.eval(entry)?);
+                }
+            }
+        }
+        assert!(
+            rewritten.len() <= length,
+            "a rewrite never lengthens a list"
+        );
+        self.retired += (length - rewritten.len()) as u64;
+        self.state[field] = Value::List(rewritten);
         Ok(())
     }
 

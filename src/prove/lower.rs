@@ -233,6 +233,7 @@ fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
             | Stmt::KeepBlobs { .. }
+            | Stmt::Rewrite { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. }
             | Stmt::Finish { .. } => {}
@@ -352,6 +353,7 @@ impl Lowering<'_> {
                 | Stmt::Take { .. }
                 | Stmt::Shrink { .. }
                 | Stmt::KeepBlobs { .. }
+                | Stmt::Rewrite { .. }
                 | Stmt::Finish { .. } => {}
             }
         }
@@ -433,6 +435,13 @@ impl Lowering<'_> {
                 self.arithmetic_trap(value, ops);
             }
             Stmt::Take { .. } | Stmt::KeepBlobs { .. } => {}
+            Stmt::Rewrite { arms, .. } => {
+                for arm in arms {
+                    if let crate::ir::Rewritten::Into(entry) = &arm.entry {
+                        self.arithmetic_trap(entry, ops);
+                    }
+                }
+            }
             Stmt::Push { field, value } => {
                 self.arithmetic_trap(value, ops);
                 let name = &self.program.state[*field].name;
