@@ -1,3 +1,4 @@
 /target
 /output
 /oracle/target
+/oracle/cloudflare/node_modules
