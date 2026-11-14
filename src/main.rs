@@ -12,10 +12,11 @@ use harnesslang::{check, emit, syntax};
 
 const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
+const SUMMARIZED_RESULT: &str = "summarized";
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -69,6 +70,7 @@ struct Flags {
     seed: u64,
     trace: Option<String>,
     dump: Option<String>,
+    summarize: Option<String>,
 }
 
 fn flags(args: &[String]) -> Option<Flags> {
@@ -83,6 +85,7 @@ fn flags(args: &[String]) -> Option<Flags> {
         seed: 0,
         trace: None,
         dump: None,
+        summarize: None,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -96,6 +99,7 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
             "--trace" => flags.trace = Some(rest.next()?.clone()),
             "--dump-journal" => flags.dump = Some(rest.next()?.clone()),
+            "--summarize" => flags.summarize = Some(rest.next()?.clone()),
             file if !file.starts_with("--") && flags.file.is_none() => {
                 flags.file = Some(file.to_owned())
             }
@@ -275,10 +279,41 @@ fn run_command(args: &[String]) -> ExitCode {
     }
 }
 
+fn summarize_command(file: &str, target: Target, journal: &str, seed: u64) -> ExitCode {
+    let program = match load(file) {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(FAILURE_EXIT);
+        }
+    };
+    let bytes = match std::fs::read(journal) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("{journal}: error: cannot read: {error}");
+            return ExitCode::from(FAILURE_EXIT);
+        }
+    };
+    let checksum = sim::dump::checksummed(target, Mutation::None);
+    let (text, _) =
+        sim::dump::summarize(&program, target, checksum, seed, SUMMARIZED_RESULT, &bytes);
+    print!("{text}");
+    ExitCode::SUCCESS
+}
+
 fn sim_command(args: &[String]) -> ExitCode {
     let Some(flags) = flags(args) else {
         return usage();
     };
+    if let (Some(journal), Some(file), Some(target), None, None) = (
+        &flags.summarize,
+        &flags.file,
+        flags.target,
+        &flags.seeds,
+        &flags.dump,
+    ) {
+        return summarize_command(file, target, journal, flags.seed);
+    }
     let (Some(file), Some(target), Some(seeds)) = (flags.file, flags.target, flags.seeds) else {
         return usage();
     };
