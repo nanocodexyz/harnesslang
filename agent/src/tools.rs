@@ -17,6 +17,7 @@ pub const READ_BYTES_MAX: u64 = 262_144;
 pub const READ_TOKENS_MAX: usize = 25_000;
 pub const BYTES_PER_TOKEN: usize = 4;
 pub const SELECTED_BYTES_PER_TOKEN: u64 = 128;
+static SHELL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub const MILLISECONDS_PER_MINUTE: u128 = 60_000;
 pub const MILLISECONDS_PER_SECOND: u128 = 1_000;
 pub const PAGE_FILL: f64 = 0.85;
@@ -34,6 +35,7 @@ const ALLOW_LARGE_UNAVAILABLE: &str =
     " allow_large is not available where this read runs; read it in parts with offset and limit.";
 const FILE_STATE: &str =
     " (file state is current in your context \u{2014} no need to Read it back)";
+const BACKGROUND_STARTED: &str = "Command running in background";
 const UNKNOWN_OUTCOME: &str = "Tool execution interrupted by a host crash; outcome unknown. Do not assume it did not run or automatically repeat it.";
 const BINARY_EXTENSIONS: [&str; 87] = [
     ".ico", ".tiff", ".tif", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
@@ -96,13 +98,25 @@ pub struct Workspace {
     pub root: PathBuf,
     pub state: PathBuf,
     pub image_bytes_max: Option<u64>,
+    pub left: std::sync::Mutex<Vec<u32>>,
 }
 
 pub enum Ran {
     Ok(String),
     Image(Vec<u8>),
     Failed(String),
+    Job(String),
 }
+
+pub enum Recovered {
+    Reply(Ran),
+    NotDispatched,
+    Unknown,
+}
+
+const RECEIPTS: &str = "calls";
+const RECEIPT_STARTED: &str = "started";
+const RECEIPT_DONE: &str = "done";
 
 fn text_field<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
     input
@@ -128,7 +142,10 @@ fn bool_field(input: &Value, key: &str) -> Result<bool, String> {
 impl Workspace {
     pub fn run(&self, tool: &str, input: &Value) -> Ran {
         let outcome = match tool {
-            "Bash" => self.bash(input),
+            "Bash" => self.bash(input, false).map(|bashed| match bashed {
+                Bashed::Ran(ran) => ran,
+                Bashed::Job(..) => unreachable!("a Bash call without room never becomes a job"),
+            }),
             "Read" => self.read(input),
             "Edit" => self.edit(input).map(Ran::Ok),
             "Write" => self.write(input).map(Ran::Ok),
@@ -140,6 +157,108 @@ impl Workspace {
         match outcome {
             Ok(ran) => ran,
             Err(error) => Ran::Failed(format!("<tool_use_error>{error}</tool_use_error>")),
+        }
+    }
+
+    fn receipt(&self, turn: u64, seq: u64, suffix: &str) -> PathBuf {
+        self.state
+            .join(RECEIPTS)
+            .join(format!("{turn}.{seq}.{suffix}"))
+    }
+
+    pub fn dispatching(&self, turn: u64, seq: u64) -> Result<(), String> {
+        let directory = self.state.join(RECEIPTS);
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let path = self.receipt(turn, seq, RECEIPT_STARTED);
+        let file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        std::fs::File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn dispatched(&self, turn: u64, seq: u64, ran: &Ran) {
+        let value = match ran {
+            Ran::Ok(text) => Value::object([("ok", Value::text(text))]),
+            Ran::Failed(text) => Value::object([("failed", Value::text(text))]),
+            Ran::Job(text) => Value::object([("job", Value::text(text))]),
+            Ran::Image(_) => return,
+        };
+        let path = self.receipt(turn, seq, RECEIPT_DONE);
+        if let Err(error) = atomic_write(&path, &value.encode()) {
+            eprintln!("hl-agent: {}: {error}", path.display());
+        }
+    }
+
+    pub fn recover(&self, turn: u64, seq: u64, tool: &str, input: &Value) -> Recovered {
+        match tool {
+            "Bash" => self.recover_bash(turn, seq),
+            "Write" => self.recover_write(turn, seq, input),
+            "Edit" => self.recover_edit(input),
+            _ => Recovered::Unknown,
+        }
+    }
+
+    fn recover_bash(&self, turn: u64, seq: u64) -> Recovered {
+        if let Ok(text) = std::fs::read_to_string(self.receipt(turn, seq, RECEIPT_DONE)) {
+            let ran = Value::decode(&text).ok().and_then(|value| {
+                let field = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+                field("ok")
+                    .map(Ran::Ok)
+                    .or_else(|| field("failed").map(Ran::Failed))
+                    .or_else(|| field("job").map(Ran::Job))
+            });
+            return ran.map_or(Recovered::Unknown, Recovered::Reply);
+        }
+        if self.receipt(turn, seq, RECEIPT_STARTED).exists() {
+            return Recovered::Unknown;
+        }
+        Recovered::NotDispatched
+    }
+
+    fn recover_write(&self, turn: u64, seq: u64, input: &Value) -> Recovered {
+        let (Ok(content), Ok(file_path)) =
+            (text_field(input, "content"), text_field(input, "file_path"))
+        else {
+            return Recovered::Unknown;
+        };
+        let Ok(path) = self.resolve(file_path) else {
+            return Recovered::Unknown;
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes == content.as_bytes() => Recovered::Reply(Ran::Ok(format!(
+                "The file {} has been updated successfully.{FILE_STATE}",
+                path.display()
+            ))),
+            _ if self.receipt(turn, seq, RECEIPT_STARTED).exists() => Recovered::Unknown,
+            _ => Recovered::NotDispatched,
+        }
+    }
+
+    fn recover_edit(&self, input: &Value) -> Recovered {
+        let (Ok(file_path), Ok(old), Ok(new)) = (
+            text_field(input, "file_path"),
+            text_field(input, "old_string"),
+            text_field(input, "new_string"),
+        ) else {
+            return Recovered::Unknown;
+        };
+        if old.is_empty() || new.contains(old) || old.contains(new) {
+            return Recovered::Unknown;
+        }
+        let Ok(path) = self.resolve(file_path) else {
+            return Recovered::Unknown;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return Recovered::Unknown;
+        };
+        match (content.contains(old), content.contains(new)) {
+            (true, false) => Recovered::NotDispatched,
+            (false, true) => Recovered::Reply(Ran::Ok(format!(
+                "The file {} has been updated successfully.",
+                path.display()
+            ))),
+            _ => Recovered::Unknown,
         }
     }
 
@@ -275,12 +394,25 @@ impl Workspace {
         })
     }
 
-    fn bash(&self, input: &Value) -> Result<Ran, String> {
+    pub fn bash_job(&self, input: &Value, room: bool) -> Bashed {
+        match self.bash(input, room) {
+            Ok(bashed) => bashed,
+            Err(error) => Bashed::Ran(Ran::Failed(format!(
+                "<tool_use_error>{error}</tool_use_error>"
+            ))),
+        }
+    }
+
+    fn bash(&self, input: &Value, room: bool) -> Result<Bashed, String> {
         if bool_field(input, "dangerouslyDisableSandbox")? {
             return Err("this host does not authorize disabling the sandbox".into());
         }
-        if bool_field(input, "run_in_background")? {
-            return Err("this executor does not support background commands".into());
+        let background = bool_field(input, "run_in_background")?;
+        if background && !room {
+            return Err(
+                "no background job can start now: the session keeps its limit of background jobs running"
+                    .into(),
+            );
         }
         let command = text_field(input, "command")?;
         if command.trim().is_empty() || command.len() > COMMAND_BYTES_MAX {
@@ -296,10 +428,25 @@ impl Workspace {
             return Err("timeout must be at least 1 millisecond".into());
         }
         let timeout = Duration::from_millis(requested.min(TIMEOUT_MAX_MS));
-        let result = self
-            .execute(command, timeout)
+        if background {
+            let started = self
+                .spawn_shell(command)
+                .map_err(|error| format!("command executor: {error}"))?;
+            return Ok(Bashed::Job(started, BACKGROUND_STARTED.to_owned()));
+        }
+        let waited = self
+            .execute(command, timeout, room)
             .map_err(|error| format!("command executor: {error}"))?;
-        Ok(rendered(&result))
+        Ok(match waited {
+            Waited::Done(shell) => Bashed::Ran(rendered(&shell)),
+            Waited::Moved(started) => Bashed::Job(
+                started,
+                format!(
+                    "Command did not complete within its {}s timeout and was moved to the background",
+                    timeout.as_secs().max(1)
+                ),
+            ),
+        })
     }
 
     fn cwd(&self) -> PathBuf {
@@ -309,11 +456,12 @@ impl Workspace {
         }
     }
 
-    fn execute(&self, command: &str, timeout: Duration) -> Result<Shell, String> {
+    fn spawn_shell(&self, command: &str) -> Result<Started, String> {
         let script = self.state.join("bash-command");
         std::fs::write(&script, command).map_err(|error| error.to_string())?;
-        let stdout_path = self.state.join("bash-stdout");
-        let stderr_path = self.state.join("bash-stderr");
+        let sequence = SHELL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stdout_path = self.state.join(format!("bash-{sequence}.stdout"));
+        let stderr_path = self.state.join(format!("bash-{sequence}.stderr"));
         let spawn = |shell: &str| -> std::io::Result<std::process::Child> {
             let _ = std::fs::remove_file(&stdout_path);
             let _ = std::fs::remove_file(&stderr_path);
@@ -331,56 +479,146 @@ impl Workspace {
                 .process_group(0)
                 .spawn()
         };
-        let mut child = match spawn(SHELL) {
+        let child = match spawn(SHELL) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => spawn(SHELL_FALLBACK),
             spawned => spawned,
         }
         .map_err(|error| error.to_string())?;
-        let started = Instant::now();
-        let mut timed_out = false;
+        Ok(Started {
+            child,
+            stdout: stdout_path,
+            stderr: stderr_path,
+        })
+    }
+
+    fn execute(&self, command: &str, timeout: Duration, movable: bool) -> Result<Waited, String> {
+        let mut started = self.spawn_shell(command)?;
+        let begun = Instant::now();
         let status = loop {
-            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            if let Some(status) = started
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
                 break status;
             }
-            if started.elapsed() >= timeout {
-                timed_out = true;
-                let _ = Command::new("kill")
-                    .arg("-KILL")
-                    .arg("--")
-                    .arg(format!("-{}", child.id()))
-                    .status();
-                break child.wait().map_err(|error| error.to_string())?;
+            if begun.elapsed() >= timeout {
+                if movable {
+                    return Ok(Waited::Moved(started));
+                }
+                kill_group(&started.child);
+                let status = started.child.wait().map_err(|error| error.to_string())?;
+                let mut shell = settled(started, status, true)?;
+                shell.message = Some(format!(
+                    "Command timed out after {}",
+                    timed_out_after(timeout)
+                ));
+                return Ok(Waited::Done(shell));
             }
             std::thread::sleep(TIMEOUT_POLL);
         };
-        let (stdout, stdout_cut) = captured(&stdout_path)?;
-        let (stderr, stderr_cut) = captured(&stderr_path)?;
-        let _ = std::fs::remove_file(&stdout_path);
-        let _ = std::fs::remove_file(&stderr_path);
-        let code = match (timed_out, status.code()) {
-            (true, _) => TIMED_OUT_STATUS,
-            (false, Some(code)) => code,
-            (false, None) => {
-                SHELL_SIGNAL_STATUS
-                    + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
-            }
-        };
-        let message =
-            timed_out.then(|| format!("Command timed out after {}", timed_out_after(timeout)));
-        Ok(Shell {
-            stdout,
-            stdout_cut,
-            stderr,
-            stderr_cut,
-            code,
-            message,
-        })
+        if group_alive(started.child.id()) {
+            self.left
+                .lock()
+                .expect("the left process groups")
+                .push(started.child.id());
+        }
+        Ok(Waited::Done(settled(started, status, false)?))
     }
+
+    pub fn stop_left(&self) {
+        let groups = std::mem::take(&mut *self.left.lock().expect("the left process groups"));
+        for group in groups {
+            kill_group_id(group);
+        }
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        self.stop_left();
+    }
+}
+
+pub struct Started {
+    pub child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+pub enum Waited {
+    Done(Shell),
+    Moved(Started),
+}
+
+pub enum Bashed {
+    Ran(Ran),
+    Job(Started, String),
+}
+
+pub fn kill_group(child: &std::process::Child) {
+    kill_group_id(child.id());
+}
+
+fn kill_group_id(group: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{group}"))
+        .status();
+}
+
+fn group_alive(group: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg("--")
+        .arg(format!("-{group}"))
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+pub fn settled(
+    started: Started,
+    status: std::process::ExitStatus,
+    timed_out: bool,
+) -> Result<Shell, String> {
+    let (stdout, stdout_cut) = captured(&started.stdout)?;
+    let (stderr, stderr_cut) = captured(&started.stderr)?;
+    let _ = std::fs::remove_file(&started.stdout);
+    let _ = std::fs::remove_file(&started.stderr);
+    let code = match (timed_out, status.code()) {
+        (true, _) => TIMED_OUT_STATUS,
+        (false, Some(code)) => code,
+        (false, None) => {
+            SHELL_SIGNAL_STATUS
+                + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
+        }
+    };
+    Ok(Shell {
+        stdout,
+        stdout_cut,
+        stderr,
+        stderr_cut,
+        code,
+        message: None,
+    })
+}
+
+pub fn shown(shell: &Shell) -> String {
+    match rendered(shell) {
+        Ran::Ok(text) | Ran::Failed(text) | Ran::Job(text) => text,
+        Ran::Image(_) => String::new(),
+    }
+}
+
+pub fn exit_code(shell: &Shell) -> i32 {
+    shell.code
 }
 
 use std::os::unix::process::CommandExt as _;
 
-struct Shell {
+pub struct Shell {
     stdout: String,
     stdout_cut: bool,
     stderr: String,

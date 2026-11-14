@@ -6,7 +6,7 @@ mod store;
 use std::io::BufRead;
 
 use harness::program;
-use harness::{CellEvent, CellPoint, Delivery, EventAnswer, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Resume, SideAnswer, Step, Stop, Suspension, ToolRequest, TurnRequest, Wait, World};
+use harness::{CellEvent, CellPoint, Delivery, EventAnswer, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Recovered, Resume, SideAnswer, Step, Stop, Suspension, ToolRequest, TurnRequest, Wait, World};
 
 pub struct Events {
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
@@ -95,6 +95,9 @@ pub struct Stats {
     pub sleeps: u64,
     pub resumes: u64,
     pub sides: u64,
+    pub recovers: u64,
+    pub job_checks: u64,
+    pub holds: u64,
 }
 
 pub struct Driver {
@@ -331,6 +334,7 @@ impl World for Driver {
         expect(&event, "effect", &Json::text(request.effect.name()));
         expect(&event, "input", request.input);
         expect(&event, "admitted", &request.admitted.map_or(Json::Null, Json::text));
+        expect(&event, "job", &Json::Bool(request.job));
         harness::output_from(field(&event, "output")).unwrap_or_else(|error| fail(&error))
     }
 
@@ -389,6 +393,7 @@ impl World for Driver {
         expect(&event, "seq", &Json::Number(request.seq));
         let traced = event.get("mode").map(|mode| mode.as_str().expect("a traced mode is text"));
         assert_eq!(traced, request.mode, "model mode at {}/{}", request.turn, request.seq);
+        assert_eq!(event.get("settings"), request.settings, "model settings at {}/{}", request.turn, request.seq);
         let context = (request.context)().encode();
         expect(&event, "context_crc", &Json::Number(u64::from(harness::crc32(context.as_bytes()))));
         field(&event, "response").clone()
@@ -479,6 +484,48 @@ impl World for Driver {
         Some(Resume { key: text(&event, "key").to_owned(), answer: text(&event, "answer").to_owned() })
     }
 
+    fn recover(&mut self, request: &ToolRequest<'_>) -> Recovered {
+        let event = self.events.next("recover");
+        expect(&event, "turn", &Json::Number(request.turn));
+        expect(&event, "seq", &Json::Number(request.seq));
+        expect(&event, "tool", &Json::text(request.tool));
+        expect(&event, "input", request.input);
+        self.stats.recovers += 1;
+        let answer = field(&event, "answer");
+        match answer.as_str() {
+            Some("not_dispatched") => Recovered::NotDispatched,
+            Some("unknown") => Recovered::Unknown,
+            Some(other) => fail(&format!("unknown recover answer {other}")),
+            None => Recovered::Reply(harness::output_from(field(answer, "reply")).unwrap_or_else(|error| fail(&error))),
+        }
+    }
+
+    fn jobs(&mut self, turn: u64, open: &[String]) -> Vec<String> {
+        let event = self.events.next("jobs");
+        expect(&event, "turn", &Json::Number(turn));
+        expect(&event, "open", &Json::Array(open.iter().map(|key| Json::text(key)).collect()));
+        self.stats.job_checks += 1;
+        let Json::Array(lost) = field(&event, "answer") else {
+            fail(&format!("trace event {} has no list of lost jobs", event.encode()));
+        };
+        lost.iter()
+            .map(|key| key.as_str().unwrap_or_else(|| fail("a lost job key is text")).to_owned())
+            .collect()
+    }
+
+    fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        let event = self.events.next("hold");
+        expect(&event, "turn", &Json::Number(turn));
+        expect(&event, "seq", &Json::Number(seq));
+        expect(&event, "until", &Json::Number(until_ms));
+        self.stats.holds += 1;
+        match text(&event, "answer") {
+            "ok" => Ok(number(&event, "clock")),
+            "crash" => Err(Stop::Crash),
+            other => fail(&format!("unknown hold answer {other}")),
+        }
+    }
+
     fn resumed(&mut self, suspension: &Suspension, _resume: &Resume, matched: bool) {
         let event = self.events.next("resumed");
         expect(&event, "turn", &Json::Number(suspension.turn));
@@ -555,7 +602,7 @@ fn main() {
     }
     let stats = &driver.stats;
     println!(
-        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={} sleeps={} resumes={}{}",
+        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={} sleeps={} resumes={} recovers={} job_checks={} holds={}{}",
         program::TARGET,
         program::HARNESS_NAME,
         stats.seeds,
@@ -575,6 +622,9 @@ fn main() {
         stats.waits,
         stats.sleeps,
         stats.resumes,
+        stats.recovers,
+        stats.job_checks,
+        stats.holds,
         if program::HAS_SIDES { format!(" side_questions={}", stats.sides) } else { String::new() }
     );
 }

@@ -74,7 +74,7 @@ pub enum Mutation {
     DropCellFinish,
 }
 
-const LOWERING_MUTATIONS: [run::mutation::Mutation; 28] = [
+const LOWERING_MUTATIONS: [run::mutation::Mutation; 29] = [
     run::mutation::Mutation::FlushAfterDispatch,
     run::mutation::Mutation::RecoveryRedispatchesExternal,
     run::mutation::Mutation::VercelRetryRedispatches,
@@ -103,6 +103,7 @@ const LOWERING_MUTATIONS: [run::mutation::Mutation; 28] = [
     run::mutation::Mutation::NestedIdempotentReportedUnknown,
     run::mutation::Mutation::SuspendBeforeFlush,
     run::mutation::Mutation::ResumeReplaysSuspend,
+    run::mutation::Mutation::RecoverTrustsLost,
 ];
 
 const PROGRAM_MUTATIONS: [Mutation; 5] = [
@@ -183,6 +184,7 @@ fn repeat_assignments(statements: &mut Vec<Stmt>) {
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
             | Stmt::KeepBlobs { .. }
+            | Stmt::Rewrite { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. }
             | Stmt::Finish { .. } => {}
@@ -656,7 +658,7 @@ fn appended(program: &Program, op: &Op) -> Count {
             let logged = program.tools[*tool].effect == EffectClass::External;
             ENTRY_UPDATE_RECORDS + if logged { NESTED_LOG_RECORDS } else { 0 }
         }
-        Op::Append(Record::Timeout(_)) => 0,
+        Op::Append(Record::Timeout(_) | Record::Recovery) => 0,
         Op::Append(_) => 1,
         Op::CloseCell(_, code) => program.codes[*code]
             .timers

@@ -110,7 +110,7 @@ class Seed {
     this.acks = [];
     this.dispatched = new Map();
     this.nestedDispatched = new Map();
-    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0 };
+    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0, recovers: 0, jobs: 0 };
     this.durableLines = () => [];
     this.checks = new CellChecks(rt, (invariant, detail) => new Failure(invariant, detail));
     this.cells = new TracedCells(this, {
@@ -250,7 +250,26 @@ class Seed {
     same("tool call class", event.effect, request.effect);
     same("tool call input", event.input, request.input);
     same("tool call admission", event.admitted, request.admitted ?? null);
+    same("tool call job room", event.job ?? false, request.job);
     return event.output;
+  }
+
+  recover(request) {
+    const event = this.cursor.next("recover", short(rt.encodeJson(rt.object([["seq", BigInt(request.seq)], ["tool", request.tool], ["turn", BigInt(request.turn)]]))));
+    same("recover turn", event.turn, BigInt(request.turn));
+    same("recover seq", event.seq, BigInt(request.seq));
+    same("recover tool", event.tool, request.tool);
+    same("recover input", event.input, request.input);
+    this.stats.recovers += 1;
+    return rt.recoveredFrom(event.answer);
+  }
+
+  jobs(turn, open) {
+    const event = this.cursor.next("jobs", `turn ${turn} open ${open.join(",")}`);
+    same("jobs turn", event.turn, BigInt(turn));
+    same("open jobs", event.open, open);
+    this.stats.jobs += 1;
+    return event.answer;
   }
 
   listing(request) {
@@ -301,6 +320,7 @@ class Seed {
       const side = this.cursor.next("side_model", `side ${request.seq}`);
       same("side model seq", side.seq, request.seq);
       same("side model mode", side.mode ?? null, request.mode);
+      same("side model settings", rt.encodeJson(side.settings ?? null), rt.encodeJson(request.settings ?? null));
       same("side model context crc", side.context_crc, BigInt(rt.crc32(rt.encodeJson(request.context))));
       return side.response;
     }
@@ -309,6 +329,7 @@ class Seed {
     same("model call seq", event.seq, request.seq);
     same("model calls_max", event.calls_max, request.calls_max);
     same("model mode", event.mode ?? null, request.mode);
+    same("model settings", rt.encodeJson(event.settings ?? null), rt.encodeJson(request.settings ?? null));
     same("model context crc", event.context_crc, BigInt(rt.crc32(rt.encodeJson(request.context))));
     return event.response;
   }
@@ -321,11 +342,11 @@ class Seed {
     return this.cursor.next("clock", "clock").answer;
   }
 
-  sleep(turn, seq, untilMs) {
+  sleep(turn, seq, untilMs, kind = "sleep") {
     const recorded = this.durableLines().map((line) => rt.decodeLine(line, false)).find((record) => record.kind === "call" && record.turn === turn && record.seq === seq);
     const durable = recorded === undefined || !rt.isObject(recorded.input) ? undefined : recorded.input.until;
     if (durable !== untilMs) throw new Failure("wait_until", `wait ${turn}/${seq} sleeps until ${untilMs} while its durable call record holds ${durable}`);
-    const event = this.cursor.next("sleep", `${turn}/${seq}`);
+    const event = this.cursor.next(kind, `${turn}/${seq}`);
     same("sleep turn", event.turn, BigInt(turn));
     same("sleep seq", event.seq, BigInt(seq));
     same("sleep until", event.until, untilMs);
@@ -397,7 +418,7 @@ class Seed {
       const body = rt.decodeJson(init.body);
       const side = Number(body.turn) === rt.SIDE_TURN;
       if (url === TOOLS_URL) {
-        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
+        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null, job: body.job, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
         if (request.nested !== null) seed.nestedTool(request);
         if (!side) fetchCheck(request);
         const output = seed.tool(request, fetchCheck.durable === undefined ? null : fetchCheck);
@@ -410,7 +431,7 @@ class Seed {
       }
       if (url === MODEL_URL) {
         if (!side) fetchCheck(null);
-        const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, context: body.context });
+        const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, settings: body.settings ?? null, context: body.context });
         return new Response(rt.encodeJson(response), { status: HTTP_OK });
       }
       throw new Error(`unexpected fetch of ${url}`);
@@ -432,6 +453,15 @@ class Seed {
       },
       async sleep(turn, seq, untilMs) {
         return seed.sleep(turn, seq, untilMs);
+      },
+      async hold(turn, seq, untilMs) {
+        return seed.sleep(turn, seq, untilMs, "hold");
+      },
+      async recover(request) {
+        return seed.recover(request);
+      },
+      async jobs(turn, open) {
+        return seed.jobs(turn, open);
       },
       async observe(event) {
         seed.cells.observe(event);
@@ -637,7 +667,7 @@ class SimWorkflow {
       this.lastInbox = { entry: log[index], live: false };
       return log[index].deliveries;
     }
-    if (!live) return [];
+    if (!live) return null;
     if (index < log.length) throw differ(`workflow step ${index} on replay`, log[index].name, name);
     this.stepIndex += 1;
     const entry = { name, output: { lines: [] }, deliveries: this.seed.inbox(turn) };
@@ -666,6 +696,17 @@ class SimWorkflow {
     this.seed.hook(point);
   }
 
+  async jobs(turn, step, open) {
+    const key = `${turn}:${this.stepIndex}`;
+    if (this.stepIndex < this.state.log.length) {
+      const asked = this.state.jobsAsked.get(key);
+      return asked === undefined ? null : { lost: asked, live: false };
+    }
+    const lost = open.length === 0 ? [] : this.seed.jobs(turn, open);
+    this.state.jobsAsked.set(key, lost);
+    return { lost, live: true };
+  }
+
   async step(name, input) {
     const index = this.stepIndex;
     this.stepIndex += 1;
@@ -681,7 +722,15 @@ class SimWorkflow {
     const context = {
       get attempt() {
         const event = seed.cursor.next("attempt", `step ${index} attempt ${attempts}`);
-        same("step attempt", event.answer, BigInt(attempts));
+        same("step attempt retried", event.answer > 1n, attempts > 1);
+        return attempts;
+      },
+      get attemptQuiet() {
+        return attempts;
+      },
+      stepAttempt(attempted) {
+        const event = seed.cursor.next("attempt", `step ${index} attempt ${attempts}`);
+        same("step attempt retried", event.answer > 1n, attempts > 1 || attempted);
         return attempts;
       },
       async nestedAttempt(turn, seq, nested) {
@@ -713,7 +762,7 @@ class SimWorkflow {
     };
     const output = await harness.runStep(input, context);
     if (input.kind === "run" && output.notDue === true) this.notDueLive = true;
-    if (input.kind === "run" && output.wait === undefined && output.suspended === undefined && output.notDue === undefined) {
+    if (input.kind === "run" && output.wait === undefined && output.suspended === undefined && output.notDue === undefined && output.ran === undefined) {
       this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
       this.seed.checks.flushed([...this.state.lines(), ...output.lines]);
       const request = rt.decodeJson(input.request);
@@ -762,6 +811,7 @@ async function vercelSeed(seed) {
     requests: [],
     log: [],
     attempts: new Map(),
+    jobsAsked: new Map(),
     host: seed.host(() => {}),
     lines() {
       return this.log.flatMap((entry) => entry.output.lines);
@@ -793,7 +843,7 @@ async function vercelSeed(seed) {
 }
 
 const seeds = parseTrace(values.trace);
-const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0 };
+const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0, recovers: 0, jobs: 0 };
 const engineTotals = { cells: 0, steps: 0, unparsed: 0 };
 const started = performance.now();
 for (const traced of seeds) {
@@ -820,7 +870,7 @@ for (const traced of seeds) {
     process.exit(1);
   }
   totals.seeds += 1;
-  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits", "sleeps", "resumes", "sides"]) totals[key] += seed.stats[key];
+  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits", "sleeps", "resumes", "sides", "recovers", "jobs"]) totals[key] += seed.stats[key];
 }
 const elapsed = Math.round(performance.now() - started);
-console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""}${totals.sides > 0 ? ` side_questions=${totals.sides}` : ""} ms=${elapsed}`);
+console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""}${totals.sides > 0 ? ` side_questions=${totals.sides}` : ""}${totals.recovers + totals.jobs > 0 ? ` recovers=${totals.recovers} jobs_asked=${totals.jobs}` : ""} ms=${elapsed}`);

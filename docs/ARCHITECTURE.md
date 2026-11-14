@@ -181,7 +181,7 @@ does (`native_call_admitted`); both refusals are recorded failures.
 `let`, assignment to a state field, `push list value`, `clear list`,
 `keep list last n` (drop all but the last `n` entries), `keep list last n after e` (the same, with `e` put first: a summary replacing what it summarizes), `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
-`for call in list parallel` (one `match dispatch(call)` whose arms only push, bind and assign:
+`for call in list parallel` (one `match dispatch(call)` whose arms, each call's lane, run after the batch:
 every call record is appended before any dispatch, none and idempotent calls
 run at once, an external call alone after one flush of the batch, results in
 list order),
@@ -235,6 +235,25 @@ writes nothing. The count is a hidden state field the checker maintains, so the
 prover bounds it and replay restores it. The Durable Object arms its alarm at
 the due, the Vercel session races its next prompt against a workflow
 `sleep()`, and `hl-agent --keep-warm` stays alive for the refreshes.
+
+### Effects in flight
+
+Three declarations concern effects still running or left open by a crash.
+`interruptible by cancel, steer` on a tool or the model lets those events
+abandon it: an effect that would start while one is pending does not run, and
+one during which one is recorded is abandoned, an external call reported
+`unknown` by a `recovery` record, a none or idempotent call `failed` with
+nanocode's interrupted text, the model's attempt `interrupted`. `jobs at most
+N` lets the host turn a call into a background job (`{"job": text}`, keyed
+`T.S`), whose notices arrive as a third event, `on job(notice: text) bound
+N`, read with `take jobs`; `hold(c)` waits for them as a wait does, and a
+turn over a session with open jobs asks the host which still run and records
+the others lost. `external recoverable` makes recovery ask the host about an
+open call before reporting it `unknown`: a reply becomes its result, not
+dispatched runs it under the same sequence number, and the recovery record
+lists each answer (`replied`, `not_dispatched`). LANGUAGE.md's Effects in
+flight has the semantics, the prover's added arms and the simulator's
+`interrupt_honored`, `job_once` and `job_reported`.
 
 ### Code mode
 

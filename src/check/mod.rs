@@ -13,12 +13,13 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 14] = [
+pub const BUILTIN_FUNCTIONS: [&str; 15] = [
     "dispatch",
     "now",
     "random",
     "len",
     "wait",
+    "hold",
     "suspend",
     "contains",
     "before",
@@ -39,6 +40,9 @@ pub const EVENT_RESUME: &str = "resume";
 pub const STEER_PARAMETER: &str = "message";
 pub const CANCELLED_READ: &str = "cancelled";
 pub const STEERS_READ: &str = "steers";
+pub const EVENT_JOB: &str = "job";
+pub const JOB_PARAMETER: &str = "notice";
+pub const JOBS_READ: &str = "jobs";
 
 pub struct Globals {
     constants: BTreeMap<String, ir::ConstId>,
@@ -107,12 +111,14 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     constants(source, &mut program, &mut globals, &mut values)?;
     model(source, &mut program, &mut globals, &mut values)?;
     sums(source, &mut program, &mut globals)?;
+    settings(source, &mut program, &globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
     spawns(source, &mut program, &mut globals, &mut values, load)?;
     codes(source, &mut program, &mut globals, &mut values)?;
     listings(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
     events(source, &mut program, &globals, &mut values)?;
+    interrupts(source, &mut program)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
     globals.hooks = hooks(&expanded, &program, &globals)?;
     let expanded = session_end(&expanded).unwrap_or(expanded);
@@ -224,6 +230,15 @@ fn model(
             }
             modes.push(mode.text.clone());
         }
+        if let (Some(event), None) = (model.interrupts.first(), &model.window) {
+            return error(
+                event.at,
+                format!(
+                    "model '{}' is interruptible only with a window: its interrupted call is the 'interrupted' variant of attempt",
+                    model.name.text
+                ),
+            );
+        }
         globals.model = Some(model.name.text.clone());
         program.model = Some(ir::Model {
             name: model.name.text.clone(),
@@ -231,8 +246,59 @@ fn model(
             reply: ir::Reply::Builtin,
             window: None,
             modes,
+            settings: Vec::new(),
+            interrupts: ir::Interrupts::default(),
         });
     }
+    Ok(())
+}
+
+fn settings(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let Some(model) = source.items.iter().find_map(|item| match item {
+        Item::Model(model) => Some(model),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let fields = params(program, globals, &model.settings)?;
+    let mut settings = Vec::with_capacity(fields.len());
+    for ((field, param), default) in fields
+        .into_iter()
+        .zip(&model.settings)
+        .zip(&model.setting_defaults)
+    {
+        if field.ty != Type::Bool && program.text_enum(&field.ty).is_none() {
+            return error(
+                param.ty.at(),
+                format!(
+                    "setting '{}' of model '{}' is {}: a model setting is a bool or a text enum, the values a host can send",
+                    field.name,
+                    model.name.text,
+                    field.ty.name(program)
+                ),
+            );
+        }
+        let Some(default) = default else {
+            return error(
+                param.name.at,
+                format!(
+                    "setting '{}' of model '{}' needs a default, which a call that leaves it out sends",
+                    field.name, model.name.text
+                ),
+            );
+        };
+        let default = default_value(program, globals, &field, default)?;
+        settings.push(ir::Setting {
+            name: field.name,
+            ty: field.ty,
+            default,
+        });
+    }
+    program
+        .model
+        .as_mut()
+        .expect("the model pass declared the model")
+        .settings = settings;
     Ok(())
 }
 
@@ -302,6 +368,13 @@ fn builtin_sums(program: &ir::Program, declared: Option<&str>) -> Vec<Sum> {
     vec![call, reply, entry]
 }
 
+fn declared_interruptible(source: &ast::Program) -> bool {
+    source.items.iter().any(|item| match item {
+        Item::Model(model) => !model.interrupts.is_empty(),
+        _ => false,
+    })
+}
+
 fn declared_window(source: &ast::Program) -> Option<&ast::Name> {
     source.items.iter().find_map(|item| match item {
         Item::Model(model) => model.window.as_ref(),
@@ -336,7 +409,7 @@ fn window(source: &ast::Program, program: &mut ir::Program, globals: &mut Global
     program.sums.push(Sum {
         name: ir::ATTEMPT_TYPE.to_owned(),
         kind: SumKind::Tagged,
-        variants: ir::attempt_variants(stop),
+        variants: ir::attempt_variants(stop, declared_interruptible(source)),
     });
     globals.types.insert(ir::STOP_TYPE.to_owned(), stop);
     globals.types.insert(ir::ATTEMPT_TYPE.to_owned(), attempt);
@@ -857,6 +930,19 @@ fn tools(
                 }
             },
         };
+        if let Some(at) = tool.recoverable
+            && tool.effect != crate::effect::EffectClass::External
+        {
+            return error(
+                at,
+                format!(
+                    "tool '{}' has effect {}: only an external tool is recoverable, since only its outcome can be unknown",
+                    tool.name.text,
+                    tool.effect.name()
+                ),
+            );
+        }
+        let jobs = tool_jobs(source, program, globals, tool, &returns)?;
         globals
             .tools
             .insert(tool.name.text.clone(), program.tools.len());
@@ -867,9 +953,119 @@ fn tools(
             returns,
             attaches,
             effect: tool.effect,
+            recoverable: tool.recoverable.is_some(),
+            interrupts: ir::Interrupts::default(),
+            jobs,
             spawn: None,
             finds: None,
         });
+    }
+    Ok(())
+}
+
+fn tool_jobs(
+    source: &ast::Program,
+    program: &ir::Program,
+    globals: &Globals,
+    tool: &ast::Tool,
+    returns: &Type,
+) -> Checked<Option<Bound>> {
+    let Some(name) = &tool.jobs else {
+        return Ok(None);
+    };
+    if tool.effect != crate::effect::EffectClass::External || *returns != Type::Text {
+        return error(
+            name.at,
+            format!(
+                "tool '{}' keeps jobs running: it must be external and return text, the message the model reads when its call becomes a job",
+                tool.name.text
+            ),
+        );
+    }
+    let noted = source
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Event(event) if event.name.text == EVENT_JOB));
+    if !noted {
+        return error(
+            name.at,
+            format!(
+                "tool '{}' keeps jobs running, so the harness needs 'on {EVENT_JOB}({JOB_PARAMETER}: text) bound N' to take their notices",
+                tool.name.text
+            ),
+        );
+    }
+    let jobs = bound(
+        program,
+        globals,
+        name,
+        "the jobs a tool keeps running at once",
+    )?;
+    if jobs.value == 0 {
+        return error(
+            name.at,
+            format!(
+                "tool '{}' keeps at most 0 jobs: drop 'jobs at most'",
+                tool.name.text
+            ),
+        );
+    }
+    Ok(Some(jobs))
+}
+
+fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
+    for item in &source.items {
+        let (names, owner) = match item {
+            Item::Tool(tool) => (&tool.interrupts, Some(tool.name.text.as_str())),
+            Item::Model(model) => (&model.interrupts, None),
+            _ => continue,
+        };
+        let mut interrupts = ir::Interrupts::default();
+        for name in names {
+            let (declared, slot) = match name.text.as_str() {
+                EVENT_CANCEL => (program.events.cancel, &mut interrupts.cancel),
+                EVENT_STEER => (program.events.steers.is_some(), &mut interrupts.steer),
+                other => {
+                    return error(
+                        name.at,
+                        format!(
+                            "'{other}' cannot interrupt an effect: write 'interruptible by {EVENT_CANCEL}', '{EVENT_STEER}' or both"
+                        ),
+                    );
+                }
+            };
+            if !declared {
+                return error(
+                    name.at,
+                    format!(
+                        "'interruptible by {}' needs 'on {}' on the harness",
+                        name.text, name.text
+                    ),
+                );
+            }
+            if *slot {
+                return error(
+                    name.at,
+                    format!("'{}' interrupts the effect twice", name.text),
+                );
+            }
+            *slot = true;
+        }
+        match owner {
+            Some(tool) => {
+                let (id, _) = program
+                    .tool(tool)
+                    .expect("tools are checked before interrupts");
+                program.tools[id].interrupts = interrupts;
+            }
+            None => {
+                program
+                    .model
+                    .as_mut()
+                    .expect("the model is checked before interrupts")
+                    .interrupts = interrupts;
+            }
+        }
     }
     Ok(())
 }
@@ -937,6 +1133,9 @@ fn spawns(
             returns: Type::Text,
             attaches: None,
             effect: crate::effect::EffectClass::External,
+            recoverable: false,
+            interrupts: ir::Interrupts::default(),
+            jobs: None,
             finds: None,
             spawn: Some(ir::Spawn {
                 file: spawn.file.text.clone(),
@@ -1729,12 +1928,13 @@ fn events(
         match event.name.text.as_str() {
             EVENT_CANCEL => cancel_event(event, program, values)?,
             EVENT_STEER => steer_event(event, program, globals)?,
+            EVENT_JOB => job_event(event, program, globals)?,
             EVENT_RESUME => resume_event(event, program)?,
             other => {
                 return error(
                     event.name.at,
                     format!(
-                        "unknown event '{other}': a harness takes '{EVENT_CANCEL}', '{EVENT_STEER}' and '{EVENT_RESUME}'"
+                        "unknown event '{other}': a harness takes '{EVENT_CANCEL}', '{EVENT_STEER}', '{EVENT_JOB}' and '{EVENT_RESUME}'"
                     ),
                 );
             }
@@ -1831,6 +2031,32 @@ fn steer_event(event: &ast::Event, program: &mut ir::Program, globals: &Globals)
     }
     let bound = bound(program, globals, limit, "the steers one turn records")?;
     program.events.steers = Some(bound);
+    Ok(())
+}
+
+fn job_event(event: &ast::Event, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let shape = format!("on {EVENT_JOB}({JOB_PARAMETER}: text) bound N");
+    let one_text = match event.params.as_slice() {
+        [param] => {
+            param.name.text == JOB_PARAMETER
+                && matches!(&param.ty, TypeExpr::Named(name) if name.text == "text")
+        }
+        _ => false,
+    };
+    let Some(limit) = event.bound.as_ref().filter(|_| one_text) else {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_JOB}' carries one text: write '{shape}'"),
+        );
+    };
+    if program.events.jobs.is_some() {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_JOB}' is already declared"),
+        );
+    }
+    let bound = bound(program, globals, limit, "the job notices one turn records")?;
+    program.events.jobs = Some(bound);
     Ok(())
 }
 

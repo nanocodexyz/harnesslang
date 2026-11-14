@@ -1,0 +1,10 @@
+harness worker
+
+tool Read(path: text) -> text effect none recoverable
+
+on run(path: text) -> text {
+  match Read(path) {
+    ok(body) => { return body }
+    failed(error) => { return error }
+  }
+}

@@ -63,6 +63,7 @@ fn writes_state(statements: &[ir::Stmt]) -> bool {
         | ir::Stmt::Push { .. }
         | ir::Stmt::Shrink { .. }
         | ir::Stmt::KeepBlobs { .. }
+        | ir::Stmt::Rewrite { .. }
         | ir::Stmt::Take { .. }
         | ir::Stmt::Parallel(_) => true,
         ir::Stmt::If {
@@ -147,7 +148,7 @@ fn reply(program: &Program) {
         );
         assert_eq!(
             program.sums[window.attempt].variants,
-            ir::attempt_variants(window.stop),
+            ir::attempt_variants(window.stop, model.interrupts.any()),
             "an attempt is ok with reply, stop and usage, or one of the model errors"
         );
         assert!(window.tokens.value > 0, "a context window holds tokens");
@@ -223,7 +224,7 @@ fn handler(program: &Program, handler: &Handler) {
                 "a suspend needs the resume event"
             );
         }
-        if let SiteKind::Wait(constant) = site.kind {
+        if let Some(constant) = site.kind.sleeps() {
             assert!(
                 constant < program.constants.len(),
                 "a wait names a constant"
@@ -329,6 +330,25 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 );
                 expr(program, handler, value);
             }
+            Stmt::Rewrite { field, arms } => {
+                let Type::List { element, .. } = &program.state[*field].ty else {
+                    panic!("a rewrite targets a list field");
+                };
+                let variants = element
+                    .variants(program)
+                    .expect("a rewrite maps a list of a sum");
+                assert_eq!(
+                    arms.len(),
+                    variants.len(),
+                    "a rewrite has one arm per variant"
+                );
+                for (index, arm) in arms.iter().enumerate() {
+                    assert_eq!(arm.variant, index, "rewrite arms are in variant order");
+                    if let ir::Rewritten::Into(entry) = &arm.entry {
+                        expr(program, handler, entry);
+                    }
+                }
+            }
             Stmt::KeepBlobs { field, .. } => {
                 assert!(
                     program.blobs.is_some(),
@@ -399,8 +419,8 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     "a parallel for dispatches its own item"
                 );
                 assert!(
-                    parallel_pushes_only(&parallel.body),
-                    "the body of a parallel for only pushes after its dispatch"
+                    lane_valid(handler, &parallel.body),
+                    "the arms of a parallel for neither return, dispatch, read events nor nest a batch"
                 );
                 expr(program, handler, &parallel.list);
                 block(
@@ -420,12 +440,12 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 used[*site] += 1;
                 args.iter().for_each(|arg| expr(program, handler, arg));
             }
-            Stmt::Take { result } => {
+            Stmt::Take { result, taken } => {
                 assert!(*result < handler.locals.len(), "a take binds a local");
                 assert_eq!(
                     Some(&handler.locals[*result].ty),
-                    program.events.steers_type().as_ref(),
-                    "a take binds a list of the declared steers"
+                    program.events.taken_type(*taken).as_ref(),
+                    "a take binds a list of the declared events"
                 );
             }
             Stmt::Finish { value } => expr(program, handler, value),
@@ -433,14 +453,16 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
     }
 }
 
-fn parallel_pushes_only(statements: &[Stmt]) -> bool {
+fn lane_valid(handler: &Handler, statements: &[Stmt]) -> bool {
     statements.iter().all(|statement| match statement {
-        Stmt::Push { .. } | Stmt::Let { .. } | Stmt::Assign { .. } => true,
+        Stmt::Finish { .. } | Stmt::Parallel(_) | Stmt::Take { .. } => false,
+        Stmt::Effect { site, .. } => handler.sites[*site].kind != SiteKind::Dispatch,
         Stmt::If {
             then, otherwise, ..
-        } => parallel_pushes_only(then) && parallel_pushes_only(otherwise),
-        Stmt::Match { arms, .. } => arms.iter().all(|arm| parallel_pushes_only(&arm.body)),
-        _ => false,
+        } => lane_valid(handler, then) && lane_valid(handler, otherwise),
+        Stmt::Match { arms, .. } => arms.iter().all(|arm| lane_valid(handler, &arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => lane_valid(handler, body),
+        _ => true,
     })
 }
 

@@ -29,6 +29,19 @@ const CONTEXT_TYPE = { list: { sum: SUM_ENTRY } };
 const POINT_BEFORE_FLUSH = { point: "before_flush" };
 const POINT_AFTER_FLUSH = { point: "after_flush" };
 const POINT_BEFORE_ACKNOWLEDGE = { point: "before_acknowledge" };
+const INTERRUPTED_REASON = "Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.";
+const ATTEMPT_INTERRUPTED = "interrupted";
+const JOB_KEY = "job";
+const JOB_DONE = "done";
+const JOB_KEY_FIELD = "key";
+const JOB_NOTICE = "notice";
+const LOST_PREFIX = "lost:";
+const RECOVERY_REPLIED = "replied";
+const RECOVERY_UNDISPATCHED = "not_dispatched";
+const NO_INTERRUPTS = { cancel: false, steer: false };
+const INTERRUPTED_BY = "interrupted_by";
+const RECOVERED_REPLY = "reply";
+const RECOVERED_ANSWERS = ["not_dispatched", "unknown"];
 
 class Panic extends Error {}
 
@@ -65,8 +78,9 @@ function fractionFrom(digits) {
 }
 
 class StepEnd {
-  constructor(records) {
+  constructor(records, position) {
     this.records = records;
+    this.position = position;
   }
 }
 
@@ -536,14 +550,19 @@ function recordJson(record) {
         ["turn", turn],
       ];
       if (record.mode !== null) entries.push([MODEL_MODE, record.mode]);
+      if (record.settings !== null) entries.push([MODEL_SETTINGS, record.settings]);
       return object([["model", object(entries)]]);
     }
-    case "recovery":
-      return object([["recovery", object([
+    case "recovery": {
+      const entries = [
         ["attempt", BigInt(record.attempt)],
         ["turn", turn],
         ["unknown", recoveryIds(record)],
-      ])]]);
+      ];
+      if (record.replied.length > 0) entries.push([RECOVERY_REPLIED, record.replied.map((seq) => callId(record.turn, seq))]);
+      if (record.undispatched.length > 0) entries.push([RECOVERY_UNDISPATCHED, record.undispatched.map((seq) => callId(record.turn, seq))]);
+      return object([["recovery", object(entries)]]);
+    }
     case "nested_call":
       return object([["call", object([
         ["call_id", nestedId(record.turn, record.seq, record.nested)],
@@ -596,7 +615,27 @@ function recordJson(record) {
 function deliveryJson(delivery) {
   const fields = [["id", delivery.id]];
   if (delivery.kind === "steer") fields.push(["message", delivery.message]);
+  if (delivery.kind === "job") fields.push([JOB_DONE, delivery.done], [JOB_KEY_FIELD, delivery.key], [JOB_NOTICE, delivery.notice]);
   return object([[delivery.kind, object(fields)]]);
+}
+
+function lostNotice(key) {
+  return `<task-notification>\n<task-id>${key}</task-id>\n<status>killed</status>\n<summary>Background command ${key} was still running when the harness that started it ended, so its completion was never reported and never will be. It was most likely stopped then; its outcome is unknown.</summary>\n</task-notification>\nRead its output file and check its effects before you rely on it or run it again.`;
+}
+
+function lostDelivery(key) {
+  return { id: LOST_PREFIX + key, kind: "job", key, notice: lostNotice(key), done: true };
+}
+
+function jobStarted(output) {
+  if (output.tag !== "ok" || !isObject(output.value)) return null;
+  const keys = Object.keys(output.value);
+  if (keys.length !== 1 || keys[0] !== JOB_KEY || typeof output.value[JOB_KEY] !== "string") return null;
+  return output.value[JOB_KEY];
+}
+
+function interruptedResponse() {
+  return object([[ATTEMPT_INTERRUPTED, []]]);
 }
 
 function deliveryFrom(json) {
@@ -611,6 +650,10 @@ function deliveryFrom(json) {
   if (pair[0] === "steer") {
     fields.exact(["id", "message"]);
     return { id, kind: "steer", message: fields.text("message") };
+  }
+  if (pair[0] === "job") {
+    fields.exact([JOB_DONE, "id", JOB_KEY_FIELD, JOB_NOTICE]);
+    return { id, kind: "job", key: fields.text(JOB_KEY_FIELD), notice: fields.text(JOB_NOTICE), done: fields.boolean(JOB_DONE) };
   }
   throw new DecodeError(`unknown event '${pair[0]}'`);
 }
@@ -721,16 +764,21 @@ function recordFrom(json) {
       return { kind: "nested_result", turn, seq, nested, output };
     }
     case "model": {
-      let mode = null;
-      if (Object.hasOwn(fields.map, MODEL_MODE)) {
-        fields.exact(["call_id", MODEL_MODE, "response", "seq", "turn"]);
-        mode = fields.text(MODEL_MODE);
-      } else {
-        fields.exact(["call_id", "response", "seq", "turn"]);
+      const keys = ["call_id", "response", "seq", "turn"];
+      const moded = Object.hasOwn(fields.map, MODEL_MODE);
+      const set = Object.hasOwn(fields.map, MODEL_SETTINGS);
+      if (moded) keys.push(MODEL_MODE);
+      if (set) keys.push(MODEL_SETTINGS);
+      fields.exact(keys);
+      const mode = moded ? fields.text(MODEL_MODE) : null;
+      let settings = null;
+      if (set) {
+        settings = fields.get(MODEL_SETTINGS);
+        if (!isObject(settings)) throw new DecodeError(`a model record's ${MODEL_SETTINGS} is not an object`);
       }
       const [turn, seq, nested] = fields.call();
       if (nested !== null) throw new DecodeError("a model reply has a nested call id");
-      return { kind: "model", turn, seq, response: fields.get("response"), mode };
+      return { kind: "model", turn, seq, response: fields.get("response"), mode, settings };
     }
     case "cell":
       return cellFrom(fields);
@@ -775,8 +823,24 @@ function cellFrom(fields) {
   return { kind: "cell", cell, fresh, session, update };
 }
 
+function attestedSeqs(fields, key, turn) {
+  if (!Object.hasOwn(fields.map, key)) return [];
+  const items = fields.map[key];
+  if (!Array.isArray(items)) throw new DecodeError(`recovery record's ${key} is not a list`);
+  const seqs = items.map((item) => {
+    if (typeof item !== "string") throw new DecodeError(`recovery's ${key} lists a call id that is not text`);
+    const [callTurn, seq] = parseCallId(item);
+    if (callTurn !== turn) throw new DecodeError(`recovery's ${key} lists a call of another turn`);
+    return seq;
+  });
+  if (seqs.length === 0 || seqs.some((seq, index) => index > 0 && seqs[index - 1] >= seq)) {
+    throw new DecodeError(`recovery's ${key} lists no calls, or lists them out of order`);
+  }
+  return seqs;
+}
+
 function recoveryFrom(fields) {
-  fields.exact(["attempt", "turn", "unknown"]);
+  fields.exact(["attempt", "turn", "unknown", ...[RECOVERY_UNDISPATCHED, RECOVERY_REPLIED].filter((key) => Object.hasOwn(fields.map, key))].sort());
   const turn = fields.turn();
   const items = fields.get("unknown");
   if (!Array.isArray(items)) throw new DecodeError("recovery record's unknown is not a list");
@@ -795,7 +859,7 @@ function recoveryFrom(fields) {
     || nested.some((pair, index) => index > 0 && nested[index - 1][0] === pair[0] && nested[index - 1][1] === pair[1])) {
     throw new DecodeError("recovery lists a call twice");
   }
-  const record = { kind: "recovery", turn, attempt: fields.number("attempt"), unknown, nested };
+  const record = { kind: "recovery", turn, attempt: fields.number("attempt"), unknown, nested, replied: attestedSeqs(fields, RECOVERY_REPLIED, turn), undispatched: attestedSeqs(fields, RECOVERY_UNDISPATCHED, turn) };
   if (!jsonEqual(recoveryIds(record), items)) throw new DecodeError("recovery lists its calls out of order");
   return record;
 }
@@ -859,7 +923,7 @@ function decodeLines(text, checksum) {
 }
 
 function newTurnLog(handler, args) {
-  return { handler, arguments: args, sites: new Map(), lastSeq: 0, attempts: 0, finished: null, nested: new Map(), lastNested: new Map(), cells: new Map(), events: [] };
+  return { handler, arguments: args, sites: new Map(), lastSeq: 0, attempts: 0, finished: null, nested: new Map(), lastNested: new Map(), cells: new Map(), events: [], undispatched: new Set() };
 }
 
 function runningLog(session, turn, what) {
@@ -878,7 +942,7 @@ function nextSite(log, turn, seq, site) {
 }
 
 function fold(records) {
-  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map(), lastEvent: 0 };
+  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map(), lastEvent: 0, jobs: new Map() };
   for (const record of records) {
     applyRecord(session, record);
   }
@@ -908,11 +972,12 @@ function applyRecord(session, record) {
       if (site === undefined) throw new Corrupt(`result for seq ${record.seq} of turn ${record.turn}, which has no call`);
       if (site.kind !== "open") throw new Corrupt(`result for seq ${record.seq} of turn ${record.turn}, which is not open`);
       log.sites.set(record.seq, { kind: "done", call: site.call, output: record.output });
+      if (jobStarted(record.output) !== null) session.jobs.set(spawnKey(record.turn, record.seq), site.call.tool);
       return;
     }
     case "model": {
       const log = runningLog(session, record.turn, "a model reply");
-      nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response, mode: record.mode });
+      nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response, mode: record.mode, settings: record.settings });
       return;
     }
     case "nested_call":
@@ -962,12 +1027,65 @@ function applyEvent(session, record) {
   }
   const cancelled = log.events.some((event) => event.delivery.kind === "cancel");
   if (cancelled && record.delivery.kind === "cancel") throw new Corrupt(`turn ${record.turn} records a second cancel`);
+  if (record.delivery.kind === "job") {
+    if (!session.jobs.has(record.delivery.key)) throw new Corrupt(`event '${record.delivery.id}' of turn ${record.turn} notes job ${record.delivery.key}, which is not running`);
+    if (record.delivery.done) session.jobs.delete(record.delivery.key);
+  }
   log.events.push({ at: record.at, delivery: record.delivery });
   session.lastEvent = record.seq;
 }
 
 function eventsTaken() {
-  return PROGRAM.events.cancel || PROGRAM.events.steers !== null;
+  return PROGRAM.events.cancel || PROGRAM.events.steers !== null || PROGRAM.events.jobs !== null;
+}
+
+function spawnKey(turn, seq) {
+  return String(turn) + SPAWN_KEY_SEPARATOR + String(seq);
+}
+
+function interruptsOf(kind, tool) {
+  if (kind === "model") return PROGRAM.model === null ? NO_INTERRUPTS : PROGRAM.model.interrupts;
+  if (kind !== "tool" && kind !== "dispatch") return NO_INTERRUPTS;
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  return declared === undefined ? NO_INTERRUPTS : declared.interrupts;
+}
+
+function anyInterrupt(interrupts) {
+  return interrupts.cancel || interrupts.steer;
+}
+
+function interruptedBy(delivery, by) {
+  return (delivery.kind === "cancel" && by.cancel) || (delivery.kind === "steer" && by.steer);
+}
+
+function interruptNames(by) {
+  return [...(by.cancel ? ["cancel"] : []), ...(by.steer ? ["steer"] : [])];
+}
+
+function recoverable(tool) {
+  return PROGRAM.tools.some((candidate) => candidate.name === tool && candidate.recoverable);
+}
+
+function jobsOf(tool) {
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  return declared === undefined ? null : declared.jobs;
+}
+
+function jobRecorded(sites, turn, key) {
+  const prefix = String(turn) + SPAWN_KEY_SEPARATOR;
+  if (!key.startsWith(prefix) || !/^[0-9]+$/.test(key.slice(prefix.length))) return true;
+  return sites.get(Number(key.slice(prefix.length)))?.kind === "done";
+}
+
+function recoveredFrom(json) {
+  if (typeof json === "string" && RECOVERED_ANSWERS.includes(json)) return { kind: json };
+  const pair = tagged(json);
+  if (pair !== null && pair[0] === RECOVERED_REPLY) return { kind: "reply", output: outputFrom(pair[1]) };
+  throw new DecodeError(`a recovery answer is not_dispatched, unknown or a reply, found ${encodeJson(json)}`);
+}
+
+function jobCount(events) {
+  return events.filter((event) => event.delivery.kind === "job").length;
 }
 
 function eventSeq(turn, index) {
@@ -980,11 +1098,16 @@ function steerCount(events) {
   return events.filter((event) => event.delivery.kind === "steer").length;
 }
 
-function admitEvent(turn, events, position, delivery) {
+function admitEvent(turn, events, position, delivery, jobs) {
   if (events.some((event) => event.delivery.id === delivery.id)) return { answer: "duplicate", record: null };
   if (delivery.kind === "cancel") {
     if (!PROGRAM.events.cancel) return { answer: "undeclared", record: null };
     if (events.some((event) => event.delivery.kind === "cancel")) return { answer: "duplicate", record: null };
+  } else if (delivery.kind === "job") {
+    if (PROGRAM.events.jobs === null) return { answer: "undeclared", record: null };
+    if (!jobs.open.has(delivery.key)) return { answer: "duplicate", record: null };
+    if (!jobs.recorded(delivery.key)) return { answer: "full", record: null };
+    if (BigInt(jobCount(events)) >= PROGRAM.events.jobs.max) return { answer: "full", record: null };
   } else {
     if (PROGRAM.events.steers === null) return { answer: "undeclared", record: null };
     if (BigInt(steerCount(events)) >= PROGRAM.events.steers.max) return { answer: "full", record: null };
@@ -992,6 +1115,7 @@ function admitEvent(turn, events, position, delivery) {
   const seq = eventSeq(turn, events.length + 1);
   if (seq === null) return { answer: "full", record: null };
   events.push({ at: position, delivery });
+  if (delivery.kind === "job" && delivery.done) jobs.open.delete(delivery.key);
   return { answer: "recorded", record: { kind: "event", turn, seq, at: position, delivery } };
 }
 
@@ -1001,8 +1125,12 @@ function closingAnswers(events, arrived) {
 
 function checkEvents(turn, log) {
   for (const event of log.events) {
-    const taken = event.delivery.kind === "cancel" ? PROGRAM.events.cancel : PROGRAM.events.steers !== null;
+    const taken = event.delivery.kind === "cancel" ? PROGRAM.events.cancel : event.delivery.kind === "job" ? PROGRAM.events.jobs !== null : PROGRAM.events.steers !== null;
     if (!taken) throw new Corrupt(`turn ${turn} records a ${event.delivery.kind} event, which the program does not take`);
+  }
+  const jobs = jobCount(log.events);
+  if (PROGRAM.events.jobs !== null && BigInt(jobs) > PROGRAM.events.jobs.max) {
+    throw new Corrupt(`turn ${turn} records ${jobs} job notices, more than ${PROGRAM.events.jobs.name} (${PROGRAM.events.jobs.max})`);
   }
   const steers = steerCount(log.events);
   if (PROGRAM.events.steers !== null && BigInt(steers) > PROGRAM.events.steers.max) {
@@ -1017,6 +1145,13 @@ function applyRecovery(session, record) {
     throw new Corrupt(`recovery attempt ${record.attempt} of turn ${record.turn} follows attempt ${log.attempts}`);
   }
   log.attempts = record.attempt;
+  for (const seq of record.undispatched) log.undispatched.add(seq);
+  for (const seq of [...record.replied, ...record.undispatched]) {
+    const site = log.sites.get(seq);
+    if (site === undefined || site.kind !== "open" || !mayBeUnknown(site.call.effect) || record.unknown.includes(seq)) {
+      throw new Corrupt(`recovery attests seq ${seq} of turn ${record.turn}, which is not an open external call`);
+    }
+  }
   for (const seq of record.unknown) {
     const site = log.sites.get(seq);
     if (site === undefined) throw new Corrupt(`recovery of seq ${seq} of turn ${record.turn}, which has no call`);
@@ -1237,6 +1372,7 @@ function dispatchClass(tool) {
 }
 
 const MODEL_MODE = "mode";
+const MODEL_SETTINGS = "settings";
 
 function inputDefaults(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);

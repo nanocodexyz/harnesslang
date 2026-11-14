@@ -371,7 +371,7 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
         | SiteKind::Random
         | SiteKind::Suspend
         | SiteKind::Deny => Ok(plain(EFFECT_RECORDS)),
-        SiteKind::Wait(constant) => {
+        SiteKind::Wait(constant) | SiteKind::Hold(constant) => {
             let mut waited = plain(EFFECT_RECORDS);
             waited[3] = Cost::of(program.constants[constant].value);
             Ok(waited)
@@ -399,6 +399,7 @@ fn statement_cost(
         | Stmt::Push { .. }
         | Stmt::Take { .. }
         | Stmt::KeepBlobs { .. }
+        | Stmt::Rewrite { .. }
         | Stmt::Shrink { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {

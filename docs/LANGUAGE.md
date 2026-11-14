@@ -494,11 +494,11 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `sessions` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `drop` `end` `finds` `fn` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `rewrite` `runs` `session` `sessions` `settings` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `join` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
+Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `hold` `join` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -544,13 +544,15 @@ item       = const | type | tool | listing | code | spawn | model | state | inva
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
-tool       = "tool" name tool_params "->" type_expr "effect" effect_class [ "finds" name ] ;
+tool       = "tool" name tool_params "->" type_expr "effect" effect_class [ "recoverable" ] [ interrupts ]
+             [ "jobs" "at" "most" bound ] [ "finds" name ] ;
+interrupts = "interruptible" "by" name { "," name } ;
 tool_params = "(" [ tool_param { "," tool_param } ] ")" ;
 tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
 listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] ;
+model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -576,6 +578,7 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | "clear" name
            | "keep" name "last" expr [ "after" expr ]
            | "keep" name "blobs" "last" bound
+           | "rewrite" name "{" { name [ "(" name { "," name } ")" ] "=>" ( expr | "drop" ) [ "," ] } "}"
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
@@ -595,7 +598,7 @@ product    = postfix { "*" postfix } ;
 postfix    = primary { "." name } ;
 primary    = number | text | "true" | "false" | "(" expr ")"
            | "take" name
-           | name [ "(" [ expr { "," expr } ] ")" [ "at" "most" bound ] [ "mode" name ] ] ;
+           | name [ "(" [ expr { "," expr } ] ")" [ "at" "most" bound ] [ "mode" name ] [ "with" "{" name ":" expr { "," name ":" expr } "}" ] ] ;
 ```
 
 Notes the grammar leaves out:
@@ -1173,6 +1176,132 @@ on ping() -> u64 {
 }
 ```
 
+`settings(name: type = default, ...)` after the modes declares the model's request
+settings, typed values the host sends with every request, such as Claude's
+reasoning effort or a fast mode. A setting is a `bool` or a [text
+enum](#text-enums), and its default is a literal of that type.
+`name(context) with {setting: e, ...}` gives a call's settings, where `e` is
+any expression of the setting's type, a state field among them, so a
+harness keeps its settings as session state that ordinary handlers change
+between turns and every call follows. A setting the call leaves out takes its
+default. Settings combine with a mode: `think(context) mode text_only with
+{effort: chosen}`. Every request of a model with settings carries all of
+them, the `model` record journals them as `"settings"`, an object of every
+setting's value (a model without settings writes none, so other journals are
+unchanged), and a replay whose call computes other settings than the record
+names diverges, as a different mode does. Settings add no call site, so the
+worst case is unchanged. The simulator records the settings of every request;
+`settings_sent` requires that each journaled reply answered a request sent with
+the settings its record names, and `settings_dropped` sends the request without
+them:
+
+```hl docs/snippets/settings.hl
+harness tuned
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type effort = "low" | "medium" | "high"
+type outcome = answered(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply settings(effort: effort = "high", fast: bool = false)
+
+state {
+  context: list<entry, context_max>
+  chosen: effort
+  quick: bool
+}
+
+on configure(level: effort, fast: bool) -> u64 {
+  chosen = level
+  quick = fast
+  return 0
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 2 <= context_max
+{
+  push context user(question)
+  match think(context) with {effort: chosen, fast: quick} {
+    failed(error) => { return stopped(error) }
+    ok(reply) => {
+      match reply {
+        answer(words) => {
+          push context user(words)
+          return answered(words)
+        }
+        calls(_) => {
+          match think(context) {
+            failed(error) => { return stopped(error) }
+            ok(forced) => {
+              match forced {
+                answer(words) => { return answered(words) }
+                calls(_) => { return stopped("the model kept calling tools") }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`configure` is a turn of its own that only assigns state, and the simulator
+draws it between the turns that ask, with random arguments, so the settings
+change from turn to turn. The first call of `ask` sends the stored settings and
+the second leaves them out, so it sends the defaults; a state field of a text
+enum starts at its first value, `"low"`:
+
+```console
+$ hl run docs/snippets/settings.hl --handler ask --arg hi --seed 0 | grep -o '"settings":{[^}]*}'
+"settings":{"effort":"low","fast":false}
+"settings":{"effort":"high","fast":false}
+$ hl sim --target vercel --seeds 0..200 --twice --mutation settings_dropped docs/snippets/settings.hl | head -n 1
+FAIL invariant=settings_sent seed=0 target=vercel profile=errors mutation=settings_dropped: model call 1/1 is journaled with settings {"effort":"low","fast":false} but its reply answered a request sent with no settings
+$ hl check docs/snippets/errors/setting-type.hl
+docs/snippets/errors/setting-type.hl:5:46: error: setting 'budget' of model 'think' is u64: a model setting is a bool or a text enum, the values a host can send
+$ hl check docs/snippets/errors/undeclared-setting.hl
+docs/snippets/errors/undeclared-setting.hl:15:36: error: model 'think' declares no setting 'speed'
+```
+
+```hl docs/snippets/errors/setting-type.hl
+harness notes
+
+const calls_max: u64 = 4
+
+model think calls calls_max settings(budget: u64 = calls_max)
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/undeclared-setting.hl
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+type effort = "low" | "high"
+
+model think calls calls_max settings(effort: effort = "high")
+
+state {
+  context: list<entry, context_max>
+}
+
+on ping() -> u64 {
+  let reply = think(context) with {speed: true}
+  return 1
+}
+```
+
+`examples/claude_code.hl` keeps Claude's reasoning effort so, as nanocode's
+session settings do: `set_effort` stores it between turns, each `prompt` turn
+pins the effort in effect when it starts, and its requests and prompt cache
+refreshes send the pinned value, which hl-agent puts in the request's
+`output_config`.
+
 ### state
 
 `state { name: type ... }` is the session's state, the only thing that lives
@@ -1263,7 +1392,8 @@ its key and a text answer; [Suspend and resume](#suspend-and-resume) has the
 details. The events below reach a running turn.
 
 `on cancel` and `on steer(message: text) bound N` declare the events a running
-turn takes from outside it: a person cancelling the turn, or steering it with
+turn takes from outside it (a third, `on job(notice: text) bound N`, takes
+the notices of background jobs: [Effects in flight](#effects-in-flight)): a person cancelling the turn, or steering it with
 one more message, as nanocode's turn inbox delivers them. A handler reads them
 with two expressions, and a read writes no record and takes no sequence
 number:
@@ -3180,6 +3310,144 @@ $ hl check examples/invalid/with_outside_model.hl
 examples/invalid/with_outside_model.hl:13:23: error: 'with' adds an entry to the context a model call reads: it is only a model call's argument
 ```
 
+### rewrite
+
+`rewrite field { pattern => entry, pattern => drop, ... }` maps the entries a state
+list already holds, in place: each entry whose variant an arm names becomes
+that arm's entry, or leaves the list when the arm says `drop`, and an entry no
+arm names stays as it is. The list is a list of a sum, such as a context of
+`entry`; a pattern names one variant and binds its fields, as a `match` arm does;
+each variant is named at most once; and an arm's entry is an expression of the
+list's element type that runs no effect, so a rewrite is a pure, total map
+over the list. It repairs a history a provider refused, as nanocode's Claude
+loop drops the blocks the provider rejected and retries once:
+
+```hl docs/snippets/rewrite.hl
+harness repair
+
+const rounds_max: u64 = 3
+const calls_max: u64 = 4
+const context_max: u64 = 64
+const result_tokens_max: u64 = 16
+
+type outcome = answered(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  repaired: bool
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  repaired = false
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => {
+        if repaired { return stopped(error) }
+        repaired = true
+        rewrite context {
+          result(call, output) => result(call, truncate_middle(output, result_tokens_max))
+          unknown(_) => drop
+        }
+      }
+      ok(reply) => {
+        push context assistant(reply)
+        match reply {
+          answer(words) => { return answered(words) }
+          calls(requested) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return stopped("the turn ran out of rounds")
+}
+```
+
+A rewrite is not an effect: it writes no record and adds nothing to the worst
+case, and what it leaves is in the checkpoint written with the turn's status,
+as for `clear` and `keep`. The prover leaves the list's length unchanged when no
+arm drops, and otherwise sets it to at most what it was, so pushes that follow
+are proved against what the rewrite can leave; it checks every arm's entry as
+it checks a pushed value, and the cuts of `truncate_middle` in an arm count among
+the program's cuts. `hl sim` checks it with `checkpoint_compacted`: every
+checkpoint holds the state that replaying the journal reaches, and
+`rewrite_live_only` rewrites only when the turn runs past its journal, not when a
+rerun replays it:
+
+```console
+$ hl check docs/snippets/rewrite.hl | grep shrink
+  proved handler ask: shrink: rewrite context leaves at most 59 of 64 entries and drops at most 59
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/rewrite.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1736 crashes=1232 power_losses=98 torn_writes=150 takeovers=0 fenced=0 dispatches=1210 unknown=320
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation rewrite_live_only docs/snippets/rewrite.hl | head -n 1
+FAIL invariant=checkpoint_compacted seed=4 target=native-jsonl profile=async mutation=rewrite_live_only: checkpoint 2 holds 10 entries of context where replaying the journal to turn 2 gives 9 entries of context: a checkpoint must hold the lists as clear and keep left them
+$ hl check docs/snippets/errors/rewrite-effect.hl
+docs/snippets/errors/rewrite-effect.hl:16:20: error: a rewrite arm runs no effect: it only maps an entry to another
+$ hl check docs/snippets/errors/rewrite-list.hl
+docs/snippets/errors/rewrite-list.hl:10:3: error: 'rewrite lines' maps the entries of a list of a sum, found a list of text
+```
+
+```hl docs/snippets/errors/rewrite-effect.hl
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+tool summarize(text: text) -> text effect none
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on shorten() -> u64 {
+  rewrite context {
+    user(words) => user(summarize(words))
+  }
+  return len(context)
+}
+```
+
+```hl docs/snippets/errors/rewrite-list.hl
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on shorten() -> u64 {
+  rewrite lines {
+    line(words) => drop
+  }
+  return len(lines)
+}
+```
+
+`examples/claude_code.hl` repairs its history so when the provider rejects a
+request over the tool changes appended to it (an error naming
+`tool_addition`, `tool_removal` or `tool_reference`): once per turn it drops the
+listing notices from the context and asks again, as nanocode strips the
+appended tool-change blocks and sends the current tool list instead.
+
 ## Effects
 
 An effect is anything whose result the program cannot recompute: a tool, the
@@ -3296,8 +3564,9 @@ points above, never less.
 
 `for call in requested parallel { ... }` runs a reply's tool calls at once, as
 nanocode runs the calls of a reply that its tools allow in parallel. Its body
-is one `match dispatch(call)` on the item it walks, whose arms push, bind
-and assign values that run no effect and read no events. A turn runs it in three steps:
+is one `match dispatch(call)` on the item it walks, whose arms are each
+call's lane: they may run effects of their own, but neither return, dispatch
+again nor read events. A turn runs it in three steps:
 
 1. In list order, each call takes the next sequence number and appends its
    `call` record (a call the journal already holds is replayed). Nothing is
@@ -3308,7 +3577,8 @@ and assign values that run no effect and read no events. A turn runs it in three
    external call runs, one flush makes every `call` record of the batch
    durable (durability point 1, once for the whole batch). Each group's
    results are appended in list order, whatever order they completed in.
-3. The arms run in list order with each call's result.
+3. The arms run in list order with each call's result, and each arm's effects
+   take the sequence numbers after the batch's, one call after another.
 
 So the journal holds, per sequence number, exactly what the plain `for`
 writes: the same `call` and `result` records, the calls of a batch
@@ -3387,8 +3657,8 @@ ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1444
 ```
 
 Anything else in the body is an error: a statement before the match, a match
-on something other than the item's dispatch, an arm that does more than push, bind and assign,
-and a parallel for inside another.
+on something other than the item's dispatch, an arm that returns, and a
+parallel for inside another.
 
 ```console
 $ hl check docs/snippets/errors/parallel-statement.hl
@@ -3396,7 +3666,7 @@ docs/snippets/errors/parallel-statement.hl:11:9: error: the body of a parallel f
 $ hl check docs/snippets/errors/parallel-dispatch.hl
 docs/snippets/errors/parallel-dispatch.hl:13:11: error: a parallel for matches on dispatch(call), the item it walks
 $ hl check docs/snippets/errors/parallel-arm.hl
-docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for only push, bind and assign: found a return
+docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for run for every call of the batch, so they cannot return: found a return
 $ hl check docs/snippets/errors/parallel-nested.hl
 docs/snippets/errors/parallel-nested.hl:11:5: error: a parallel for cannot be nested in another parallel for
 ```
@@ -3487,6 +3757,99 @@ on run(requested: list<call, calls_max>) -> u64 {
   }
   return 0
 }
+```
+
+#### Lanes
+
+An arm of a parallel for is its call's lane, as nanocode's Claude loop runs
+each `durable_tool` of a batch through `hooked_handler`, the handler with its
+PostToolUse hook. The lane runs after the batch, in list order, with its
+call's result, and its effects are ordinary effects: each takes the next
+sequence number after the batch's, appends its own records and follows its
+own durability point, so a crash in a lane leaves the batch's results
+journaled and the lane's call as a crash leaves any call. An `after tool`
+hook runs in each lane, before the match takes an arm; a `before tool` hook
+would decide each call before the batch dispatches it, which a lane cannot
+do, so a harness with one is refused a parallel for:
+
+```hl docs/snippets/lanes.hl
+harness lanes
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+const summary_tokens_max: u64 = 32
+
+tool Read(path: text) -> text effect none
+tool Grep(pattern: text) -> text effect none
+tool Bash(command: text) -> text effect external
+tool scan(output: text) -> bool effect none
+tool summarize(output: text) -> text effect idempotent
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+after tool(c: call, outcome: maybe<text>) {
+  match outcome {
+    ok(output) => {
+      match scan(output) {
+        ok(flagged) => {
+          if flagged { deny("the output of " ++ c.tool ++ " was flagged and withheld") }
+        }
+        failed(_) => {}
+      }
+    }
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on ask(question: text) -> text
+  requires len(context) + 2 + calls_max <= context_max
+{
+  push context user(question)
+  let reply = think(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => {
+      for call in requested parallel {
+        match dispatch(call) {
+          ok(output) => {
+            match summarize(output) {
+              ok(short) => { push context result(call, truncate_middle(short, summary_tokens_max)) }
+              failed(error) => { push context error(call, error) }
+            }
+          }
+          failed(error) => { push context error(call, error) }
+          unknown => { push context unknown(call) }
+        }
+      }
+      return "ran the calls"
+    }
+  }
+}
+```
+
+The worst case is the plain loop's, lanes included, since every effect keeps
+its own record. The simulator runs the lanes' effects with crashes between
+them on every target; a parallel for whose lanes run effects numbers them
+after the batch where the plain loop interleaves them with its calls, so its
+journal is not compared with the plain loop's (`sequential_equal` holds for
+batches whose arms only push). `lane_seq_shared` numbers the lanes' effects
+from the batch's first sequence number instead, and the rerun's replay
+diverges:
+
+```console
+$ hl check docs/snippets/lanes.hl | grep -E 'handler ask: worst|proved for'
+  handler ask: worst case 13 effects, 28 journal records, 13 outbound requests
+docs/snippets/lanes.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+$ hl sim --target cloudflare --seeds 0..200 docs/snippets/lanes.hl
+ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1612 crashes=1108 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=1962 unknown=133
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation lane_seq_shared docs/snippets/lanes.hl | head -n 1
+FAIL invariant=liveness seed=0 target=native-jsonl profile=errors mutation=lane_seq_shared: turn 2: replay of turn 2 diverged at seq 2: the journal records spawn_agent, the program runs 'scan' (2/2)
 ```
 
 ### Waits
@@ -4345,6 +4708,343 @@ clock check and are caught as `backend_equal` on every target.
 allows for it (`cache_refreshes`: a five-minute cache write costs 1.25 times
 an input token and a read 0.1 times, so twelve reads cost what one more write
 would).
+
+### Effects in flight
+
+Three of nanocode's behaviours concern an effect that is still running, or
+that a crash left open: a cancel or steer that abandons a running tool or
+model stream (nanocode's `agent/durable.rs`, the select on cancel around
+`call_tool`), a Bash call that keeps running as a background job and reports
+later (`claude_bash.rs`), and a host that answers for a call a crash left
+open (`recover_tool`). `docs/snippets/in_flight.hl` uses all three:
+
+```hl docs/snippets/in_flight.hl
+harness worker
+
+const rounds_max: u64 = 6
+const calls_max: u64 = 3
+const entries_max: u64 = 512
+const steers_max: u64 = 2
+const notices_max: u64 = 4
+const jobs_max: u64 = 2
+const window_tokens: u64 = 100000
+const hold_ms: u64 = 30000
+
+type outcome = done(text) | stopped(text) | exhausted
+
+tool Bash(command: text) -> text effect external recoverable interruptible by cancel, steer jobs at most jobs_max
+tool Read(path: text) -> text effect none interruptible by cancel
+tool Write(path: text, body: text) -> text effect external recoverable
+
+model infer calls calls_max window window_tokens interruptible by cancel
+
+on cancel
+on steer(message: text) bound steers_max
+on job(notice: text) bound notices_max
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + rounds_max * (3 + calls_max + steers_max + notices_max) <= entries_max
+{
+  push context user(input)
+  loop round below rounds_max {
+    for steer in take steers { push context user(steer) }
+    for notice in take jobs { push context user(notice) }
+    match infer(context) {
+      ok(reply, _, _, _, _, _) => {
+        push context assistant(reply)
+        match reply {
+          answer(words) => {
+            let woke = hold(hold_ms)
+            if cancelled { return stopped("cancelled") }
+            return done(words)
+          }
+          calls(requested) => {
+            for call in requested parallel {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+            if cancelled {
+              push context user("[Request interrupted by user]")
+              return stopped("cancelled during tools")
+            }
+          }
+        }
+      }
+      interrupted => {
+        push context user("[Request interrupted by user]")
+        return stopped("cancelled during the model")
+      }
+      throttled(error, _) => { return stopped(error) }
+      transient(error, _) => { return stopped(error) }
+      rejected(error) => { return stopped(error) }
+    }
+  }
+  return exhausted
+}
+```
+
+#### Interruptible effects
+
+`interruptible by cancel`, `interruptible by steer` or both, after a tool's
+effect class or at the end of a `model` declaration, lets those events, which
+the harness must declare, abandon the effect:
+
+- An interruptible effect that would start while an event that interrupts it
+  is recorded in the turn (a cancel, or a steer `take steers` has not yet
+  taken) does not run: a tool's result is `failed` with nanocode's
+  `StartedToolCall::REASON` text ("Tool execution interrupted; outcome
+  unknown. Do not assume it did not run or automatically repeat it."), and
+  the model's is `interrupted`.
+- An interruptible effect during which such an event is recorded (at its own
+  sequence number) is abandoned: the host is told to stop it, an external
+  tool's call is reported `unknown` with a `recovery` record, as nanocode
+  reports a tool that raced the cancel, a none or idempotent tool's result is
+  `failed` with the same text, and the model's is `interrupted`.
+- An interruptible model needs a `window`: its `attempt` gains a fifth
+  variant, `interrupted`, recorded as `{"interrupted":[]}`, so the match on
+  it must say what the turn does then. nanocode pushes
+  "[Request interrupted by user]" and ends the turn (`agent.rs`,
+  `INTERRUPTED_BY_USER`), which the snippet's arm writes.
+- In a parallel for, the calls of the group during which the event arrived are
+  abandoned and the later groups' calls do not start, as nanocode answers the
+  calls of an interrupted batch.
+
+Replay needs nothing new: the result records already hold the outcome, and the
+event records hold when each event arrived. On Vercel, whose events enter at
+step boundaries, an interruptible effect runs in a step of its own: it flushes
+before it runs and takes the events that arrived while it ran before its
+result is recorded. A cell's nested calls are not interruptible.
+
+#### Jobs
+
+`jobs at most N` on an external tool that returns text lets the host turn a
+call into a background job, as nanocode's Bash does with `run_in_background` or
+past its timeout: the host answers at once with `{"job": text}`, the program
+reads `ok(text)`, and the job is open under the key `T.S` of the call's turn
+and sequence number until a notice closes it. The request says whether the
+tool has room (fewer than `N` of its jobs open in the session); a job started
+without room is recorded as the call's failure. The harness takes the
+notices with `on job(notice: text) bound M`, a third event beside cancel and
+steer: `{"job":{"done":D,"id":I,"key":K,"notice":T}}`, recorded with `at`
+like a steer, at most `M` per turn, and read with `take jobs`, the notices
+recorded since the last `take jobs`, oldest first. A notice with `done`
+false (nanocode's stall notice, a job waiting on interactive input) leaves the
+job open; one with `done` true closes it. Notices that arrive while no turn
+runs wait for the next turn, which records them during its first effects.
+
+`hold(c)` or `hold(e) at most c` is the turn hold nanocode runs before a turn
+ends: a wait, flushed first and journaled like one, that returns the clock as
+soon as a job notice or a cancel arrives, or at its deadline, and at once
+when no job is open. It records the events that woke it at its own sequence
+number. `examples/claude_code.hl` holds for up to nanocode's
+`DEFAULT_BACKGROUND_TIMEOUT_MS` (600 s, after which a moved job is stopped) when
+it would answer, and goes on with another round when notices arrived.
+
+A job does not outlive its host's process on every target, so whenever a turn
+runs over a session with open jobs the runtime asks the host which of them
+still run, and for each it no longer runs records nanocode's "killed, outcome
+unknown" notice (`id` `lost:K`, `done` true) at the next effect, as
+nanocode does at load.
+
+#### Recovery hooks
+
+`effect external recoverable` marks a tool whose host can tell what became
+of a call a crash left open: a `Write` can compare the file's digest with the
+one it would write, a `Bash` host can look for the job it started. Before
+reporting such a call `unknown`, recovery asks the host with the call's own
+turn, sequence number and input, and records its answer in the `recovery`
+record:
+
+| The host answers | Recorded | The turn sees |
+| --- | --- | --- |
+| the real reply | `"replied":["T/S"]`, then the call's `result` | the reply, `ok` or `failed` |
+| not dispatched | `"not_dispatched":["T/S"]` | the call runs now, under the same sequence number and call record |
+| unknown | `"unknown":["T/S"]` | `unknown` |
+
+The two lists appear only when they hold a call, so other journals are
+unchanged. On Vercel the step that finds a reopened external call past its
+first attempt asks the host the same way. On Postgres an answer of not
+dispatched claims the call for the asking owner's epoch, and the host refuses
+the call from an owner of an older epoch, which would otherwise run it a
+second time after a takeover.
+
+#### Hosts
+
+In the generated Rust, `Host` gains `recover(request)` (answering `Recovered::Reply`,
+`NotDispatched` or `Unknown`), `jobs(turn, open)` (the keys of open jobs it no longer
+runs) and `hold(turn, seq, until_ms)`, each with a default for a host that uses
+none of them; `ToolRequest` carries `job` (the tool has room for a job) and,
+with `ModelRequest`, `interrupts`, the events that abandon it, which the host
+watches in its inbox. Job notices reach the runtime through `Host::inbox` as
+`Inbound::Job`. The Durable Object and the Vercel binding ask the host at
+`HL_RECOVER_URL` and `HL_JOBS_URL`, abort an interruptible request's `fetch`
+with an `AbortSignal` when a cancel or steer is posted, and take job notices
+posted without a turn. `hl-agent` uses all of it for `examples/claude_code.hl`:
+a Bash call past its timeout keeps running as a job and is held for at the end
+of the turn, `run_in_background` jobs end with the turn as nanocode's
+`ENDS_WITH_TURN` binding says, and recovery answers from the file a `Write`
+or `Edit` left, or from the receipts `Bash` writes before and after it runs.
+
+#### What the checker, prover and simulator do
+
+The checker refuses each declaration that cannot hold:
+
+```console
+$ hl check docs/snippets/errors/interrupt-undeclared.hl
+docs/snippets/errors/interrupt-undeclared.hl:3:67: error: 'interruptible by cancel' needs 'on cancel' on the harness
+$ hl check docs/snippets/errors/model-interrupt-window.hl
+docs/snippets/errors/model-interrupt-window.hl:5:46: error: model 'infer' is interruptible only with a window: its interrupted call is the 'interrupted' variant of attempt
+$ hl check docs/snippets/errors/recoverable-none.hl
+docs/snippets/errors/recoverable-none.hl:3:43: error: tool 'Read' has effect none: only an external tool is recoverable, since only its outcome can be unknown
+$ hl check docs/snippets/errors/jobs-no-event.hl
+docs/snippets/errors/jobs-no-event.hl:5:63: error: tool 'Bash' keeps jobs running, so the harness needs 'on job(notice: text) bound N' to take their notices
+$ hl check docs/snippets/errors/hold-no-jobs.hl
+docs/snippets/errors/hold-no-jobs.hl:6:14: error: 'hold' waits for job notices, so it needs 'on job(notice: text) bound N' on the harness
+```
+
+```hl docs/snippets/errors/interrupt-undeclared.hl
+harness worker
+
+tool Bash(command: text) -> text effect external interruptible by cancel
+
+on run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}
+```
+
+```hl docs/snippets/errors/model-interrupt-window.hl
+harness worker
+
+const calls_max: u64 = 4
+
+model infer calls calls_max interruptible by cancel
+
+on cancel
+
+on run() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/recoverable-none.hl
+harness worker
+
+tool Read(path: text) -> text effect none recoverable
+
+on run(path: text) -> text {
+  match Read(path) {
+    ok(body) => { return body }
+    failed(error) => { return error }
+  }
+}
+```
+
+```hl docs/snippets/errors/jobs-no-event.hl
+harness worker
+
+const jobs_max: u64 = 4
+
+tool Bash(command: text) -> text effect external jobs at most jobs_max
+
+on run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}
+```
+
+```hl docs/snippets/errors/hold-no-jobs.hl
+harness worker
+
+const hold_ms: u64 = 1000
+
+on run() -> u64 {
+  let woke = hold(hold_ms)
+  return woke
+}
+```
+
+`hl check` counts job notices beside the steers and the cancel, and a hold's
+milliseconds among the waits:
+
+```console
+$ hl check docs/snippets/in_flight.hl | sed -n 1,8p
+docs/snippets/in_flight.hl: harness worker: 3 tool(s), 1 state field(s), 1 handler(s)
+  handler prompt: worst case 24 effects, 45 journal records, 24 outbound requests
+    effects: round below rounds_max (6) x call below calls_max (3)
+    journal records: round below rounds_max (6) x call below calls_max (3)
+    outbound requests: round below rounds_max (6) x call below calls_max (3)
+    milliseconds of waits: 30000, no loops
+    plus one recovery record per restart
+    plus at most 7 event record(s) per turn (1 cancel, steers_max (2) steer(s), notices_max (4) job notice(s))
+```
+
+The prover adds three arms to every interruptible effect (it finishes, it is
+abandoned while it runs, it never starts) and to a recoverable call reopened
+after a crash (the host's three answers), and proves durability, finishing
+once and the worst case on each. external_once holds unless the host attested
+the call was not dispatched; trusting an `unknown` answer is caught:
+
+```console
+$ hl prove --target native-jsonl --mutation recover_trusts_lost docs/snippets/in_flight.hl 2>&1 | grep -m 1 -o 'external_once: [^;]*'
+external_once: external dispatch(call) runs again after recovery found its call open
+$ hl prove --target vercel --mutation recover_trusts_lost docs/snippets/in_flight.hl 2>&1 | grep -m 1 -o 'external_once: [^;]*'
+external_once: external reopened dispatch(call) runs again on a retried step
+```
+
+The simulator sends cancels and steers that land while effects run, starts jobs
+that stall, finish across turns or die in crashes, and answers recovery
+truthfully (the reply the tool returned, not dispatched when it never ran) or
+`unknown`:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/in_flight.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1903 crashes=1399 power_losses=145 torn_writes=226 takeovers=0 fenced=0 dispatches=760 unknown=222 events=130 sleeps=35 suspensions=0 interrupted=36 recovered=140 not_dispatched=302 recover_unknown=192 jobs=67 job_notices=21 jobs_died=33
+$ hl sim --target server-postgres --seeds 0..200 docs/snippets/in_flight.hl
+ok target=server-postgres mutation=none seeds=0..200 (200 seeds): turns=504 runs=1396 crashes=823 power_losses=0 torn_writes=0 takeovers=115 fenced=69 dispatches=739 unknown=145 events=124 sleeps=36 suspensions=0 interrupted=28 recovered=110 not_dispatched=141 recover_unknown=105 jobs=58 job_notices=23 jobs_died=25
+$ hl sim --target vercel --seeds 0..200 docs/snippets/in_flight.hl
+ok target=vercel mutation=none seeds=0..200 (200 seeds): turns=504 runs=1671 crashes=1167 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=808 unknown=96 events=173 sleeps=31 suspensions=0 interrupted=48 recovered=61 not_dispatched=49 recover_unknown=43 jobs=60 job_notices=24 jobs_died=26
+```
+
+| Invariant | Holds | Planted bug |
+| --- | --- | --- |
+| `interrupt_honored` | an interruptible effect whose outcome is recorded after an event that interrupts it arrived during it, or after a cancel, records an interrupted outcome, and no outcome is interrupted without such an event | `interrupt_ignored` |
+| `external_once` | an abandoned external call is not sent again, and a recovered one runs again only after its host attested it never ran | `interrupt_reruns`, `recover_trusts_lost` |
+| `job_once` | a job is closed at most once, and reported lost only after its host lost it | `job_lost_all` |
+| `job_reported` | a job its host lost is reported lost by the next run that records events | `job_lost_dropped` |
+| `unknown_reported` | a recovered reply is the reply the tool returned | |
+| `wait_until` | a hold sleeps no later than its durable deadline | `wait_oversleeps` |
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation interrupt_ignored docs/snippets/in_flight.hl
+FAIL invariant=interrupt_honored seed=5 target=native-jsonl profile=lying mutation=interrupt_ignored: 1/5 is interruptible by cancel and an event that interrupts it was recorded before its outcome, yet it records a finished outcome
+replay: hl sim --target native-jsonl --seeds 5..6 --mutation interrupt_ignored docs/snippets/in_flight.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation interrupt_reruns docs/snippets/in_flight.hl
+FAIL invariant=external_once seed=28 target=native-jsonl profile=errors mutation=interrupt_reruns: external call 1/4 (Bash) was dispatched 2 times
+replay: hl sim --target native-jsonl --seeds 28..29 --mutation interrupt_reruns docs/snippets/in_flight.hl
+$ hl sim --target vercel --seeds 0..200 --mutation recover_trusts_lost docs/snippets/in_flight.hl
+FAIL invariant=external_once seed=4 target=vercel profile=errors mutation=recover_trusts_lost: external call 1/2 (Write) was dispatched 2 times
+replay: hl sim --target vercel --seeds 4..5 --mutation recover_trusts_lost docs/snippets/in_flight.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation job_lost_all docs/snippets/in_flight.hl
+FAIL invariant=job_once seed=19 target=native-jsonl profile=errors mutation=job_lost_all: job 3.4 is reported lost in turn 3, yet it was still running
+replay: hl sim --target native-jsonl --seeds 19..20 --mutation job_lost_all docs/snippets/in_flight.hl
+$ hl sim --target native-jsonl --seeds 0..100 --mutation job_lost_dropped docs/snippets/in_flight.hl
+FAIL invariant=job_reported seed=29 target=native-jsonl profile=async mutation=job_lost_dropped: job 1.4 died in a crash and its host reported it lost, yet a later run took events without recording its lost notice
+replay: hl sim --target native-jsonl --seeds 29..30 --mutation job_lost_dropped docs/snippets/in_flight.hl
+```
 
 ### Traps
 

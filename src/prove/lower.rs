@@ -2,12 +2,13 @@ use std::collections::BTreeSet;
 
 use crate::effect::EffectClass;
 use crate::ir::{
-    BinaryOp, CodeId, Expr, Handler, Kept, Parallel, Program, SiteClass, SiteId, SiteKind, Stmt,
-    ToolId,
+    BinaryOp, CodeId, Expr, Handler, Interrupts, Kept, Parallel, Program, SiteClass, SiteId,
+    SiteKind, Stmt, ToolId,
 };
 use crate::prove::Mutation;
 use crate::prove::text::Names;
 use crate::run::mutation::Mutation as RunMutation;
+use crate::target::inbound::{self, Drain};
 use crate::target::{self, AtomicUnit, Flush, Recovery};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,6 +71,8 @@ pub enum Entry {
     Replayed,
     Reopened(Slot),
     ReopenedInBatch(SiteId),
+    Attested(Slot),
+    AttestedInBatch(SiteId),
     Has(SiteId),
     FirstAttempt(Slot),
     LaterAttempt(Slot),
@@ -230,6 +233,7 @@ fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
             | Stmt::KeepBlobs { .. }
+            | Stmt::Rewrite { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. }
             | Stmt::Finish { .. } => {}
@@ -349,6 +353,7 @@ impl Lowering<'_> {
                 | Stmt::Take { .. }
                 | Stmt::Shrink { .. }
                 | Stmt::KeepBlobs { .. }
+                | Stmt::Rewrite { .. }
                 | Stmt::Finish { .. } => {}
             }
         }
@@ -430,6 +435,13 @@ impl Lowering<'_> {
                 self.arithmetic_trap(value, ops);
             }
             Stmt::Take { .. } | Stmt::KeepBlobs { .. } => {}
+            Stmt::Rewrite { arms, .. } => {
+                for arm in arms {
+                    if let crate::ir::Rewritten::Into(entry) = &arm.entry {
+                        self.arithmetic_trap(entry, ops);
+                    }
+                }
+            }
             Stmt::Push { field, value } => {
                 self.arithmetic_trap(value, ops);
                 let name = &self.program.state[*field].name;
@@ -506,7 +518,7 @@ impl Lowering<'_> {
             Stmt::Parallel(parallel) => self.parallel(parallel, ops),
             Stmt::Effect { site, args, .. } => {
                 args.iter().for_each(|arg| self.arithmetic_trap(arg, ops));
-                if let SiteKind::Wait(cap) = self.handler.sites[*site].kind {
+                if let Some(cap) = self.handler.sites[*site].kind.sleeps() {
                     let cap = &self.program.constants[cap].name;
                     ops.push(self.trap(format!("a wait past {cap}")));
                 }
@@ -602,6 +614,21 @@ impl Lowering<'_> {
                     what: what.to_owned(),
                 }],
             ));
+            if self.recoverable(Slot::Site(site)) {
+                let external = self.batched(site, Batched::External);
+                arms.push(arm(
+                    format!("the host attests {what} was not dispatched, so it runs in the batch"),
+                    Entry::AttestedInBatch(external),
+                    Vec::new(),
+                ));
+                if self.run_mutation() == RunMutation::RecoverTrustsLost {
+                    arms.push(arm(
+                        format!("the host answers that {what}'s outcome is unknown, yet it runs in the batch"),
+                        Entry::ReopenedInBatch(external),
+                        Vec::new(),
+                    ));
+                }
+            }
         }
         arms.push(arm(
             format!("{what} replayed from its recorded result"),
@@ -615,16 +642,39 @@ impl Lowering<'_> {
         let gate = self.model.gate_before_outbound && self.mutation != Mutation::DropFlush;
         let other = self.batched(site, Batched::Other);
         let mut group = Vec::new();
+        let interrupts = self.batch_interrupts(EffectClass::None);
+        let interrupts = Interrupts {
+            cancel: interrupts.cancel || self.batch_interrupts(EffectClass::Idempotent).cancel,
+            steer: interrupts.steer || self.batch_interrupts(EffectClass::Idempotent).steer,
+        };
         if gate {
             group.push(Op::Flush(Point::OutputGate));
+        } else if self.flushes_to_interrupt(interrupts) && self.mutation != Mutation::DropFlush {
+            group.push(Op::Flush(Point::BeforeExternal));
         }
-        group.push(Op::Run {
-            slot: Slot::Site(other),
-            class: EffectClass::None,
-            outbound: true,
-            what: format!("{what} in a group of none and idempotent calls"),
-        });
-        group.push(Op::Append(Record::BatchResult(other)));
+        let ran = vec![
+            Op::Run {
+                slot: Slot::Site(other),
+                class: EffectClass::None,
+                outbound: true,
+                what: format!("{what} in a group of none and idempotent calls"),
+            },
+            Op::Append(Record::BatchResult(other)),
+        ];
+        if interrupts.any() {
+            group.push(Op::Choice(vec![
+                arm(format!("a group of {what} runs"), Entry::Plain, ran),
+                arm(
+                    format!(
+                        "a group of {what} does not start: an event that interrupts it is pending"
+                    ),
+                    Entry::Plain,
+                    vec![Op::Append(Record::BatchResult(other))],
+                ),
+            ]));
+        } else {
+            group.extend(ran);
+        }
         let mut arms = vec![arm(
             format!("a group of {what} with effect none or idempotent runs at once"),
             Entry::Has(other),
@@ -660,16 +710,30 @@ impl Lowering<'_> {
                 arm(
                     format!("reopened {what} reads attempt 2 or later"),
                     Entry::LaterAttempt(Slot::Site(reopened)),
-                    vec![
-                        Op::Append(Record::Recovery),
-                        Op::Flush(Point::Recovery),
-                        Op::Yield {
-                            slot: Slot::Site(reopened),
-                            class: EffectClass::External,
-                            seen: Seen::Unknown,
-                            what: what.to_owned(),
-                        },
-                    ],
+                    if self.recoverable(Slot::Site(site)) {
+                        let mut ops = vec![Op::Append(Record::Recovery)];
+                        let mut rerun = vec![Op::Flush(Point::Recovery)];
+                        rerun.extend(self.batch_external(reopened, what, true));
+                        ops.extend(self.recovered(
+                            Slot::Site(reopened),
+                            EffectClass::External,
+                            what,
+                            rerun,
+                        ));
+                        ops.push(Op::Flush(Point::Recovery));
+                        ops
+                    } else {
+                        vec![
+                            Op::Append(Record::Recovery),
+                            Op::Flush(Point::Recovery),
+                            Op::Yield {
+                                slot: Slot::Site(reopened),
+                                class: EffectClass::External,
+                                seen: Seen::Unknown,
+                                what: what.to_owned(),
+                            },
+                        ]
+                    },
                 ),
             ]));
             arms.push(arm(
@@ -707,7 +771,37 @@ impl Lowering<'_> {
         if self.in_step() {
             ops.push(Op::Flush(Point::StepCommit));
         }
-        ops
+        if !self.batch_interrupts(EffectClass::External).any() {
+            return ops;
+        }
+        let interrupted = vec![
+            ops[0].clone(),
+            Op::Append(Record::Recovery),
+            Op::Flush(Point::Recovery),
+            Op::Yield {
+                slot: Slot::Site(site),
+                class: EffectClass::External,
+                seen: Seen::Unknown,
+                what: format!("{label}{what}"),
+            },
+        ];
+        let mut preempted = vec![Op::Append(Record::BatchResult(site))];
+        if self.in_step() {
+            preempted.push(Op::Flush(Point::StepCommit));
+        }
+        vec![Op::Choice(vec![
+            arm(format!("{label}{what} finishes"), Entry::Plain, ops),
+            arm(
+                format!("{label}{what} is interrupted by an event that arrives while it runs"),
+                Entry::Plain,
+                interrupted,
+            ),
+            arm(
+                format!("{label}{what} does not start: an event that interrupts it is pending"),
+                Entry::Plain,
+                preempted,
+            ),
+        ])]
     }
 
     fn dispatch_classes(&self) -> Vec<EffectClass> {
@@ -822,6 +916,137 @@ impl Lowering<'_> {
         vec![Op::Choice(arms)]
     }
 
+    fn interrupts(&self, slot: Slot, class: EffectClass) -> Interrupts {
+        let Slot::Site(site) = slot else {
+            return Interrupts::default();
+        };
+        if site >= self.handler.sites.len() {
+            return Interrupts::default();
+        }
+        match self.handler.sites[site].kind {
+            SiteKind::Model => self.program.interrupts(SiteKind::Model, ""),
+            SiteKind::Tool(tool) => self.program.tools[tool].interrupts,
+            SiteKind::Dispatch => self
+                .program
+                .tools
+                .iter()
+                .filter(|tool| tool.effect == class)
+                .fold(Interrupts::default(), |all, tool| Interrupts {
+                    cancel: all.cancel || tool.interrupts.cancel,
+                    steer: all.steer || tool.interrupts.steer,
+                }),
+            _ => Interrupts::default(),
+        }
+    }
+
+    fn batch_interrupts(&self, class: EffectClass) -> Interrupts {
+        self.program
+            .tools
+            .iter()
+            .filter(|tool| tool.effect == class)
+            .fold(Interrupts::default(), |all, tool| Interrupts {
+                cancel: all.cancel || tool.interrupts.cancel,
+                steer: all.steer || tool.interrupts.steer,
+            })
+    }
+
+    fn recoverable(&self, slot: Slot) -> bool {
+        let Slot::Site(site) = slot else {
+            return false;
+        };
+        if site >= self.handler.sites.len() {
+            return self.program.tools.iter().any(|tool| tool.recoverable);
+        }
+        match self.handler.sites[site].kind {
+            SiteKind::Tool(tool) => self.program.tools[tool].recoverable,
+            SiteKind::Dispatch => self.program.tools.iter().any(|tool| tool.recoverable),
+            _ => false,
+        }
+    }
+
+    fn flushes_to_interrupt(&self, interrupts: Interrupts) -> bool {
+        interrupts.any() && inbound::of(self.model.target).drain != Drain::AfterRun
+    }
+
+    fn interruptible_run(
+        &self,
+        slot: Slot,
+        class: EffectClass,
+        what: &str,
+        finished: Vec<Op>,
+        record: Record,
+        step: bool,
+    ) -> Vec<Op> {
+        let ran = finished[0].clone();
+        let interrupted = if class.may_be_unknown() {
+            vec![
+                ran,
+                Op::Append(Record::Recovery),
+                Op::Flush(Point::Recovery),
+                Op::Yield {
+                    slot,
+                    class,
+                    seen: Seen::Unknown,
+                    what: what.to_owned(),
+                },
+            ]
+        } else {
+            let mut ops = vec![ran, Op::Append(record)];
+            if step {
+                ops.push(Op::Flush(Point::StepCommit));
+            }
+            ops
+        };
+        let mut preempted = vec![Op::Append(record)];
+        if step {
+            preempted.push(Op::Flush(Point::StepCommit));
+        }
+        vec![Op::Choice(vec![
+            arm(format!("{what} finishes"), Entry::Plain, finished),
+            arm(
+                format!("{what} is interrupted by an event that arrives while it runs"),
+                Entry::Plain,
+                interrupted,
+            ),
+            arm(
+                format!("{what} does not start: an event that interrupts it is pending"),
+                Entry::Plain,
+                preempted,
+            ),
+        ])]
+    }
+
+    fn recovered(&self, slot: Slot, class: EffectClass, what: &str, rerun: Vec<Op>) -> Vec<Op> {
+        let trusts = self.run_mutation() == RunMutation::RecoverTrustsLost;
+        let unknown = if trusts {
+            rerun.clone()
+        } else {
+            vec![Op::Yield {
+                slot,
+                class,
+                seen: Seen::Unknown,
+                what: what.to_owned(),
+            }]
+        };
+        vec![Op::Choice(vec![
+            arm(
+                format!("the host answers that {what}'s outcome is unknown"),
+                Entry::Plain,
+                unknown,
+            ),
+            arm(
+                format!("the host answers with {what}'s real reply"),
+                Entry::Plain,
+                vec![Op::Append(Record::Result(slot))],
+            ),
+            arm(
+                format!("the host attests {what} was not dispatched"),
+                Entry::Attested(slot),
+                rerun,
+            ),
+        ])]
+    }
+
     fn is_model(&self, slot: Slot) -> bool {
         matches!(slot, Slot::Site(site) if self.handler.sites[site].kind == SiteKind::Model)
     }
@@ -859,7 +1084,8 @@ impl Lowering<'_> {
     }
 
     fn required(&self, slot: Slot, class: EffectClass) -> bool {
-        self.handler.sites[slot.site()].durability.flushes(class)
+        (self.handler.sites[slot.site()].durability.flushes(class)
+            || self.flushes_to_interrupt(self.interrupts(slot, class)))
             && self.mutation != Mutation::DropFlush
     }
 
@@ -870,7 +1096,7 @@ impl Lowering<'_> {
             Record::Result(slot)
         };
         let ran = match (slot, self.handler.sites[slot.site()].kind) {
-            (Slot::Site(_), SiteKind::Wait(constant)) => Op::Sleep {
+            (Slot::Site(_), SiteKind::Wait(constant) | SiteKind::Hold(constant)) => Op::Sleep {
                 slot,
                 ms: self.program.constants[constant].value,
                 what: what.to_owned(),
@@ -885,6 +1111,9 @@ impl Lowering<'_> {
         let mut ops = vec![ran, Op::Append(record)];
         if step {
             ops.push(Op::Flush(Point::StepCommit));
+        }
+        if self.interrupts(slot, class).any() {
+            return self.interruptible_run(slot, class, what, ops, record, step);
         }
         ops
     }
@@ -970,6 +1199,15 @@ impl Lowering<'_> {
         );
         let retry = if redispatches {
             self.run(slot, class, what, true)
+        } else if self.recoverable(slot) && class.may_be_unknown() {
+            let mut ops = vec![Op::Append(Record::Recovery)];
+            ops.extend(self.recovered(slot, class, what, {
+                let mut rerun = vec![Op::Flush(Point::Recovery)];
+                rerun.extend(self.run(slot, class, what, true));
+                rerun
+            }));
+            ops.push(Op::Flush(Point::Recovery));
+            ops
         } else {
             vec![
                 Op::Append(Record::Recovery),
@@ -1026,6 +1264,9 @@ impl Lowering<'_> {
                 RunMutation::RecoveryReportsFailed,
                 RunMutation::CellRecoveryReportsFailed,
             );
+            if self.recoverable(slot) && !slot.nested() && !failed {
+                return self.recovered(slot, class, what, self.rerun(slot, class, what));
+            }
             return vec![unknown(if failed { Seen::Failed } else { Seen::Unknown })];
         }
         let maybe = slot.nested()

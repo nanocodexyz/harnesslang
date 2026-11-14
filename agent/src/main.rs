@@ -1,5 +1,6 @@
 mod anthropic;
 mod children;
+mod jobs;
 mod json;
 mod stream;
 mod tools;
@@ -179,6 +180,7 @@ struct Agent {
     ledger: Ledger,
     children: Option<children::Children>,
     label: String,
+    jobs: jobs::Jobs,
 }
 
 fn to_value(json: &Json) -> Value {
@@ -204,7 +206,20 @@ impl Agent {
         ]));
     }
 
-    fn run_tool(&mut self, turn: u64, seq: u64, tool: &str, input: &Value) -> tools::Ran {
+    fn run_tool(
+        &mut self,
+        turn: u64,
+        seq: u64,
+        tool: &str,
+        input: &Value,
+        room: bool,
+    ) -> tools::Ran {
+        let receipted = matches!(tool, "Bash" | "Write") && self.children.is_some();
+        if receipted && let Err(error) = self.workspace.dispatching(turn, seq) {
+            return tools::Ran::Failed(format!(
+                "<tool_use_error>receipt: {error}</tool_use_error>"
+            ));
+        }
         self.ledger.append(Value::object([
             ("kind", Value::text("tool")),
             ("at_ms", Value::number(now_ms())),
@@ -222,11 +237,35 @@ impl Agent {
             self.label,
             harness::call_id(turn, seq)
         );
-        match &mut self.children {
+        let ran = match &mut self.children {
             Some(children) if tool == children::SPAWN_TOOL => children.spawn(turn, seq, input),
             Some(children) if tool == children::LIST_TOOL => children.list(input),
             None if tool == children::SUBMIT_TOOL => children::submitted(input),
+            _ if receipted && tool == "Bash" => self.bash(turn, seq, input, room),
             _ => self.workspace.run(tool, input),
+        };
+        if receipted {
+            self.workspace.dispatched(turn, seq, &ran);
+        }
+        ran
+    }
+
+    fn bash(&mut self, turn: u64, seq: u64, input: &Value, room: bool) -> tools::Ran {
+        match self.workspace.bash_job(input, room) {
+            tools::Bashed::Ran(ran) => ran,
+            tools::Bashed::Job(started, message) => {
+                let key = format!("{turn}.{seq}");
+                let held = !input
+                    .get("run_in_background")
+                    .is_some_and(|value| matches!(value, Value::Bool(true)));
+                let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+                self.jobs.start(&key, started, command, held);
+                eprintln!(
+                    "{}: {turn}/{seq} Bash became background job {key}",
+                    self.label
+                );
+                tools::Ran::Job(jobs::started_text(&key, &message, held))
+            }
         }
     }
 
@@ -235,11 +274,12 @@ impl Agent {
         turn: u64,
         seq: u64,
         mode: Option<&str>,
+        effort: Option<&str>,
         context: &Value,
         attached: &anthropic::Attached<'_>,
     ) -> Value {
         let call = harness::call_id(turn, seq);
-        let body = match self.client.body(context, mode, attached) {
+        let body = match self.client.body(context, mode, effort, attached) {
             Ok(body) => body,
             Err(error) => {
                 return anthropic::transient(&format!("context does not render: {error}"), 0);
@@ -296,18 +336,119 @@ fn random() -> u64 {
     u64::from(nanos) ^ now_ms().rotate_left(u32::BITS)
 }
 
+macro_rules! output_of {
+    ($module:ident, $ran:expr) => {
+        match $ran {
+            tools::Ran::Ok(text) => $module::Output::Ok($module::Json::String(text)),
+            tools::Ran::Image(bytes) => $module::Output::Ok($module::host_blob_bytes(&bytes)),
+            tools::Ran::Failed(text) => $module::Output::Failed(text),
+            tools::Ran::Job(text) => $module::Output::Ok($module::Json::Object(
+                std::collections::BTreeMap::from([("job".to_owned(), $module::Json::String(text))]),
+            )),
+        }
+    };
+}
+
 macro_rules! host_for {
     ($module:ident) => {
         impl $module::Host for Agent {
             fn tool(&mut self, request: &$module::ToolRequest<'_>) -> $module::Output {
                 let input =
                     Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
-                match self.run_tool(request.turn, request.seq, request.tool, &input) {
-                    tools::Ran::Ok(text) => $module::Output::Ok($module::Json::String(text)),
-                    tools::Ran::Image(bytes) => {
-                        $module::Output::Ok($module::host_blob_bytes(&bytes))
+                let ran =
+                    self.run_tool(request.turn, request.seq, request.tool, &input, request.job);
+                output_of!($module, ran)
+            }
+
+            fn recover(&mut self, request: &$module::ToolRequest<'_>) -> $module::Recovered {
+                let input =
+                    Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
+                let recovered =
+                    self.workspace
+                        .recover(request.turn, request.seq, request.tool, &input);
+                eprintln!(
+                    "{}: {} recover {}: {}",
+                    self.label,
+                    harness::call_id(request.turn, request.seq),
+                    request.tool,
+                    match &recovered {
+                        tools::Recovered::Reply(_) => "reply",
+                        tools::Recovered::NotDispatched => "not_dispatched",
+                        tools::Recovered::Unknown => "unknown",
                     }
-                    tools::Ran::Failed(text) => $module::Output::Failed(text),
+                );
+                self.ledger.append(Value::object([
+                    ("kind", Value::text("recover")),
+                    ("at_ms", Value::number(now_ms())),
+                    ("tool", Value::text(request.tool)),
+                    (
+                        "call",
+                        Value::text(&harness::call_id(request.turn, request.seq)),
+                    ),
+                    (
+                        "answer",
+                        Value::text(match &recovered {
+                            tools::Recovered::Reply(_) => "reply",
+                            tools::Recovered::NotDispatched => "not_dispatched",
+                            tools::Recovered::Unknown => "unknown",
+                        }),
+                    ),
+                ]));
+                match recovered {
+                    tools::Recovered::Reply(ran) => {
+                        $module::Recovered::Reply(output_of!($module, ran))
+                    }
+                    tools::Recovered::NotDispatched => $module::Recovered::NotDispatched,
+                    tools::Recovered::Unknown => $module::Recovered::Unknown,
+                }
+            }
+
+            fn jobs(&mut self, _turn: u64, open: &[String]) -> Vec<String> {
+                self.jobs.poll();
+                open.iter()
+                    .filter(|key| !self.jobs.knows(key))
+                    .cloned()
+                    .collect()
+            }
+
+            fn hold(&mut self, _turn: u64, _seq: u64, until_ms: u64) -> Result<u64, $module::Stop> {
+                loop {
+                    self.jobs.poll();
+                    let now = now_ms();
+                    if self.jobs.pending() || !self.jobs.holding() || now >= until_ms {
+                        return Ok(now);
+                    }
+                    std::thread::sleep(jobs::JOB_POLL);
+                }
+            }
+
+            fn inbox(&mut self, _turn: u64) -> Vec<$module::Delivery> {
+                self.jobs
+                    .notices()
+                    .into_iter()
+                    .map(|(key, notice)| $module::Delivery {
+                        id: format!("{}{key}", jobs::DONE_PREFIX),
+                        inbound: $module::Inbound::Job($module::JobNotice {
+                            key,
+                            notice,
+                            done: true,
+                        }),
+                    })
+                    .collect()
+            }
+
+            fn answer(
+                &mut self,
+                _turn: u64,
+                _position: u64,
+                answers: &[(String, $module::EventAnswer)],
+            ) {
+                for (id, answer) in answers {
+                    let delivered = matches!(
+                        answer,
+                        $module::EventAnswer::Recorded | $module::EventAnswer::Duplicate
+                    );
+                    self.jobs.answered(id, delivered);
                 }
             }
 
@@ -326,8 +467,18 @@ macro_rules! host_for {
                         )
                     })
                 };
-                let reply =
-                    self.run_model(request.turn, request.seq, request.mode, &context, &attached);
+                let effort = request
+                    .settings
+                    .and_then(|settings| settings.get(anthropic::EFFORT_SETTING))
+                    .and_then(|effort| effort.as_str());
+                let reply = self.run_model(
+                    request.turn,
+                    request.seq,
+                    request.mode,
+                    effort,
+                    &context,
+                    &attached,
+                );
                 $module::Json::decode(&reply.encode())
                     .expect("a reply the host built decodes as harness JSON")
             }
@@ -595,6 +746,7 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
         root: cwd,
         state,
         image_bytes_max: program::blob_bound("Read").map(|(_, bytes)| bytes),
+        left: std::sync::Mutex::new(Vec::new()),
     };
     Ok((
         Agent {
@@ -603,6 +755,7 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
             ledger: Ledger { file },
             children: Some(children),
             label: "hl-agent".to_owned(),
+            jobs: jobs::Jobs::default(),
         },
         instruction,
     ))
@@ -671,6 +824,8 @@ fn main() {
         arguments: Arguments::Prompt(instruction, options.rounds),
     };
     let ran = run_turn(&mut agent, &mut disk, &request);
+    agent.jobs.stop_all();
+    agent.workspace.stop_left();
     if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
         keep_warm(&mut agent, &mut disk, options.keep_warm);
     }

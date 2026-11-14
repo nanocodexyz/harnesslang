@@ -81,9 +81,21 @@ class CloudflareWorld {
   }
 
   async tool(request) {
-    const output = await this.object.host.tool(request);
+    const output = await this.object.interruptible(request.interrupts, (signal) => this.object.host.tool({ ...request, signal }));
     for (const record of this.deferred.splice(0)) this.object.insert(record);
     return output;
+  }
+
+  recover(request) {
+    return this.object.host.recover(request);
+  }
+
+  jobs(turn, open) {
+    return this.object.host.jobs(turn, open);
+  }
+
+  hold(turn, seq, untilMs) {
+    return this.object.held((signal) => this.object.host.hold(turn, seq, untilMs, signal));
   }
 
   async listing(request) {
@@ -99,7 +111,7 @@ class CloudflareWorld {
   }
 
   model(request) {
-    return this.object.host.model(request);
+    return this.object.interruptible(request.interrupts, (signal) => this.object.host.model({ ...request, signal }));
   }
 
   now() {
@@ -169,6 +181,8 @@ class HarnessObject {
       toolsUrl: env.HL_TOOLS_URL,
       listingsUrl: env.HL_LISTINGS_URL,
       modelUrl: env.HL_MODEL_URL,
+      recoverUrl: env.HL_RECOVER_URL,
+      jobsUrl: env.HL_JOBS_URL,
       now: () => Date.now(),
       random: platformRandom,
     });
@@ -184,6 +198,36 @@ class HarnessObject {
     this.runningTurn = null;
     this.waiting = [];
     this.resumes = [];
+    this.interrupting = new Set();
+    this.holding = new Set();
+  }
+
+  async interruptible(by, run) {
+    if (by === undefined || !anyInterrupt(by)) return run(undefined);
+    const entry = { by, controller: new AbortController() };
+    this.interrupting.add(entry);
+    try {
+      return await run(entry.controller.signal);
+    } finally {
+      this.interrupting.delete(entry);
+    }
+  }
+
+  async held(run) {
+    const controller = new AbortController();
+    this.holding.add(controller);
+    try {
+      return await run(controller.signal);
+    } finally {
+      this.holding.delete(controller);
+    }
+  }
+
+  wake(delivery) {
+    for (const entry of this.interrupting) {
+      if (interruptedBy(delivery, entry.by)) entry.controller.abort();
+    }
+    for (const controller of this.holding) controller.abort();
   }
 
   pendingResume(suspension) {
@@ -218,13 +262,17 @@ class HarnessObject {
   }
 
   arrived(turn) {
-    return this.waiting.filter((entry) => entry.turn === turn).map((entry) => entry.delivery);
+    return this.waiting.filter((entry) => entry.turn === turn || entry.delivery.kind === "job").map((entry) => entry.delivery);
   }
 
   answered(turn, answers) {
     for (const [id, answer] of answers) {
       const index = this.waiting.findIndex((entry) => entry.turn === turn && entry.delivery.id === id);
       if (index >= 0) this.waiting.splice(index, 1)[0].resolve(answer);
+      else {
+        const job = this.waiting.findIndex((entry) => entry.delivery.kind === "job" && entry.delivery.id === id);
+        if (job >= 0) this.waiting.splice(job, 1)[0].resolve(answer);
+      }
     }
   }
 
@@ -233,13 +281,14 @@ class HarnessObject {
     let delivery;
     try {
       const body = decodeJson(await request.text());
-      turn = smallNumber(body.turn, "an event's turn");
       delivery = deliveryFrom(body.event);
+      turn = delivery.kind === "job" && body.turn === undefined ? null : smallNumber(body.turn, "an event's turn");
     } catch (error) {
       if (error instanceof DecodeError) return new Response(error.message, { status: HTTP_BAD_REQUEST });
       throw error;
     }
     const answered = (answer) => new Response(encodeJson(object([["answer", answer]])), { headers: { "content-type": "application/json" } });
+    if (delivery.kind === "job") return this.deliverJob(turn, delivery, answered);
     if (this.runningTurn !== turn) {
       const log = fold(this.load()).turns.get(turn);
       if (log === undefined || log.finished === null) return new Response("not_running", { status: HTTP_SERVICE_UNAVAILABLE });
@@ -248,8 +297,22 @@ class HarnessObject {
     if (BigInt(this.waiting.length) >= PROGRAM.events.recordsMax) {
       return new Response(`${this.waiting.length} events already wait for turn ${turn}`, { status: HTTP_SERVICE_UNAVAILABLE });
     }
-    const answer = await new Promise((resolve) => this.waiting.push({ turn, delivery, resolve }));
+    const answer = await new Promise((resolve) => {
+      this.waiting.push({ turn, delivery, resolve });
+      this.wake(delivery);
+    });
     if (answer === "not_running") return new Response(answer, { status: HTTP_SERVICE_UNAVAILABLE });
+    return answered(answer);
+  }
+
+  async deliverJob(turn, delivery, answered) {
+    if (BigInt(this.waiting.length) >= PROGRAM.events.recordsMax) {
+      return new Response(`${this.waiting.length} events already wait for this object`, { status: HTTP_SERVICE_UNAVAILABLE });
+    }
+    const answer = await new Promise((resolve) => {
+      this.waiting.push({ turn, delivery, resolve });
+      this.wake(delivery);
+    });
     return answered(answer);
   }
 
@@ -351,7 +414,11 @@ class HarnessObject {
     } finally {
       this.running = false;
       this.runningTurn = null;
-      for (const entry of this.waiting.splice(0)) entry.resolve("not_running");
+      const jobs = this.waiting.filter((entry) => entry.delivery.kind === "job");
+      for (const entry of this.waiting.splice(0)) {
+        if (entry.delivery.kind !== "job") entry.resolve("not_running");
+      }
+      this.waiting.push(...jobs);
     }
   }
 

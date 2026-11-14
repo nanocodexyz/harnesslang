@@ -1,4 +1,5 @@
 const WAIT_TOOL = "wait";
+const HOLD_TOOL = "hold";
 const WAIT_MS = "ms";
 const WAIT_UNTIL = "until";
 const SUSPEND_TOOL = "suspend";
@@ -15,6 +16,12 @@ function spawnOutput(tool, scope, turn, seq, output) {
   if (output.tag !== "ok" || declared === undefined || !declared.spawn) return output;
   const key = String(turn) + SPAWN_KEY_SEPARATOR + String(seq);
   return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };
+}
+
+class StepRan {
+  constructor(ran) {
+    this.ran = ran;
+  }
 }
 
 class Suspended {
@@ -47,6 +54,11 @@ class Engine {
     this.nextCell = 0;
     this.events = log.events.slice();
     this.taken = 0;
+    this.takenJobs = 0;
+    this.jobs = new Map();
+    this.lost = [];
+    this.attested = new Set();
+    this.undispatchedBefore = log.undispatched;
     this.admitted = new Map();
     this.listed = new Map();
     this.notices = new Map();
@@ -87,32 +99,113 @@ class Engine {
     return this.events.some((event) => event.delivery.kind === "cancel" && event.at <= this.seq);
   }
 
-  take() {
-    const visible = this.events.filter((event) => event.delivery.kind === "steer" && event.at <= this.seq);
-    assert(this.taken <= visible.length, "the steers a turn sees only grow");
-    const fresh = visible.slice(this.taken).map((event) => event.delivery.message);
-    this.taken = visible.length;
+  take(kind) {
+    assert(kind === "steer" || kind === "job", "take reads steers or job notices");
+    const counter = kind === "job" ? "takenJobs" : "taken";
+    const visible = this.events.filter((event) => event.delivery.kind === kind && event.at <= this.seq);
+    assert(this[counter] <= visible.length, "the events a turn sees only grow");
+    const fresh = visible.slice(this[counter]).map((event) => (kind === "job" ? event.delivery.notice : event.delivery.message));
+    this[counter] = visible.length;
     return fresh;
   }
 
   async drain() {
-    if (this.target.inbound !== "after_run" || !eventsTaken() || !this.mode.live) return;
+    if (this.target.inbound !== "after_run") return;
+    await this.drainNow();
+  }
+
+  async drainDirect(ran) {
+    if (!eventsTaken() || !this.mode.live) return;
+    if (this.target.inbound === "after_run") {
+      await this.drainNow();
+      return;
+    }
+    assert(this.buffer.length === 0, "an effect that drains right after it runs flushed before it ran");
+    throw new StepRan(ran);
+  }
+
+  async drainNow() {
+    if (!eventsTaken() || !this.mode.live) return;
     const world = this.mode.world;
-    const arrived = await world.inbox(this.turn);
+    const queued = this.lost.splice(0);
+    const arrived = [...queued, ...(await world.inbox(this.turn))];
     if (arrived.length === 0) return;
     const position = this.seq;
     const answers = [];
     let recorded = false;
-    for (const delivery of arrived) {
-      const admitted = admitEvent(this.turn, this.events, position, delivery);
+    const jobs = { open: this.jobs, recorded: (key) => jobRecorded(this.sites, this.turn, key) };
+    for (let index = 0; index < arrived.length; index++) {
+      const delivery = arrived[index];
+      const admitted = admitEvent(this.turn, this.events, position, delivery, jobs);
       if (admitted.record !== null) {
         this.append(admitted.record);
         recorded = true;
+      }
+      if (index < queued.length) {
+        if (admitted.answer === "full") this.lost.push(delivery);
+        continue;
       }
       answers.push([delivery.id, admitted.answer]);
     }
     if (recorded) await this.flush();
     await world.answer(this.turn, position, answers);
+  }
+
+  preempted(by) {
+    if (!anyInterrupt(by)) return false;
+    const cancelled = by.cancel && this.events.some((event) => event.delivery.kind === "cancel");
+    const steered = by.steer && steerCount(this.events) > this.taken;
+    return cancelled || steered;
+  }
+
+  flushesToInterrupt(by) {
+    return anyInterrupt(by) && this.target.inbound !== "after_run";
+  }
+
+  jobRoom(tool) {
+    const bound = jobsOf(tool);
+    if (bound === null) return false;
+    let open = 0;
+    for (const owner of this.jobs.values()) if (owner === tool) open += 1;
+    return BigInt(open) < bound;
+  }
+
+  toolOutput(tool, returns, seq, room, raw) {
+    if (jobStarted(raw) === null) return this.checked(tool, returns, raw);
+    if (!room) return { tag: "failed", error: `tool ${tool} started a job, which it may not: it is not a jobs tool or keeps its bound of jobs running` };
+    this.jobs.set(spawnKey(this.turn, seq), tool);
+    return raw;
+  }
+
+  startedJobs(entries) {
+    const started = [];
+    for (const [seq, tool, output] of entries) {
+      const key = spawnKey(this.turn, seq);
+      if (output.tag === "ok" && jobStarted(output) !== null && this.jobs.has(key)) started.push([key, tool]);
+    }
+    return started;
+  }
+
+  async ran(seq) {
+    const world = this.mode.world;
+    if (world.ran === undefined) return null;
+    const ran = await world.ran(this.turn, seq);
+    if (ran === null) return null;
+    for (const [key, tool] of ran.started) this.jobs.set(key, tool);
+    return ran;
+  }
+
+  async freshAfterRecovery(seq) {
+    const world = this.mode.world;
+    if (world.undispatched === undefined) return false;
+    return world.undispatched(this.turn, seq);
+  }
+
+  async hold(seq, call) {
+    if (this.jobs.size === 0 && this.lost.length === 0) return this.mode.world.clock();
+    const until = isObject(call.input) ? call.input[WAIT_UNTIL] : undefined;
+    if (typeof until !== "bigint") throw new Corrupt(`turn ${this.turn} seq ${seq}: a hold's input lacks its deadline`);
+    return this.mode.world.hold(this.turn, seq, until);
   }
 
   append(record) {
@@ -174,7 +267,7 @@ class Engine {
     if (!this.mode.live || this.buffer.length === 0) return;
     const world = this.mode.world;
     await world.hook(POINT_BEFORE_FLUSH);
-    await world.flush(this.mode.epoch, this.buffer.slice());
+    await world.flush(this.mode.epoch, this.buffer.slice(), this.seq);
     this.buffer = [];
     await world.hook(POINT_AFTER_FLUSH);
   }
@@ -234,6 +327,8 @@ class Engine {
         return { tool: PROGRAM.codes[site.code].name, effect: "none", input: args[0] };
       case "wait":
         return { tool: WAIT_TOOL, effect: "none", input: object([[WAIT_MS, args[0]]]) };
+      case "hold":
+        return { tool: HOLD_TOOL, effect: "none", input: object([[WAIT_MS, args[0]]]) };
       case "suspend":
         return { tool: SUSPEND_TOOL, effect: "none", input: object([[SUSPEND_KEY, args[0]]]) };
       case "deny": {
@@ -248,14 +343,15 @@ class Engine {
 
   async effect(siteId, args) {
     const site = this.handler.sites[siteId];
-    if (site.kind === "wait" && args[0] > site.ms) throw new Trap(`bound(${site.cap})`);
+    const sleeps = site.kind === "wait" || site.kind === "hold";
+    if (sleeps && args[0] > site.ms) throw new Trap(`bound(${site.cap})`);
     this.seq += 1;
     const seq = this.seq;
     const call = this.resolve(site, args);
     const code = site.kind === "cell" ? site.code : site.kind === "dispatch" ? codeNamed(call.tool) : null;
     if (code !== null) return this.cellSite(code, seq, { ...call, effect: "none" });
     if (site.kind === "suspend") return this.suspendSite(siteId, seq, call);
-    if (site.kind === "wait") return this.waitSite(siteId, seq, call, args);
+    if (sleeps) return this.waitSite(siteId, seq, call, args);
     if (site.class !== "dispatched") {
       assert(site.class === call.effect, "a fixed site runs with its declared class");
     }
@@ -280,6 +376,9 @@ class Engine {
         if (site.kind !== "model") throw this.diverged(seq, "a model reply", call.tool);
         if (logged.mode !== site.mode) {
           throw this.diverged(seq, `a model reply in ${modeText(logged.mode)}`, `${call.tool} in ${modeText(site.mode)}`);
+        }
+        if (!jsonEqual(logged.settings, settingsOf(args))) {
+          throw this.diverged(seq, `a model reply with ${settingsText(logged.settings)}`, `${call.tool} with ${settingsText(settingsOf(args))}`);
         }
         return this.reply(logged.response);
       case "unknown":
@@ -447,17 +546,55 @@ class Engine {
   async reopen(siteId, seq, call, args) {
     this.requireLive(seq);
     if (mayBeUnknown(call.effect) && this.target.recovery === "in_step") {
-      const attempt = await this.mode.world.attempt(this.turn, seq);
-      if (attempt > 1 && this.mutation !== "vercel_retry_redispatches") return this.unknown(seq, call);
+      const world = this.mode.world;
+      const ran = world.ran === undefined ? null : await world.ran(this.turn, seq);
+      if (ran !== null || (await this.freshAfterRecovery(seq))) return this.dispatch(siteId, seq, call, args, true);
+      const attempt = await world.attempt(this.turn, seq, this.undispatchedBefore.has(seq));
+      if (attempt > 1 && this.mutation !== "vercel_retry_redispatches") {
+        const retried = await this.retried(seq, call);
+        if (retried.value !== undefined) return retried.value;
+        if (retried.output !== undefined) return this.settle(this.handler.sites[siteId], call, retried.output);
+      }
       return this.dispatch(siteId, seq, call, args, true);
     }
-    assert(!mayBeUnknown(call.effect), "recovery turns every open external call unknown before the turn runs again");
+    const attested = this.attested.delete(seq);
+    assert(!mayBeUnknown(call.effect) || attested, "recovery turns every open external call unknown before the turn runs again, unless its host attested it was not dispatched");
     return this.execute(siteId, seq, call, args);
+  }
+
+  async retried(seq, call) {
+    const recovered = await this.askRecover(seq, call);
+    const kind = recovered.kind;
+    const attempt = this.nextAttempt();
+    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: kind === "unknown" ? [seq] : [], nested: [], replied: kind === "reply" ? [seq] : [], undispatched: kind === "not_dispatched" ? [seq] : [] });
+    if (kind === "unknown") {
+      this.sites.set(seq, { kind: "unknown", call });
+      await this.flush();
+      return { value: variant(VARIANT_UNKNOWN, []) };
+    }
+    if (kind === "not_dispatched") {
+      await this.flush();
+      return {};
+    }
+    assert(kind === "reply", "a host answers a recovery with a reply, not dispatched or unknown");
+    this.append({ kind: "result", turn: this.turn, seq, output: recovered.output });
+    this.sites.set(seq, { kind: "done", call, output: recovered.output });
+    await this.flush();
+    return { output: recovered.output };
+  }
+
+  async askRecover(seq, call) {
+    if (!recoverable(call.tool)) return { kind: "unknown" };
+    const returns = dispatchedReturns(call.tool);
+    const room = this.jobRoom(call.tool);
+    const recovered = await this.mode.world.recover({ turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: null, job: room, interrupts: interruptsOf("dispatch", call.tool) });
+    if (recovered.kind !== "reply") return recovered;
+    return { kind: "reply", output: this.toolOutput(call.tool, returns, seq, room, recovered.output) };
   }
 
   async unknown(seq, call) {
     const attempt = this.nextAttempt();
-    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: [seq], nested: [] });
+    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: [seq], nested: [], replied: [], undispatched: [] });
     this.sites.set(seq, { kind: "unknown", call });
     await this.flush();
     return variant(VARIANT_UNKNOWN, []);
@@ -466,7 +603,7 @@ class Engine {
   async execute(siteId, seq, call, args) {
     const site = this.handler.sites[siteId];
     const gate = this.target.gateBeforeOutbound && outbound(site.kind);
-    const required = flushes(site.durability, call.effect);
+    const required = flushes(site.durability, call.effect) || this.flushesToInterrupt(interruptsOf(site.kind, call.tool));
     if (mayBeUnknown(call.effect)) await this.mode.world.beforeExternal();
     if (required || gate) {
       await this.flush();
@@ -511,7 +648,7 @@ class Engine {
         case "open": {
           this.same(seq, logged.call, call);
           this.requireLive(seq);
-          const recovered = !mayBeUnknown(call.effect) || this.target.recovery === "in_step";
+          const recovered = !mayBeUnknown(call.effect) || this.target.recovery === "in_step" || this.attested.delete(seq);
           const mutated = this.mutation === "recovery_redispatches_external" || this.mutation === "recovery_reports_failed";
           assert(recovered || mutated, "recovery turns every open external call unknown before the turn runs again");
           pending.push({ index, seq, call, reopened: true });
@@ -535,70 +672,136 @@ class Engine {
   async batchGroup(site, group, values) {
     const external = mayBeUnknown(group[0].call.effect);
     assert(!external || group.length === 1, "an external call of a parallel for runs alone");
+    const by = group.map((waiting) => interruptsOf("dispatch", waiting.call.tool));
+    const interrupting = { cancel: by.some((one) => one.cancel), steer: by.some((one) => one.steer) };
     const gate = this.target.gateBeforeOutbound;
     const inStep = external && this.target.recovery === "in_step";
     const late = external && !gate && this.mutation === "batch_flush_after_dispatch";
     if (external) await this.mode.world.beforeExternal();
-    if ((external || gate) && !late) {
+    if ((external || gate || this.flushesToInterrupt(interrupting)) && !late) {
       await this.flush();
       assert(this.buffer.length === 0, "every call record of a parallel for is durable before an external call of it runs");
     }
-    if (inStep) {
-      const first = group[0];
-      const attempt = await this.mode.world.attempt(this.turn, first.seq);
+    const first = group[0];
+    let ran = await this.ran(first.seq);
+    if (inStep && ran === null && !(await this.freshAfterRecovery(first.seq))) {
+      const attempt = await this.mode.world.attempt(this.turn, first.seq, this.undispatchedBefore.has(first.seq));
       if (first.reopened && attempt > 1 && this.mutation !== "vercel_retry_redispatches") {
-        values[first.index] = await this.unknown(first.seq, first.call);
-        return;
+        const retried = await this.retried(first.seq, first.call);
+        if (retried.value !== undefined) {
+          values[first.index] = retried.value;
+          return;
+        }
+        if (retried.output !== undefined) {
+          values[first.index] = this.settle(site, first.call, retried.output);
+          return;
+        }
+      } else {
+        assert(first.reopened || attempt === 1, "a fresh external step starts at its first attempt");
       }
-      assert(first.reopened || attempt === 1, "a fresh external step starts at its first attempt");
     }
     assert(reportsUnknown(site.result), "a dispatch yields an outcome that reports unknown");
+    if (ran === null) {
+      ran = await this.batchRun(group, by);
+      if (this.sites.get(this.seq)?.kind === "open") {
+        if (this.flushesToInterrupt(interrupting)) await this.drainDirect(ran);
+        else await this.drain();
+      }
+    }
+    const arrived = this.events.slice(ran.events);
+    for (const [position, output] of ran.outputs) {
+      const waiting = group[position];
+      const interrupted = !ran.preempted[position] && arrived.some((event) => interruptedBy(event.delivery, by[position]));
+      if (interrupted) this.jobs.delete(spawnKey(this.turn, waiting.seq));
+      if (interrupted && mayBeUnknown(waiting.call.effect)) {
+        values[waiting.index] = await this.unknown(waiting.seq, waiting.call);
+        continue;
+      }
+      const recorded = interrupted ? { tag: "failed", error: INTERRUPTED_REASON } : output;
+      this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output: recorded });
+      this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output: recorded });
+      values[waiting.index] = this.settle(site, waiting.call, recorded);
+    }
+    if (late || inStep) await this.flush();
+  }
+
+  async batchRun(group, by) {
+    const preempted = group.map((waiting, position) => this.preempted(by[position]));
     const returned = group.map((waiting) => dispatchedReturns(waiting.call.tool));
-    const gates = group.map((waiting) => this.gate(waiting.call));
+    const rooms = group.map((waiting) => this.jobRoom(waiting.call.tool));
+    const gates = group.map((waiting, position) => (preempted[position] ? { refused: INTERRUPTED_REASON } : this.gate(waiting.call)));
     const sent = [];
     for (let position = 0; position < group.length; position++) {
       if (gates[position].refused === undefined) sent.push(position);
     }
     const requests = sent.map((position) => {
       const waiting = group[position];
-      return { turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns: returned[position], admitted: gates[position].admitted };
+      return { turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns: returned[position], admitted: gates[position].admitted, job: rooms[position], interrupts: by[position] };
     });
     const batch = requests.length === 0 ? [] : await this.mode.world.tools(requests, CONCURRENT_REQUESTS_MAX);
     assert(batch.length === sent.length, "a batch returns one output per request");
-    if (this.sites.get(this.seq)?.kind === "open") await this.drain();
     const completed = batch.map(([position, output]) => [sent[position], output]);
     for (let position = 0; position < group.length; position++) {
       if (gates[position].refused !== undefined) completed.push([position, { tag: "failed", error: gates[position].refused }]);
     }
     const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
-    for (const [position, raw] of ordered) {
+    const outputs = ordered.map(([position, raw]) => {
       const waiting = group[position];
-      const output = spawnOutput(waiting.call.tool, this.mode.scope, this.turn, waiting.seq, this.checked(waiting.call.tool, returned[position], raw));
-      this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output });
-      this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output });
-      values[waiting.index] = this.settle(site, waiting.call, output);
-    }
-    if (late || inStep) await this.flush();
+      return [position, spawnOutput(waiting.call.tool, this.mode.scope, this.turn, waiting.seq, this.toolOutput(waiting.call.tool, returned[position], waiting.seq, rooms[position], raw))];
+    });
+    const started = this.startedJobs(outputs.map(([position, output]) => [group[position].seq, group[position].call.tool, output]));
+    return { seq: group[0].seq, position: this.seq, events: this.events.length, model: false, preempted, outputs, started };
   }
 
   async dispatch(siteId, seq, call, args, step) {
     const site = this.handler.sites[siteId];
-    const world = this.mode.world;
-    await this.hook(runPoint("before_run", site.kind, call.effect));
-    if (site.kind === "model") {
-      const callsMax = PROGRAM.model === null ? 0n : PROGRAM.model.calls;
-      const response = await world.model({ turn: this.turn, seq, callsMax, mode: site.mode, context: args[0], blobs: this.blobs });
+    const by = interruptsOf(site.kind, call.tool);
+    let ran = await this.ran(seq);
+    if (ran === null) {
+      await this.hook(runPoint("before_run", site.kind, call.effect));
+      const preempted = this.preempted(by);
+      const output = await this.runEffect(site, seq, call, args, preempted, by);
       await this.hook(runPoint("after_run", site.kind, call.effect));
-      await this.drain();
-      this.append({ kind: "model", turn: this.turn, seq, response, mode: site.mode });
-      this.sites.set(seq, { kind: "reply", response, mode: site.mode });
+      const model = site.kind === "model";
+      const started = model ? [] : this.startedJobs([[seq, call.tool, output]]);
+      ran = { seq, position: this.seq, events: this.events.length, model, preempted: [preempted], outputs: [[0, output]], started };
+      if (anyInterrupt(by) || site.kind === "hold") await this.drainDirect(ran);
+      else await this.drain();
+    }
+    const output = ran.outputs[0][1];
+    const interrupted = !ran.preempted[0] && this.events.slice(ran.events).some((event) => interruptedBy(event.delivery, by));
+    if (site.kind === "model") {
+      const response = interrupted ? interruptedResponse() : output;
+      const settings = settingsOf(args);
+      this.append({ kind: "model", turn: this.turn, seq, response, mode: site.mode, settings });
+      this.sites.set(seq, { kind: "reply", response, mode: site.mode, settings });
       return this.reply(response);
+    }
+    if (interrupted) {
+      this.jobs.delete(spawnKey(this.turn, seq));
+      if (mayBeUnknown(call.effect)) return this.unknown(seq, call);
+    }
+    const recorded = interrupted ? { tag: "failed", error: INTERRUPTED_REASON } : output;
+    this.append({ kind: "result", turn: this.turn, seq, output: recorded });
+    this.sites.set(seq, { kind: "done", call, output: recorded });
+    if (step) await this.flush();
+    return this.settle(site, call, recorded);
+  }
+
+  async runEffect(site, seq, call, args, preempted, by) {
+    const world = this.mode.world;
+    if (site.kind === "model") {
+      if (preempted) return interruptedResponse();
+      const callsMax = PROGRAM.model === null ? 0n : PROGRAM.model.calls;
+      return world.model({ turn: this.turn, seq, callsMax, mode: site.mode, settings: settingsOf(args), context: args[0], blobs: this.blobs, interrupts: by });
     }
     let output;
     if (site.kind === "wait") {
       const until = isObject(call.input) ? call.input[WAIT_UNTIL] : undefined;
       if (typeof until !== "bigint") throw new Corrupt(`turn ${this.turn} seq ${seq}: a wait's input lacks its deadline`);
       output = { tag: "ok", value: await world.sleep(this.turn, seq, until) };
+    } else if (site.kind === "hold") {
+      output = { tag: "ok", value: await this.hold(seq, call) };
     } else if (site.kind === "now") {
       output = { tag: "ok", value: await world.now() };
     } else if (site.kind === "random") {
@@ -608,6 +811,8 @@ class Engine {
     } else if (site.kind === "listing") {
       const listing = PROGRAM.listings[site.tool];
       output = checkedListing(listing, await world.listing({ turn: this.turn, seq, listing: listing.name }));
+    } else if (preempted) {
+      output = { tag: "failed", error: INTERRUPTED_REASON };
     } else {
       const returns = site.result.known ?? site.result.maybe ?? (reportsUnknown(site.result) ? dispatchedReturns(call.tool) : undefined);
       assert(returns !== undefined, "a tool site yields known or maybe");
@@ -615,16 +820,12 @@ class Engine {
       if (gate.refused !== undefined) {
         output = { tag: "failed", error: gate.refused };
       } else {
-        const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted };
-        output = spawnOutput(call.tool, this.mode.scope, this.turn, seq, this.checked(call.tool, returns, await world.tool(request)));
+        const room = this.jobRoom(call.tool);
+        const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted, job: room, interrupts: by };
+        output = spawnOutput(call.tool, this.mode.scope, this.turn, seq, this.toolOutput(call.tool, returns, seq, room, await world.tool(request)));
       }
     }
-    await this.hook(runPoint("after_run", site.kind, call.effect));
-    await this.drain();
-    this.append({ kind: "result", turn: this.turn, seq, output });
-    this.sites.set(seq, { kind: "done", call, output });
-    if (step) await this.flush();
-    return this.settle(site, call, output);
+    return output;
   }
 
   checked(tool, returns, raw) {
@@ -699,6 +900,11 @@ class Engine {
 
   decode(site, call, output) {
     const corrupt = (message) => new Corrupt(`turn ${this.turn} result: ${message}`);
+    const job = jobStarted(output);
+    if (job !== null) {
+      if (jobsOf(call.tool) === null) throw corrupt(`${call.tool} started a job, which only a jobs tool does`);
+      return variant(VARIANT_OK, [job]);
+    }
     if (reportsUnknown(site.result) && site.result.maybe === undefined) return this.dispatched(call, output, corrupt);
     if (site.result === "text" && output.tag === "ok") {
       if (typeof output.value !== "string") throw corrupt(`${encodeJson(output.value)} is not text`);
@@ -803,7 +1009,7 @@ class EngineCellHost {
 
   async recovered(seq, nested) {
     const engine = this.engine;
-    engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]] });
+    engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]], replied: [], undispatched: [] });
     const key = nestedKey(seq, nested);
     const site = engine.nested.get(key);
     if (site !== undefined && site.kind === "open") engine.nested.set(key, { kind: "unknown", call: site.call });
@@ -839,7 +1045,7 @@ function codeNamed(name) {
 }
 
 async function closeInbox(world, turn, position, events) {
-  const arrived = await world.inbox(turn);
+  const arrived = (await world.inbox(turn)).filter((delivery) => delivery.kind !== "job");
   if (arrived.length === 0) return;
   await world.answer(turn, position, closingAnswers(events, arrived));
 }
@@ -899,13 +1105,31 @@ function assumeNestedFailed(log, ids) {
   });
 }
 
-function recoverAtLoad(log, mutation) {
+async function recoverLoaded(world, turn, seq, call) {
+  if (!recoverable(call.tool)) return { kind: "unknown" };
+  const recovered = await world.recover({ turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns: "text", admitted: null, job: false, interrupts: interruptsOf("dispatch", call.tool) });
+  if (recovered.kind !== "reply") return recovered;
+  if (jobStarted(recovered.output) !== null && jobsOf(call.tool) !== null) return recovered;
+  return { kind: "reply", output: checkedOutput(call.tool, "text", recovered.output) };
+}
+
+async function recoverAtLoad(world, turn, log, mutation) {
   const unknown = [];
-  for (const [seq, site] of log.sites) {
-    if (site.kind === "open" && mayBeUnknown(site.call.effect)) unknown.push(seq);
-  }
-  for (const seq of unknown) {
-    log.sites.set(seq, { kind: "unknown", call: log.sites.get(seq).call });
+  const replied = [];
+  const undispatched = [];
+  for (const [seq, site] of [...log.sites]) {
+    if (site.kind !== "open" || !mayBeUnknown(site.call.effect)) continue;
+    const recovered = await recoverLoaded(world, turn, seq, site.call);
+    if (recovered.kind === "unknown") {
+      log.sites.set(seq, { kind: "unknown", call: site.call });
+      unknown.push(seq);
+    } else if (recovered.kind === "not_dispatched") {
+      undispatched.push(seq);
+    } else {
+      assert(recovered.kind === "reply", "a host answers a recovery with a reply, not dispatched or unknown");
+      log.sites.set(seq, { kind: "done", call: site.call, output: recovered.output });
+      replied.push([seq, recovered.output]);
+    }
   }
   const nested = [];
   const skipped = mutation === "cell_recovery_redispatches_external" || mutation === "recovery_skipped";
@@ -917,7 +1141,14 @@ function recoverAtLoad(log, mutation) {
     const key = nestedKey(seq, id);
     log.nested.set(key, { kind: "unknown", call: log.nested.get(key).call });
   }
-  return { unknown, nested };
+  return { unknown, nested, replied, undispatched };
+}
+
+async function lostJobs(world, turn, session) {
+  if (PROGRAM.events.jobs === null || session.jobs.size === 0) return [];
+  const open = [...session.jobs.keys()].sort();
+  const lost = await world.jobs(turn, open);
+  return lost.filter((key) => session.jobs.has(key)).map((key) => lostDelivery(key));
 }
 
 function cloneLog(log) {
@@ -961,7 +1192,7 @@ async function runTurn(setup, world, epoch, records, request) {
   const blobs = sessionBlobs(session);
   blobs.checkState(state);
   const pending = [];
-  let unknown = { unknown: [], nested: [] };
+  let unknown = { unknown: [], nested: [], replied: [], undispatched: [] };
   let log;
   if (existing !== undefined) {
     if (existing.handler !== request.handler || (!idles && !jsonEqual(existing.arguments, args))) {
@@ -969,7 +1200,7 @@ async function runTurn(setup, world, epoch, records, request) {
     }
     checkEvents(request.turn, existing);
     log = cloneLog(existing);
-    if (setup.target.recovery === "at_load") unknown = recoverAtLoad(log, setup.mutation);
+    if (setup.target.recovery === "at_load") unknown = await recoverAtLoad(world, request.turn, log, setup.mutation);
   } else {
     const next = session.turns.size === 0 ? 1 : session.lastTurn + 1;
     if (request.turn !== next) throw new Corrupt(`turn ${request.turn} is requested when turn ${next} is next`);
@@ -991,9 +1222,18 @@ async function runTurn(setup, world, epoch, records, request) {
   if (PROGRAM.sides.length > 0) engine.snapshot = stateFromJson(stateJson(state));
   engine.nextCell = nextCell(session);
   engine.blobs = blobs;
+  engine.jobs = new Map(session.jobs);
+  for (const [seq, output] of unknown.replied) {
+    if (jobStarted(output) !== null) engine.jobs.set(spawnKey(request.turn, seq), log.sites.get(seq).call.tool);
+  }
+  engine.lost = await lostJobs(world, request.turn, session);
+  engine.attested = new Set(unknown.undispatched);
   for (const record of pending) engine.append(record);
-  if (unknown.unknown.length > 0 || unknown.nested.length > 0) {
-    engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown: unknown.unknown, nested: unknown.nested });
+  if (unknown.unknown.length > 0 || unknown.nested.length > 0 || unknown.replied.length > 0 || unknown.undispatched.length > 0) {
+    engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown: unknown.unknown, nested: unknown.nested, replied: unknown.replied.map(([seq]) => seq), undispatched: unknown.undispatched });
+  }
+  for (const [seq, output] of unknown.replied) {
+    engine.append({ kind: "result", turn: request.turn, seq, output });
   }
   for (const [seq, nested, output] of assumed) {
     engine.append({ kind: "nested_result", turn: request.turn, seq, nested, output });
@@ -1102,6 +1342,18 @@ class SideWorld {
   async resumed() {
     throw new Panic(SIDE_REFUSED + ": suspend");
   }
+
+  async recover() {
+    throw new Panic(SIDE_REFUSED + ": a side question runs no external call");
+  }
+
+  async jobs() {
+    throw new Panic(SIDE_REFUSED + ": a side question starts no turn");
+  }
+
+  async hold() {
+    throw new Panic(SIDE_REFUSED + ": hold");
+  }
 }
 
 function sideNamed(name) {
@@ -1196,6 +1448,9 @@ function toolRequestJson(request) {
     ["turn", BigInt(request.turn)],
   ];
   if (request.admitted !== null) entries.push(["admitted", request.admitted]);
+  entries.push(["job", request.job === true]);
+  const by = request.interrupts ?? NO_INTERRUPTS;
+  if (anyInterrupt(by)) entries.push([INTERRUPTED_BY, interruptNames(by)]);
   return object(entries);
 }
 
@@ -1215,8 +1470,23 @@ function modelRequestJson(request) {
     ["turn", BigInt(request.turn)],
   ];
   if (request.mode !== null) entries.push([MODEL_MODE, request.mode]);
+  if (request.settings !== null) entries.push([MODEL_SETTINGS, request.settings]);
+  const by = request.interrupts ?? NO_INTERRUPTS;
+  if (anyInterrupt(by)) entries.push([INTERRUPTED_BY, interruptNames(by)]);
   if (PROGRAM.blobs !== undefined) entries.push([MODEL_BLOBS, request.blobs.json()]);
   return object(entries);
+}
+
+function settingsOf(args) {
+  if (PROGRAM.model === null || PROGRAM.model.settings.length === 0) return null;
+  assert(args.length === 1 + PROGRAM.model.settings.length, "a model site passes the context and every setting");
+  const entries = PROGRAM.model.settings.map((setting, index) => [setting.name, toJson(setting.type, args[index + 1])]);
+  entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return object(entries);
+}
+
+function settingsText(settings) {
+  return settings === null ? "no settings" : `settings ${encodeJson(settings)}`;
 }
 
 function modeText(mode) {
@@ -1226,21 +1496,57 @@ function modeText(mode) {
 class HostError extends Error {}
 
 function defaultHost(config) {
-  const post = async (url, json) => {
-    const response = await config.fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: encodeJson(json) });
+  const post = async (url, json, signal) => {
+    const response = await config.fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: encodeJson(json), signal });
     const body = await response.text();
     if (!response.ok) throw new HostError(`${url} answered ${response.status}: ${body}`);
     return decodeJson(body);
   };
+  const until = (untilMs, signal) => new Promise((resolve) => {
+    const left = Number(untilMs) - Number(config.now());
+    if (left <= 0 || signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, left);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
   return {
     async tool(request) {
-      return outputFrom(await post(config.toolsUrl, toolRequestJson(request)));
+      try {
+        return outputFrom(await post(config.toolsUrl, toolRequestJson(request), request.signal));
+      } catch (error) {
+        if (request.signal?.aborted) return { tag: "failed", error: INTERRUPTED_REASON };
+        throw error;
+      }
     },
     async listing(request) {
       return outputFrom(await post(config.listingsUrl, listingRequestJson(request)));
     },
     async model(request) {
-      return post(config.modelUrl, modelRequestJson(request));
+      try {
+        return await post(config.modelUrl, modelRequestJson(request), request.signal);
+      } catch (error) {
+        if (request.signal?.aborted) return interruptedResponse();
+        throw error;
+      }
+    },
+    async recover(request) {
+      if (config.recoverUrl === undefined) return { kind: "unknown" };
+      return recoveredFrom(await post(config.recoverUrl, toolRequestJson(request)));
+    },
+    async jobs(turn, open) {
+      if (config.jobsUrl === undefined) return [];
+      const lost = await post(config.jobsUrl, object([["open", open], ["turn", BigInt(turn)]]));
+      if (!Array.isArray(lost) || lost.some((key) => typeof key !== "string")) throw new DecodeError("a jobs answer lists the lost job keys as text");
+      return lost;
+    },
+    async hold(turn, seq, untilMs, signal) {
+      await until(untilMs, signal);
+      return BigInt(config.now());
     },
     now() {
       return BigInt(config.now());
@@ -1280,7 +1586,7 @@ const runtime = {
   encodeJson, decodeJson, crc32, encodeLine, decodeLine, encodeLines, decodeLines,
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
   Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
-  deliveryJson, deliveryFrom, suspensionJson, suspensionFrom, resumeJson, resumeFrom,
+  deliveryJson, deliveryFrom, outputFrom, outputJson, recoveredFrom, suspensionJson, suspensionFrom, resumeJson, resumeFrom,
   SIDE_TURN, answerSide, sideRequestFromJson, sideAnswerJson,
   idleDue,
 };

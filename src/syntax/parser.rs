@@ -1,8 +1,8 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
     Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
-    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
-    TypeBody, TypeDef, TypeExpr, VariantDef,
+    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, RewriteArm, Settings,
+    Spawn, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -43,6 +43,7 @@ const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'code', 'spawn', 'model',
 pub const SESSION_END_HANDLER: &str = "session_end";
 pub const CODE_TOOLS_FIELD: &str = "tools";
 pub const WAIT_BUILTIN: &str = "wait";
+pub const HOLD_BUILTIN: &str = "hold";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -277,6 +278,22 @@ impl<'a> Parser<'a> {
             None
         };
         let effect = self.effect_class()?;
+        let recoverable = if self.is_word("recoverable") {
+            let at = self.at();
+            self.advance();
+            Some(at)
+        } else {
+            None
+        };
+        let interrupts = self.interrupts()?;
+        let jobs = if self.is_word("jobs") {
+            self.advance();
+            self.word("at")?;
+            self.word("most")?;
+            Some(self.bound("the jobs a tool keeps running at once")?)
+        } else {
+            None
+        };
         let finds = if self.is_word("finds") {
             self.advance();
             Some(self.name("the listing a search finds tools of")?)
@@ -290,8 +307,26 @@ impl<'a> Parser<'a> {
             returns,
             attaches,
             effect,
+            recoverable,
+            interrupts,
+            jobs,
             finds,
         })
+    }
+
+    fn interrupts(&mut self) -> Parsed<Vec<Name>> {
+        let mut events = Vec::new();
+        if !self.is_word("interruptible") {
+            return Ok(events);
+        }
+        self.advance();
+        self.word("by")?;
+        events.push(self.name("an event that interrupts the effect")?);
+        while self.is_symbol(Symbol::Comma) {
+            self.advance();
+            events.push(self.name("an event that interrupts the effect")?);
+        }
+        Ok(events)
     }
 
     fn effect_class(&mut self) -> Parsed<EffectClass> {
@@ -393,12 +428,22 @@ impl<'a> Parser<'a> {
                 modes.push(self.name("a model call mode")?);
             }
         }
+        let (settings, setting_defaults) = if self.is_word("settings") {
+            self.advance();
+            self.tool_params()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let interrupts = self.interrupts()?;
         Ok(Model {
             name,
             calls,
             reply,
             modes,
+            settings,
+            setting_defaults,
             window,
+            interrupts,
         })
     }
 
@@ -753,6 +798,7 @@ impl<'a> Parser<'a> {
                 let value = self.expr()?;
                 Ok(Stmt::Push { at, list, value })
             }
+            "rewrite" if matches!(self.peek_second(), Token::Name(_)) => self.rewrite(),
             "clear" => {
                 self.advance();
                 let list = self.name("a list to clear")?;
@@ -881,6 +927,29 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         Ok(Stmt::Match { at, subject, arms })
+    }
+
+    fn rewrite(&mut self) -> Parsed<Stmt> {
+        let at = self.word("rewrite")?;
+        let list = self.name("a list to rewrite")?;
+        self.symbol(Symbol::LeftBrace)?;
+        let mut arms = Vec::new();
+        while !self.is_symbol(Symbol::RightBrace) {
+            let pattern = self.pattern()?;
+            self.symbol(Symbol::FatArrow)?;
+            let entry = if self.is_word("drop") {
+                self.advance();
+                None
+            } else {
+                Some(self.expr()?)
+            };
+            arms.push(RewriteArm { pattern, entry });
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+            }
+        }
+        self.advance();
+        Ok(Stmt::Rewrite { at, list, arms })
     }
 
     fn pattern(&mut self) -> Parsed<Pattern> {
@@ -1066,7 +1135,9 @@ impl<'a> Parser<'a> {
                 }
                 self.advance();
                 let mut args = self.arguments()?;
-                if callee.text == WAIT_BUILTIN && self.is_word("at") {
+                if (callee.text == WAIT_BUILTIN || callee.text == HOLD_BUILTIN)
+                    && self.is_word("at")
+                {
                     self.advance();
                     self.word("most")?;
                     args.push(Expr::Name(self.bound("the most a wait sleeps")?));
@@ -1077,9 +1148,38 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                Ok(Expr::Call { callee, args, mode })
+                let settings = if self.is_word("with")
+                    && matches!(self.peek_second(), Token::Symbol(Symbol::LeftBrace))
+                {
+                    Some(self.settings()?)
+                } else {
+                    None
+                };
+                Ok(Expr::Call {
+                    callee,
+                    args,
+                    mode,
+                    settings,
+                })
             }
             _ => Err(self.unexpected("an expression")),
+        }
+    }
+
+    fn settings(&mut self) -> Parsed<Settings> {
+        let at = self.word("with")?;
+        self.symbol(Symbol::LeftBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            let name = self.name("a model setting")?;
+            self.symbol(Symbol::Colon)?;
+            fields.push((name, self.expr()?));
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+                continue;
+            }
+            self.symbol(Symbol::RightBrace)?;
+            return Ok(Settings { at, fields });
         }
     }
 

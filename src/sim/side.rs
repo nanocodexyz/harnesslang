@@ -22,6 +22,7 @@ pub enum SideCall {
     Model {
         seq: u64,
         mode: Option<String>,
+        settings: Option<Json>,
         context: Json,
         response: Json,
     },
@@ -103,15 +104,25 @@ impl Replay<'_> {
         let same = match (recorded, asked) {
             (
                 Some(SideCall::Model {
-                    seq, mode, context, ..
+                    seq,
+                    mode,
+                    settings,
+                    context,
+                    ..
                 }),
                 SideCall::Model {
                     seq: asked_seq,
                     mode: asked_mode,
+                    settings: asked_settings,
                     context: asked_context,
                     ..
                 },
-            ) => seq == asked_seq && mode == asked_mode && context == asked_context,
+            ) => {
+                seq == asked_seq
+                    && mode == asked_mode
+                    && settings == asked_settings
+                    && context == asked_context
+            }
             (
                 Some(SideCall::Tool {
                     seq, tool, input, ..
@@ -155,6 +166,7 @@ impl SideHost for Replay<'_> {
         let asked = SideCall::Model {
             seq: request.seq,
             mode: request.mode.map(str::to_owned),
+            settings: request.settings.cloned(),
             context: context_json(self.program, request),
             response: Json::Null,
         };
@@ -403,11 +415,15 @@ impl SimWorld<'_> {
             if let Some(mode) = request.mode {
                 fields.push((journal::MODEL_MODE, Json::text(mode)));
             }
+            if let Some(settings) = request.settings {
+                fields.push((journal::MODEL_SETTINGS, settings.clone()));
+            }
             fields
         });
         self.sides.calls.push(SideCall::Model {
             seq: request.seq,
             mode: request.mode.map(str::to_owned),
+            settings: request.settings.cloned(),
             context,
             response: response.clone(),
         });

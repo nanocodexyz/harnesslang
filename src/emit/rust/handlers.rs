@@ -96,6 +96,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 self.line(&format!("state.{field} = {value};"));
             }
             Stmt::Push { field, value } => self.push(*field, value),
+            Stmt::Rewrite { field, arms } => self.rewrite(*field, arms),
             Stmt::Shrink { field, kept } => {
                 let count = match kept {
                     Kept::Nothing => "0_u64".to_owned(),
@@ -157,9 +158,13 @@ impl<'a, 'p> Body<'a, 'p> {
             }
             Stmt::Parallel(parallel) => self.parallel(parallel),
             Stmt::Effect { site, args, result } => self.effect(*site, args, *result),
-            Stmt::Take { result } => {
+            Stmt::Take { result, taken } => {
                 let local = self.local(*result);
-                self.line(&format!("let {local} = engine.take_steers();"));
+                let read = match taken {
+                    ir::Taken::Steers => "take_steers",
+                    ir::Taken::Jobs => "take_jobs",
+                };
+                self.line(&format!("let {local} = engine.{read}();"));
             }
             Stmt::Finish { value } => {
                 let value = self.expr(value);
@@ -238,6 +243,66 @@ impl<'a, 'p> Body<'a, 'p> {
         self.line("}");
     }
 
+    fn rewrite(&mut self, field: ir::FieldId, arms: &[ir::RewriteArm]) {
+        let Type::List { element, .. } = &self.program.state[field].ty else {
+            panic!("the checker rewrites only lists");
+        };
+        let Type::Sum(sum) = **element else {
+            panic!("the checker rewrites only lists of a sum");
+        };
+        let variants = element
+            .variants(self.program)
+            .expect("a rewrite maps a sum");
+        let prefix = super::types::sum_name(self.program, sum);
+        let name = self.field(field);
+        self.line("{");
+        self.depth += 1;
+        self.line(&format!(
+            "let mut rewritten = Vec::with_capacity(state.{name}.len());"
+        ));
+        self.line(&format!("for item in std::mem::take(&mut state.{name}) {{"));
+        self.depth += 1;
+        self.line("match item {");
+        self.depth += 1;
+        for (arm, variant) in arms.iter().zip(&variants) {
+            let path = format!("{prefix}::{}", variant_ident(&variant.name));
+            let rest = if variant.fields.is_empty() {
+                path.clone()
+            } else {
+                format!("{path}(..)")
+            };
+            match &arm.entry {
+                ir::Rewritten::Kept => {
+                    self.line(&format!("kept @ {rest} => rewritten.push(kept),"))
+                }
+                ir::Rewritten::Dropped => self.line(&format!("{rest} => {{}}")),
+                ir::Rewritten::Into(entry) => {
+                    let bindings: Vec<String> = arm
+                        .bindings
+                        .iter()
+                        .map(|binding| {
+                            binding.map_or_else(|| "_".to_owned(), |local| self.local(local))
+                        })
+                        .collect();
+                    let pattern = if variant.fields.is_empty() {
+                        path
+                    } else {
+                        format!("{path}({})", bindings.join(", "))
+                    };
+                    let entry = self.expr(entry);
+                    self.line(&format!("{pattern} => rewritten.push({entry}),"));
+                }
+            }
+        }
+        self.depth -= 1;
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
+        self.line(&format!("state.{name} = rewritten;"));
+        self.depth -= 1;
+        self.line("}");
+    }
+
     fn matching(&mut self, subject: &Expr, ty: &Type, arms: &[ir::Arm]) {
         let subject = self.expr(subject);
         let variants = ty.variants(self.program).expect("a match is over a sum");
@@ -306,6 +371,26 @@ impl<'a, 'p> Body<'a, 'p> {
         self.line(&decode);
         self.depth -= 1;
         self.line("};");
+    }
+
+    fn settings(&mut self, model: &ir::Model) -> String {
+        if model.settings.is_empty() {
+            return "None".to_owned();
+        }
+        let fields: Vec<String> = model
+            .settings
+            .iter()
+            .enumerate()
+            .map(|(index, setting)| {
+                format!(
+                    "({:?}, {}(&argument{}))",
+                    setting.name,
+                    self.types.to_json(&setting.ty),
+                    index + 1
+                )
+            })
+            .collect();
+        format!("Some(Json::object([{}]))", fields.join(", "))
     }
 
     fn cell_site(&mut self, code: ir::CodeId, result: &Type) {
@@ -402,8 +487,9 @@ impl<'a, 'p> Body<'a, 'p> {
                     EffectClass::Idempotent
                 ));
                 self.line(&format!("let context = || {context}(&argument0);"));
+                let settings = self.settings(model);
                 let run = format!(
-                    "Run::Model {{ calls_max: {}, context: &context }}",
+                    "Run::Model {{ calls_max: {}, context: &context, settings: {settings} }}",
                     constant(&model.calls.name)
                 );
                 let decode = match (result, &model.window) {
@@ -431,21 +517,24 @@ impl<'a, 'p> Body<'a, 'p> {
                 ("Model", run, decode)
             }
             SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
-            SiteKind::Wait(constant_id) => {
+            SiteKind::Wait(constant_id) | SiteKind::Hold(constant_id) => {
+                let (tool, variant) = match kind {
+                    SiteKind::Hold(_) => (ir::HOLD_TOOL, "Hold"),
+                    _ => (ir::WAIT_TOOL, "Wait"),
+                };
                 let cap = &self.program.constants[constant_id].name;
                 self.line(&format!(
                     "let argument0 = wait_capped(argument0, {}, {cap:?})?;",
                     constant(cap)
                 ));
                 self.line(&format!(
-                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
-                    ir::WAIT_TOOL,
+                    "let call = Call {{ tool: {tool:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
                     EffectClass::None,
                     crate::run::engine::WAIT_MS
                 ));
                 (
-                    "Wait",
-                    "Run::Wait".to_owned(),
+                    variant,
+                    format!("Run::{variant}"),
                     "scalar(engine, answer)?".to_owned(),
                 )
             }

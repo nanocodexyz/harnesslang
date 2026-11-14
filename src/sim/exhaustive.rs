@@ -597,6 +597,18 @@ impl World for Run<'_, '_> {
         World::inbox(&mut self.state.sim, turn)
     }
 
+    fn recover(&mut self, request: &ToolRequest<'_>) -> crate::run::engine::Recovered {
+        World::recover(&mut self.state.sim, request)
+    }
+
+    fn jobs(&mut self, turn: u64, open: &[String]) -> Vec<String> {
+        World::jobs(&mut self.state.sim, turn, open)
+    }
+
+    fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        self.sleep(turn, seq, until_ms)
+    }
+
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]) {
         World::answer(&mut self.state.sim, turn, position, answers);
     }

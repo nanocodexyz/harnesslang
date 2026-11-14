@@ -1,0 +1,71 @@
+harness worker
+
+const rounds_max: u64 = 6
+const calls_max: u64 = 3
+const entries_max: u64 = 512
+const steers_max: u64 = 2
+const notices_max: u64 = 4
+const jobs_max: u64 = 2
+const window_tokens: u64 = 100000
+const hold_ms: u64 = 30000
+
+type outcome = done(text) | stopped(text) | exhausted
+
+tool Bash(command: text) -> text effect external recoverable interruptible by cancel, steer jobs at most jobs_max
+tool Read(path: text) -> text effect none interruptible by cancel
+tool Write(path: text, body: text) -> text effect external recoverable
+
+model infer calls calls_max window window_tokens interruptible by cancel
+
+on cancel
+on steer(message: text) bound steers_max
+on job(notice: text) bound notices_max
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + rounds_max * (3 + calls_max + steers_max + notices_max) <= entries_max
+{
+  push context user(input)
+  loop round below rounds_max {
+    for steer in take steers { push context user(steer) }
+    for notice in take jobs { push context user(notice) }
+    match infer(context) {
+      ok(reply, _, _, _, _, _) => {
+        push context assistant(reply)
+        match reply {
+          answer(words) => {
+            let woke = hold(hold_ms)
+            if cancelled { return stopped("cancelled") }
+            return done(words)
+          }
+          calls(requested) => {
+            for call in requested parallel {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+            if cancelled {
+              push context user("[Request interrupted by user]")
+              return stopped("cancelled during tools")
+            }
+          }
+        }
+      }
+      interrupted => {
+        push context user("[Request interrupted by user]")
+        return stopped("cancelled during the model")
+      }
+      throttled(error, _) => { return stopped(error) }
+      transient(error, _) => { return stopped(error) }
+      rejected(error) => { return stopped(error) }
+    }
+  }
+  return exhausted
+}

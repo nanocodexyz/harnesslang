@@ -159,12 +159,13 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Now
         | SiteKind::Random
         | SiteKind::Wait(_)
+        | SiteKind::Hold(_)
         | SiteKind::Suspend
         | SiteKind::Deny
         | SiteKind::Cell(_) => "null".to_owned(),
     };
     let (ms, cap) = match site.kind {
-        SiteKind::Wait(constant) => (
+        SiteKind::Wait(constant) | SiteKind::Hold(constant) => (
             format!("{}n", program.constants[constant].value),
             js_string(&program.constants[constant].name),
         ),
@@ -238,14 +239,20 @@ fn program_literal(program: &Program) -> String {
         let attaches = tool.attaches.as_ref().map_or_else(String::new, |bytes| {
             format!(", attaches: {}", type_literal(&Type::Blob(bytes.clone())))
         });
+        let jobs = tool
+            .jobs
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |bound| format!("{}n", bound.value));
         writeln!(
             out,
-            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\"{finds}{attaches}{spawns} }},",
+            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\", interrupts: {}, recoverable: {}, jobs: {jobs}{finds}{attaches}{spawns} }},",
             js_string(&tool.name),
             fields_literal(&tool.params),
             defaults_literal(&tool.defaults),
             type_literal(&tool.returns),
             tool.effect.name(),
+            interrupts_literal(tool.interrupts),
+            tool.recoverable,
         )
         .expect("writing to a string succeeds");
     }
@@ -274,24 +281,41 @@ fn program_literal(program: &Program) -> String {
                 window.tokens.value, window.attempt
             )
         });
+        let settings: Vec<String> = model
+            .settings
+            .iter()
+            .map(|setting| {
+                format!(
+                    "{{ name: {}, type: {} }}",
+                    js_string(&setting.name),
+                    type_literal(&setting.ty)
+                )
+            })
+            .collect();
         format!(
-            "{{ name: {}, calls: {}n, declared: {}, window: {window} }}",
+            "{{ name: {}, calls: {}n, declared: {}, window: {window}, interrupts: {}, settings: [{}] }}",
             js_string(&model.name),
             model.calls.value,
-            model.declared()
+            model.declared(),
+            interrupts_literal(model.interrupts),
+            settings.join(", ")
         )
     });
     let events = &program.events;
-    let steers = events.steers.as_ref().map_or("null".to_owned(), |bound| {
-        format!(
-            "{{ name: {}, max: {}n }}",
-            js_string(&bound.name),
-            bound.value
-        )
-    });
+    let taken = |bound: Option<&crate::ir::Bound>| {
+        bound.map_or("null".to_owned(), |bound| {
+            format!(
+                "{{ name: {}, max: {}n }}",
+                js_string(&bound.name),
+                bound.value
+            )
+        })
+    };
+    let steers = taken(events.steers.as_ref());
+    let jobs = taken(events.jobs.as_ref());
     write!(
         out,
-        "  ],\n  model: {model},\n  events: {{ cancel: {}, steers: {steers}, recordsMax: {}n }},\n  state: {},\n  handlers: [\n",
+        "  ],\n  model: {model},\n  events: {{ cancel: {}, steers: {steers}, jobs: {jobs}, recordsMax: {}n }},\n  state: {},\n  handlers: [\n",
         events.cancel,
         events.records_max(),
         fields_literal(&program.state)
@@ -333,6 +357,13 @@ fn program_literal(program: &Program) -> String {
     }
     out.push_str("};\n");
     out
+}
+
+fn interrupts_literal(interrupts: crate::ir::Interrupts) -> String {
+    format!(
+        "{{ cancel: {}, steer: {} }}",
+        interrupts.cancel, interrupts.steer
+    )
 }
 
 fn bound_literal(bound: &crate::ir::Bound) -> String {
@@ -438,6 +469,52 @@ impl Writer<'_> {
         }
     }
 
+    fn rewrite(&mut self, field: usize, arms: &[crate::ir::RewriteArm]) {
+        let program = self.program;
+        let depth = self.depth;
+        self.line("{");
+        self.depth += 1;
+        self.line(&format!("const rewritten_{depth} = [];"));
+        self.line(&format!("for (const item_{depth} of state[{field}]) {{"));
+        self.depth += 1;
+        self.line(&format!("switch (item_{depth}.v) {{"));
+        for (position, arm) in arms.iter().enumerate() {
+            assert_eq!(arm.variant, position, "rewrite arms are in variant order");
+            self.line(&format!("case {position}: {{"));
+            self.depth += 1;
+            match &arm.entry {
+                crate::ir::Rewritten::Kept => {
+                    self.line(&format!("rewritten_{depth}.push(item_{depth});"))
+                }
+                crate::ir::Rewritten::Dropped => {}
+                crate::ir::Rewritten::Into(entry) => {
+                    for (index, binding) in arm.bindings.iter().enumerate() {
+                        if let Some(local) = binding {
+                            self.line(&format!("local_{local} = item_{depth}.f[{index}];"));
+                        }
+                    }
+                    self.line(&format!(
+                        "rewritten_{depth}.push({});",
+                        expr(program, entry)
+                    ));
+                }
+            }
+            self.line("break;");
+            self.depth -= 1;
+            self.line("}");
+        }
+        self.line("default:");
+        self.line(&format!(
+            "{INDENT}throw new Panic(\"a rewrite covers every variant\");"
+        ));
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
+        self.line(&format!("state[{field}] = rewritten_{depth};"));
+        self.depth -= 1;
+        self.line("}");
+    }
+
     fn statement(&mut self, statement: &Stmt) {
         let program = self.program;
         let depth = self.depth;
@@ -454,6 +531,7 @@ impl Writer<'_> {
             Stmt::Push { field, value } => {
                 self.line(&format!("rt.push({field}, {});", expr(program, value)))
             }
+            Stmt::Rewrite { field, arms } => self.rewrite(*field, arms),
             Stmt::Shrink { field, kept } => match kept {
                 Kept::Nothing => self.line(&format!("rt.keep({field}, 0n);")),
                 Kept::Last(count) => {
@@ -571,7 +649,9 @@ impl Writer<'_> {
                     args.join(", ")
                 ));
             }
-            Stmt::Take { result } => self.line(&format!("local_{result} = rt.take();")),
+            Stmt::Take { result, taken } => {
+                self.line(&format!("local_{result} = rt.take(\"{}\");", taken.name()));
+            }
             Stmt::Finish { value } => self.line(&format!("return {};", expr(program, value))),
         }
     }

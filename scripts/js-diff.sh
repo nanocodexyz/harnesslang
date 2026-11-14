@@ -22,15 +22,20 @@ mkdir -p "$out"
 plant_expression() {
   case "$1" in
     none) echo 's/^$//' ;;
-    flush_after_dispatch) echo 's/const required = flushes(site.durability, call.effect);/const required = false;/' ;;
+    flush_after_dispatch) echo 's/const required = flushes(site.durability, call.effect) || /const required = false \&\& /' ;;
     bound_message) echo 's/new DecodeError(`bound(${type.bound})`)/new DecodeError(`bound ${type.bound}`)/' ;;
     enum_unchecked) echo 's/^function checkedOutput(tool, returns, output) {$/&\n  return output;/' ;;
     default_unfilled) echo 's/if (defaults\[index\] !== null \&\& !Object.hasOwn(input, param.name)) input\[param.name\] = defaults\[index\];/void defaults;/' ;;
+    rewrite_kept_lost) echo 's/^\( *\)rewritten_\([0-9]*\)\.push(item_\2);$/\1void item_\2;/' ;;
+    settings_dropped) echo 's/mode: site.mode, settings: settingsOf(args), context/mode: site.mode, settings: null, context/' ;;
     mode_dropped) echo 's/world.model({ turn: this.turn, seq, callsMax, mode: site.mode,/world.model({ turn: this.turn, seq, callsMax, mode: null,/' ;;
     blob_unjournaled) echo 's/this.blobs.journaled(data, true)/this.blobs.journaled(data, false)/' ;;
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
     grandchild_unscoped) echo 's/return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };/return { tag: "ok", value: key };/' ;;
     idle_early) echo 's/if (clock < due) return { ran: "not_due"/if (false \&\& clock < due) return { ran: "not_due"/' ;;
+    interrupt_ignored) echo 's/const interrupted = !ran.preempted\[0\] \&\& /const interrupted = false \&\& /' ;;
+    recover_reply_ignored) echo 's/if (recovered.kind !== "reply") return recovered;/return { kind: "unknown" };/' ;;
+    job_unopened) echo 's/if (jobStarted(record.output) !== null) session.jobs.set/if (false) session.jobs.set/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

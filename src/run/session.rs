@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::effect::EffectClass;
 use crate::run::cell_journal::{CellLog, CellUpdate};
-use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record};
+use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, job_started};
 use crate::run::json::Json;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub enum SiteLog {
     Open(Call),
     Done(Call, Output),
     Unknown(Call),
-    Reply(Json, Option<String>),
+    Reply(Json, Option<String>, Option<Json>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +92,7 @@ pub struct Session {
     pub checkpoints: BTreeMap<u64, String>,
     pub cell_origins: BTreeMap<u64, (u64, u64)>,
     pub last_event: u64,
+    pub jobs: BTreeMap<String, String>,
 }
 
 impl Session {
@@ -259,6 +260,18 @@ fn event(
     if cancelled && delivery.inbound == Inbound::Cancel {
         return Err(format!("turn {turn} records a second cancel"));
     }
+    if let Inbound::Job(job) = &delivery.inbound {
+        if !session.jobs.contains_key(&job.key) {
+            return Err(format!(
+                "event '{}' of turn {turn} notes job {}, which is not running",
+                delivery.id, job.key
+            ));
+        }
+        if job.done {
+            session.jobs.remove(&job.key);
+        }
+    }
+    let log = running(session, turn, "an event")?;
     log.events.push(Recorded {
         at,
         delivery: delivery.clone(),
@@ -326,20 +339,25 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
                     "result for seq {seq} of turn {turn}, which is not open"
                 ));
             };
+            let tool = call.tool.clone();
             *site = SiteLog::Done(call.clone(), output.clone());
+            if job_started(output).is_some() {
+                session.jobs.insert(crate::ir::spawn_key(*turn, *seq), tool);
+            }
         }
         Record::Model {
             turn,
             seq,
             response,
             mode,
+            settings,
         } => {
             let log = running(session, *turn, "a model reply")?;
             next_site(
                 log,
                 *turn,
                 *seq,
-                SiteLog::Reply(response.clone(), mode.clone()),
+                SiteLog::Reply(response.clone(), mode.clone(), settings.clone()),
             )?;
         }
         Record::NestedCall {
@@ -381,8 +399,21 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
             attempt,
             unknown,
             nested,
+            replied,
+            undispatched,
         } => {
             let log = running(session, *turn, "a recovery")?;
+            for seq in replied.iter().chain(undispatched) {
+                let open = matches!(
+                    log.sites.get(seq),
+                    Some(SiteLog::Open(call)) if call.effect.may_be_unknown()
+                );
+                if !open || unknown.contains(seq) {
+                    return Err(format!(
+                        "recovery attests seq {seq} of turn {turn}, which is not an open external call"
+                    ));
+                }
+            }
             for id in nested {
                 recover_nested(log, *turn, *id)?;
             }
