@@ -13,8 +13,10 @@ plant="${AGENT_DRILL_PLANT:-none}"
 seed="${AGENT_DRILL_SEED:-1}"
 out=output/agent-drill-$mode
 [ "$plant" = none ] || out="$out-$plant"
-agent=agent/target/release/hl-agent
-mock=agent/target/release/mock-messages
+target=agent/target
+[ "$plant" = none ] || target=output/agent-target-$plant
+agent=$target/release/hl-agent
+mock=$target/release/mock-messages
 killed_status=137
 
 finished=0
@@ -40,7 +42,7 @@ case "$plant" in
 esac
 
 cargo build --release --locked -j2 --quiet
-HL_AGENT_PLANT="$plant_text" cargo build --release -j2 --quiet --manifest-path agent/Cargo.toml
+HL_AGENT_PLANT="$plant_text" CARGO_TARGET_DIR="$(pwd)/$target" HL_BIN="$(pwd)/target/release/hl" cargo build --release --locked -j2 --quiet --manifest-path agent/Cargo.toml
 
 rm -rf "$out"
 mkdir -p "$out/ws"

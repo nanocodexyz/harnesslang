@@ -322,6 +322,25 @@ drill() {
   echo "drill: flush_after_dispatch and no_fence are caught in the real SQLite and Postgres databases"
 }
 
+agent() {
+  if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' agent/src agent/build.rs; then
+    echo "agent/ has comments or test functions" >&2
+    exit 1
+  fi
+  rustfmt --edition 2024 --check agent/build.rs agent/src/*.rs agent/src/bin/*.rs
+  AGENT_DRILL_SEED=1 scripts/agent-drill.sh
+  if AGENT_DRILL_SEED=1 AGENT_DRILL_PLANT=batch_flush_after_dispatch scripts/agent-drill.sh > "$scratch/agent-drill-plant.log" 2>&1; then
+    echo "agent: batch_flush_after_dispatch survived the hl-agent kill -9 drill" >&2
+    exit 1
+  fi
+  if ! grep -q 'external calls dispatched more than once' "$scratch/agent-drill-plant.log"; then
+    echo "agent: the planted drill failed for another reason:" >&2
+    cat "$scratch/agent-drill-plant.log" >&2
+    exit 1
+  fi
+  echo "agent: hl-agent survives kill -9 against the local mock without repeating an external call, and batch_flush_after_dispatch is caught"
+}
+
 stage build build
 stage census scripts/mutations.sh --census
 queue rules rules
@@ -357,6 +376,7 @@ done
 queue exhaustive scripts/exhaustive.sh
 queue js-mutations scripts/js-mutations.sh
 queue prove scripts/prove-mutations.sh
+queue agent agent
 run_queued
 stage census-examples census_examples
 if [ "${HL_ORACLE:-0}" = 1 ]; then
