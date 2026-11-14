@@ -81,4 +81,17 @@ scripts/mutations.sh
 if [ "${HL_ORACLE:-0}" = 1 ]; then
   scripts/oracle.sh
 fi
+if [ "${HL_DRILL:-0}" = 1 ]; then
+  DRILL_SESSIONS=4 scripts/rust-crash-drill.sh
+  if DRILL_SESSIONS=8 DRILL_MUTATION=flush_after_dispatch scripts/rust-crash-drill.sh > "$scratch/drill-mutation.log" 2>&1; then
+    echo "drill: flush_after_dispatch survived the crash drill" >&2
+    exit 1
+  fi
+  if ! grep -qE 'external [0-9]+/[0-9]+ ran (before its call record was durable|as its recorded tool)' "$scratch/drill-mutation.log"; then
+    echo "drill: flush_after_dispatch failed for another reason:" >&2
+    cat "$scratch/drill-mutation.log" >&2
+    exit 1
+  fi
+  echo "drill: flush_after_dispatch is caught on the real files"
+fi
 echo "check.sh: ok"
