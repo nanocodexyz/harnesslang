@@ -16,6 +16,8 @@ import urllib.parse
 ROOT = os.path.dirname(os.path.abspath(__file__))
 AGENT_MOUNT = "/opt/nanoeval-agent"
 JOURNAL_MOUNT = "/opt/nanoeval-journal"
+CA_MOUNT = "/opt/nanoeval-ca.crt"
+CA_ENV = ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS")
 METER_PORT = 18777
 RELAY_PORT = 13128
 DOCKER_BRIDGE = "bridge"
@@ -225,6 +227,10 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
             run += ["--cpus", str(config["cpus"]), "--memory", str(config["memory_mb"] + args.agent_memory_mb) + "m"]
         for key, value in env.items():
             run += ["-e", key + "=" + value]
+        if args.ca_bundle:
+            run += ["-v", os.path.abspath(args.ca_bundle) + ":" + CA_MOUNT + ":ro"]
+            for key in CA_ENV:
+                run += ["-e", key + "=" + CA_MOUNT]
         run += ["-v", agent_root + ":" + AGENT_MOUNT + ":ro", "-v", journal + ":" + JOURNAL_MOUNT, "--entrypoint", "", image, "tail", "-f", "/dev/null"]
         sh(run)
         instruction = open(os.path.join(row["dir"], "instruction.md")).read()
@@ -290,6 +296,7 @@ def main():
     parser.add_argument("--meter-port", type=int, default=METER_PORT)
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT)
     parser.add_argument("--only", action="append")
+    parser.add_argument("--ca-bundle")
     args = parser.parse_args()
     agents = args.agents.split(",")
     for agent in agents:
