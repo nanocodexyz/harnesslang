@@ -13,7 +13,7 @@ questions (`on side`); the prompt cache's lifetime (`on idle`); effects in
 flight (`interruptible by cancel, steer`, background jobs with `jobs at most`,
 `on job` and `hold`, and recovery hooks with `external recoverable`);
 rewriting entries already in the history (`rewrite`); and request settings held
-as session state (`settings` and `with {...}` on a model call), all in LANGUAGE.md. `hl-agent` runs real child sessions of `claude_code_child.hl`.
+as session state (`settings` and `with {...}` on a model call); code cells across calls (`waits` with yield, wait, terminate, turn-end stops, and a cancel that stops a cell with STOPPED or STOPPED_UNKNOWN); and forking or rewinding a session at a finished turn (`fork NAME at latest|turn`, `on forked`, and a host's `fork_entry`, which `hl-agent --fork-from` uses), all in LANGUAGE.md. `hl-agent` runs real child sessions of `claude_code_child.hl`.
 
 The list below comes from a fresh read of nanocode c7679e3's Claude backend
 (`crates/backends/claude/src`) and Codex backend (`crates/backends/codex/src`),
@@ -32,35 +32,29 @@ A parallel for's arms are now each call's lane: they run effects of their own an
 - Claude groups a reply's calls by name, every call when parallel_tools is on, otherwise consecutive parallel_safe_tools (agent.rs:1148-1162, tool_batches 2932-2946), and Codex runs every call of a reply at once, external ones included (model/run/tool_calls.rs:659-820). The batch here still groups by effect class: an external call runs alone after a flush.
 
 Smallest addition: `parallel when cond(call)`, a pure grouping predicate chosen by the program instead of the effect class (consecutive calls for which it holds form one group, externals included, after the one flush of the batch's call records), and a lane prelude that runs a `before tool` hook per call before the batch records it, with the hook's decision carried per call instead of in shared hidden fields.
-## 3. Code cells that outlive their tool call (yield, wait, detach)
+## 3. What cells across calls leave out
 
-Claude's exec and wait race a running cell's progress against cancel. On a stop it runs stop_code_cells and returns STOPPED or STOPPED_UNKNOWN, with the output gathered before the stop (agent.rs:6965-7044, stop_code_cells and settle_code_turn 6154-6190). Each cell's nested-call summaries are kept across rounds (agent.rs:8157-8165). Codex terminates every turn cell when a turn completes or is cancelled (model/run/turn.rs:288, 303, 383-396). A failed turn with no active call detaches its cells instead, so they outlive the turn (turn.rs:335-357, 366-381). After a crash it reattaches a cell still running on the host with recover_code, and runs it fresh when the call was never sent (tool_calls.rs:1277-1287).
+A cell now yields after `yield_ms`, a site of the `waits` tool continues it, `terminate` and every turn's end stop it, and a cancel stops an interruptible one (LANGUAGE.md, Code mode, Cells across calls and Stopping a cell). What nanocode does beyond that:
 
-Why not: CODE_MODE.md, Not in this spec, says it: a harnesslang turn blocks on its cell, and yield_ms only goes into the header. A cell cannot return "Script running" and be collected by a later `wait` call in another round. There is also no lifecycle for a cell that is still running when its site, round or turn ends: terminated or detached, with nested calls left open. LANGUAGE.md's Code mode section has no second site for the same cell.
+- Codex detaches a failed turn's cells instead of terminating them, so they outlive the turn and a later turn may wait on them (model/run/turn.rs:335-357, 366-381). Here a trap stops every cell of its turn. A detached cell's later records would belong to a turn whose status is already written, which every fold here and nanocode's turnlog Fold refuse; its header sits before that turn's checkpoint, where every target's load starts; and recovery reports open calls unknown only for unfinished turns.
+- A yielded cell does not run between sites: nanocode's cell keeps running on the host while the model works, and `wait` collects what it did meanwhile. Here a cell is a coroutine of its sites, and only its timers move on.
+- The STOPPED text carries no output gathered before the stop, since the engine reports output only at a cell's end.
+- After a crash Codex reattaches a cell still running on the host with recover_code (tool_calls.rs:1277-1287); here a cell is replayed from its journal.
 
-Smallest addition: A `waits name` clause on `code`. A site may finish with running(cell) after yield_ms, and a site of the wait tool continues that cell's journal. Every running cell is stopped at its turn's `return`, with open nested calls recorded unknown, unless the program says `detach`. Cell records are already keyed by cell, so C1 and C2 hold unchanged. cell_finish_once is extended to: exactly one `finished` per cell across all its sites. A new property, cell_settled_at_turn_end, requires each cell to be finished or detached when its turn's status is flushed, with open nested ids carried as unknown. The calls and timers bounds become per cell, summed over its sites in the worst case. The simulator yields cells and drives waits across rounds and crashes. Mutation: cell_leaks, a cell left running past its turn.
-
-## 7. Forking or rewinding a session at a boundary
-
-Claude forks a session, or a side conversation, from the latest boundary, a completed turn or a checkpoint (agent.rs:3190-3257, fork_point 4292-4311). Boundaries are published per round (agent.rs:4245-4265). The child's state is scrubbed: no tasks, pending continuation, previous message id or container, lifecycle_started false so SessionStart hooks run again, and auto-compaction off for side conversations. Its first record is a checkpoint under a branched policy. A rewind picks an earlier checkpoint, keeps admitted tool ids and recovery notices, and adds a notice that effects from discarded turns may still exist (agent/durable.rs:1640-1675). Codex publishes a fork snapshot before every model call (model/run/turn.rs:834-841, 922) and branches sessions (agent/driver/branch.rs:97-160).
-
-Why not: spawn starts a fresh session of another handler, with only typed arguments (LANGUAGE.md, Spawn and join). A side question reads a snapshot but writes nothing. Nothing creates a session of the same harness that starts from another session's state at a chosen finished turn, and no hook decides what a fork keeps and resets.
-
-Smallest addition: A `fork name at latest|turn` tool, external like spawn and keyed T.S. The child's journal starts with a `forked` record and a checkpoint holding the parent's state at that turn, taken from the parent's durable journal as a side question's snapshot is. An `on forked(origin: text)` hook may assign, clear, keep and push but run no effects, and resets fields such as job handles or flags. The checker counts forks as sessions in the spawn tree's worst case. The simulator checks fork_state_equal (the child's initial state is the replay of the parent's durable journal at that turn, after the hook). Mutation: fork_live_state, which forks from the running turn's state.
+Smallest addition for detach: a `detached` cell record written at a trap, which a later turn's wait site continues under nested ids of the continuing turn, with open detached calls listed by a session-level recovery record and the journal read whole when a program detaches; cell_settled_at_turn_end would accept a detached cell, and a mutation that drops the detached record would be caught when a later wait finds no cell.
 
 ## 9. What effects in flight leave out
 
-Gaps 1, 4 and 6 of the earlier list are closed (LANGUAGE.md, Effects in flight). What
+Gaps 1, 4 and 6 of the earlier list are closed (LANGUAGE.md, Effects in flight), a cancel stops an interruptible code cell, and hl-agent sends nanocode's stall notice when a background job's output stays quiet for 45 s on what looks like an interactive prompt. What
 nanocode does there that the additions do not write:
 
-- A `wait`, a cell's nested calls and a running code cell are not interruptible:
-  only tools and the model are. nanocode's retry sleep, cell stop and turn hold
-  race the cancel; here only `hold` wakes on a cancel.
+- A `wait` is not interruptible: nanocode's retry sleep races the cancel;
+  here only `hold` and an interruptible code cell's timer waits and nested
+  calls end early on one.
 - A steer cannot be withdrawn once recorded (Codex's skipped withdrawn steers).
 - A job notice that arrives while no turn runs is recorded by the next turn the
   host admits; nothing admits a turn because a job finished (nanocode's
   `Delivery::Prompted`). `examples/claude_code.hl` takes notices only when it
   would answer, after its `hold`, not at every round (taking them every round cost
   3.1M prover steps more).
-- hl-agent sends no stall notices: its jobs report only their end.
 

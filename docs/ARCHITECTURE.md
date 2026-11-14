@@ -268,6 +268,25 @@ nanocode's unknown outcome. [CODE_MODE.md](CODE_MODE.md) is the whole design:
 construct, IR, cell journal records and durability points C1 and C2, recovery
 and placement per target, simulator invariants, proofs, mutations and oracle.
 
+With `waits wait` a cell outlives its site: a site that would sleep past
+`yield_ms` answers "Script running with cell ID N", a later site of the wait
+tool replays the cell from its journal and runs it on, and every turn's end
+writes the finished update of each cell still running
+(`cell_settled_at_turn_end`). A code tool `interruptible by cancel` stops its
+cell when a cancel arrives during a nested call or timer, with nanocode's
+STOPPED or STOPPED_UNKNOWN.
+
+### Fork and rewind
+
+`fork NAME at latest|turn` starts a session of the same harness from this
+one's state after a finished turn: its journal opens with a `host` record
+`forked` (nanocode-turnlog's `Host`) and the entry checkpoint at revision 0,
+holding the parent's durable state at that turn passed through `on forked`,
+which may assign but runs no effect. A rewind is a fork at an earlier turn,
+the number of discarded turns given to the hook. A host forks through the same
+`fork_entry` every backend exposes; `hl-agent --fork-from` uses the generated
+Rust one. LANGUAGE.md's Fork and rewind has the simulator's `fork_state_equal`.
+
 ## Execution model
 
 A session is a journal. A handler runs as ordinary code; each effect site gets
