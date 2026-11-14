@@ -21,6 +21,7 @@ struct Checker<'a> {
     reads_events: bool,
     in_hook: bool,
     spawn_subject: bool,
+    side: Option<String>,
     used: std::collections::BTreeSet<ast::HookKind>,
 }
 
@@ -40,6 +41,7 @@ pub fn check(
         reads_events: false,
         in_hook: false,
         spawn_subject: false,
+        side: definition.side.then(|| definition.name.text.clone()),
         used: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::new();
@@ -63,8 +65,12 @@ pub fn check(
         )?),
         None => None,
     };
-    checker.reads_events = true;
-    let mut body = checker.opening(&params, definition.body.at)?;
+    checker.reads_events = !definition.side;
+    let mut body = if definition.side {
+        Vec::new()
+    } else {
+        checker.opening(&params, definition.body.at)?
+    };
     let (rest, returned) = checker.block(&definition.body)?;
     body.extend(rest);
     if !returned {
@@ -119,6 +125,7 @@ pub fn invariant(
         reads_events: false,
         in_hook: false,
         spawn_subject: false,
+        side: None,
         used: std::collections::BTreeSet::new(),
     };
     let condition = checker.condition(
@@ -239,6 +246,14 @@ impl Checker<'_> {
         if self.reads_events {
             return Ok(());
         }
+        if let Some(side) = &self.side {
+            return error(
+                at,
+                format!(
+                    "side handler '{side}' cannot read '{what}': a side question is not a turn, so it takes no events"
+                ),
+            );
+        }
         error(
             at,
             format!("'{what}' reads the turn's events, so it belongs in a handler's body"),
@@ -322,7 +337,62 @@ impl Checker<'_> {
         Ok((field, (**element).clone()))
     }
 
+    fn side_writes(&self, statement: &ast::Stmt) -> Checked<()> {
+        let Some(side) = &self.side else {
+            return Ok(());
+        };
+        let what = match statement {
+            ast::Stmt::Assign { name, .. } => format!("assign to '{}'", name.text),
+            ast::Stmt::Push { list, .. } => format!("push onto '{}'", list.text),
+            ast::Stmt::Clear { list, .. } => format!("clear '{}'", list.text),
+            ast::Stmt::Keep { list, .. } => format!("keep the end of '{}'", list.text),
+            ast::Stmt::KeepBlobs { list, .. } => format!("keep the blobs of '{}'", list.text),
+            ast::Stmt::For { parallel: true, .. } => "dispatch a parallel for".to_owned(),
+            _ => return Ok(()),
+        };
+        error(
+            statement_at(statement),
+            format!(
+                "side handler '{side}' cannot {what}: a side question reads the session's state at its last finished turn and changes none of it"
+            ),
+        )
+    }
+
+    fn side_call(&self, callee: &ast::Name) -> Checked<()> {
+        let Some(side) = &self.side else {
+            return Ok(());
+        };
+        let name = callee.text.as_str();
+        let what = if let Some(&tool) = self.globals.tools.get(name) {
+            let tool = &self.program.tools[tool];
+            if tool.effect == EffectClass::None {
+                return Ok(());
+            }
+            let kind = if tool.spawn.is_some() {
+                "spawn tool"
+            } else {
+                "tool"
+            };
+            format!("call {kind} '{name}' of effect {}", tool.effect.name())
+        } else if self.globals.codes.contains_key(name) {
+            format!("run code tool '{name}'")
+        } else if self.globals.listings.contains_key(name) {
+            format!("read listing '{name}'")
+        } else if ["dispatch", "wait", "suspend", "now", "random", JOIN].contains(&name) {
+            format!("call '{name}'")
+        } else {
+            return Ok(());
+        };
+        error(
+            callee.at,
+            format!(
+                "side handler '{side}' cannot {what}: a side question is journaled nowhere, so it calls only the model and tools of effect none"
+            ),
+        )
+    }
+
     fn statement(&mut self, statement: &ast::Stmt, out: &mut Vec<Stmt>) -> Checked<bool> {
+        self.side_writes(statement)?;
         match statement {
             ast::Stmt::Let { name, ty, value } => {
                 let wanted = match ty {
@@ -1172,6 +1242,7 @@ impl Checker<'_> {
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
+        self.side_call(callee)?;
         let at = callee.at;
         let is_model = self.globals.model.as_deref() == Some(callee.text.as_str());
         if let Some(mode) = mode.filter(|_| !is_model) {

@@ -507,11 +507,16 @@ pub fn check_limits(program: &Program, model: &Model) -> Vec<String> {
     let Some(limit) = model.limits.outbound_requests_per_invocation else {
         return errors;
     };
-    for handler in &program.handlers {
+    let handlers = program
+        .handlers
+        .iter()
+        .map(|handler| ("handler", handler))
+        .chain(program.sides.iter().map(|side| ("side handler", side)));
+    for (kind, handler) in handlers {
         let requests = &handler.worst.requests;
         if requests.total > limit.value {
             errors.push(format!(
-                "handler '{}': worst case {} outbound requests exceeds {}'s limit of {} {}; loops: {}",
+                "{kind} '{}': worst case {} outbound requests exceeds {}'s limit of {} {}; loops: {}",
                 handler.name,
                 requests.total,
                 model.target.name(),

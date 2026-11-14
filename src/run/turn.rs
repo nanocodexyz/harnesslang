@@ -331,6 +331,7 @@ pub fn run_turn(
         target,
         mutation,
     };
+    let snapshot = (!program.sides.is_empty()).then(|| state.clone());
     let mut engine = Engine::new(
         setup,
         handler,
@@ -341,6 +342,9 @@ pub fn run_turn(
     )
     .with_next_cell(session.next_cell())
     .with_blobs(blobs);
+    if let Some(snapshot) = snapshot {
+        engine = engine.with_snapshot(snapshot);
+    }
     for record in pending {
         engine.append(record);
     }

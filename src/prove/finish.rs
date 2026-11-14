@@ -3,7 +3,7 @@ use crate::prove::text::Names;
 use crate::prove::{Finding, Report};
 
 pub fn prove(program: &Program, report: &mut Report) {
-    for handler in &program.handlers {
+    for handler in program.handlers.iter().chain(&program.sides) {
         let names = Names::new(program, Some(handler));
         let mut walk = Walk {
             program,

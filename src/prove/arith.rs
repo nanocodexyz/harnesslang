@@ -68,7 +68,7 @@ struct Prover<'a> {
 
 pub fn prove(program: &Program, report: &mut Report) {
     zero_state(program, report);
-    for handler in &program.handlers {
+    for handler in program.handlers.iter().chain(&program.sides) {
         let mut prover = Prover::new(program, Some(handler));
         let mut state = prover.entry_state();
         prover.path.push("requires".to_owned());

@@ -6,6 +6,7 @@ pub mod faults;
 pub mod invariants;
 pub mod park;
 pub mod rng;
+pub mod side;
 pub mod strict;
 pub mod trace;
 pub mod world;
@@ -135,9 +136,14 @@ fn drive_turn(
         if let Some(trace) = &mut world.trace {
             trace.exit(&ran);
         }
+        world.side_fault()?;
         match ran {
             Ok(Ran::Finished(_)) => return Ok(()),
-            Ok(Ran::Suspended(suspension)) => world.suspended(&suspension)?,
+            Ok(Ran::Suspended(suspension)) => {
+                world.suspended(&suspension)?;
+                let parked = format!("while turn {} is parked", request.turn);
+                world.side_between(side::SIDE_PARKED_PPM, parked)?;
+            }
             Ok(Ran::AlreadyFinished(finish)) => {
                 crate::run::World::acknowledge(world, &finish);
                 return Ok(());
@@ -256,7 +262,9 @@ fn run_seed_unguarded(
             arguments,
         };
         world.begin_turn(&request, faulty);
-        let driven = drive_turn(program, &mut world, &request);
+        let driven = drive_turn(program, &mut world, &request).and_then(|()| {
+            world.side_between(side::SIDE_BETWEEN_TURNS_PPM, format!("after turn {turn}"))
+        });
         world.inbox.end_turn(turn);
         if let Err(violation) = driven {
             let specific = match world.medium.durable() {
@@ -405,6 +413,7 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.children += more.children;
     total.joined += more.joined;
     total.child_crashes += more.child_crashes;
+    total.side_questions += more.side_questions;
 }
 
 pub fn run_child(
@@ -608,7 +617,11 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                 } else {
                     String::new()
                 }
-            ),
+            ) + &if stats.side_questions > 0 {
+                format!(" side_questions={}", stats.side_questions)
+            } else {
+                String::new()
+            },
         ),
     }
 }

@@ -207,6 +207,7 @@ pub struct Handler {
     pub requires: Option<Expr>,
     pub body: Block,
     pub ends_session: bool,
+    pub side: bool,
 }
 
 #[derive(Clone, Debug)]

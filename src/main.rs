@@ -220,6 +220,23 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
     lines.join("\n")
 }
 
+fn side_lines(side: &ir::Handler) -> String {
+    let worst = &side.worst;
+    [
+        format!(
+            "  side handler {}: worst case {} effects, 0 journal records, {} outbound requests",
+            side.name, worst.effects.total, worst.requests.total
+        ),
+        format!("    effects: {}", worst.effects.describe_loops()),
+        format!("    outbound requests: {}", worst.requests.describe_loops()),
+        "    journaled nowhere: it runs over the state at the last finished turn".to_owned(),
+    ]
+    .join(
+        "
+",
+    )
+}
+
 fn check_command(args: &[String]) -> ExitCode {
     let Some(flags) = flags(args) else {
         return usage();
@@ -243,6 +260,9 @@ fn check_command(args: &[String]) -> ExitCode {
     );
     for handler in &program.handlers {
         println!("{}", worst_lines(&program, handler));
+    }
+    for side in &program.sides {
+        println!("{}", side_lines(side));
     }
     let proved_targets = flags
         .target

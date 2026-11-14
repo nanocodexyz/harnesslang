@@ -11,6 +11,7 @@ use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, call_id};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::session::{Call, Recorded, SiteLog, TurnLog};
+use crate::run::side::{self, SideAnswer, SideRequest};
 use crate::run::value::{self, Value};
 use crate::target::inbound::{self, Drain};
 use crate::target::{self, Recovery};
@@ -188,6 +189,16 @@ pub trait World {
     fn inbox(&mut self, turn: u64) -> Vec<Delivery>;
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]);
     fn read(&mut self, read: &Read);
+    fn side(&mut self, _turn: u64, _seq: u64, _buffered: &[Record]) -> Option<SideRequest> {
+        None
+    }
+    fn sided(
+        &mut self,
+        _request: &SideRequest,
+        _answer: &Result<SideAnswer, Exit>,
+        _buffered: &[Record],
+    ) {
+    }
 }
 
 pub fn close_inbox(world: &mut dyn World, turn: u64, position: u64, events: &[Recorded]) {
@@ -328,6 +339,7 @@ pub struct Engine<'a> {
     notices: BTreeMap<ir::ListingId, String>,
     discovered: BTreeMap<ir::ListingId, BTreeSet<String>>,
     blobs: Blobs,
+    snapshot: Option<Vec<Value>>,
 }
 
 enum Flow {
@@ -387,7 +399,17 @@ impl<'a> Engine<'a> {
             notices: BTreeMap::new(),
             discovered: BTreeMap::new(),
             blobs: Blobs::default(),
+            snapshot: None,
         }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: Vec<Value>) -> Self {
+        assert!(
+            !self.program.sides.is_empty(),
+            "only a program with side handlers keeps the snapshot a side question reads"
+        );
+        self.snapshot = Some(snapshot);
+        self
     }
 
     pub fn with_blobs(mut self, blobs: Blobs) -> Self {
@@ -1366,11 +1388,11 @@ impl<'a> Engine<'a> {
                 self.reopen(site_id, seq, call, &args)
             }
             None => {
+                self.require_live(seq)?;
+                self.side_question(seq)?;
                 if site.kind == SiteKind::Model {
-                    self.require_live(seq)?;
                     return self.execute(site_id, seq, &call, &args);
                 }
-                self.require_live(seq)?;
                 self.append(Record::Call {
                     turn: self.turn,
                     seq,
@@ -1382,6 +1404,42 @@ impl<'a> Engine<'a> {
                 self.execute(site_id, seq, &call, &args)
             }
         }
+    }
+
+    fn side_question(&mut self, seq: u64) -> Result<(), Halt> {
+        if self.program.sides.is_empty() {
+            return Ok(());
+        }
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("a side question arrives only while a turn runs live")
+        };
+        let Some(request) = world.side(self.turn, seq, &self.buffer) else {
+            return Ok(());
+        };
+        let state = if self.mutation == Mutation::SideLiveState {
+            self.state.clone()
+        } else {
+            self.snapshot
+                .clone()
+                .expect("a live run of a program with side handlers keeps its snapshot")
+        };
+        let setup = Setup {
+            program: self.program,
+            target: self.target,
+            mutation: self.mutation,
+        };
+        let ran = side::run(setup, &mut **world, state, self.blobs.clone(), &request);
+        let answer = match ran {
+            Ok((answer, records)) => {
+                if self.mutation == Mutation::SideJournaled {
+                    self.buffer.extend(records);
+                }
+                Ok(answer)
+            }
+            Err(exit) => Err(exit),
+        };
+        world.sided(&request, &answer, &self.buffer);
+        Ok(())
     }
 
     fn suspend_site(&mut self, site_id: usize, seq: u64, call: Call) -> Result<Value, Halt> {

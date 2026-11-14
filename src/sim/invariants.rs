@@ -51,10 +51,11 @@ pub enum Invariant {
     SearchListed,
     DeniedUnrun,
     ChildScoped,
+    SideIsolated,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -91,6 +92,7 @@ impl Invariant {
         Self::SearchListed,
         Self::DeniedUnrun,
         Self::ChildScoped,
+        Self::SideIsolated,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -131,6 +133,7 @@ impl Invariant {
             Self::SearchListed => "search_listed",
             Self::DeniedUnrun => "denied_unrun",
             Self::ChildScoped => "child_scoped",
+            Self::SideIsolated => "side_isolated",
         }
     }
 }
@@ -542,6 +545,7 @@ fn sessions_and_denials(world: &SimWorld<'_>, records: &[Record]) -> Result<(), 
 }
 
 pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violation> {
+    world.side_fault()?;
     sessions_and_denials(world, records)?;
     for (id, dispatched) in &world.dispatched {
         if dispatched.external > 1 {
