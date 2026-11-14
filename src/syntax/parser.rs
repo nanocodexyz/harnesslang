@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Const, Expr, Handler, Invariant, Item, Model, Name, Param, Pattern,
-    Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Const, Expr, Function, Handler, Invariant, Item, Model, Name, Param,
+    Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -35,7 +35,7 @@ pub const KEYWORDS: [&str; 24] = [
     "requires",
 ];
 
-const ITEMS: &str = "'const', 'type', 'tool', 'model', 'state', 'invariant' or 'on'";
+const ITEMS: &str = "'const', 'type', 'tool', 'model', 'state', 'invariant', 'fn' or 'on'";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -173,6 +173,7 @@ impl<'a> Parser<'a> {
             "model" => self.model().map(Item::Model),
             "state" => self.state().map(Item::State),
             "invariant" => self.invariant().map(Item::Invariant),
+            "fn" => self.function().map(Item::Function),
             "on" => self.handler().map(Item::Handler),
             _ => Err(self.unexpected(ITEMS)),
         }
@@ -304,6 +305,14 @@ impl<'a> Parser<'a> {
         Ok(State { at, fields })
     }
 
+    fn function(&mut self) -> Parsed<Function> {
+        self.word("fn")?;
+        let name = self.name("a fn name")?;
+        let params = self.params()?;
+        let body = self.block()?;
+        Ok(Function { name, params, body })
+    }
+
     fn handler(&mut self) -> Parsed<Handler> {
         self.word("on")?;
         let name = self.name("a handler name")?;
@@ -415,9 +424,15 @@ impl<'a> Parser<'a> {
             "let" => {
                 self.advance();
                 let name = self.name("a binding name")?;
+                let ty = if self.is_symbol(Symbol::Colon) {
+                    self.advance();
+                    Some(self.type_expr()?)
+                } else {
+                    None
+                };
                 self.symbol(Symbol::Assign)?;
                 let value = self.expr()?;
-                Ok(Stmt::Let { name, value })
+                Ok(Stmt::Let { name, ty, value })
             }
             "push" => {
                 self.advance();
@@ -460,8 +475,13 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let name = self.name("a statement")?;
+                if self.is_symbol(Symbol::LeftParen) {
+                    self.advance();
+                    let args = self.arguments()?;
+                    return Ok(Stmt::Call { callee: name, args });
+                }
                 if !self.is_symbol(Symbol::Assign) {
-                    return Err(self.unexpected("'=' after a name that starts a statement"));
+                    return Err(self.unexpected("'=' or '(' after a name that starts a statement"));
                 }
                 self.advance();
                 let value = self.expr()?;
@@ -679,22 +699,27 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Name(callee));
                 }
                 self.advance();
-                let mut args = Vec::new();
-                if self.is_symbol(Symbol::RightParen) {
-                    self.advance();
-                    return Ok(Expr::Call { callee, args });
-                }
-                loop {
-                    args.push(self.expr()?);
-                    if self.is_symbol(Symbol::Comma) {
-                        self.advance();
-                        continue;
-                    }
-                    self.symbol(Symbol::RightParen)?;
-                    return Ok(Expr::Call { callee, args });
-                }
+                let args = self.arguments()?;
+                Ok(Expr::Call { callee, args })
             }
             _ => Err(self.unexpected("an expression")),
+        }
+    }
+
+    fn arguments(&mut self) -> Parsed<Vec<Expr>> {
+        let mut args = Vec::new();
+        if self.is_symbol(Symbol::RightParen) {
+            self.advance();
+            return Ok(args);
+        }
+        loop {
+            args.push(self.expr()?);
+            if self.is_symbol(Symbol::Comma) {
+                self.advance();
+                continue;
+            }
+            self.symbol(Symbol::RightParen)?;
+            return Ok(args);
         }
     }
 }

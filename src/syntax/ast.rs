@@ -21,6 +21,7 @@ pub enum Item {
     Model(Model),
     State(State),
     Invariant(Invariant),
+    Function(Function),
     Handler(Handler),
 }
 
@@ -82,6 +83,13 @@ pub struct Param {
 }
 
 #[derive(Clone, Debug)]
+pub struct Function {
+    pub name: Name,
+    pub params: Vec<Param>,
+    pub body: Block,
+}
+
+#[derive(Clone, Debug)]
 pub struct Handler {
     pub name: Name,
     pub params: Vec<Param>,
@@ -127,6 +135,7 @@ pub struct Block {
 pub enum Stmt {
     Let {
         name: Name,
+        ty: Option<TypeExpr>,
         value: Expr,
     },
     Assign {
@@ -164,6 +173,16 @@ pub enum Stmt {
     Return {
         at: Position,
         value: Expr,
+    },
+    Call {
+        callee: Name,
+        args: Vec<Expr>,
+    },
+    Inlined {
+        at: Position,
+        function: Name,
+        arguments: Vec<(Param, Expr)>,
+        body: Block,
     },
 }
 

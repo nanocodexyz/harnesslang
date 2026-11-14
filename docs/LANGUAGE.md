@@ -492,7 +492,7 @@ Keywords: `harness` `const` `type` `tool` `model` `state` `on` `let` `push` `if`
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `in` `known` `maybe`
+Contextual words: `below` `calls` `fn` `in` `known` `maybe`
 
 Builtin functions, whose names declarations may not take:
 
@@ -538,7 +538,7 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | model | state | invariant | handler ;
+item       = const | type | tool | model | state | invariant | function | handler ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
@@ -547,6 +547,7 @@ effect_class = "none" | "idempotent" | "external" ;
 model      = "model" name "calls" bound ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
+function   = "fn" name params block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
 bound      = name ;
@@ -555,14 +556,15 @@ type_expr  = "list" "<" type_expr "," bound ">"
            | "maybe" "<" type_expr ">"
            | name ;
 block      = "{" { statement } "}" ;
-statement  = "let" name "=" expr
+statement  = "let" name [ ":" type_expr ] "=" expr
            | "push" name expr
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
            | "for" name "in" expr block
            | "return" expr
-           | name "=" expr ;
+           | name "=" expr
+           | name "(" [ expr { "," expr } ] ")" ;
 if         = "if" expr block [ "else" ( if | block ) ] ;
 arm        = ( name [ "(" name { "," name } ")" ] | text ) "=>" block ;
 expr       = and { "or" and } ;
@@ -780,6 +782,260 @@ on ping() -> u64
 }
 ```
 
+### fn
+
+`fn name(param: type, ...) { ... }` names a block of statements that handlers
+share, and the statement `name(argument, ...)` runs it. The checker inlines the
+body at each call before it lowers the handler, so every handler that calls a
+fn gets its own effect sites, sequence numbers, worst case and proofs, as if
+the body were written there. A call is the same as writing, in a block of its
+own, `let param: type = argument` for each parameter in order, then the body:
+
+- A fn sees its parameters, its own bindings and the harness's declarations
+  (constants, types and their variants, tools, the model, state fields), never
+  its caller's locals, so its names may repeat its caller's.
+- A fn has no value. A `return` in its body finishes the turn of the handler
+  that called it, with that handler's result type; a body that does not
+  return goes on to the statement after the call.
+- A fn may call another fn but never itself, directly or through others.
+- Every fn is called somewhere: only an inlined body is checked.
+
+`examples/subagents.hl` shares its model loop between its two handlers this way.
+This program shares a comment and a log line between two handlers:
+
+```hl docs/snippets/fn.hl
+harness reporter
+
+const lines_max: u64 = 64
+
+type report = posted(text) | refused(text) | lost
+
+tool comment(change: text, body: text) -> text effect external
+
+state {
+  lines: list<text, lines_max>
+}
+
+fn note(label: text, detail: text) {
+  push lines label ++ ": " ++ detail
+}
+
+fn post(target: text, body: text) {
+  match comment(target, body) {
+    ok(link) => {
+      note("posted", link)
+      return posted(link)
+    }
+    failed(error) => {
+      note("refused", error)
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+
+on approve(change: text) -> report
+  requires len(lines) < lines_max
+{
+  post(change, "approved")
+}
+
+on withdraw(change: text, reason: text) -> report
+  requires len(lines) < lines_max
+{
+  post(change, "withdrawn: " ++ reason)
+}
+```
+
+Written out by hand, it is this program, and every target emits the same code
+for both:
+
+```hl docs/snippets/fn_inline.hl
+harness reporter
+
+const lines_max: u64 = 64
+
+type report = posted(text) | refused(text) | lost
+
+tool comment(change: text, body: text) -> text effect external
+
+state {
+  lines: list<text, lines_max>
+}
+
+on approve(change: text) -> report
+  requires len(lines) < lines_max
+{
+  let target: text = change
+  let body: text = "approved"
+  match comment(target, body) {
+    ok(link) => {
+      let label: text = "posted"
+      let detail: text = link
+      push lines label ++ ": " ++ detail
+      return posted(link)
+    }
+    failed(error) => {
+      let label: text = "refused"
+      let detail: text = error
+      push lines label ++ ": " ++ detail
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+
+on withdraw(change: text, reason: text) -> report
+  requires len(lines) < lines_max
+{
+  let target: text = change
+  let body: text = "withdrawn: " ++ reason
+  match comment(target, body) {
+    ok(link) => {
+      let label: text = "posted"
+      let detail: text = link
+      push lines label ++ ": " ++ detail
+      return posted(link)
+    }
+    failed(error) => {
+      let label: text = "refused"
+      let detail: text = error
+      push lines label ++ ": " ++ detail
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+```
+
+```console
+$ for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do hl emit --target $target docs/snippets/fn_inline.hl > output/fn_inline.out; hl emit --target $target docs/snippets/fn.hl | cmp - output/fn_inline.out && echo "$target: identical"; done
+native-jsonl: identical
+native-sqlite: identical
+server-postgres: identical
+cloudflare: identical
+vercel: identical
+```
+
+A model loop that asks again after running tools by calling itself is
+recursion, which the checker refuses, naming the cycle; a `loop` with a named
+bound is how a harness repeats:
+
+```hl examples/invalid/fn_recursion.hl
+harness fn_recursion
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = completed(text) | failed(text)
+
+tool read(path: text) -> text effect none
+
+model infer calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+fn ask() {
+  let reply = infer(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return completed(words) }
+    calls(requested) => { run_tools(requested) }
+  }
+}
+
+fn run_tools(requested: list<call, calls_max>) {
+  for call in requested {
+    match dispatch(call) {
+      ok(output) => { push context result(call, output) }
+      failed(error) => { push context error(call, error) }
+      unknown => { push context unknown(call) }
+    }
+  }
+  ask()
+}
+
+on prompt(input: text) -> outcome {
+  push context user(input)
+  ask()
+}
+```
+
+```console
+$ hl check examples/invalid/fn_recursion.hl
+examples/invalid/fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask; a fn is inlined where it is called, so it cannot call itself, directly or through another fn
+$ hl check docs/snippets/errors/fn-self.hl
+docs/snippets/errors/fn-self.hl:9:3: error: fn 'again' is recursive: again -> again; a fn is inlined where it is called, so it cannot call itself, directly or through another fn
+$ hl check examples/invalid/fn_arity.hl
+examples/invalid/fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1
+$ hl check examples/invalid/fn_hidden_name.hl
+examples/invalid/fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input': a fn sees its parameters, its own bindings and the harness's declarations
+$ hl check docs/snippets/errors/fn-expression.hl
+docs/snippets/errors/fn-expression.hl:8:15: error: fn 'greet' has no value: call it as a statement of its own, not inside an expression
+$ hl check docs/snippets/errors/fn-statement.hl
+docs/snippets/errors/fn-statement.hl:6:3: error: 'read' is not a fn: only a fn is called as a statement; bind an effect's result with let or match it
+$ hl check docs/snippets/errors/fn-unused.hl
+docs/snippets/errors/fn-unused.hl:7:4: error: fn 'reset' is never called
+```
+
+```hl docs/snippets/errors/fn-self.hl
+harness notes
+
+state {
+  count: u64
+}
+
+fn again() {
+  count = count + 1
+  again()
+}
+
+on ping() -> u64 {
+  again()
+  return count
+}
+```
+
+```hl docs/snippets/errors/fn-expression.hl
+harness notes
+
+fn greet(name: text) {
+  return "hello " ++ name
+}
+
+on ping(name: text) -> text {
+  let words = greet(name)
+  return words
+}
+```
+
+```hl docs/snippets/errors/fn-statement.hl
+harness notes
+
+tool read(path: text) -> text effect none
+
+on ping(path: text) -> u64 {
+  read(path)
+  return 1
+}
+```
+
+```hl docs/snippets/errors/fn-unused.hl
+harness notes
+
+state {
+  count: u64
+}
+
+fn reset() {
+  count = 0
+}
+
+on ping() -> u64 { return count }
+```
+
 ## Types
 
 | Type | Values | Operations |
@@ -809,7 +1065,8 @@ Rules:
   takes the one sum that has the variant; `ok`, `failed` and `unknown` always
   need an expected type.
 - Names are bound once per handler: no shadowing, and a local may not reuse
-  a state field's, constant's, tool's or the model's name.
+  a state field's, constant's, tool's or the model's name. A fn's body is a
+  scope of its own, so its names may repeat its caller's.
 - Locals (`let`, parameters, loop variables, pattern bindings) never change.
   Only state fields are assigned and pushed.
 
@@ -1116,6 +1373,7 @@ on ping() -> u64 { return 1 }
 | Statement | Meaning |
 | --- | --- |
 | `let x = e` | bind a new local |
+| `let x: T = e` | bind a new local of type `T`; `e` is checked against `T`, so a variant constructor takes its type from it |
 | `field = e` | assign a state field |
 | `push field e` | append to a state list; a full list traps with `bound(field)` |
 | `if c { } else if c { } else { }` | `c` is `bool` |
@@ -1123,9 +1381,11 @@ on ping() -> u64 { return 1 }
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
 | `for x in list { }` | runs the body once per element of the list as it was when the loop started |
 | `return e` | finish the turn with `e`, of the handler's result type |
+| `f(a, ...)` | run [fn](#fn) `f`'s body here |
 
-There is no `while`, no recursion and no user function: a handler is
-straight-line code over bounded loops, so its worst case is a number.
+There is no `while` and no recursion, and a fn is inlined where it is
+called: a handler is straight-line code over bounded loops, so its worst
+case is a number.
 
 ```console
 $ hl check docs/snippets/errors/missing-variant.hl
@@ -1321,7 +1581,8 @@ The compiler's own bounds:
 
 | Bound | Value | Source |
 | --- | --- | --- |
-| nesting of blocks, types, expressions | `NESTING_DEPTH_MAX` = 64 | policy |
+| nesting of blocks, types, expressions | `NESTING_DEPTH_MAX` = 64 | policy; also bounds the blocks of a handler once its fns are inlined |
+| statements per handler once its fns are inlined | `STATEMENTS_PER_HANDLER_MAX` = 65,536 | policy: over a thousand times the largest example handler; a program whose fns double at each level reaches it in milliseconds |
 | prover steps per handler | `PROOF_STEPS_PER_HANDLER_MAX` = 4,000,000 | policy; reaching it fails the obligation and says so |
 | constraints per prover step | `PROOF_CONSTRAINTS_MAX` = 4,096 | policy; same |
 | nesting of a journal's JSON | `JSON_DEPTH_MAX` = 128 | policy |

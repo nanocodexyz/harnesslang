@@ -1,0 +1,8 @@
+harness notes
+
+tool read(path: text) -> text effect none
+
+on ping(path: text) -> u64 {
+  read(path)
+  return 1
+}
