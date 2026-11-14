@@ -420,10 +420,15 @@ fn refuse_unsupported(program: &Program) -> Result<(), String> {
             "model windows, settings and declared replies",
         ),
     ];
-    match refused.iter().find(|(refuses, _)| *refuses) {
-        Some((_, what)) => not_yet(what),
-        None => Ok(()),
+    let what: Vec<&str> = refused
+        .iter()
+        .filter(|(refuses, _)| *refuses)
+        .map(|(_, what)| *what)
+        .collect();
+    if what.is_empty() {
+        return Ok(());
     }
+    not_yet(&what.join(", "))
 }
 
 pub fn program_text(program: &Program, target: crate::target::Target) -> Result<String, String> {

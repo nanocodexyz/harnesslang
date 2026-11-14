@@ -8,6 +8,7 @@
 (import "hl" "random" (func $host_random (result i64)))
 (import "hl" "attempt" (func $host_attempt (param i64 i64) (result i64)))
 (import "hl" "acknowledge" (func $host_acknowledge (param i32 i32)))
+(import "hl" "world" (func $host_world (param i32 i32) (result i64)))
 (memory (export "memory") 2)
 (global $PAGE_BYTES i32 (i32.const 65536))
 (global $PAGE_SHIFT i32 (i32.const 16))

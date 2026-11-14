@@ -79,7 +79,7 @@ for (const line of readFileSync(values.trace, "utf8").split("\n")) {
   else seeds[seeds.length - 1].events.push(event);
 }
 
-const stats = { seeds: 0, events: 0, runs: 0, owners: 0, flushes: 0, hooks: 0, instantiate_ms: 0, run_ms: 0 };
+const stats = { seeds: 0, events: 0, runs: 0, owners: 0, flushes: 0, hooks: 0, world: 0, instantiate_ms: 0, run_ms: 0 };
 
 class Seed {
   constructor(events) {
@@ -261,6 +261,18 @@ class Instance {
         same("attempt seq", event.seq, seq);
         return BigInt(event.answer);
       },
+      world: (at, length) => {
+        const request = parseJson(this.text(at, length));
+        const kind = request.event;
+        const event = seed.next(kind, short(encodeJson(request)));
+        for (const key of Object.keys(request)) {
+          if (key !== "event") same(kind + " " + key + " at event " + (seed.index - 1), event[key] ?? null, request[key]);
+        }
+        stats.world += 1;
+        if (event.answer === "crash") throw new Stopped("crash");
+        if (event.answer === "fenced") throw new Stopped("fenced");
+        return this.giveText(encodeJson(event));
+      },
       acknowledge: (at, length) => {
         seed.acknowledged(parseJson(this.text(at, length)));
       },
@@ -281,6 +293,6 @@ for (const { seed: header, events } of seeds) {
 }
 console.log(
   "ok backend=wasm target=" + values.target + " seeds=" + stats.seeds + " events=" + stats.events + " runs=" + stats.runs + " owners=" + stats.owners +
-    " flushes=" + stats.flushes + " hooks=" + stats.hooks + " module_bytes=" + moduleBytes.length + " compile_ms=" + compileMs.toFixed(1) +
+    " flushes=" + stats.flushes + " hooks=" + stats.hooks + " world=" + stats.world + " module_bytes=" + moduleBytes.length + " compile_ms=" + compileMs.toFixed(1) +
     " instantiate_us_per_run=" + ((stats.instantiate_ms * 1000) / Math.max(stats.runs, 1)).toFixed(1) + " run_ms=" + stats.run_ms.toFixed(1),
 );
