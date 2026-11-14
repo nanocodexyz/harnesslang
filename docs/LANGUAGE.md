@@ -447,10 +447,12 @@ $ hl run examples/agent.hl --handler prompt --arg hello | head -n 1
 file using only std, which a host drives through `run_jsonl`:
 
 ```console
-$ hl emit --target native-jsonl examples/agent.hl | grep -E '^pub fn run_jsonl|^pub trait (Host|Disk)'
-pub trait Host {
-pub trait Disk {
-pub fn run_jsonl<H: Host>(host: &mut H, disk: &mut dyn Disk, request: &TurnRequest) -> Result<Ran, RunError> {
+$ hl emit --target native-jsonl examples/agent.hl | grep -E -A 4 '^pub fn run_jsonl'
+pub fn run_jsonl<H: Host>(
+    host: &mut H,
+    disk: &mut dyn Disk,
+    request: &TurnRequest,
+) -> Result<Ran, RunError> {
 ```
 
 [Targets](#targets) lists what every target generates.
