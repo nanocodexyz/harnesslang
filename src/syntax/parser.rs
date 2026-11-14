@@ -43,6 +43,7 @@ const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'code', 'spawn', 'model',
 pub const SESSION_END_HANDLER: &str = "session_end";
 pub const CODE_TOOLS_FIELD: &str = "tools";
 pub const WAIT_BUILTIN: &str = "wait";
+pub const HOLD_BUILTIN: &str = "hold";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -277,6 +278,22 @@ impl<'a> Parser<'a> {
             None
         };
         let effect = self.effect_class()?;
+        let recoverable = if self.is_word("recoverable") {
+            let at = self.at();
+            self.advance();
+            Some(at)
+        } else {
+            None
+        };
+        let interrupts = self.interrupts()?;
+        let jobs = if self.is_word("jobs") {
+            self.advance();
+            self.word("at")?;
+            self.word("most")?;
+            Some(self.bound("the jobs a tool keeps running at once")?)
+        } else {
+            None
+        };
         let finds = if self.is_word("finds") {
             self.advance();
             Some(self.name("the listing a search finds tools of")?)
@@ -290,8 +307,26 @@ impl<'a> Parser<'a> {
             returns,
             attaches,
             effect,
+            recoverable,
+            interrupts,
+            jobs,
             finds,
         })
+    }
+
+    fn interrupts(&mut self) -> Parsed<Vec<Name>> {
+        let mut events = Vec::new();
+        if !self.is_word("interruptible") {
+            return Ok(events);
+        }
+        self.advance();
+        self.word("by")?;
+        events.push(self.name("an event that interrupts the effect")?);
+        while self.is_symbol(Symbol::Comma) {
+            self.advance();
+            events.push(self.name("an event that interrupts the effect")?);
+        }
+        Ok(events)
     }
 
     fn effect_class(&mut self) -> Parsed<EffectClass> {
@@ -393,12 +428,14 @@ impl<'a> Parser<'a> {
                 modes.push(self.name("a model call mode")?);
             }
         }
+        let interrupts = self.interrupts()?;
         Ok(Model {
             name,
             calls,
             reply,
             modes,
             window,
+            interrupts,
         })
     }
 
@@ -1066,7 +1103,7 @@ impl<'a> Parser<'a> {
                 }
                 self.advance();
                 let mut args = self.arguments()?;
-                if callee.text == WAIT_BUILTIN && self.is_word("at") {
+                if (callee.text == WAIT_BUILTIN || callee.text == HOLD_BUILTIN) && self.is_word("at") {
                     self.advance();
                     self.word("most")?;
                     args.push(Expr::Name(self.bound("the most a wait sleeps")?));

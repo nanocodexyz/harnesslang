@@ -147,7 +147,7 @@ fn reply(program: &Program) {
         );
         assert_eq!(
             program.sums[window.attempt].variants,
-            ir::attempt_variants(window.stop),
+            ir::attempt_variants(window.stop, model.interrupts.any()),
             "an attempt is ok with reply, stop and usage, or one of the model errors"
         );
         assert!(window.tokens.value > 0, "a context window holds tokens");
@@ -223,7 +223,7 @@ fn handler(program: &Program, handler: &Handler) {
                 "a suspend needs the resume event"
             );
         }
-        if let SiteKind::Wait(constant) = site.kind {
+        if let Some(constant) = site.kind.sleeps() {
             assert!(
                 constant < program.constants.len(),
                 "a wait names a constant"
@@ -420,12 +420,12 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 used[*site] += 1;
                 args.iter().for_each(|arg| expr(program, handler, arg));
             }
-            Stmt::Take { result } => {
+            Stmt::Take { result, taken } => {
                 assert!(*result < handler.locals.len(), "a take binds a local");
                 assert_eq!(
                     Some(&handler.locals[*result].ty),
-                    program.events.steers_type().as_ref(),
-                    "a take binds a list of the declared steers"
+                    program.events.taken_type(*taken).as_ref(),
+                    "a take binds a list of the declared events"
                 );
             }
             Stmt::Finish { value } => expr(program, handler, value),

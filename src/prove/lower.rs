@@ -506,7 +506,7 @@ impl Lowering<'_> {
             Stmt::Parallel(parallel) => self.parallel(parallel, ops),
             Stmt::Effect { site, args, .. } => {
                 args.iter().for_each(|arg| self.arithmetic_trap(arg, ops));
-                if let SiteKind::Wait(cap) = self.handler.sites[*site].kind {
+                if let Some(cap) = self.handler.sites[*site].kind.sleeps() {
                     let cap = &self.program.constants[cap].name;
                     ops.push(self.trap(format!("a wait past {cap}")));
                 }

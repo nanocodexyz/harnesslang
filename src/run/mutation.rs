@@ -69,10 +69,14 @@ pub enum Mutation {
     SideLiveState,
     SideJournaled,
     IdleEarly,
+    InterruptIgnored,
+    InterruptReruns,
+    RecoverTrustsLost,
+    JobLostDropped,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 67] = [
+    pub const ALL: [Self; 71] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -140,6 +144,10 @@ impl Mutation {
         Self::SideLiveState,
         Self::SideJournaled,
         Self::IdleEarly,
+        Self::InterruptIgnored,
+        Self::InterruptReruns,
+        Self::RecoverTrustsLost,
+        Self::JobLostDropped,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -211,6 +219,10 @@ impl Mutation {
             Self::SideLiveState => "side_live_state",
             Self::SideJournaled => "side_journaled",
             Self::IdleEarly => "idle_early",
+            Self::InterruptIgnored => "interrupt_ignored",
+            Self::InterruptReruns => "interrupt_reruns",
+            Self::RecoverTrustsLost => "recover_trusts_lost",
+            Self::JobLostDropped => "job_lost_dropped",
         }
     }
 
@@ -292,7 +304,11 @@ impl Mutation {
             | Self::FamilyOneLevel
             | Self::SideLiveState
             | Self::SideJournaled
-            | Self::IdleEarly => all,
+            | Self::IdleEarly
+            | Self::InterruptIgnored
+            | Self::InterruptReruns
+            | Self::RecoverTrustsLost
+            | Self::JobLostDropped => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

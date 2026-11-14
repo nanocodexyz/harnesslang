@@ -187,25 +187,76 @@ pub struct Program {
 pub struct Events {
     pub cancel: bool,
     pub steers: Option<Bound>,
+    pub jobs: Option<Bound>,
     pub resume: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    Steers,
+    Jobs,
+}
+
+impl Taken {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Steers => "steer",
+            Self::Jobs => "job",
+        }
+    }
 }
 
 impl Events {
     pub const fn any(&self) -> bool {
-        self.cancel || self.steers.is_some()
+        self.cancel || self.steers.is_some() || self.jobs.is_some()
     }
 
     pub fn records_max(&self) -> u64 {
-        u64::from(self.cancel) + self.steers.as_ref().map_or(0, |bound| bound.value)
+        u64::from(self.cancel)
+            + self.steers.as_ref().map_or(0, |bound| bound.value)
+            + self.jobs.as_ref().map_or(0, |bound| bound.value)
     }
 
-    pub fn steers_type(&self) -> Option<Type> {
-        self.steers.as_ref().map(|bound| Type::List {
+    pub const fn taken(&self, taken: Taken) -> Option<&Bound> {
+        match taken {
+            Taken::Steers => self.steers.as_ref(),
+            Taken::Jobs => self.jobs.as_ref(),
+        }
+    }
+
+    pub fn taken_type(&self, taken: Taken) -> Option<Type> {
+        self.taken(taken).map(|bound| Type::List {
             element: Box::new(Type::Text),
             capacity: bound.clone(),
         })
     }
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Interrupts {
+    pub cancel: bool,
+    pub steer: bool,
+}
+
+impl Interrupts {
+    pub const fn any(self) -> bool {
+        self.cancel || self.steer
+    }
+
+    pub fn describe(self) -> String {
+        let mut names = Vec::new();
+        if self.cancel {
+            names.push("cancel");
+        }
+        if self.steer {
+            names.push("steer");
+        }
+        names.join(", ")
+    }
+}
+
+pub const INTERRUPTED_REASON: &str = "Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.";
+pub const JOB_KEY: &str = "job";
 
 #[derive(Clone, Debug)]
 pub struct Invariant {
@@ -219,6 +270,32 @@ impl Program {
             .iter()
             .enumerate()
             .find(|(_, tool)| tool.name == name)
+    }
+
+    pub fn interrupts(&self, kind: SiteKind, tool: &str) -> Interrupts {
+        match kind {
+            SiteKind::Model => self
+                .model
+                .as_ref()
+                .map_or_else(Interrupts::default, |model| model.interrupts),
+            SiteKind::Tool(_) | SiteKind::Dispatch => self
+                .tool(tool)
+                .map_or_else(Interrupts::default, |(_, declared)| declared.interrupts),
+            _ => Interrupts::default(),
+        }
+    }
+
+    pub fn recoverable(&self, tool: &str) -> bool {
+        self.tool(tool).is_some_and(|(_, declared)| declared.recoverable)
+    }
+
+    pub fn jobs_of(&self, tool: &str) -> Option<&Bound> {
+        self.tool(tool).and_then(|(_, declared)| declared.jobs.as_ref())
+    }
+
+    pub fn any_interruptible(&self) -> bool {
+        self.model.as_ref().is_some_and(|model| model.interrupts.any())
+            || self.tools.iter().any(|tool| tool.interrupts.any())
     }
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
@@ -409,6 +486,9 @@ pub struct Tool {
     pub returns: Type,
     pub attaches: Option<Bound>,
     pub effect: EffectClass,
+    pub recoverable: bool,
+    pub interrupts: Interrupts,
+    pub jobs: Option<Bound>,
     pub spawn: Option<Spawn>,
     pub finds: Option<ListingId>,
 }
@@ -493,6 +573,7 @@ pub struct Model {
     pub reply: Reply,
     pub window: Option<Window>,
     pub modes: Vec<String>,
+    pub interrupts: Interrupts,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -516,7 +597,8 @@ pub const ATTEMPT_OK: VariantId = 0;
 pub const ATTEMPT_THROTTLED: VariantId = 1;
 pub const ATTEMPT_TRANSIENT: VariantId = 2;
 pub const ATTEMPT_REJECTED: VariantId = 3;
-pub const ATTEMPT_VARIANTS: [&str; 4] = ["ok", "throttled", "transient", "rejected"];
+pub const ATTEMPT_INTERRUPTED: VariantId = 4;
+pub const ATTEMPT_VARIANTS: [&str; 5] = ["ok", "throttled", "transient", "rejected", "interrupted"];
 pub const ATTEMPT_REPLY: usize = 0;
 pub const ATTEMPT_STOP: usize = 1;
 pub const USAGE_FIELDS: [&str; 4] = ["input", "output", "cache_read", "cache_write"];
@@ -525,7 +607,7 @@ pub const ATTEMPT_OK_FIELDS: usize = ATTEMPT_USAGE + USAGE_FIELDS.len();
 pub const ATTEMPT_ERROR: usize = 0;
 pub const ATTEMPT_RETRY_AFTER: usize = 1;
 
-pub fn attempt_variants(stop: SumId) -> Vec<Variant> {
+pub fn attempt_variants(stop: SumId, interruptible: bool) -> Vec<Variant> {
     let mut ok = vec![Type::Sum(REPLY), Type::Sum(stop)];
     ok.extend(USAGE_FIELDS.iter().map(|_| Type::U64));
     assert_eq!(
@@ -538,10 +620,17 @@ pub fn attempt_variants(stop: SumId) -> Vec<Variant> {
         vec![Type::Text, Type::U64],
         vec![Type::Text, Type::U64],
         vec![Type::Text],
+        Vec::new(),
     ];
+    let count = if interruptible {
+        ATTEMPT_VARIANTS.len()
+    } else {
+        ATTEMPT_INTERRUPTED
+    };
     ATTEMPT_VARIANTS
         .iter()
         .zip(fields)
+        .take(count)
         .map(|(name, fields)| Variant {
             name: (*name).to_owned(),
             fields,
@@ -638,6 +727,7 @@ pub enum SiteKind {
     Random,
     Cell(CodeId),
     Wait(ConstId),
+    Hold(ConstId),
     Suspend,
     Deny,
 }
@@ -660,17 +750,26 @@ impl SiteKind {
             Self::Random => "random",
             Self::Cell(_) => "cell",
             Self::Wait(_) => "wait",
+            Self::Hold(_) => "hold",
             Self::Suspend => "suspend",
             Self::Deny => "deny",
         }
     }
 
     pub const fn parks(self) -> bool {
-        matches!(self, Self::Wait(_) | Self::Suspend)
+        matches!(self, Self::Wait(_) | Self::Hold(_) | Self::Suspend)
+    }
+
+    pub const fn sleeps(self) -> Option<ConstId> {
+        match self {
+            Self::Wait(cap) | Self::Hold(cap) => Some(cap),
+            _ => None,
+        }
     }
 }
 
 pub const WAIT_TOOL: &str = "wait";
+pub const HOLD_TOOL: &str = "hold";
 pub const SUSPEND_TOOL: &str = "suspend";
 pub const DENY_TOOL: &str = "deny";
 pub const SESSION_STARTED_FIELD: &str = "_session_started";
@@ -786,6 +885,7 @@ pub enum Stmt {
     },
     Take {
         result: LocalId,
+        taken: Taken,
     },
     Finish {
         value: Expr,

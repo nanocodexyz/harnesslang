@@ -38,6 +38,9 @@ impl<'a> Names<'a> {
             SiteKind::Wait(constant) => {
                 return format!("wait({})", self.program.constants[constant].name);
             }
+            SiteKind::Hold(constant) => {
+                return format!("hold({})", self.program.constants[constant].name);
+            }
             kind => kind.name().to_owned(),
         };
         let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
@@ -126,7 +129,7 @@ fn collect<'a>(
             Stmt::Effect { site, args, result } => {
                 effects.insert(*result, (*site, args.as_slice()));
             }
-            Stmt::Take { result } => {
+            Stmt::Take { result, .. } => {
                 takes.insert(*result);
             }
             Stmt::If {

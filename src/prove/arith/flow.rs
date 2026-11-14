@@ -106,7 +106,7 @@ impl Prover<'_> {
                     self.value(&mut state, arg);
                 }
                 let handler = self.handler.expect("an effect belongs to a handler");
-                if let crate::ir::SiteKind::Wait(cap) = handler.sites[*site].kind {
+                if let Some(cap) = handler.sites[*site].kind.sleeps() {
                     self.wait_bound(&mut state, &args[0], cap);
                 }
                 self.bind(&mut state, *result, None);
@@ -120,7 +120,7 @@ impl Prover<'_> {
                 }
                 Some(state)
             }
-            Stmt::Take { result } => {
+            Stmt::Take { result, .. } => {
                 self.bind(&mut state, *result, None);
                 Some(state)
             }

@@ -7,7 +7,7 @@ use crate::ir::{
 use crate::run::blob::Blobs;
 use crate::run::cell::{self, CellEvent, CellHost, CellOutcome, CellPoint, Input, Step, Wait};
 use crate::run::cell_journal::{CellLog, divergence_text};
-use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, call_id};
+use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, call_id, job_started};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::session::{Call, Recorded, SiteLog, TurnLog};
@@ -85,6 +85,24 @@ pub struct ToolRequest<'a> {
     pub returns: &'a Type,
     pub nested: Option<NestedRef>,
     pub admitted: Option<&'a str>,
+    pub job: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recovered {
+    Reply(Output),
+    NotDispatched,
+    Unknown,
+}
+
+impl Recovered {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Reply(_) => "reply",
+            Self::NotDispatched => "not_dispatched",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +205,9 @@ pub trait World {
     fn resume(&mut self, suspension: &Suspension) -> Option<Resume>;
     fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool);
     fn inbox(&mut self, turn: u64) -> Vec<Delivery>;
+    fn recover(&mut self, request: &ToolRequest<'_>) -> Recovered;
+    fn jobs(&mut self, turn: u64, open: &[String]) -> Vec<String>;
+    fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop>;
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]);
     fn read(&mut self, read: &Read);
     fn scope(&self) -> String {
@@ -205,7 +226,11 @@ pub trait World {
 }
 
 pub fn close_inbox(world: &mut dyn World, turn: u64, position: u64, events: &[Recorded]) {
-    let arrived = world.inbox(turn);
+    let arrived: Vec<Delivery> = world
+        .inbox(turn)
+        .into_iter()
+        .filter(|delivery| !matches!(delivery.inbound, Inbound::Job(_)))
+        .collect();
     if arrived.is_empty() {
         return;
     }
@@ -333,6 +358,10 @@ pub struct Engine<'a> {
     next_cell: u64,
     events: Vec<Recorded>,
     taken: usize,
+    taken_jobs: usize,
+    jobs: BTreeMap<String, String>,
+    lost: Vec<Delivery>,
+    attested: BTreeSet<u64>,
     frozen: Option<u64>,
     finishing: bool,
     retired: u64,
@@ -393,6 +422,10 @@ impl<'a> Engine<'a> {
             next_cell: 0,
             events: log.events.clone(),
             taken: 0,
+            taken_jobs: 0,
+            jobs: BTreeMap::new(),
+            lost: Vec::new(),
+            attested: BTreeSet::new(),
             frozen: frozen(log),
             finishing: false,
             retired: 0,
@@ -417,6 +450,17 @@ impl<'a> Engine<'a> {
 
     pub fn with_blobs(mut self, blobs: Blobs) -> Self {
         self.blobs = blobs;
+        self
+    }
+
+    pub fn with_jobs(mut self, jobs: BTreeMap<String, String>, lost: Vec<Delivery>) -> Self {
+        self.jobs = jobs;
+        self.lost = lost;
+        self
+    }
+
+    pub fn with_attested(mut self, attested: BTreeSet<u64>) -> Self {
+        self.attested = attested;
         self
     }
 
@@ -618,14 +662,22 @@ impl<'a> Engine<'a> {
         let Mode::Live { world, .. } = &mut self.mode else {
             return Ok(());
         };
-        let arrived = world.inbox(self.turn);
+        let mut arrived = std::mem::take(&mut self.lost);
+        let lost = arrived.len();
+        arrived.extend(world.inbox(self.turn));
         if arrived.is_empty() {
             return Ok(());
         }
         let position = self.seq;
         let mut answers = Vec::with_capacity(arrived.len());
-        for delivery in arrived {
+        for (index, delivery) in arrived.into_iter().enumerate() {
             let answer = self.admit_event(position, &delivery);
+            if index < lost {
+                if answer == Answer::Full {
+                    self.lost.push(delivery);
+                }
+                continue;
+            }
             answers.push((delivery.id, answer));
         }
         let recorded = answers
@@ -699,6 +751,17 @@ impl<'a> Engine<'a> {
                     return Answer::Full;
                 }
             }
+            Inbound::Job(job) => {
+                let Some(bound) = &declared.jobs else {
+                    return Answer::Undeclared;
+                };
+                if !self.jobs.contains_key(&job.key) {
+                    return Answer::Duplicate;
+                }
+                if job_count(&self.events) >= bound.value {
+                    return Answer::Full;
+                }
+            }
         }
         let Some(seq) = event_seq(
             declared.records_max(),
@@ -717,7 +780,64 @@ impl<'a> Engine<'a> {
             at: position,
             delivery: delivery.clone(),
         });
+        if let Inbound::Job(job) = &delivery.inbound
+            && job.done
+        {
+            self.jobs.remove(&job.key);
+        }
         Answer::Recorded
+    }
+
+    fn preempted(&self, interrupts: ir::Interrupts) -> bool {
+        if !interrupts.any() {
+            return false;
+        }
+        let cancelled = interrupts.cancel
+            && self
+                .events
+                .iter()
+                .any(|event| event.delivery.inbound == Inbound::Cancel);
+        let steered = interrupts.steer && steer_count(&self.events) > self.taken as u64;
+        cancelled || steered
+    }
+
+    fn drain_interrupting(&mut self, interrupts: ir::Interrupts) -> Result<bool, Halt> {
+        let before = self.events.len();
+        let own = inbound::of(self.target.target).drain != Drain::AfterRun;
+        if interrupts.any() && own {
+            self.drain()?;
+        } else {
+            self.drain_at(Drain::AfterRun)?;
+        }
+        Ok(self.events[before..]
+            .iter()
+            .any(|event| event.delivery.inbound.interrupts(interrupts)))
+    }
+
+    fn flushes_to_interrupt(&self, interrupts: ir::Interrupts) -> bool {
+        interrupts.any() && inbound::of(self.target.target).drain != Drain::AfterRun
+    }
+
+    fn job_room(&self, tool: &str) -> bool {
+        let Some(bound) = self.program.jobs_of(tool) else {
+            return false;
+        };
+        let open = self.jobs.values().filter(|owner| *owner == tool).count() as u64;
+        open < bound.value
+    }
+
+    fn job_output(&mut self, tool: &str, seq: u64, room: bool, output: Output) -> Output {
+        if job_started(&output).is_none() {
+            return output;
+        }
+        if !room {
+            return Output::Failed(format!(
+                "tool {tool} started a job, which it may not: it is not a jobs tool or keeps its bound of jobs running"
+            ));
+        }
+        self.jobs
+            .insert(ir::spawn_key(self.turn, seq), tool.to_owned());
+        output
     }
 
     fn visible(&self, kind: &Inbound) -> Vec<&Recorded> {
@@ -755,25 +875,34 @@ impl<'a> Engine<'a> {
         cancelled
     }
 
-    fn take(&mut self) -> Value {
-        let kind = Inbound::Steer(String::new());
+    fn take(&mut self, taken: ir::Taken) -> Value {
+        let kind = match taken {
+            ir::Taken::Steers => Inbound::Steer(String::new()),
+            ir::Taken::Jobs => Inbound::Job(crate::run::journal::JobNotice {
+                key: String::new(),
+                notice: String::new(),
+                done: false,
+            }),
+        };
         let visible: Vec<(String, String)> = self
             .visible(&kind)
             .iter()
             .map(|event| match &event.delivery.inbound {
                 Inbound::Steer(message) => (event.delivery.id.clone(), message.clone()),
+                Inbound::Job(job) => (event.delivery.id.clone(), job.notice.clone()),
                 Inbound::Cancel => unreachable!("visible keeps one kind"),
             })
             .collect();
-        assert!(
-            self.taken <= visible.len(),
-            "the steers a turn sees only grow"
-        );
-        let fresh: Vec<Value> = visible[self.taken..]
+        let counter = match taken {
+            ir::Taken::Steers => &mut self.taken,
+            ir::Taken::Jobs => &mut self.taken_jobs,
+        };
+        assert!(*counter <= visible.len(), "the events a turn sees only grow");
+        let fresh: Vec<Value> = visible[*counter..]
             .iter()
             .map(|(_, message)| Value::Text(message.clone()))
             .collect();
-        self.taken = visible.len();
+        *counter = visible.len();
         self.observe(&kind, visible.into_iter().map(|(id, _)| id).collect());
         Value::List(fresh)
     }
@@ -877,9 +1006,9 @@ impl<'a> Engine<'a> {
                 let value = self.effect(*site, values)?;
                 self.locals[*result] = Some(value);
             }
-            Stmt::Take { result } => {
-                let steers = self.take();
-                self.locals[*result] = Some(steers);
+            Stmt::Take { result, taken } => {
+                let events = self.take(*taken);
+                self.locals[*result] = Some(events);
             }
             Stmt::Finish { value } => return Ok(Flow::Return(self.eval(value)?)),
         }
@@ -960,13 +1089,17 @@ impl<'a> Engine<'a> {
                 assert!(
                     !call.effect.may_be_unknown()
                         || in_step
+                        || self.attested.contains(&seq)
                         || matches!(
                             self.mutation,
                             Mutation::RecoveryRedispatchesExternal
                                 | Mutation::RecoveryReportsFailed
                         ),
-                    "recovery turns every open external call unknown before the turn runs again"
+                    "recovery turns every open external call unknown before the turn runs again, unless its host attested it was not dispatched"
                 );
+                if call.effect.may_be_unknown() {
+                    self.attested.remove(&seq);
+                }
                 Ok(Some(Pending {
                     index,
                     seq,
@@ -1008,7 +1141,21 @@ impl<'a> Engine<'a> {
         let gate = self.target.gate_before_outbound;
         let in_step = external && matches!(self.target.recovery, Recovery::InStep { .. });
         let late = external && !gate && self.mutation == Mutation::BatchFlushAfterDispatch;
-        if (external || gate) && !late {
+        let interrupts: Vec<ir::Interrupts> = group
+            .iter()
+            .map(|waiting| {
+                self.program
+                    .interrupts(SiteKind::Dispatch, &waiting.call.tool)
+            })
+            .collect();
+        let interrupting = interrupts
+            .iter()
+            .fold(ir::Interrupts::default(), |all, one| ir::Interrupts {
+                cancel: all.cancel || one.cancel,
+                steer: all.steer || one.steer,
+            });
+        let preempted: Vec<bool> = interrupts.iter().map(|one| self.preempted(*one)).collect();
+        if (external || gate || self.flushes_to_interrupt(interrupting)) && !late {
             self.flush()?;
             assert!(
                 self.buffer.is_empty(),
@@ -1022,22 +1169,57 @@ impl<'a> Engine<'a> {
                 Mode::Replay => unreachable!("replay never runs an effect"),
             };
             if first.reopened && attempt > 1 && self.mutation != Mutation::VercelRetryRedispatches {
-                values[first.index] = Some(self.unknown(first.seq, first.call.clone())?);
-                return Ok(());
+                match self.retried(first.seq, &first.call)? {
+                    Retried::Settled(value) => {
+                        values[first.index] = Some(value);
+                        return Ok(());
+                    }
+                    Retried::Recorded(output) => {
+                        let site = self.handler.sites[parallel.site].clone();
+                        values[first.index] = Some(self.settle(&site, &first.call, &output)?);
+                        return Ok(());
+                    }
+                    Retried::Run => {}
+                }
             }
             assert!(
                 first.reopened || attempt == 1,
                 "a fresh external step starts at its first attempt"
             );
         }
-        let completed = self.batch_dispatch(group)?;
+        let completed = self.batch_dispatch(group, &preempted)?;
         let replayed = !matches!(self.sites.get(&self.seq), Some(SiteLog::Open(_)));
+        let before = self.events.len();
         if !replayed || self.mutation == Mutation::BatchDrainsReplayed {
-            self.drain_at(Drain::AfterRun)?;
+            if self.flushes_to_interrupt(interrupting) {
+                self.drain()?;
+            } else {
+                self.drain_at(Drain::AfterRun)?;
+            }
         }
+        let arrived: Vec<Inbound> = self.events[before..]
+            .iter()
+            .map(|event| event.delivery.inbound.clone())
+            .collect();
         let site = self.handler.sites[parallel.site].clone();
         for (position, output) in completed {
             let waiting = &group[position];
+            let interrupted = !preempted[position]
+                && self.mutation != Mutation::InterruptIgnored
+                && arrived
+                    .iter()
+                    .any(|inbound| inbound.interrupts(interrupts[position]));
+            let output = match interrupted {
+                false => output,
+                true if waiting.call.effect.may_be_unknown() => {
+                    if self.mutation == Mutation::InterruptReruns {
+                        drop(self.batch_dispatch(std::slice::from_ref(waiting), &[false])?);
+                    }
+                    values[waiting.index] = Some(self.unknown(waiting.seq, waiting.call.clone())?);
+                    continue;
+                }
+                true => Output::Failed(ir::INTERRUPTED_REASON.to_owned()),
+            };
             self.append(Record::Result {
                 turn: self.turn,
                 seq: waiting.seq,
@@ -1055,14 +1237,29 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn batch_dispatch(&mut self, group: &[Pending]) -> Result<Vec<(usize, Output)>, Halt> {
+    fn batch_dispatch(
+        &mut self,
+        group: &[Pending],
+        preempted: &[bool],
+    ) -> Result<Vec<(usize, Output)>, Halt> {
         let returned: Vec<Type> = group
             .iter()
             .map(|waiting| self.dispatched_returns(&waiting.call.tool))
             .collect();
+        let rooms: Vec<bool> = group
+            .iter()
+            .map(|waiting| self.job_room(&waiting.call.tool))
+            .collect();
         let gates: Vec<Result<Option<String>, String>> = group
             .iter()
-            .map(|waiting| self.dispatch_gate(&waiting.call))
+            .zip(preempted)
+            .map(|(waiting, preempted)| {
+                if *preempted {
+                    Err(ir::INTERRUPTED_REASON.to_owned())
+                } else {
+                    self.dispatch_gate(&waiting.call)
+                }
+            })
             .collect();
         let sent: Vec<usize> = (0..group.len())
             .filter(|position| gates[*position].is_ok())
@@ -1080,6 +1277,7 @@ impl<'a> Engine<'a> {
                     returns: &returned[*position],
                     admitted: gates[*position].as_ref().ok().and_then(Option::as_deref),
                     nested: None,
+                    job: rooms[*position],
                 }
             })
             .collect();
@@ -1118,7 +1316,11 @@ impl<'a> Engine<'a> {
             .map(|(position, output)| {
                 let tool = &group[position].call.tool;
                 let seq = group[position].seq;
-                let output = self.checked(tool, &returned[position], output);
+                let output = if job_started(&output).is_some() {
+                    self.job_output(tool, seq, rooms[position], output)
+                } else {
+                    self.checked(tool, &returned[position], output)
+                };
                 (
                     position,
                     spawn_output(
@@ -1292,6 +1494,11 @@ impl<'a> Engine<'a> {
                 effect: EffectClass::None,
                 input: Json::object([(WAIT_MS, Json::Number(args[0].as_u64()))]),
             },
+            SiteKind::Hold(_) => Call {
+                tool: ir::HOLD_TOOL.to_owned(),
+                effect: EffectClass::None,
+                input: Json::object([(WAIT_MS, Json::Number(args[0].as_u64()))]),
+            },
             SiteKind::Suspend => Call {
                 tool: ir::SUSPEND_TOOL.to_owned(),
                 effect: EffectClass::None,
@@ -1327,7 +1534,7 @@ impl<'a> Engine<'a> {
 
     fn effect(&mut self, site_id: usize, args: Vec<Value>) -> Result<Value, Halt> {
         let site = &self.handler.sites[site_id];
-        if let SiteKind::Wait(cap) = site.kind {
+        if let Some(cap) = site.kind.sleeps() {
             let cap = &self.program.constants[cap];
             if args[0].as_u64() > cap.value {
                 return Err(Halt::Trap(format!("bound({})", cap.name)));
@@ -1351,7 +1558,7 @@ impl<'a> Engine<'a> {
         if site.kind == SiteKind::Suspend {
             return self.suspend_site(site_id, seq, call);
         }
-        if let SiteKind::Wait(_) = site.kind {
+        if site.kind.sleeps().is_some() {
             return self.wait_site(site_id, seq, call, &args);
         }
         if let SiteClass::Fixed(class) = site.class {
@@ -1761,18 +1968,29 @@ impl<'a> Engine<'a> {
                 Mode::Replay => unreachable!("replay never reopens a call"),
             };
             if attempt > 1 && self.mutation != Mutation::VercelRetryRedispatches {
-                return self.unknown(seq, call);
+                match self.retried(seq, &call)? {
+                    Retried::Settled(value) => return Ok(value),
+                    Retried::Recorded(output) => {
+                        let site = self.handler.sites[site_id].clone();
+                        return self.settle(&site, &call, &output);
+                    }
+                    Retried::Run => {}
+                }
             }
             return self.dispatch(site_id, seq, &call, args, true);
         }
         assert!(
             !call.effect.may_be_unknown()
+                || self.attested.contains(&seq)
                 || matches!(
                     self.mutation,
                     Mutation::RecoveryRedispatchesExternal | Mutation::RecoveryReportsFailed
                 ),
-            "recovery turns every open external call unknown before the turn runs again"
+            "recovery turns every open external call unknown before the turn runs again, unless its host attested it was not dispatched"
         );
+        if call.effect.may_be_unknown() {
+            self.attested.remove(&seq);
+        }
         if self.mutation == Mutation::RerunRewritesCall && !call.effect.may_be_unknown() {
             self.append(Record::Call {
                 turn: self.turn,
@@ -1785,6 +2003,79 @@ impl<'a> Engine<'a> {
         self.execute(site_id, seq, &call, args)
     }
 
+    fn retried(&mut self, seq: u64, call: &Call) -> Result<Retried, Halt> {
+        let recovered = self.ask_recover(seq, call);
+        let recovered = match recovered {
+            Recovered::Unknown if self.mutation == Mutation::RecoverTrustsLost => {
+                Recovered::NotDispatched
+            }
+            recovered => recovered,
+        };
+        let attempt = self.next_attempt();
+        let (replied, undispatched, unknown) = match &recovered {
+            Recovered::Reply(_) => (vec![seq], Vec::new(), Vec::new()),
+            Recovered::NotDispatched => (Vec::new(), vec![seq], Vec::new()),
+            Recovered::Unknown => (Vec::new(), Vec::new(), vec![seq]),
+        };
+        self.append(Record::Recovery {
+            turn: self.turn,
+            attempt,
+            unknown,
+            nested: Vec::new(),
+            replied,
+            undispatched,
+        });
+        match recovered {
+            Recovered::Unknown => {
+                self.sites.insert(seq, SiteLog::Unknown(call.clone()));
+                self.flush()?;
+                Ok(Retried::Settled(Value::Variant(ir::UNKNOWN, Vec::new())))
+            }
+            Recovered::NotDispatched => {
+                self.flush()?;
+                Ok(Retried::Run)
+            }
+            Recovered::Reply(output) => {
+                self.append(Record::Result {
+                    turn: self.turn,
+                    seq,
+                    output: output.clone(),
+                });
+                self.sites
+                    .insert(seq, SiteLog::Done(call.clone(), output.clone()));
+                self.flush()?;
+                Ok(Retried::Recorded(output))
+            }
+        }
+    }
+
+    fn ask_recover(&mut self, seq: u64, call: &Call) -> Recovered {
+        if !self.program.recoverable(&call.tool) {
+            return Recovered::Unknown;
+        }
+        let returns = self.dispatched_returns(&call.tool);
+        let room = self.job_room(&call.tool);
+        let turn = self.turn;
+        let recovered = self.world().recover(&ToolRequest {
+            turn,
+            seq,
+            tool: &call.tool,
+            effect: call.effect,
+            input: &call.input,
+            returns: &returns,
+            nested: None,
+            admitted: None,
+            job: room,
+        });
+        match recovered {
+            Recovered::Reply(output) => {
+                let output = self.checked(&call.tool, &returns, output);
+                Recovered::Reply(self.job_output(&call.tool, seq, room, output))
+            }
+            other => other,
+        }
+    }
+
     fn unknown(&mut self, seq: u64, call: Call) -> Result<Value, Halt> {
         let attempt = self.next_attempt();
         self.append(Record::Recovery {
@@ -1792,6 +2083,8 @@ impl<'a> Engine<'a> {
             attempt,
             unknown: vec![seq],
             nested: Vec::new(),
+            replied: Vec::new(),
+            undispatched: Vec::new(),
         });
         self.sites.insert(seq, SiteLog::Unknown(call));
         self.flush()?;
@@ -1807,7 +2100,9 @@ impl<'a> Engine<'a> {
     ) -> Result<Value, Halt> {
         let site = &self.handler.sites[site_id];
         let gate = self.target.gate_before_outbound && site.kind.outbound();
-        let required = site.durability.flushes(call.effect);
+        let interrupts = self.program.interrupts(site.kind, &call.tool);
+        let required =
+            site.durability.flushes(call.effect) || self.flushes_to_interrupt(interrupts);
         let late = match self.mutation {
             Mutation::FlushAfterDispatch => required && !gate,
             Mutation::GateReleasesEarly => gate,
@@ -1849,50 +2144,131 @@ impl<'a> Engine<'a> {
     ) -> Result<Value, Halt> {
         let site = self.handler.sites[site_id].clone();
         self.hook(Point::BeforeRun(site.kind, call.effect))?;
-        let gate = self.gate(&site, call);
+        let interrupts = self.program.interrupts(site.kind, &call.tool);
+        let preempted = self.preempted(interrupts);
+        let output = match site.kind {
+            SiteKind::Model => return self.model_site(&site, seq, call, args, preempted),
+            SiteKind::Wait(_) | SiteKind::Hold(_) => {
+                let woke = if matches!(site.kind, SiteKind::Hold(_)) {
+                    self.hold(seq, call)?
+                } else {
+                    self.sleep(seq, call)?
+                };
+                self.hook(Point::AfterRun(site.kind, call.effect))?;
+                if matches!(site.kind, SiteKind::Hold(_)) {
+                    self.drain()?;
+                } else {
+                    self.drain_at(Drain::AfterRun)?;
+                }
+                return self.waited(site_id, seq, call, woke);
+            }
+            SiteKind::Cell(_) => unreachable!("a cell site runs through the cell runner"),
+            SiteKind::Suspend => unreachable!("a suspend ends the run before it would run"),
+            _ => self.run_site(&site, seq, call, args, preempted),
+        };
+        self.hook(Point::AfterRun(site.kind, call.effect))?;
+        let interrupted = self.drain_interrupting(interrupts)?
+            && !preempted
+            && self.mutation != Mutation::InterruptIgnored;
+        let output = if interrupted {
+            if call.effect.may_be_unknown() {
+                if self.mutation == Mutation::InterruptReruns {
+                    drop(self.run_site(&site, seq, call, args, false));
+                }
+                return self.unknown(seq, call.clone());
+            }
+            Output::Failed(ir::INTERRUPTED_REASON.to_owned())
+        } else {
+            output
+        };
+        self.append(Record::Result {
+            turn: self.turn,
+            seq,
+            output: output.clone(),
+        });
+        self.sites
+            .insert(seq, SiteLog::Done(call.clone(), output.clone()));
+        if step {
+            self.flush()?;
+        }
+        self.settle(&site, call, &output)
+    }
+
+    fn model_site(
+        &mut self,
+        site: &Site,
+        seq: u64,
+        call: &Call,
+        args: &[Value],
+        preempted: bool,
+    ) -> Result<Value, Halt> {
+        let interrupts = self.program.interrupts(site.kind, &call.tool);
+        let calls_max = self
+            .program
+            .model
+            .as_ref()
+            .map_or(0, |model| model.calls.value);
+        let mode = site
+            .mode
+            .map(|mode| self.program.mode_name(mode).to_owned());
+        let sent = mode
+            .as_deref()
+            .filter(|_| self.mutation != Mutation::ModeDropped);
+        let response = if preempted {
+            interrupted_response()
+        } else {
+            let Mode::Live { world, .. } = &mut self.mode else {
+                unreachable!("replay never runs an effect");
+            };
+            world.model(&ModelRequest {
+                turn: self.turn,
+                seq,
+                calls_max,
+                mode: sent,
+                context: &args[0],
+                blobs: &self.blobs,
+            })
+        };
+        self.hook(Point::AfterRun(site.kind, call.effect))?;
+        let interrupted = self.drain_interrupting(interrupts)?
+            && !preempted
+            && self.mutation != Mutation::InterruptIgnored;
+        let response = if interrupted {
+            interrupted_response()
+        } else {
+            response
+        };
+        if self.reply_unrecorded(&response) {
+            return self.reply(&response);
+        }
+        let recorded = if self.mutation == Mutation::RetryAfterUnjournaled {
+            value::without_retry_after(&response)
+        } else {
+            response.clone()
+        };
+        self.append(Record::Model {
+            turn: self.turn,
+            seq,
+            response: recorded.clone(),
+            mode: mode.clone(),
+        });
+        self.sites.insert(seq, SiteLog::Reply(recorded, mode));
+        self.reply(&response)
+    }
+
+    fn run_site(
+        &mut self,
+        site: &Site,
+        seq: u64,
+        call: &Call,
+        args: &[Value],
+        preempted: bool,
+    ) -> Output {
+        let gate = self.gate(site, call);
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
-        let output = match site.kind {
-            SiteKind::Model => {
-                let calls_max = self
-                    .program
-                    .model
-                    .as_ref()
-                    .map_or(0, |model| model.calls.value);
-                let mode = site
-                    .mode
-                    .map(|mode| self.program.mode_name(mode).to_owned());
-                let sent = mode
-                    .as_deref()
-                    .filter(|_| self.mutation != Mutation::ModeDropped);
-                let response = world.model(&ModelRequest {
-                    turn: self.turn,
-                    seq,
-                    calls_max,
-                    mode: sent,
-                    context: &args[0],
-                    blobs: &self.blobs,
-                });
-                self.hook(Point::AfterRun(site.kind, call.effect))?;
-                self.drain_at(Drain::AfterRun)?;
-                if self.reply_unrecorded(&response) {
-                    return self.reply(&response);
-                }
-                let recorded = if self.mutation == Mutation::RetryAfterUnjournaled {
-                    value::without_retry_after(&response)
-                } else {
-                    response.clone()
-                };
-                self.append(Record::Model {
-                    turn: self.turn,
-                    seq,
-                    response: recorded.clone(),
-                    mode: mode.clone(),
-                });
-                self.sites.insert(seq, SiteLog::Reply(recorded, mode));
-                return self.reply(&response);
-            }
+        match site.kind {
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
             SiteKind::Random => Output::Ok(Json::Number(world.random())),
             SiteKind::Deny => {
@@ -1910,18 +2286,11 @@ impl<'a> Engine<'a> {
                         returns: &Type::Text,
                         admitted: None,
                         nested: None,
+                        job: false,
                     });
                     drop(ran);
                 }
                 Output::Failed(args[1].as_text().to_owned())
-            }
-            SiteKind::Cell(_) => unreachable!("a cell site runs through the cell runner"),
-            SiteKind::Suspend => unreachable!("a suspend ends the run before it would run"),
-            SiteKind::Wait(_) => {
-                let woke = self.sleep(seq, call)?;
-                self.hook(Point::AfterRun(site.kind, call.effect))?;
-                self.drain_at(Drain::AfterRun)?;
-                return self.waited(site_id, seq, call, woke);
             }
             SiteKind::Listing(listing) => {
                 let listing = &self.program.listings[listing];
@@ -1933,6 +2302,9 @@ impl<'a> Engine<'a> {
                 value::checked_listing(listing, output)
             }
             SiteKind::Tool(_) | SiteKind::Dispatch => {
+                if preempted {
+                    return Output::Failed(ir::INTERRUPTED_REASON.to_owned());
+                }
                 let returns = match &site.result {
                     Type::Known(inner) | Type::Maybe(inner) => (**inner).clone(),
                     other if other.reports_unknown(self.program) => {
@@ -1940,6 +2312,7 @@ impl<'a> Engine<'a> {
                     }
                     other => panic!("a tool site yields known or maybe, found {other:?}"),
                 };
+                let room = self.job_room(&call.tool);
                 let Mode::Live { world, .. } = &mut self.mode else {
                     unreachable!("replay never runs an effect");
                 };
@@ -1956,8 +2329,13 @@ impl<'a> Engine<'a> {
                             returns: &returns,
                             admitted: admitted.as_deref(),
                             nested: None,
+                            job: room,
                         });
-                        let output = self.checked(&call.tool, &returns, output);
+                        let output = if job_started(&output).is_some() {
+                            self.job_output(&call.tool, seq, room, output)
+                        } else {
+                            self.checked(&call.tool, &returns, output)
+                        };
                         spawn_output(
                             self.program,
                             self.mutation,
@@ -1970,20 +2348,32 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-        };
-        self.hook(Point::AfterRun(site.kind, call.effect))?;
-        self.drain_at(Drain::AfterRun)?;
-        self.append(Record::Result {
-            turn: self.turn,
-            seq,
-            output: output.clone(),
-        });
-        self.sites
-            .insert(seq, SiteLog::Done(call.clone(), output.clone()));
-        if step {
-            self.flush()?;
+            SiteKind::Model
+            | SiteKind::Wait(_)
+            | SiteKind::Hold(_)
+            | SiteKind::Cell(_)
+            | SiteKind::Suspend => unreachable!("dispatch runs these sites itself"),
         }
-        self.settle(&site, call, &output)
+    }
+
+    fn hold(&mut self, seq: u64, call: &Call) -> Result<u64, Halt> {
+        if self.jobs.is_empty() && self.lost.is_empty() {
+            return Ok(self.world().clock());
+        }
+        let until = wait_until(&call.input).ok_or_else(|| {
+            Halt::Exit(Exit::Corrupt(format!(
+                "turn {} seq {seq}: a hold's input lacks its deadline",
+                self.turn
+            )))
+        })?;
+        let ms = wait_ms(&call.input).unwrap_or(0);
+        let until = if self.mutation == Mutation::WaitOversleeps {
+            until.saturating_add(ms)
+        } else {
+            until
+        };
+        let turn = self.turn;
+        Ok(self.world().hold(turn, seq, until)?)
     }
 
     fn dispatched_returns(&self, tool: &str) -> Type {
@@ -2143,6 +2533,15 @@ impl<'a> Engine<'a> {
         let corrupt = |error: String| {
             Halt::Exit(Exit::Corrupt(format!("turn {} result: {error}", self.turn)))
         };
+        if let Some(text) = job_started(output) {
+            if self.program.jobs_of(&call.tool).is_none() {
+                return Err(corrupt(format!(
+                    "{} started a job, which only a jobs tool does",
+                    call.tool
+                )));
+            }
+            return Ok(Value::Variant(ir::OK, vec![Value::Text(text.to_owned())]));
+        }
         if site.result.reports_unknown(self.program) && !matches!(site.result, Type::Maybe(_)) {
             return match output {
                 Output::Failed(error) => {
@@ -2261,6 +2660,8 @@ impl CellHost for Engine<'_> {
             attempt,
             unknown: Vec::new(),
             nested: vec![(seq, nested)],
+            replied: Vec::new(),
+            undispatched: Vec::new(),
         });
         if let Some(SiteLog::Open(call)) = self.nested.get(&(seq, nested)).cloned() {
             self.nested.insert((seq, nested), SiteLog::Unknown(call));
@@ -2381,6 +2782,26 @@ pub fn event_seq(records_max: u64, turn: u64, index: u64) -> Option<u64> {
     turn.checked_sub(1)?
         .checked_mul(records_max)?
         .checked_add(index)
+}
+
+pub fn interrupted_response() -> Json {
+    Json::object([(
+        ir::ATTEMPT_VARIANTS[ir::ATTEMPT_INTERRUPTED],
+        Json::Array(Vec::new()),
+    )])
+}
+
+enum Retried {
+    Settled(Value),
+    Recorded(Output),
+    Run,
+}
+
+pub fn job_count(events: &[Recorded]) -> u64 {
+    events
+        .iter()
+        .filter(|event| matches!(event.delivery.inbound, Inbound::Job(_)))
+        .count() as u64
 }
 
 pub fn steer_count(events: &[Recorded]) -> u64 {

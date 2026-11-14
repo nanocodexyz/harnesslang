@@ -147,6 +147,9 @@ pub struct Tool {
     pub returns: TypeExpr,
     pub attaches: Option<TypeExpr>,
     pub effect: EffectClass,
+    pub recoverable: Option<Position>,
+    pub interrupts: Vec<Name>,
+    pub jobs: Option<Name>,
     pub finds: Option<Name>,
 }
 
@@ -179,6 +182,7 @@ pub struct Model {
     pub reply: Option<Name>,
     pub modes: Vec<Name>,
     pub window: Option<Name>,
+    pub interrupts: Vec<Name>,
 }
 
 #[derive(Clone, Debug)]
