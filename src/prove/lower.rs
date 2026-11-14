@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::effect::EffectClass;
 use crate::ir::{
     BinaryOp, CodeId, Expr, Handler, Kept, Parallel, Program, SiteClass, SiteId, SiteKind, Stmt,
-    ToolId, Type,
+    ToolId,
 };
 use crate::prove::Mutation;
 use crate::prove::text::Names;
@@ -229,6 +229,7 @@ fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
             | Stmt::Assign { .. }
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
+            | Stmt::KeepBlobs { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. }
             | Stmt::Finish { .. } => {}
@@ -264,6 +265,7 @@ fn arithmetic(value: &Expr) -> bool {
         | Expr::Constant(_)
         | Expr::Local(_)
         | Expr::Field(_)
+        | Expr::ListingNotice(_)
         | Expr::Cancelled => false,
     }
 }
@@ -346,6 +348,7 @@ impl Lowering<'_> {
                 | Stmt::Push { .. }
                 | Stmt::Take { .. }
                 | Stmt::Shrink { .. }
+                | Stmt::KeepBlobs { .. }
                 | Stmt::Finish { .. } => {}
             }
         }
@@ -426,7 +429,7 @@ impl Lowering<'_> {
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
                 self.arithmetic_trap(value, ops);
             }
-            Stmt::Take { .. } => {}
+            Stmt::Take { .. } | Stmt::KeepBlobs { .. } => {}
             Stmt::Push { field, value } => {
                 self.arithmetic_trap(value, ops);
                 let name = &self.program.state[*field].name;
@@ -1025,8 +1028,10 @@ impl Lowering<'_> {
             );
             return vec![unknown(if failed { Seen::Failed } else { Seen::Unknown })];
         }
-        let maybe =
-            slot.nested() || matches!(self.handler.sites[slot.site()].result, Type::Maybe(_));
+        let maybe = slot.nested()
+            || self.handler.sites[slot.site()]
+                .result
+                .reports_unknown(self.program);
         let reported = self.mutated(
             slot,
             RunMutation::IdempotentReportedUnknown,

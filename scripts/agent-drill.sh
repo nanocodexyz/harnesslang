@@ -54,10 +54,12 @@ case "$mode" in
       for step in $(seq 1 "$steps"); do
         printf '{"text":"Step %d.","throttle":%d,"calls":[{"name":"Bash","input":{"command":"echo step%d >> effects.log && sleep %s","description":"Record step %d"}},{"name":"Read","input":{"file_path":"effects.log"}}]},' "$step" "$(( step == 1 ))" "$step" "$tool_sleep" "$step"
       done
+      printf '{"calls":[{"name":"Read","input":{"file_path":"pixel.png"}}]},'
       printf '{"text":"Writing done.txt n","stop":"max_tokens"},'
       printf '{"calls":[{"name":"Write","input":{"file_path":"done.txt","content":"done\\n"}}]},'
       printf '{"answer":"All steps ran."}]\n'
     } > "$out/script.json"
+    printf '\211PNG\r\n\032\nhl-agent drill image' > "$workspace/pixel.png"
     "$mock" "$out/port" "$out/script.json" "$mock_delay_ms" 2> "$out/mock.log" &
     mock_pid=$!
     for _ in $(seq 1 100); do
@@ -180,10 +182,18 @@ discarded = [record["call"] for record in discarded if record.get("kind") == "st
 unanswered = sorted(set(discarded) - replies)
 if unanswered:
     sys.exit(f"agent-drill: streams cut by a kill were not requested again to a journaled reply: {unanswered}")
+blobs = []
+for line in open(f"{out}/journal/journal.jsonl"):
+    record = json.loads(line)["record"]
+    output = record.get("result", {}).get("output", {})
+    if isinstance(output.get("ok"), dict) and "blob" in output["ok"]:
+        blobs.append(output["ok"])
+if mode == "mock" and (len(blobs) != 1 or "data" not in blobs[0]):
+    sys.exit(f"agent-drill: the image read journaled {len(blobs)} blob results, expected one holding its data")
 leftover = [name for name in os.listdir(f"{out}/journal/state") if name.endswith(".sse")]
 if leftover:
     sys.exit(f"agent-drill: partial streams left after the turn finished: {leftover}")
-print(f"agent-drill: external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
+print(f"agent-drill: blobs_journaled={len(blobs)} external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
 EOF
 finished=1
 echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool)"

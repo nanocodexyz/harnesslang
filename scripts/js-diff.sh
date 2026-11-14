@@ -20,6 +20,7 @@ plant_expression() {
     enum_unchecked) echo 's/^function checkedOutput(tool, returns, output) {$/&\n  return output;/' ;;
     default_unfilled) echo 's/if (defaults\[index\] !== null \&\& !Object.hasOwn(input, param.name)) input\[param.name\] = defaults\[index\];/void defaults;/' ;;
     mode_dropped) echo 's/world.model({ turn: this.turn, seq, callsMax, mode: site.mode,/world.model({ turn: this.turn, seq, callsMax, mode: null,/' ;;
+    blob_unjournaled) echo 's/this.blobs.journaled(data, true)/this.blobs.journaled(data, false)/' ;;
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac

@@ -111,6 +111,10 @@ on prompt(input: text) -> outcome
   `ir::Sum` with `SumKind::Text`, written in the journal as the text. Matched
   by value, exhaustively; a text literal is a value where the enum is
   expected.
+- `blob<N>`: at most `N` opaque bytes a tool returns, journaled by their
+  SHA-256 digest with the bytes in the first result that holds them; it rides
+  in lists and context entries (`attached`) and `keep L blobs last N` evicts
+  the oldest as nanocode's image window does.
 - `list<T, N>`: a list with capacity `N`, a named constant. `push` onto a full
   list fails the handler with `bound(name)`, naming the list.
 - State fields start at zero (`0`, `false`, empty text, a text enum's first
@@ -566,7 +570,9 @@ Invariants, named as nanocode-sim names them:
 | `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed that sends no events the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `mode_sent` | every journaled model reply answered a request sent in the mode its `model` record names (`mode_dropped` sends the request without its mode) |
-| `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
+| `blob_journaled` | every journaled blob's data hashes to its digest, a result that holds only a digest follows one that holds its data, and every checkpoint's blobs are held (`blob_unjournaled` journals digests alone) |
+| `search_listed` | every name a journaled search found was listed by its turn's latest read of the listing before it (`search_unchecked` records searches unchecked) |
+| `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, a deferred one only after a search of its turn found it (`discovery_unchecked`), and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
 | `suspend_durable`, `resume_matched`, `wait_until`, `wall_limit` | waits and suspends, defined in [LANGUAGE.md](LANGUAGE.md#suspend-and-resume) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded`, `nested_enum_valid` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 

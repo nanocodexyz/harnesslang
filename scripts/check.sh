@@ -211,9 +211,13 @@ invalid_fail() {
   expect_error examples/invalid/wait_uncapped.hl any "wait_bound: wait(after_ms) may sleep past its cap retry_cap_ms and trap with bound(retry_cap_ms)"
   expect_error examples/invalid/with_outside_model.hl any "with_outside_model.hl:13:23: error: 'with' adds an entry to the context a model call reads: it is only a model call's argument"
   expect_error examples/invalid/long_wait.hl vercel "handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds vercel's limit of 800000 milliseconds per wait"
+  expect_error examples/invalid/blob_row.hl cloudflare "tool 'photo': a result record of blob<photo_bytes_max> (2097152 bytes) holds up to 2796399 bytes, over cloudflare's limit of 2000000 bytes per journal row"
   local target
   for target in native-jsonl native-sqlite server-postgres vercel; do
     "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
+  done
+  for target in native-jsonl native-sqlite server-postgres vercel; do
+    "$hl" check --target "$target" examples/invalid/blob_row.hl > /dev/null
   done
   for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do
     "$hl" check --target "$target" examples/invalid/over_wait.hl > /dev/null
@@ -366,7 +370,7 @@ for file in $examples; do
     queue js-diff js_diff_one "$target" "$file"
   done
 done
-for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl; do
+for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
   done

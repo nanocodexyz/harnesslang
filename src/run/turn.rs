@@ -1,4 +1,5 @@
 use crate::ir::{Handler, Program};
+use crate::run::blob::Blobs;
 use crate::run::engine::{
     End, Engine, Exit, Finish, Mode, Setup, Suspension, World, close_inbox, steer_count,
 };
@@ -277,6 +278,8 @@ pub fn run_turn(
         }));
     }
     let state = state_before(program, target, &session, request.turn)?;
+    let blobs = Blobs::of_session(program, &session).map_err(corrupt)?;
+    blobs.check_state(program, &state).map_err(corrupt)?;
     let mut pending = Vec::new();
     let mut unknown = Vec::new();
     let mut assumed = Vec::new();
@@ -336,7 +339,8 @@ pub fn run_turn(
         state,
         &log,
     )
-    .with_next_cell(session.next_cell());
+    .with_next_cell(session.next_cell())
+    .with_blobs(blobs);
     for record in pending {
         engine.append(record);
     }

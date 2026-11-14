@@ -1,0 +1,11 @@
+harness notes
+
+const calls_max: u64 = 4
+const mcp_max: u64 = 8
+
+tool search(query: text) -> text effect external finds mcp
+tools from listing(mcp, mcp_max) (query: text) effect none
+
+model think calls calls_max
+
+on ping() -> u64 { return 1 }

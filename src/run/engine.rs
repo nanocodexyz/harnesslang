@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::effect::EffectClass;
 use crate::ir::{
     self, BinaryOp, Expr, Handler, Kept, Parallel, Program, Site, SiteClass, SiteKind, Stmt, Type,
 };
+use crate::run::blob::Blobs;
 use crate::run::cell::{self, CellEvent, CellHost, CellOutcome, CellPoint, Input, Step, Wait};
 use crate::run::cell_journal::{CellLog, divergence_text};
 use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, call_id};
@@ -147,6 +148,7 @@ pub struct ModelRequest<'a> {
     pub calls_max: u64,
     pub mode: Option<&'a str>,
     pub context: &'a Value,
+    pub blobs: &'a Blobs,
 }
 
 pub trait World {
@@ -322,6 +324,10 @@ pub struct Engine<'a> {
     retired: u64,
     unretired: BTreeMap<usize, Vec<Value>>,
     admitted: BTreeMap<ir::ListingId, BTreeMap<String, String>>,
+    listed: BTreeMap<ir::ListingId, BTreeMap<String, String>>,
+    notices: BTreeMap<ir::ListingId, String>,
+    discovered: BTreeMap<ir::ListingId, BTreeSet<String>>,
+    blobs: Blobs,
 }
 
 enum Flow {
@@ -377,7 +383,16 @@ impl<'a> Engine<'a> {
             retired: 0,
             unretired: BTreeMap::new(),
             admitted: BTreeMap::new(),
+            listed: BTreeMap::new(),
+            notices: BTreeMap::new(),
+            discovered: BTreeMap::new(),
+            blobs: Blobs::default(),
         }
+    }
+
+    pub fn with_blobs(mut self, blobs: Blobs) -> Self {
+        self.blobs = blobs;
+        self
     }
 
     pub fn with_next_cell(mut self, next_cell: u64) -> Self {
@@ -757,6 +772,19 @@ impl<'a> Engine<'a> {
             }
             Stmt::Push { field, value } => self.push(*field, value)?,
             Stmt::Shrink { field, kept } => self.shrink(*field, kept)?,
+            Stmt::KeepBlobs { field, count } => {
+                let attached = self
+                    .program
+                    .blobs
+                    .as_ref()
+                    .expect("the checker keeps blobs only in a program with blobs")
+                    .attached;
+                let evict = self.mutation != Mutation::BlobsUnevicted;
+                let Value::List(items) = &mut self.state[*field] else {
+                    panic!("keep blobs targets a list field");
+                };
+                crate::run::blob::keep_blobs(items, attached, count.value, evict);
+            }
             Stmt::If {
                 condition,
                 then,
@@ -890,7 +918,8 @@ impl<'a> Engine<'a> {
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
-                values[index] = Some(self.decode(site, &output)?);
+                let site = site.clone();
+                values[index] = Some(self.settle(&site, &call, &output)?);
                 Ok(None)
             }
             Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
@@ -993,7 +1022,7 @@ impl<'a> Engine<'a> {
                 waiting.seq,
                 SiteLog::Done(waiting.call.clone(), output.clone()),
             );
-            values[waiting.index] = Some(self.decode(&site, &output)?);
+            values[waiting.index] = Some(self.settle(&site, &waiting.call, &output)?);
         }
         if late || in_step {
             self.flush()?;
@@ -1002,7 +1031,10 @@ impl<'a> Engine<'a> {
     }
 
     fn batch_dispatch(&mut self, group: &[Pending]) -> Result<Vec<(usize, Output)>, Halt> {
-        let returns = Type::Text;
+        let returned: Vec<Type> = group
+            .iter()
+            .map(|waiting| self.dispatched_returns(&waiting.call.tool))
+            .collect();
         let gates: Vec<Result<Option<String>, String>> = group
             .iter()
             .map(|waiting| self.dispatch_gate(&waiting.call))
@@ -1020,7 +1052,7 @@ impl<'a> Engine<'a> {
                     tool: &waiting.call.tool,
                     effect: waiting.call.effect,
                     input: &waiting.call.input,
-                    returns: &returns,
+                    returns: &returned[*position],
                     admitted: gates[*position].as_ref().ok().and_then(Option::as_deref),
                     nested: None,
                 }
@@ -1059,12 +1091,7 @@ impl<'a> Engine<'a> {
             .into_iter()
             .map(|(position, output)| {
                 let tool = &group[position].call.tool;
-                let output = if self.mutation == Mutation::EnumUnchecked {
-                    value::fallback_output(self.program, &returns, output)
-                } else {
-                    value::checked_output(self.program, tool, &returns, output)
-                };
-                (position, output)
+                (position, self.checked(tool, &returned[position], output))
             })
             .collect();
         Ok(checked)
@@ -1153,6 +1180,7 @@ impl<'a> Engine<'a> {
         let reads = Reads {
             cancelled,
             uncut: self.mutation == Mutation::TruncateUncut,
+            notices: Some(&self.notices),
         };
         evaluate_with(self.program, &self.state, &self.locals, reads, expr).map_err(Halt::Trap)
     }
@@ -1291,8 +1319,8 @@ impl<'a> Engine<'a> {
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
-                self.admit_listing(site, &output)?;
-                self.decode(site, &output)
+                let site = site.clone();
+                self.settle(&site, &call, &output)
             }
             Some(SiteLog::Reply(response, recorded)) => {
                 if site.kind != SiteKind::Model {
@@ -1310,7 +1338,7 @@ impl<'a> Engine<'a> {
             }
             Some(SiteLog::Unknown(recorded)) => {
                 self.same(seq, &recorded, &call)?;
-                if !matches!(site.result, Type::Maybe(_)) {
+                if !site.result.reports_unknown(self.program) {
                     return self.reopen(site_id, seq, call, &args);
                 }
                 Ok(Value::Variant(ir::UNKNOWN, Vec::new()))
@@ -1347,14 +1375,14 @@ impl<'a> Engine<'a> {
                     return self.suspend_fresh(seq, call);
                 }
                 let site = &self.handler.sites[site_id];
-                self.decode(site, &output)
+                self.decode(site, &call, &output)
             }
             Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 self.require_live(seq)?;
                 if let Some(answer) = self.take_resume(seq, &recorded)? {
                     let site = &self.handler.sites[site_id];
-                    return self.decode(site, &answer);
+                    return self.decode(site, &call, &answer);
                 }
                 self.suspend(seq, &recorded)
             }
@@ -1437,7 +1465,7 @@ impl<'a> Engine<'a> {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &without_until(&recorded), &call)?;
                 let site = &self.handler.sites[site_id];
-                self.decode(site, &output)
+                self.decode(site, &call, &output)
             }
             Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
                 self.same(seq, &without_until(&recorded), &call)?;
@@ -1508,7 +1536,7 @@ impl<'a> Engine<'a> {
                 .insert(seq, SiteLog::Done(call.clone(), output.clone()));
         }
         let site = &self.handler.sites[site_id];
-        self.decode(site, &output)
+        self.decode(site, &call, &output)
     }
 
     fn cell_site(&mut self, code: crate::ir::CodeId, seq: u64, call: Call) -> Result<Value, Halt> {
@@ -1756,6 +1784,7 @@ impl<'a> Engine<'a> {
                     calls_max,
                     mode: sent,
                     context: &args[0],
+                    blobs: &self.blobs,
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
                 self.drain_at(Drain::AfterRun)?;
@@ -1798,7 +1827,13 @@ impl<'a> Engine<'a> {
             SiteKind::Tool(_) | SiteKind::Dispatch => {
                 let returns = match &site.result {
                     Type::Known(inner) | Type::Maybe(inner) => (**inner).clone(),
+                    other if other.reports_unknown(self.program) => {
+                        self.dispatched_returns(&call.tool)
+                    }
                     other => panic!("a tool site yields known or maybe, found {other:?}"),
+                };
+                let Mode::Live { world, .. } = &mut self.mode else {
+                    unreachable!("replay never runs an effect");
                 };
                 match gate {
                     Err(refused) => Output::Failed(refused),
@@ -1813,11 +1848,7 @@ impl<'a> Engine<'a> {
                             admitted: admitted.as_deref(),
                             nested: None,
                         });
-                        if self.mutation == Mutation::EnumUnchecked {
-                            value::fallback_output(self.program, &returns, output)
-                        } else {
-                            value::checked_output(self.program, &call.tool, &returns, output)
-                        }
+                        self.checked(&call.tool, &returns, output)
                     }
                 }
             }
@@ -1834,8 +1865,63 @@ impl<'a> Engine<'a> {
         if step {
             self.flush()?;
         }
-        self.admit_listing(&site, &output)?;
-        self.decode(&site, &output)
+        self.settle(&site, call, &output)
+    }
+
+    fn dispatched_returns(&self, tool: &str) -> Type {
+        match self
+            .program
+            .tool(tool)
+            .map(|(_, declared)| &declared.returns)
+        {
+            Some(Type::Blob(bytes)) if self.program.blobs.is_some() => Type::Blob(bytes.clone()),
+            _ => Type::Text,
+        }
+    }
+
+    fn checked(&mut self, tool: &str, returns: &Type, output: Output) -> Output {
+        let output = if self.mutation == Mutation::EnumUnchecked {
+            value::fallback_output(self.program, returns, output)
+        } else {
+            value::checked_output(self.program, tool, returns, output)
+        };
+        let output = match self.program.search_of(tool) {
+            Some(listing) if self.mutation != Mutation::SearchUnchecked => value::checked_search(
+                self.program,
+                tool,
+                listing,
+                self.admitted.get(&listing),
+                output,
+            ),
+            _ => output,
+        };
+        let _ = returns;
+        match output {
+            Output::Ok(json)
+                if crate::run::blob::returned_bound(self.program, tool).is_some()
+                    && crate::run::blob::host_data(&json).is_some() =>
+            {
+                let data = crate::run::blob::host_data(&json).expect("matched above");
+                let with_data = self.mutation != Mutation::BlobUnjournaled;
+                Output::Ok(self.blobs.journaled(data, with_data))
+            }
+            output => output,
+        }
+    }
+
+    fn settle(&mut self, site: &Site, call: &Call, output: &Output) -> Result<Value, Halt> {
+        self.admit_listing(site, output)?;
+        if let (Some(listing), Output::Ok(Json::String(text))) =
+            (self.program.search_of(&call.tool), output)
+        {
+            let found = self.discovered.entry(listing).or_default();
+            for name in value::found_names(text) {
+                if let Some((_, bare)) = self.program.listed(name) {
+                    found.insert(bare.to_owned());
+                }
+            }
+        }
+        self.decode(site, call, output)
     }
 
     fn gate(&self, site: &Site, call: &Call) -> Result<Option<String>, String> {
@@ -1858,18 +1944,29 @@ impl<'a> Engine<'a> {
         if self.mutation == Mutation::ListingUnchecked {
             return Ok(None);
         }
-        match self
+        let Some(fingerprint) = self
             .admitted
             .get(&listing)
             .and_then(|tools| tools.get(name))
-        {
-            Some(fingerprint) => Ok(Some(fingerprint.clone())),
-            None => Err(value::not_admitted(
+        else {
+            return Err(value::not_admitted(
                 &call.tool,
                 &self.program.listings[listing].name,
                 name,
-            )),
+            ));
+        };
+        let found = self
+            .discovered
+            .get(&listing)
+            .is_some_and(|found| found.contains(name));
+        if self.program.deferred(listing) && !found && self.mutation != Mutation::DiscoveryUnchecked
+        {
+            return Err(value::not_discovered(
+                &call.tool,
+                &self.program.listings[listing].name,
+            ));
         }
+        Ok(Some(fingerprint.clone()))
     }
 
     fn admit_listing(&mut self, site: &Site, output: &Output) -> Result<(), Halt> {
@@ -1881,9 +1978,19 @@ impl<'a> Engine<'a> {
                 let tools = value::admitted(json).map_err(|error| {
                     Halt::Exit(Exit::Corrupt(format!("turn {} result: {error}", self.turn)))
                 })?;
+                let name = &self.program.listings[listing].name;
+                let notice = match self.listed.get(&listing) {
+                    Some(before) if self.mutation != Mutation::NoticeDropped => {
+                        value::notice(name, before, &tools)
+                    }
+                    _ => String::new(),
+                };
+                self.notices.insert(listing, notice);
+                self.listed.insert(listing, tools.clone());
                 self.admitted.insert(listing, tools);
             }
             Output::Failed(_) => {
+                self.notices.insert(listing, String::new());
                 self.admitted.remove(&listing);
             }
         }
@@ -1914,10 +2021,30 @@ impl<'a> Engine<'a> {
             && value::model_failure(response).is_some()
     }
 
-    fn decode(&self, site: &Site, output: &Output) -> Result<Value, Halt> {
+    fn decode(&self, site: &Site, call: &Call, output: &Output) -> Result<Value, Halt> {
         let corrupt = |error: String| {
             Halt::Exit(Exit::Corrupt(format!("turn {} result: {error}", self.turn)))
         };
+        if site.result.reports_unknown(self.program) && !matches!(site.result, Type::Maybe(_)) {
+            return match output {
+                Output::Failed(error) => {
+                    Ok(Value::Variant(ir::FAILED, vec![Value::Text(error.clone())]))
+                }
+                Output::Ok(json @ Json::Object(_))
+                    if crate::run::blob::returned_bound(self.program, &call.tool).is_some() =>
+                {
+                    let digest = crate::run::blob::digest_of(json).map_err(corrupt)?;
+                    Ok(Value::Variant(
+                        ir::DISPATCHED_BLOB,
+                        vec![Value::Blob(digest.to_owned())],
+                    ))
+                }
+                Output::Ok(Json::String(text)) => {
+                    Ok(Value::Variant(ir::OK, vec![Value::Text(text.clone())]))
+                }
+                Output::Ok(json) => Err(corrupt(format!("{} is not text", json.encode()))),
+            };
+        }
         if let (SiteKind::Listing(_), Output::Ok(json)) = (site.kind, output) {
             let tools = value::admitted(json).map_err(corrupt)?;
             return Ok(Value::Variant(ir::OK, vec![Value::U64(tools.len() as u64)]));
@@ -2127,6 +2254,7 @@ fn reads_cancelled(expr: &Expr) -> bool {
         | Expr::Text(_)
         | Expr::Constant(_)
         | Expr::Local(_)
+        | Expr::ListingNotice(_)
         | Expr::Field(_) => false,
         Expr::Member { base, .. } => reads_cancelled(base),
         Expr::Construct { fields, .. } => fields.iter().any(reads_cancelled),
@@ -2144,9 +2272,10 @@ fn reads_cancelled(expr: &Expr) -> bool {
 }
 
 #[derive(Clone, Copy)]
-pub struct Reads {
+pub struct Reads<'r> {
     pub cancelled: Option<bool>,
     pub uncut: bool,
+    pub notices: Option<&'r BTreeMap<ir::ListingId, String>>,
 }
 
 pub fn evaluate(
@@ -2159,6 +2288,7 @@ pub fn evaluate(
     let reads = Reads {
         cancelled,
         uncut: false,
+        notices: None,
     };
     evaluate_with(program, state, locals, reads, expr)
 }
@@ -2167,7 +2297,7 @@ pub fn evaluate_with(
     program: &Program,
     state: &[Value],
     locals: &[Option<Value>],
-    reads: Reads,
+    reads: Reads<'_>,
     expr: &Expr,
 ) -> Result<Value, String> {
     let cancelled = reads.cancelled;
@@ -2231,6 +2361,14 @@ pub fn evaluate_with(
         Expr::Cancelled => {
             Value::Bool(cancelled.expect("a turn reads its events before it evaluates 'cancelled'"))
         }
+        Expr::ListingNotice(listing) => Value::Text(
+            reads
+                .notices
+                .expect("only a handler's body reads a listing's notice")
+                .get(listing)
+                .cloned()
+                .unwrap_or_default(),
+        ),
     })
 }
 
