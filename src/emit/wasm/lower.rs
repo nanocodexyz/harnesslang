@@ -53,7 +53,10 @@ impl<'p> Function<'_, 'p> {
                 let text = self.tables.text(value);
                 self.emit(format!("i64.const {text}"));
             }
-            Expr::Constant(constant) => self.emit(format!("i64.const {}", self.program().constants[*constant].value)),
+            Expr::Constant(constant) => self.emit(format!(
+                "i64.const {}",
+                self.program().constants[*constant].value
+            )),
             Expr::Local(local) => self.emit(format!("local.get $l{local}")),
             Expr::Field(field) => {
                 self.emit("global.get $state");
@@ -62,9 +65,14 @@ impl<'p> Function<'_, 'p> {
             Expr::Member { base, index } => {
                 self.expr(base)?;
                 self.emit("i32.wrap_i64");
-                self.emit(format!("i64.load offset={}", SUM_FIELDS_OFFSET + index * SLOT_BYTES));
+                self.emit(format!(
+                    "i64.load offset={}",
+                    SUM_FIELDS_OFFSET + index * SLOT_BYTES
+                ));
             }
-            Expr::Construct { variant, fields, .. } => {
+            Expr::Construct {
+                variant, fields, ..
+            } => {
                 if fields.len() > SUM_FIELDS_DIRECT_MAX {
                     return not_yet("variants of more than three fields");
                 }
@@ -74,7 +82,12 @@ impl<'p> Function<'_, 'p> {
                 }
                 self.emit(format!("call $sum_{}", fields.len()));
             }
-            Expr::Binary { op, operand, left, right } => self.binary(*op, operand, left, right)?,
+            Expr::Binary {
+                op,
+                operand,
+                left,
+                right,
+            } => self.binary(*op, operand, left, right)?,
             Expr::Not(operand) => {
                 self.expr(operand)?;
                 self.emit("i64.eqz");
@@ -95,7 +108,13 @@ impl<'p> Function<'_, 'p> {
         Ok(())
     }
 
-    fn binary(&mut self, op: BinaryOp, operand: &Type, left: &Expr, right: &Expr) -> Result<(), String> {
+    fn binary(
+        &mut self,
+        op: BinaryOp,
+        operand: &Type,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<(), String> {
         self.expr(left)?;
         if op == BinaryOp::Concat {
             self.emit("i32.wrap_i64");
@@ -106,7 +125,11 @@ impl<'p> Function<'_, 'p> {
             BinaryOp::Add => vec!["call $u64_add".to_owned()],
             BinaryOp::Subtract => vec!["call $u64_subtract".to_owned()],
             BinaryOp::Multiply => vec!["call $u64_multiply".to_owned()],
-            BinaryOp::Concat => vec!["i32.wrap_i64".to_owned(), "call $text_concat".to_owned(), "i64.extend_i32_u".to_owned()],
+            BinaryOp::Concat => vec![
+                "i32.wrap_i64".to_owned(),
+                "call $text_concat".to_owned(),
+                "i64.extend_i32_u".to_owned(),
+            ],
             BinaryOp::Less => compare("i64.lt_u"),
             BinaryOp::LessEqual => compare("i64.le_u"),
             BinaryOp::Greater => compare("i64.gt_u"),
@@ -153,7 +176,11 @@ impl<'p> Function<'_, 'p> {
                 self.emit(format!("i64.store offset={}", field * SLOT_BYTES));
             }
             Stmt::Push { field, value } => self.push(*field, value)?,
-            Stmt::If { condition, then, otherwise } => {
+            Stmt::If {
+                condition,
+                then,
+                otherwise,
+            } => {
                 self.expr(condition)?;
                 self.halt_check();
                 self.emit("i32.wrap_i64");
@@ -165,7 +192,9 @@ impl<'p> Function<'_, 'p> {
             }
             Stmt::Match { subject, arms, .. } => self.matched(subject, arms)?,
             Stmt::Loop { index, bound, body } => self.counted(*index, bound.value, body)?,
-            Stmt::For { item, list, body, .. } => self.each(*item, list, body)?,
+            Stmt::For {
+                item, list, body, ..
+            } => self.each(*item, list, body)?,
             Stmt::Effect { site, args, result } => self.effect(*site, args, *result)?,
             Stmt::Finish { value } => {
                 self.expr(value)?;
@@ -309,7 +338,14 @@ fn handler_function(tables: &mut Tables<'_>, index: usize) -> Result<String, Str
         }
         tables.site(&format!("$site{index}_{site_index}"), site)?;
     }
-    let mut function = Function { tables, handler, index, body: Vec::new(), temps: 0, labels: 0 };
+    let mut function = Function {
+        tables,
+        handler,
+        index,
+        body: Vec::new(),
+        temps: 0,
+        labels: 0,
+    };
     for (position, local) in handler.params.iter().enumerate() {
         function.emit("local.get $arguments");
         function.emit(format!("i64.load offset={}", position * SLOT_BYTES));
@@ -330,7 +366,9 @@ fn handler_function(tables: &mut Tables<'_>, index: usize) -> Result<String, Str
     function.block(&handler.body)?;
     function.emit("unreachable");
     function.emit("end");
-    let mut text = format!("(func $handler{index}_run (param $arguments i32) (result i64) (local $result i64) (local $args i32)");
+    let mut text = format!(
+        "(func $handler{index}_run (param $arguments i32) (result i64) (local $result i64) (local $args i32)"
+    );
     for local in 0..function.handler.locals.len() {
         write!(text, " (local $l{local} i64)").expect("writing to a string succeeds");
     }
@@ -355,12 +393,32 @@ fn refuse_unsupported(program: &Program) -> Result<(), String> {
         (program.blobs.is_some(), "blobs"),
         (!program.sides.is_empty(), "side questions"),
         (program.any_interruptible(), "interruptible effects"),
-        (program.tools.iter().any(|tool| tool.recoverable), "recoverable tools"),
-        (program.tools.iter().any(|tool| tool.jobs.is_some()), "background jobs"),
-        (program.tools.iter().any(|tool| tool.spawn.is_some()), "spawn tools"),
-        (program.tools.iter().any(|tool| tool.fork.is_some()), "fork tools"),
-        (program.tools.iter().any(|tool| tool.finds.is_some()), "search tools"),
-        (program.model.as_ref().is_some_and(|model| model.window.is_some() || model.declared() || !model.settings.is_empty()), "model windows, settings and declared replies"),
+        (
+            program.tools.iter().any(|tool| tool.recoverable),
+            "recoverable tools",
+        ),
+        (
+            program.tools.iter().any(|tool| tool.jobs.is_some()),
+            "background jobs",
+        ),
+        (
+            program.tools.iter().any(|tool| tool.spawn.is_some()),
+            "spawn tools",
+        ),
+        (
+            program.tools.iter().any(|tool| tool.fork.is_some()),
+            "fork tools",
+        ),
+        (
+            program.tools.iter().any(|tool| tool.finds.is_some()),
+            "search tools",
+        ),
+        (
+            program.model.as_ref().is_some_and(|model| {
+                model.window.is_some() || model.declared() || !model.settings.is_empty()
+            }),
+            "model windows, settings and declared replies",
+        ),
     ];
     match refused.iter().find(|(refuses, _)| *refuses) {
         Some((_, what)) => not_yet(what),
@@ -377,7 +435,8 @@ pub fn program_text(program: &Program, target: crate::target::Target) -> Result<
         functions.push_str(&handler_function(&mut tables, index)?);
     }
     tables.program(target)?;
-    let mut run = String::from("(func $run_handler (param $index i32) (param $arguments i32) (result i64)\n");
+    let mut run =
+        String::from("(func $run_handler (param $index i32) (param $arguments i32) (result i64)\n");
     for index in 0..program.handlers.len() {
         writeln!(run, "  (if (i32.eq (local.get $index) (i32.const {index})) (then (return (call $handler{index}_run (local.get $arguments)))))").expect("writing to a string succeeds");
     }

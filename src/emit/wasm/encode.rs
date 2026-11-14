@@ -176,7 +176,11 @@ impl Module {
         count(&mut body, self.globals.len());
         for global in &self.globals {
             body.push(global.ty.code());
-            body.push(if global.mutable { GLOBAL_MUT } else { GLOBAL_CONST });
+            body.push(if global.mutable {
+                GLOBAL_MUT
+            } else {
+                GLOBAL_CONST
+            });
             match global.ty {
                 ValType::I32 => {
                     body.push(OP_I32_CONST);
@@ -218,7 +222,11 @@ impl Module {
                 count(&mut code, run);
                 code.push(ty.code());
             }
-            assert_eq!(function.body.last(), Some(&OP_END), "a function body ends with end");
+            assert_eq!(
+                function.body.last(),
+                Some(&OP_END),
+                "a function body ends with end"
+            );
             code.extend_from_slice(&function.body);
             count(&mut body, code.len());
             body.extend_from_slice(&code);

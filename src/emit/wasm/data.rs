@@ -57,17 +57,27 @@ pub fn wat_string(bytes: &[u8]) -> String {
 pub fn context_type() -> Type {
     Type::List {
         element: Box::new(Type::Sum(ir::ENTRY)),
-        capacity: ir::Bound { name: String::new(), value: 0 },
+        capacity: ir::Bound {
+            name: String::new(),
+            value: 0,
+        },
     }
 }
 
 fn word(value: u64, what: &str) -> Result<u32, String> {
-    u32::try_from(value).map_err(|_| format!("emit: not yet in wasm: {what} of {value} does not fit a 32-bit word"))
+    u32::try_from(value)
+        .map_err(|_| format!("emit: not yet in wasm: {what} of {value} does not fit a 32-bit word"))
 }
 
 impl<'p> Tables<'p> {
     pub fn new(program: &'p Program) -> Self {
-        Self { program, out: String::new(), texts: BTreeMap::new(), types: Vec::new(), sums: BTreeSet::new() }
+        Self {
+            program,
+            out: String::new(),
+            texts: BTreeMap::new(),
+            types: Vec::new(),
+            sums: BTreeSet::new(),
+        }
     }
 
     pub fn text(&mut self, value: &str) -> String {
@@ -75,7 +85,8 @@ impl<'p> Tables<'p> {
             return name.clone();
         }
         let name = format!("$t{}", self.texts.len());
-        writeln!(self.out, "(text {name} {})", wat_string(value.as_bytes())).expect("writing to a string succeeds");
+        writeln!(self.out, "(text {name} {})", wat_string(value.as_bytes()))
+            .expect("writing to a string succeeds");
         self.texts.insert(value.to_owned(), name.clone());
         name
     }
@@ -93,7 +104,10 @@ impl<'p> Tables<'p> {
             Type::List { element, capacity } => {
                 let element = self.ty(element)?;
                 let bound = self.text(&capacity.name);
-                format!("{TYPE_LIST} {element} {} {bound}", word(capacity.value, "a list's capacity")?)
+                format!(
+                    "{TYPE_LIST} {element} {} {bound}",
+                    word(capacity.value, "a list's capacity")?
+                )
             }
             Type::Sum(sum) => format!("{TYPE_SUM} {} 0 0", self.sum(*sum)?),
             Type::Known(inner) => format!("{TYPE_KNOWN} {} 0 0", self.ty(inner)?),
@@ -116,7 +130,12 @@ impl<'p> Tables<'p> {
             (_, ir::SumKind::Tagged) => SUM_TAGGED,
         };
         let sum_name = self.text(&definition.name);
-        writeln!(self.out, "(words {name} {sum_name} {kind} {} {name}_variants)", definition.variants.len()).expect("writing to a string succeeds");
+        writeln!(
+            self.out,
+            "(words {name} {sum_name} {kind} {} {name}_variants)",
+            definition.variants.len()
+        )
+        .expect("writing to a string succeeds");
         let mut variants = Vec::new();
         for (index, variant) in definition.variants.iter().enumerate() {
             let variant_name = self.text(&variant.name);
@@ -125,11 +144,18 @@ impl<'p> Tables<'p> {
                 fields.push(self.ty(field)?);
             }
             let label = format!("{name}_{index}");
-            writeln!(self.out, "(words {label}_fields {})", fields.join(" ")).expect("writing to a string succeeds");
-            writeln!(self.out, "(words {label} {variant_name} {} {label}_fields)", variant.fields.len()).expect("writing to a string succeeds");
+            writeln!(self.out, "(words {label}_fields {})", fields.join(" "))
+                .expect("writing to a string succeeds");
+            writeln!(
+                self.out,
+                "(words {label} {variant_name} {} {label}_fields)",
+                variant.fields.len()
+            )
+            .expect("writing to a string succeeds");
             variants.push(label);
         }
-        writeln!(self.out, "(words {name}_variants {})", variants.join(" ")).expect("writing to a string succeeds");
+        writeln!(self.out, "(words {name}_variants {})", variants.join(" "))
+            .expect("writing to a string succeeds");
         Ok(name)
     }
 
@@ -151,13 +177,21 @@ impl<'p> Tables<'p> {
                 None => "0".to_owned(),
             };
             let param_label = format!("{label}_param{position}");
-            writeln!(self.out, "(words {param_label} {name} {ty} {default})").expect("writing to a string succeeds");
+            writeln!(self.out, "(words {param_label} {name} {ty} {default})")
+                .expect("writing to a string succeeds");
             params.push(param_label);
         }
         let name = self.text(&tool.name);
         let returns = self.ty(&tool.returns)?;
-        writeln!(self.out, "(words {label}_params {})", params.join(" ")).expect("writing to a string succeeds");
-        writeln!(self.out, "(words {label} {name} {} {} {label}_params {returns})", effect_code(tool.effect), tool.params.len()).expect("writing to a string succeeds");
+        writeln!(self.out, "(words {label}_params {})", params.join(" "))
+            .expect("writing to a string succeeds");
+        writeln!(
+            self.out,
+            "(words {label} {name} {} {} {label}_params {returns})",
+            effect_code(tool.effect),
+            tool.params.len()
+        )
+        .expect("writing to a string succeeds");
         Ok(label)
     }
 
@@ -185,8 +219,16 @@ impl<'p> Tables<'p> {
             ir::Durability::Cell => return Err("emit: not yet in wasm: code cells".to_owned()),
         };
         let result = self.ty(&site.result)?;
-        let argument = if kind == KIND_MODEL { self.ty(&context_type())? } else { "0".to_owned() };
-        writeln!(self.out, "(words {label} {kind} {class} {durability} {result} {tool} {argument})").expect("writing to a string succeeds");
+        let argument = if kind == KIND_MODEL {
+            self.ty(&context_type())?
+        } else {
+            "0".to_owned()
+        };
+        writeln!(
+            self.out,
+            "(words {label} {kind} {class} {durability} {result} {tool} {argument})"
+        )
+        .expect("writing to a string succeeds");
         Ok(())
     }
 
@@ -204,22 +246,41 @@ impl<'p> Tables<'p> {
         for (index, handler) in program.handlers.iter().enumerate() {
             let mut params = Vec::new();
             for (position, local) in handler.params.iter().enumerate() {
-                params.push(self.field(&format!("$handler{index}_param{position}"), &handler.locals[*local])?);
+                params.push(self.field(
+                    &format!("$handler{index}_param{position}"),
+                    &handler.locals[*local],
+                )?);
             }
             let name = self.text(&handler.name);
             let returns = self.ty(&handler.returns)?;
-            writeln!(self.out, "(words $handler{index}_params {})", params.join(" ")).expect("writing to a string succeeds");
-            writeln!(self.out, "(words $handler{index} {name} {} $handler{index}_params {returns} {index})", params.len()).expect("writing to a string succeeds");
+            writeln!(
+                self.out,
+                "(words $handler{index}_params {})",
+                params.join(" ")
+            )
+            .expect("writing to a string succeeds");
+            writeln!(
+                self.out,
+                "(words $handler{index} {name} {} $handler{index}_params {returns} {index})",
+                params.len()
+            )
+            .expect("writing to a string succeeds");
             handlers.push(format!("$handler{index}"));
         }
         let (model, calls) = match &program.model {
-            Some(model) => (self.text(&model.name), word(model.calls.value, "a model's calls bound")?),
+            Some(model) => (
+                self.text(&model.name),
+                word(model.calls.value, "a model's calls bound")?,
+            ),
             None => ("0".to_owned(), 0),
         };
         let name = self.text(&program.name);
-        writeln!(self.out, "(words $program_handlers {})", handlers.join(" ")).expect("writing to a string succeeds");
-        writeln!(self.out, "(words $program_fields {})", fields.join(" ")).expect("writing to a string succeeds");
-        writeln!(self.out, "(words $program_tools {})", tools.join(" ")).expect("writing to a string succeeds");
+        writeln!(self.out, "(words $program_handlers {})", handlers.join(" "))
+            .expect("writing to a string succeeds");
+        writeln!(self.out, "(words $program_fields {})", fields.join(" "))
+            .expect("writing to a string succeeds");
+        writeln!(self.out, "(words $program_tools {})", tools.join(" "))
+            .expect("writing to a string succeeds");
         writeln!(
             self.out,
             "(words $program {name} {} $program_handlers {} $program_fields {model} {calls} {} $program_tools)",
@@ -231,7 +292,12 @@ impl<'p> Tables<'p> {
         let model = target::model(target);
         let checksum = u32::from(target == Target::NativeJsonl);
         let in_step = u32::from(matches!(model.recovery, target::Recovery::InStep { .. }));
-        writeln!(self.out, "(words $target {checksum} {} {in_step})", u32::from(model.gate_before_outbound)).expect("writing to a string succeeds");
+        writeln!(
+            self.out,
+            "(words $target {checksum} {} {in_step})",
+            u32::from(model.gate_before_outbound)
+        )
+        .expect("writing to a string succeeds");
         Ok(())
     }
 }

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::encode::{
-    Data, Export, ExportKind, FuncType, Function, Global, Import, Module, OP_END, OP_I32_CONST, OP_I64_CONST, ValType, count, index_u32,
-    signed, unsigned,
+    Data, Export, ExportKind, FuncType, Function, Global, Import, Module, OP_END, OP_I32_CONST,
+    OP_I64_CONST, ValType, count, index_u32, signed, unsigned,
 };
 
 const NESTING_MAX: usize = 4096;
@@ -77,7 +77,10 @@ fn tokenize(text: &str) -> Result<Vec<Sexp>, String> {
             b' ' | b'\t' | b'\r' => at += 1,
             b'(' => {
                 if stack.len() > NESTING_MAX {
-                    return fail(line, format!("nesting deeper than nesting_max ({NESTING_MAX})"));
+                    return fail(
+                        line,
+                        format!("nesting deeper than nesting_max ({NESTING_MAX})"),
+                    );
                 }
                 stack.push((Vec::new(), line));
                 at += 1;
@@ -92,16 +95,27 @@ fn tokenize(text: &str) -> Result<Vec<Sexp>, String> {
             }
             b'"' => {
                 let (value, next) = string(bytes, at + 1, line)?;
-                stack.last_mut().expect("the stack holds the top level").0.push(Sexp::Text(value, line));
+                stack
+                    .last_mut()
+                    .expect("the stack holds the top level")
+                    .0
+                    .push(Sexp::Text(value, line));
                 at = next;
             }
             _ => {
                 let start = at;
-                while at < bytes.len() && !matches!(bytes[at], b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'"') {
+                while at < bytes.len()
+                    && !matches!(bytes[at], b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'"')
+                {
                     at += 1;
                 }
-                let word = std::str::from_utf8(&bytes[start..at]).expect("a word of utf-8 text is utf-8");
-                stack.last_mut().expect("the stack holds the top level").0.push(Sexp::Atom(word.to_owned(), line));
+                let word =
+                    std::str::from_utf8(&bytes[start..at]).expect("a word of utf-8 text is utf-8");
+                stack
+                    .last_mut()
+                    .expect("the stack holds the top level")
+                    .0
+                    .push(Sexp::Atom(word.to_owned(), line));
             }
         }
     }
@@ -128,7 +142,9 @@ fn string(bytes: &[u8], mut at: usize, line: usize) -> Result<(Vec<u8>, usize), 
                     Some(b'"') => (b'"', 2),
                     Some(b'\'') => (b'\'', 2),
                     _ => {
-                        let digits = bytes.get(at + 1..at + 3).and_then(|pair| std::str::from_utf8(pair).ok());
+                        let digits = bytes
+                            .get(at + 1..at + 3)
+                            .and_then(|pair| std::str::from_utf8(pair).ok());
                         match digits.and_then(|pair| u8::from_str_radix(pair, HEX_RADIX).ok()) {
                             Some(decoded) => (decoded, 3),
                             None => return fail(line, "bad string escape"),
@@ -151,7 +167,10 @@ pub fn number(word: &str) -> Option<i128> {
         Some(rest) => (true, rest),
         None => (false, word),
     };
-    let cleaned: String = digits.chars().filter(|character| *character != '_').collect();
+    let cleaned: String = digits
+        .chars()
+        .filter(|character| *character != '_')
+        .collect();
     let magnitude = match cleaned.strip_prefix("0x") {
         Some(hex) => i128::from_str_radix(hex, HEX_RADIX).ok()?,
         None => i128::from_str_radix(&cleaned, DECIMAL_RADIX).ok()?,
@@ -196,10 +215,12 @@ fn simple_op(word: &str) -> Option<(u8, Immediate)> {
     }
 }
 
-const COMPARISONS: [&str; 10] = ["eq", "ne", "lt_s", "lt_u", "gt_s", "gt_u", "le_s", "le_u", "ge_s", "ge_u"];
+const COMPARISONS: [&str; 10] = [
+    "eq", "ne", "lt_s", "lt_u", "gt_s", "gt_u", "le_s", "le_u", "ge_s", "ge_u",
+];
 const ARITHMETIC: [&str; 18] = [
-    "clz", "ctz", "popcnt", "add", "sub", "mul", "div_s", "div_u", "rem_s", "rem_u", "and", "or", "xor", "shl", "shr_s", "shr_u", "rotl",
-    "rotr",
+    "clz", "ctz", "popcnt", "add", "sub", "mul", "div_s", "div_u", "rem_s", "rem_u", "and", "or",
+    "xor", "shl", "shr_s", "shr_u", "rotl", "rotr",
 ];
 const I32_COMPARISON_FIRST: u8 = 0x46;
 const I64_COMPARISON_FIRST: u8 = 0x51;
@@ -262,7 +283,12 @@ impl Body<'_> {
         let Some(text) = word.atom() else {
             return fail(line, "expected a label");
         };
-        if let Some(depth) = self.labels.iter().rev().position(|label| label.as_deref() == Some(text)) {
+        if let Some(depth) = self
+            .labels
+            .iter()
+            .rev()
+            .position(|label| label.as_deref() == Some(text))
+        {
             return Ok(index_u32(depth));
         }
         match number(text).and_then(|value| u32::try_from(value).ok()) {
@@ -298,7 +324,11 @@ impl Body<'_> {
         }
     }
 
-    fn block_type(&self, items: &[Sexp], mut at: usize) -> Result<(Option<String>, u8, usize), String> {
+    fn block_type(
+        &self,
+        items: &[Sexp],
+        mut at: usize,
+    ) -> Result<(Option<String>, u8, usize), String> {
         let mut label = None;
         if let Some(word) = items.get(at).and_then(Sexp::atom)
             && word.starts_with('$')
@@ -320,7 +350,13 @@ impl Body<'_> {
         Ok((label, code, at))
     }
 
-    fn flat(&mut self, word: &str, line: usize, items: &[Sexp], at: usize) -> Result<usize, String> {
+    fn flat(
+        &mut self,
+        word: &str,
+        line: usize,
+        items: &[Sexp],
+        at: usize,
+    ) -> Result<usize, String> {
         match word {
             "block" | "loop" | "if" => {
                 let (label, code, next) = self.block_type(items, at)?;
@@ -353,14 +389,26 @@ impl Body<'_> {
         Ok(())
     }
 
-    fn immediate<'s>(&self, items: &'s [Sexp], at: usize, line: usize, word: &str) -> Result<&'s Sexp, String> {
+    fn immediate<'s>(
+        &self,
+        items: &'s [Sexp],
+        at: usize,
+        line: usize,
+        word: &str,
+    ) -> Result<&'s Sexp, String> {
         match items.get(at) {
             Some(item) => Ok(item),
             None => fail(line, format!("{word} needs an immediate")),
         }
     }
 
-    fn plain(&mut self, word: &str, line: usize, items: &[Sexp], at: usize) -> Result<usize, String> {
+    fn plain(
+        &mut self,
+        word: &str,
+        line: usize,
+        items: &[Sexp],
+        at: usize,
+    ) -> Result<usize, String> {
         let locals = &self.locals;
         let globals = &self.names.globals;
         match word {
@@ -375,8 +423,13 @@ impl Body<'_> {
                 Ok(at + 1)
             }
             "global.get" | "global.set" => {
-                let index = self.index(self.immediate(items, at, line, word)?, globals, "global")?;
-                self.out.push(if word == "global.get" { OP_GLOBAL_GET } else { OP_GLOBAL_SET });
+                let index =
+                    self.index(self.immediate(items, at, line, word)?, globals, "global")?;
+                self.out.push(if word == "global.get" {
+                    OP_GLOBAL_GET
+                } else {
+                    OP_GLOBAL_SET
+                });
                 unsigned(&mut self.out, u64::from(index));
                 Ok(at + 1)
             }
@@ -393,16 +446,29 @@ impl Body<'_> {
                 Ok(at + 1)
             }
             "br_table" => self.br_table(items, at, line),
-            "i32.const" | "i64.const" => self.constant(word, line, self.immediate(items, at, line, word)?).map(|()| at + 1),
+            "i32.const" | "i64.const" => self
+                .constant(word, line, self.immediate(items, at, line, word)?)
+                .map(|()| at + 1),
             "memory.size" | "memory.grow" => {
-                self.out.push(if word == "memory.size" { OP_MEMORY_SIZE } else { OP_MEMORY_GROW });
+                self.out.push(if word == "memory.size" {
+                    OP_MEMORY_SIZE
+                } else {
+                    OP_MEMORY_GROW
+                });
                 self.out.push(MEMORY_ZERO);
                 Ok(at)
             }
             "memory.copy" | "memory.fill" => {
                 self.out.push(OP_PREFIX_MISC);
                 let copy = word == "memory.copy";
-                unsigned(&mut self.out, if copy { MISC_MEMORY_COPY } else { MISC_MEMORY_FILL });
+                unsigned(
+                    &mut self.out,
+                    if copy {
+                        MISC_MEMORY_COPY
+                    } else {
+                        MISC_MEMORY_FILL
+                    },
+                );
                 self.out.push(MEMORY_ZERO);
                 if copy {
                     self.out.push(MEMORY_ZERO);
@@ -416,7 +482,9 @@ impl Body<'_> {
     fn br_table(&mut self, items: &[Sexp], mut at: usize, line: usize) -> Result<usize, String> {
         let mut depths = Vec::new();
         while let Some(item) = items.get(at)
-            && item.atom().is_some_and(|word| word.starts_with('$') || number(word).is_some())
+            && item
+                .atom()
+                .is_some_and(|word| word.starts_with('$') || number(word).is_some())
         {
             depths.push(self.label(item)?);
             at += 1;
@@ -438,13 +506,19 @@ impl Body<'_> {
             return fail(line, format!("{word} needs a number"));
         };
         if word == "i32.const" {
-            let Some(wrapped) = i32::try_from(value).ok().or_else(|| u32::try_from(value).ok().map(|unsigned| unsigned as i32)) else {
+            let Some(wrapped) = i32::try_from(value)
+                .ok()
+                .or_else(|| u32::try_from(value).ok().map(|unsigned| unsigned as i32))
+            else {
                 return fail(line, format!("{value} does not fit i32"));
             };
             self.out.push(OP_I32_CONST);
             signed(&mut self.out, i64::from(wrapped));
         } else {
-            let Some(wrapped) = i64::try_from(value).ok().or_else(|| u64::try_from(value).ok().map(|unsigned| unsigned as i64)) else {
+            let Some(wrapped) = i64::try_from(value)
+                .ok()
+                .or_else(|| u64::try_from(value).ok().map(|unsigned| unsigned as i64))
+            else {
                 return fail(line, format!("{value} does not fit i64"));
             };
             self.out.push(OP_I64_CONST);
@@ -453,7 +527,13 @@ impl Body<'_> {
         Ok(())
     }
 
-    fn simple(&mut self, word: &str, line: usize, items: &[Sexp], mut at: usize) -> Result<usize, String> {
+    fn simple(
+        &mut self,
+        word: &str,
+        line: usize,
+        items: &[Sexp],
+        mut at: usize,
+    ) -> Result<usize, String> {
         let Some((code, immediate)) = simple_op(word) else {
             return fail(line, format!("unknown instruction {word}"));
         };
@@ -463,9 +543,13 @@ impl Body<'_> {
             let mut align = natural;
             while let Some(argument) = items.get(at).and_then(Sexp::atom) {
                 if let Some(value) = argument.strip_prefix("offset=") {
-                    offset = number(value).and_then(|value| u32::try_from(value).ok()).ok_or_else(|| format!("wat line {line}: bad offset"))?;
+                    offset = number(value)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| format!("wat line {line}: bad offset"))?;
                 } else if let Some(value) = argument.strip_prefix("align=") {
-                    let bytes = number(value).and_then(|value| u32::try_from(value).ok()).ok_or_else(|| format!("wat line {line}: bad align"))?;
+                    let bytes = number(value)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| format!("wat line {line}: bad align"))?;
                     align = bytes.trailing_zeros();
                 } else {
                     break;
@@ -552,7 +636,11 @@ struct Header {
     body_at: usize,
 }
 
-fn typed_fields(list: &[Sexp], line: usize, into: &mut Vec<(Option<String>, ValType)>) -> Result<(), String> {
+fn typed_fields(
+    list: &[Sexp],
+    line: usize,
+    into: &mut Vec<(Option<String>, ValType)>,
+) -> Result<(), String> {
     let words: Vec<&str> = list[1..].iter().filter_map(Sexp::atom).collect();
     if words.len() != list.len() - 1 {
         return fail(line, "a param, result or local lists types");
@@ -575,7 +663,14 @@ fn typed_fields(list: &[Sexp], line: usize, into: &mut Vec<(Option<String>, ValT
 }
 
 fn header(items: &[Sexp], line: usize) -> Result<Header, String> {
-    let mut header = Header { name: None, export: None, params: Vec::new(), results: Vec::new(), locals: Vec::new(), body_at: items.len() };
+    let mut header = Header {
+        name: None,
+        export: None,
+        params: Vec::new(),
+        results: Vec::new(),
+        locals: Vec::new(),
+        body_at: items.len(),
+    };
     let mut at = 1;
     if let Some(word) = items.get(at).and_then(Sexp::atom)
         && word.starts_with('$')
@@ -586,7 +681,9 @@ fn header(items: &[Sexp], line: usize) -> Result<Header, String> {
     while let Some(Sexp::List(list, inner_line)) = items.get(at) {
         match list.first().and_then(Sexp::atom) {
             Some("export") => match list.get(1) {
-                Some(Sexp::Text(name, _)) => header.export = Some(String::from_utf8_lossy(name).into_owned()),
+                Some(Sexp::Text(name, _)) => {
+                    header.export = Some(String::from_utf8_lossy(name).into_owned())
+                }
                 _ => return fail(*inner_line, "an export names itself"),
             },
             Some("param") => typed_fields(list, *inner_line, &mut header.params)?,
@@ -610,7 +707,11 @@ fn header(items: &[Sexp], line: usize) -> Result<Header, String> {
 pub fn assemble(text: &str) -> Result<Module, String> {
     let forms = tokenize(text)?;
     let mut module = Module::default();
-    let mut names = Names { functions: BTreeMap::new(), globals: BTreeMap::new(), symbols: BTreeMap::new() };
+    let mut names = Names {
+        functions: BTreeMap::new(),
+        globals: BTreeMap::new(),
+        symbols: BTreeMap::new(),
+    };
     let mut bodies = Vec::new();
     layout(&forms, &mut module, &mut names)?;
     for form in &forms {
@@ -627,7 +728,10 @@ pub fn assemble(text: &str) -> Result<Module, String> {
             Some("import" | "text" | "words") => {}
             Some("func") => {
                 let parsed = header(items, *line)?;
-                let ty = FuncType { params: parsed.params.iter().map(|(_, ty)| *ty).collect(), results: parsed.results.clone() };
+                let ty = FuncType {
+                    params: parsed.params.iter().map(|(_, ty)| *ty).collect(),
+                    results: parsed.results.clone(),
+                };
                 let index = imported + index_u32(bodies.len());
                 let name = parsed.name.clone().expect("a header is named");
                 let ty_index = module.type_index(ty);
@@ -635,7 +739,11 @@ pub fn assemble(text: &str) -> Result<Module, String> {
                     return fail(*line, "a function is named twice");
                 }
                 if let Some(export) = &parsed.export {
-                    module.exports.push(Export { name: export.clone(), kind: ExportKind::Function, index });
+                    module.exports.push(Export {
+                        name: export.clone(),
+                        kind: ExportKind::Function,
+                        index,
+                    });
                 }
                 bodies.push((parsed, items, ty_index));
             }
@@ -658,24 +766,44 @@ fn function(names: &Names, parsed: &Header, items: &[Sexp], ty: u32) -> Result<F
             locals.insert(name.clone(), index_u32(position));
         }
     }
-    let mut body = Body { names, locals, labels: Vec::new(), out: Vec::new() };
+    let mut body = Body {
+        names,
+        locals,
+        labels: Vec::new(),
+        out: Vec::new(),
+    };
     body.sequence(&items[parsed.body_at..])?;
     if !body.labels.is_empty() {
         return fail(items[0].line(), "a block is not ended");
     }
     body.out.push(OP_END);
-    Ok(Function { ty, locals: parsed.locals.iter().map(|(_, ty)| *ty).collect(), body: body.out })
+    Ok(Function {
+        ty,
+        locals: parsed.locals.iter().map(|(_, ty)| *ty).collect(),
+        body: body.out,
+    })
 }
 
 fn import(form: &Sexp, module: &mut Module, names: &mut Names) -> Result<(), String> {
     let Sexp::List(items, line) = form else {
         return fail(form.line(), "an import is a list");
     };
-    let (Some(Sexp::Text(from, _)), Some(Sexp::Text(name, _)), Some(Sexp::List(signature, inner_line))) = (items.get(1), items.get(2), items.get(3)) else {
-        return fail(*line, "an import is (import \"module\" \"name\" (func ...))");
+    let (
+        Some(Sexp::Text(from, _)),
+        Some(Sexp::Text(name, _)),
+        Some(Sexp::List(signature, inner_line)),
+    ) = (items.get(1), items.get(2), items.get(3))
+    else {
+        return fail(
+            *line,
+            "an import is (import \"module\" \"name\" (func ...))",
+        );
     };
     let parsed = header(signature, *inner_line)?;
-    let ty = FuncType { params: parsed.params.iter().map(|(_, ty)| *ty).collect(), results: parsed.results };
+    let ty = FuncType {
+        params: parsed.params.iter().map(|(_, ty)| *ty).collect(),
+        results: parsed.results,
+    };
     let index = index_u32(module.imports.len());
     let ty_index = module.type_index(ty);
     module.imports.push(Import {
@@ -683,27 +811,43 @@ fn import(form: &Sexp, module: &mut Module, names: &mut Names) -> Result<(), Str
         name: String::from_utf8_lossy(name).into_owned(),
         ty: ty_index,
     });
-    names.functions.insert(parsed.name.expect("a header is named"), index);
+    names
+        .functions
+        .insert(parsed.name.expect("a header is named"), index);
     Ok(())
 }
 
-fn global(items: &[Sexp], line: usize, module: &mut Module, names: &mut Names) -> Result<(), String> {
+fn global(
+    items: &[Sexp],
+    line: usize,
+    module: &mut Module,
+    names: &mut Names,
+) -> Result<(), String> {
     let Some(name) = items.get(1).and_then(Sexp::atom) else {
         return fail(line, "a global is named");
     };
     let (ty, mutable) = match items.get(2) {
         Some(Sexp::Atom(word, _)) => (ValType::parse(word), false),
-        Some(Sexp::List(list, _)) if list.first().and_then(Sexp::atom) == Some("mut") => (list.get(1).and_then(Sexp::atom).and_then(ValType::parse), true),
+        Some(Sexp::List(list, _)) if list.first().and_then(Sexp::atom) == Some("mut") => (
+            list.get(1).and_then(Sexp::atom).and_then(ValType::parse),
+            true,
+        ),
         _ => (None, false),
     };
     let Some(ty) = ty else {
         return fail(line, "a global has a type");
     };
     let init = match items.get(3) {
-        Some(Sexp::List(list, _)) if list.len() == 2 => list[1].atom().and_then(|word| names.value(word)),
+        Some(Sexp::List(list, _)) if list.len() == 2 => {
+            list[1].atom().and_then(|word| names.value(word))
+        }
         _ => None,
     };
-    let Some(init) = init.and_then(|value| i64::try_from(value).ok().or_else(|| u64::try_from(value).ok().map(|unsigned| unsigned as i64))) else {
+    let Some(init) = init.and_then(|value| {
+        i64::try_from(value)
+            .ok()
+            .or_else(|| u64::try_from(value).ok().map(|unsigned| unsigned as i64))
+    }) else {
         return fail(line, "a global starts at a constant");
     };
     let index = index_u32(module.globals.len());
@@ -721,7 +865,11 @@ fn memory(items: &[Sexp], line: usize, module: &mut Module) -> Result<(), String
                 let Some(Sexp::Text(name, _)) = list.get(1) else {
                     return fail(line, "an export names itself");
                 };
-                module.exports.push(Export { name: String::from_utf8_lossy(name).into_owned(), kind: ExportKind::Memory, index: 0 });
+                module.exports.push(Export {
+                    name: String::from_utf8_lossy(name).into_owned(),
+                    kind: ExportKind::Memory,
+                    index: 0,
+                });
             }
             Sexp::Atom(word, _) => match number(word).and_then(|pages| u32::try_from(pages).ok()) {
                 Some(pages) => module.memory_pages = Some(pages),
@@ -738,8 +886,13 @@ fn memory(items: &[Sexp], line: usize, module: &mut Module) -> Result<(), String
 
 fn data(items: &[Sexp], line: usize, module: &mut Module) -> Result<(), String> {
     let offset = match items.get(1) {
-        Some(Sexp::List(list, _)) if list.first().and_then(Sexp::atom) == Some("i32.const") && list.len() == 2 => {
-            list[1].atom().and_then(number).and_then(|value| u32::try_from(value).ok())
+        Some(Sexp::List(list, _))
+            if list.first().and_then(Sexp::atom) == Some("i32.const") && list.len() == 2 =>
+        {
+            list[1]
+                .atom()
+                .and_then(number)
+                .and_then(|value| u32::try_from(value).ok())
         }
         _ => None,
     };
@@ -777,7 +930,11 @@ fn layout(forms: &[Sexp], module: &mut Module, names: &mut Names) -> Result<(), 
         if !matches!(kind, Some("text" | "words")) {
             continue;
         }
-        let Some(name) = items.get(1).and_then(Sexp::atom).filter(|word| word.starts_with('$')) else {
+        let Some(name) = items
+            .get(1)
+            .and_then(Sexp::atom)
+            .filter(|word| word.starts_with('$'))
+        else {
             return fail(*line, "a text or words form is named");
         };
         let size = if kind == Some("text") {
@@ -803,7 +960,16 @@ fn layout(forms: &[Sexp], module: &mut Module, names: &mut Names) -> Result<(), 
     let mut bytes = Vec::with_capacity((end - STATIC_BASE_BYTES) as usize);
     for (items, line, is_text) in placed {
         if is_text {
-            let length: usize = items[2..].iter().map(|item| if let Sexp::Text(text, _) = item { text.len() } else { 0 }).sum();
+            let length: usize = items[2..]
+                .iter()
+                .map(|item| {
+                    if let Sexp::Text(text, _) = item {
+                        text.len()
+                    } else {
+                        0
+                    }
+                })
+                .sum();
             bytes.extend_from_slice(&index_u32(length).to_le_bytes());
             for item in &items[2..] {
                 if let Sexp::Text(text, _) = item {
@@ -812,7 +978,14 @@ fn layout(forms: &[Sexp], module: &mut Module, names: &mut Names) -> Result<(), 
             }
         } else {
             for item in &items[2..] {
-                let value = item.atom().and_then(|word| names.value(word)).and_then(|value| u32::try_from(value).ok().or_else(|| i32::try_from(value).ok().map(|signed| signed as u32)));
+                let value = item
+                    .atom()
+                    .and_then(|word| names.value(word))
+                    .and_then(|value| {
+                        u32::try_from(value)
+                            .ok()
+                            .or_else(|| i32::try_from(value).ok().map(|signed| signed as u32))
+                    });
                 let Some(value) = value else {
                     return fail(line, "a word is a number or a placed name");
                 };
@@ -824,6 +997,9 @@ fn layout(forms: &[Sexp], module: &mut Module, names: &mut Names) -> Result<(), 
         }
     }
     bytes.resize((end - STATIC_BASE_BYTES) as usize, 0);
-    module.data.push(Data { offset: STATIC_BASE_BYTES, bytes });
+    module.data.push(Data {
+        offset: STATIC_BASE_BYTES,
+        bytes,
+    });
     Ok(())
 }

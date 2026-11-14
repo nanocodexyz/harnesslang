@@ -16,7 +16,7 @@ const SUMMARIZED_RESULT: &str = "summarized";
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format source|wasm|wat [--plant NAME]] FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -690,10 +690,6 @@ fn assemble_command(args: &[String]) -> ExitCode {
     }
 }
 
-fn return_bytes(bytes: &[u8]) -> ExitCode {
-    write_bytes(bytes)
-}
-
 fn write_bytes(bytes: &[u8]) -> ExitCode {
     use std::io::Write;
     match std::io::stdout().lock().write_all(bytes) {
@@ -709,9 +705,23 @@ fn emit_command(args: &[String]) -> ExitCode {
     if args.iter().any(|arg| arg == "--sql") {
         return harnesslang::emit::sql::command::emit_listing(args);
     }
-    let wasm = args.iter().any(|arg| arg == "--wasm");
-    let wat = args.iter().any(|arg| arg == "--wat");
-    let rest: Vec<String> = args.iter().filter(|arg| *arg != "--wasm" && *arg != "--wat").cloned().collect();
+    let mut format = "source";
+    let mut plant = "none";
+    let mut rest = Vec::new();
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--format" => match words.next() {
+                Some(value) => format = value.as_str(),
+                None => return usage(),
+            },
+            "--plant" => match words.next() {
+                Some(value) => plant = value.as_str(),
+                None => return usage(),
+            },
+            _ => rest.push(arg.clone()),
+        }
+    }
     let Some(flags) = flags(&rest) else {
         return usage();
     };
@@ -725,18 +735,19 @@ fn emit_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
-    let emitted = if wasm {
-        emit::wasm::emit(&program, target).map(|bytes| return_bytes(&bytes))
-    } else if wat {
-        emit::wasm::emit_text(&program, target).map(|text| {
+    let emitted = match format {
+        "wasm" => {
+            emit::wasm::emit_planted(&program, target, plant).map(|bytes| write_bytes(&bytes))
+        }
+        "wat" => emit::wasm::emit_text_planted(&program, target, plant).map(|text| {
             print!("{text}");
             ExitCode::SUCCESS
-        })
-    } else {
-        emit::emit(&program, target).map(|code| {
+        }),
+        "source" if plant == "none" => emit::emit(&program, target).map(|code| {
             print!("{code}");
             ExitCode::SUCCESS
-        })
+        }),
+        _ => return usage(),
     };
     match emitted {
         Ok(code) => code,
