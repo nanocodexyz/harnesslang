@@ -15,9 +15,11 @@ const FAILURE_EXIT: u8 = 1;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE",
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl emit --target {targets} FILE
+       {prove}",
         targets = Target::names(),
-        mutations = Mutation::names()
+        mutations = Mutation::names(),
+        prove = harnesslang::prove::cli::usage()
     );
     ExitCode::from(USAGE_EXIT)
 }
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
         "sim" => sim_command(rest),
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
+        "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
         _ => usage(),
     }
 }
@@ -144,8 +147,19 @@ fn check_command(args: &[String]) -> ExitCode {
     for handler in &program.handlers {
         println!("{}", worst_lines(handler));
     }
+    let proved_targets = flags.target.map_or_else(|| Target::ALL.to_vec(), |target| vec![target]);
+    let proved = harnesslang::prove::cli::report(
+        &file,
+        &program,
+        &proved_targets,
+        harnesslang::prove::Mutation::None,
+    );
     let Some(target) = flags.target else {
-        return ExitCode::SUCCESS;
+        return if proved {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(FAILURE_EXIT)
+        };
     };
     let model = target::model(target);
     println!("{}", target::describe(&model));
@@ -162,7 +176,7 @@ fn check_command(args: &[String]) -> ExitCode {
         );
     }
     let errors = target::check_limits(&program, &model);
-    if errors.is_empty() {
+    if errors.is_empty() && proved {
         println!("{file}: ok for {}", target.name());
         return ExitCode::SUCCESS;
     }

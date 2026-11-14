@@ -3,6 +3,7 @@ harness agent
 const turn_steps_max: u64 = 64
 const calls_per_step_max: u64 = 16
 const context_entries_max: u64 = 4096
+const turns_max: u64 = 1000000
 
 type outcome = completed(text) | failed(text) | exhausted
 
@@ -17,7 +18,13 @@ state {
   turns: u64
 }
 
-on prompt(input: text) -> outcome {
+invariant turns_bounded: turns <= turns_max
+invariant context_bounded: len(context) <= context_entries_max
+
+on prompt(input: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+{
   push context user(input)
   turns = turns + 1
   loop step below turn_steps_max {

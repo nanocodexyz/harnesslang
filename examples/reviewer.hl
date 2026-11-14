@@ -5,6 +5,7 @@ const calls_per_round_max: u64 = 8
 const notes_max: u64 = 1024
 const links_max: u64 = 64
 const review_budget_ms: u64 = 600000
+const reviews_max: u64 = 1000000
 
 type verdict = approved(text, u64) | changes(text, u64) | abandoned(text)
 
@@ -22,7 +23,14 @@ state {
   salt: u64
 }
 
-on review_change(change: text, strict: bool) -> verdict {
+invariant reviews_bounded: reviewed <= reviews_max
+invariant links_bounded: len(links) <= links_max
+
+on review_change(change: text, strict: bool) -> verdict
+  requires reviewed < reviews_max
+    and len(notes) + 2 + rounds_max * (1 + calls_per_round_max) <= notes_max
+    and len(links) + rounds_max * calls_per_round_max <= links_max
+{
   let started = now()
   salt = random()
   reviewed = reviewed + 1
@@ -51,8 +59,10 @@ on review_change(change: text, strict: bool) -> verdict {
     match reply {
       answer(words) => {
         let finished = now()
-        if finished - started > review_budget_ms {
-          return changes("over budget: " ++ words, round)
+        if finished >= started {
+          if finished - started > review_budget_ms {
+            return changes("over budget: " ++ words, round)
+          }
         }
         if round == 0 {
           return approved(words, round)
@@ -84,7 +94,9 @@ on review_change(change: text, strict: bool) -> verdict {
   return abandoned("no verdict within rounds_max")
 }
 
-on summarize(heading: text) -> text {
+on summarize(heading: text) -> text
+  requires len(notes) + 1 + links_max <= notes_max
+{
   push notes user(heading)
   for link in links {
     push notes user("posted " ++ link)

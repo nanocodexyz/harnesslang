@@ -2,6 +2,7 @@ pub mod check;
 pub mod effect;
 pub mod emit;
 pub mod ir;
+pub mod prove;
 pub mod run;
 pub mod sim;
 pub mod syntax;
