@@ -160,7 +160,11 @@ fn modified(statements: &[Stmt], program: &Program, out: &mut BTreeSet<Quantity>
                 .for_each(|arm| modified(&arm.body, program, out)),
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => modified(body, program, out),
             Stmt::Parallel(parallel) => modified(&parallel.body, program, out),
-            Stmt::Let { .. } | Stmt::Effect { .. } | Stmt::Take { .. } | Stmt::Finish { .. } => {}
+            Stmt::Let { .. }
+            | Stmt::Effect { .. }
+            | Stmt::Take { .. }
+            | Stmt::KeepBlobs { .. }
+            | Stmt::Finish { .. } => {}
         }
     }
 }

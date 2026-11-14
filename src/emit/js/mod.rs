@@ -114,6 +114,11 @@ fn type_literal(ty: &Type) -> String {
         ),
         Type::Known(inner) => format!("{{ known: {} }}", type_literal(inner)),
         Type::Maybe(inner) => format!("{{ maybe: {} }}", type_literal(inner)),
+        Type::Blob(bytes) => format!(
+            "{{ blob: {}n, bound: {} }}",
+            bytes.value,
+            js_string(&bytes.name)
+        ),
     }
 }
 
@@ -392,6 +397,7 @@ impl Writer<'_> {
         let program = self.program;
         let depth = self.depth;
         match statement {
+            Stmt::KeepBlobs { .. } => unimplemented!("keep blobs in the generated JavaScript"),
             Stmt::Let { local, value } => {
                 self.line(&format!("local_{local} = {};", expr(program, value)))
             }
@@ -543,6 +549,7 @@ fn binary(op: BinaryOp, left: String, right: String) -> String {
 
 fn expr(program: &Program, expression: &Expr) -> String {
     match expression {
+        Expr::ListingNotice(_) => unimplemented!("listing notices in the generated JavaScript"),
         Expr::U64(value) => format!("{value}n"),
         Expr::Bool(value) => value.to_string(),
         Expr::Text(value) => js_string(value),

@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `reply` `take` `tools` `window` `with`
+Contextual words: `after` `at` `below` `blob` `blobs` `bound` `calls` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `reply` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -544,7 +544,7 @@ item       = const | type | tool | listing | code | model | state | invariant | 
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
-tool       = "tool" name tool_params "->" type_expr "effect" effect_class ;
+tool       = "tool" name tool_params "->" type_expr "effect" effect_class [ "finds" name ] ;
 tool_params = "(" [ tool_param { "," tool_param } ] ")" ;
 tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
@@ -561,12 +561,14 @@ bound      = name ;
 type_expr  = "list" "<" type_expr "," bound ">"
            | "known" "<" type_expr ">"
            | "maybe" "<" type_expr ">"
+           | "blob" "<" bound ">"
            | name ;
 block      = "{" { statement } "}" ;
 statement  = "let" name [ ":" type_expr ] "=" expr
            | "push" name expr
            | "clear" name
            | "keep" name "last" expr [ "after" expr ]
+           | "keep" name "blobs" "last" bound
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
@@ -597,7 +599,7 @@ Notes the grammar leaves out:
 - Operators bind, loosest first: `or`, `and`, `not`, comparisons, `+ - ++`,
   `*`, `.`. Binary operators are left associative; a comparison does not chain
   (`a < b < c` is a parse error).
-- `known` and `maybe` start a type only when `<` follows. A field name after
+- `known`, `maybe` and `blob` start a type only when `<` follows. A field name after
   `.` may be any name.
 - A `bound` is a name: a number there is an error that names the number.
 - Nesting of blocks, types and expressions is bounded by
@@ -757,7 +759,7 @@ on ping() -> u64 { return 1 }
 
 ```console
 $ hl check docs/snippets/errors/tool-returns.hl
-docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text or a text enum
+docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text, a text enum or a blob
 ```
 
 ```hl docs/snippets/errors/tool-returns.hl
@@ -901,7 +903,7 @@ examples/invalid/listing_unknown.hl:11:5: error: 'unknown' is not a variant of k
 $ hl check docs/snippets/errors/listing-name.hl
 docs/snippets/errors/listing-name.hl:5:20: error: listing 'team__docs' names its tools 'team__docs__NAME', so its name holds no '__' and does not end with '_'
 $ hl check docs/snippets/errors/listing-arguments.hl
-docs/snippets/errors/listing-arguments.hl:8:9: error: listing 'docs' takes 0 argument(s), found 1
+docs/snippets/errors/listing-arguments.hl:8:14: error: cannot append a notice to 'query': it is a local binding, and only state fields change
 $ hl check docs/snippets/errors/listing-bound.hl
 docs/snippets/errors/listing-bound.hl:3:26: error: the tools one listing may hold must be a named constant, found number 16
 ```

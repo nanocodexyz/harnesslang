@@ -41,6 +41,20 @@ pub const OUTCOME_VARIANTS: [&str; 3] = ["ok", "failed", "unknown"];
 
 pub const LISTED_TOOL_SEPARATOR: &str = "__";
 
+pub const NOTICE_VARIANT: &str = "notice";
+pub const ATTACHED_VARIANT: &str = "attached";
+pub const DISPATCHED_TYPE: &str = "dispatched";
+pub const DISPATCHED_BLOB: VariantId = 3;
+pub const DISPATCHED_VARIANTS: [&str; 4] = ["ok", "failed", "unknown", "blob"];
+pub const SEARCH_SEPARATOR: char = '\n';
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Blobs {
+    pub bytes: Bound,
+    pub dispatched: SumId,
+    pub attached: VariantId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bound {
     pub name: String,
@@ -56,6 +70,7 @@ pub enum Type {
     List { element: Box<Type>, capacity: Bound },
     Known(Box<Type>),
     Maybe(Box<Type>),
+    Blob(Bound),
 }
 
 impl Type {
@@ -70,6 +85,32 @@ impl Type {
             }
             Self::Known(inner) => format!("known<{}>", inner.name(program)),
             Self::Maybe(inner) => format!("maybe<{}>", inner.name(program)),
+            Self::Blob(bytes) => format!("blob<{}>", bytes.name),
+        }
+    }
+
+    pub fn holds_blob(&self, program: &Program) -> bool {
+        match self {
+            Self::Blob(_) => true,
+            Self::List { element, .. } => element.holds_blob(program),
+            Self::Known(inner) | Self::Maybe(inner) => inner.holds_blob(program),
+            Self::Sum(sum) => program.sums[*sum]
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .any(|field| matches!(field, Self::Blob(_))),
+            Self::U64 | Self::Bool | Self::Text => false,
+        }
+    }
+
+    pub fn reports_unknown(&self, program: &Program) -> bool {
+        match self {
+            Self::Maybe(_) => true,
+            Self::Sum(sum) => program
+                .blobs
+                .as_ref()
+                .is_some_and(|blobs| blobs.dispatched == *sum),
+            _ => false,
         }
     }
 
@@ -78,7 +119,7 @@ impl Type {
             Self::Sum(sum) => Some(program.sums[*sum].variants.clone()),
             Self::Known(inner) => Some(outcome_variants(inner, false)),
             Self::Maybe(inner) => Some(outcome_variants(inner, true)),
-            Self::U64 | Self::Bool | Self::Text | Self::List { .. } => None,
+            Self::U64 | Self::Bool | Self::Text | Self::List { .. } | Self::Blob(_) => None,
         }
     }
 }
@@ -136,6 +177,8 @@ pub struct Program {
     pub handlers: Vec<Handler>,
     pub events: Events,
     pub cuts: Vec<u64>,
+    pub notice: Option<VariantId>,
+    pub blobs: Option<Blobs>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -248,6 +291,21 @@ impl Program {
         Some(defaults.as_slice())
     }
 
+    pub fn dispatch_result(&self) -> Type {
+        match &self.blobs {
+            Some(blobs) => Type::Sum(blobs.dispatched),
+            None => Type::Maybe(Box::new(Type::Text)),
+        }
+    }
+
+    pub fn search_of(&self, tool: &str) -> Option<ListingId> {
+        self.tool(tool).and_then(|(_, declared)| declared.finds)
+    }
+
+    pub fn deferred(&self, listing: ListingId) -> bool {
+        self.tools.iter().any(|tool| tool.finds == Some(listing))
+    }
+
     pub fn mode_name(&self, mode: ModeId) -> &str {
         &self
             .model
@@ -312,6 +370,7 @@ pub struct Tool {
     pub defaults: Vec<Option<Literal>>,
     pub returns: Type,
     pub effect: EffectClass,
+    pub finds: Option<ListingId>,
 }
 
 #[derive(Clone, Debug)]
@@ -576,6 +635,10 @@ pub enum Stmt {
         field: FieldId,
         kept: Kept,
     },
+    KeepBlobs {
+        field: FieldId,
+        count: Bound,
+    },
     If {
         condition: Expr,
         then: Vec<Stmt>,
@@ -699,6 +762,7 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
         | Stmt::Assign { .. }
         | Stmt::Push { .. }
         | Stmt::Shrink { .. }
+        | Stmt::KeepBlobs { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
         | Stmt::Finish { .. } => statement.clone(),
@@ -717,6 +781,7 @@ pub fn has_parallel(statements: &[Stmt]) -> bool {
         | Stmt::Assign { .. }
         | Stmt::Push { .. }
         | Stmt::Shrink { .. }
+        | Stmt::KeepBlobs { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
         | Stmt::Finish { .. } => false,
@@ -750,6 +815,7 @@ fn expr_cuts(value: &Expr, constants: &[Constant], out: &mut Vec<u64>) {
         | Expr::Constant(_)
         | Expr::Local(_)
         | Expr::Field(_)
+        | Expr::ListingNotice(_)
         | Expr::Cancelled => {}
     }
 }
@@ -797,7 +863,7 @@ fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
                 block_cuts(&parallel.body, constants, out);
             }
             Stmt::Effect { args, .. } => args.iter().for_each(|arg| expr_cuts(arg, constants, out)),
-            Stmt::Take { .. } => {}
+            Stmt::Take { .. } | Stmt::KeepBlobs { .. } => {}
         }
     }
 }
@@ -877,6 +943,7 @@ pub enum Expr {
         op: TextOp,
         args: Vec<Expr>,
     },
+    ListingNotice(ListingId),
     Cancelled,
 }
 

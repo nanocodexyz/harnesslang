@@ -11,6 +11,7 @@ pub enum Value {
     Text(String),
     Variant(VariantId, Vec<Value>),
     List(Vec<Value>),
+    Blob(String),
 }
 
 impl Value {
@@ -24,7 +25,7 @@ impl Value {
                 assert!(!sum.variants.is_empty(), "a text enum has a value");
                 Self::Variant(0, Vec::new())
             }),
-            Type::Known(_) | Type::Maybe(_) => None,
+            Type::Known(_) | Type::Maybe(_) | Type::Blob(_) => None,
         }
     }
 
@@ -69,6 +70,7 @@ pub fn to_json(program: &Program, ty: &Type, value: &Value) -> Json {
         (Type::U64, Value::U64(number)) => Json::Number(*number),
         (Type::Bool, Value::Bool(flag)) => Json::Bool(*flag),
         (Type::Text, Value::Text(text)) => Json::String(text.clone()),
+        (Type::Blob(_), Value::Blob(digest)) => crate::run::blob::value_json(digest),
         (Type::List { element, .. }, Value::List(items)) => Json::Array(
             items
                 .iter()
@@ -154,6 +156,9 @@ pub fn from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value, Str
                 return Err("call has fields other than id, tool and input".to_owned());
             }
             Ok(Value::Variant(0, fields))
+        }
+        Type::Blob(_) => {
+            crate::run::blob::digest_of(json).map(|digest| Value::Blob(digest.to_owned()))
         }
         Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => variant_from_json(program, ty, json),
     }
@@ -273,6 +278,7 @@ pub fn returned(program: &Program, returns: &Type) -> String {
             Type::U64 => "a u64".to_owned(),
             Type::Bool => "a bool".to_owned(),
             Type::Text => "text".to_owned(),
+            Type::Blob(_) => "a blob".to_owned(),
             other => {
                 panic!("the checker admits only scalar or text enum tool results, found {other:?}")
             }
@@ -281,6 +287,9 @@ pub fn returned(program: &Program, returns: &Type) -> String {
 }
 
 pub fn checked_output(program: &Program, tool: &str, returns: &Type, output: Output) -> Output {
+    if let Type::Blob(bytes) = returns {
+        return crate::run::blob::checked(tool, bytes, output);
+    }
     let Output::Ok(json) = &output else {
         return output;
     };
@@ -396,6 +405,85 @@ pub fn checked_listing(listing: &ir::Listing, output: Output) -> Output {
         ));
     }
     output
+}
+
+pub fn not_discovered(tool: &str, listing: &str) -> String {
+    format!("{tool} was not discovered: no search of listing {listing} found it in this turn")
+}
+
+pub fn not_found(tool: &str, found: &str, listing: &str) -> String {
+    format!("{tool} found {found:?}, which listing {listing} did not list in this turn")
+}
+
+pub fn found_names(text: &str) -> Vec<&str> {
+    text.split(ir::SEARCH_SEPARATOR)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+pub fn checked_search(
+    program: &Program,
+    tool: &str,
+    listing: ir::ListingId,
+    admitted: Option<&BTreeMap<String, String>>,
+    output: Output,
+) -> Output {
+    let Output::Ok(Json::String(text)) = &output else {
+        return output;
+    };
+    let declared = &program.listings[listing];
+    let names = found_names(text);
+    if names.len() as u64 > declared.bound.value {
+        return Output::Failed(format!(
+            "{tool} found {} tools, over listing {}'s bound {} ({})",
+            names.len(),
+            declared.name,
+            declared.bound.name,
+            declared.bound.value
+        ));
+    }
+    for found in names {
+        let listed = program
+            .listed(found)
+            .filter(|(id, _)| *id == listing)
+            .is_some_and(|(_, name)| admitted.is_some_and(|tools| tools.contains_key(name)));
+        if !listed {
+            return Output::Failed(not_found(tool, found, &declared.name));
+        }
+    }
+    output
+}
+
+pub fn notice(
+    listing: &str,
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> String {
+    let named = |name: &str| format!("{listing}{}{name}", ir::LISTED_TOOL_SEPARATOR);
+    let added: Vec<String> = after
+        .keys()
+        .filter(|name| !before.contains_key(*name))
+        .map(|name| named(name))
+        .collect();
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|(name, fingerprint)| before.get(*name).is_some_and(|old| old != *fingerprint))
+        .map(|(name, _)| named(name))
+        .collect();
+    let removed: Vec<String> = before
+        .keys()
+        .filter(|name| !after.contains_key(*name))
+        .map(|name| named(name))
+        .collect();
+    let parts: Vec<String> = [("added", added), ("changed", changed), ("removed", removed)]
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(what, names)| format!("{what} {}", names.join(", ")))
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("tools of listing {listing} changed: {}", parts.join("; "))
 }
 
 pub fn admitted(json: &Json) -> Result<BTreeMap<String, String>, String> {

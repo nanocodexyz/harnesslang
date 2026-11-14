@@ -37,6 +37,7 @@ impl Prover<'_> {
                 let state = self.shrink(state, *field, kept);
                 Some(self.compact(state))
             }
+            Stmt::KeepBlobs { .. } => Some(state),
             Stmt::If {
                 condition,
                 then,

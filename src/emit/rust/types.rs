@@ -99,6 +99,7 @@ impl<'p> Types<'p> {
             Type::List { element, .. } => format!("Vec<{}>", self.rust(element)),
             Type::Known(inner) => format!("Known<{}>", self.rust(inner)),
             Type::Maybe(inner) => format!("Maybe<{}>", self.rust(inner)),
+            Type::Blob(_) => unimplemented!("blobs in the generated Rust"),
         }
     }
 

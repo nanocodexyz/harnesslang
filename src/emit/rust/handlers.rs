@@ -71,6 +71,7 @@ impl<'a, 'p> Body<'a, 'p> {
 
     fn statement(&mut self, statement: &Stmt) {
         match statement {
+            Stmt::KeepBlobs { .. } => unimplemented!("keep blobs in the generated Rust"),
             Stmt::Let { local, value } => {
                 let value = self.expr(value);
                 let local = self.local(*local);
@@ -454,7 +455,10 @@ impl<'a, 'p> Body<'a, 'p> {
         match expr {
             Expr::U64(_) | Expr::Constant(_) | Expr::Len(_) | Expr::TextLen(_) => Type::U64,
             Expr::Bool(_) | Expr::Not(_) | Expr::Cancelled => Type::Bool,
-            Expr::Text(_) | Expr::Member { .. } | Expr::Truncate { .. } => Type::Text,
+            Expr::Text(_)
+            | Expr::Member { .. }
+            | Expr::Truncate { .. }
+            | Expr::ListingNotice(_) => Type::Text,
             Expr::With { list, .. } => self.type_of(list),
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
@@ -470,6 +474,7 @@ impl<'a, 'p> Body<'a, 'p> {
 
     pub fn expr(&mut self, expr: &Expr) -> String {
         match expr {
+            Expr::ListingNotice(_) => unimplemented!("listing notices in the generated Rust"),
             Expr::U64(value) => format!("{value}_u64"),
             Expr::Bool(value) => value.to_string(),
             Expr::Text(value) => format!("String::from({value:?})"),

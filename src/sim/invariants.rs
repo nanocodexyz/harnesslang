@@ -47,10 +47,12 @@ pub enum Invariant {
     WaitUntil,
     WallLimit,
     ModeSent,
+    BlobJournaled,
+    SearchListed,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -83,6 +85,8 @@ impl Invariant {
         Self::WaitUntil,
         Self::WallLimit,
         Self::ModeSent,
+        Self::BlobJournaled,
+        Self::SearchListed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -119,6 +123,8 @@ impl Invariant {
             Self::WaitUntil => "wait_until",
             Self::WallLimit => "wall_limit",
             Self::ModeSent => "mode_sent",
+            Self::BlobJournaled => "blob_journaled",
+            Self::SearchListed => "search_listed",
         }
     }
 }
@@ -508,6 +514,8 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     nested_enum_valid(world, records)?;
     let refused = tool_admitted(world, records)?;
     mode_sent(world, records)?;
+    blob_journaled(world.program, records)?;
+    search_listed(world.program, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()
@@ -523,7 +531,8 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             );
         }
         if let Some(results) = calls.results.get(id)
-            && results.first() != dispatched.outputs.first()
+            && results.first().cloned().map(crate::run::blob::digested)
+                != dispatched.outputs.first().cloned()
         {
             return violation(
                 Invariant::UnknownReported,
@@ -718,6 +727,108 @@ fn admitted_fingerprint<'a>(
         .get(name)
 }
 
+fn blob_journaled(program: &Program, records: &[Record]) -> Result<(), Violation> {
+    if program.blobs.is_none() {
+        return Ok(());
+    }
+    let mut tools: BTreeMap<String, &str> = BTreeMap::new();
+    let mut blobs = crate::run::blob::Blobs::default();
+    for record in records {
+        match record {
+            Record::Call {
+                turn, seq, tool, ..
+            } => {
+                tools.insert(call_id(*turn, *seq), tool);
+            }
+            Record::Result {
+                turn,
+                seq,
+                output: Output::Ok(json),
+            } => {
+                let id = call_id(*turn, *seq);
+                let blob = tools
+                    .get(&id)
+                    .is_some_and(|tool| crate::run::blob::returned_bound(program, tool).is_some());
+                if !blob {
+                    continue;
+                }
+                if let Err(error) = blobs.read(json) {
+                    return violation(
+                        Invariant::BlobJournaled,
+                        format!("result {id} ({}): {error}", tools[&id]),
+                    );
+                }
+            }
+            Record::Checkpoint {
+                revision, payload, ..
+            } => {
+                let Ok(state) = crate::run::json::decode(payload)
+                    .map_err(|error| error.to_string())
+                    .and_then(|json| value::state_from_json(program, &json))
+                else {
+                    continue;
+                };
+                if let Err(error) = blobs.check_state(program, &state) {
+                    return violation(
+                        Invariant::BlobJournaled,
+                        format!("checkpoint {revision}: {error}"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn search_listed(program: &Program, records: &[Record]) -> Result<(), Violation> {
+    if !program.tools.iter().any(|tool| tool.finds.is_some()) {
+        return Ok(());
+    }
+    let (calls, admissions, results) = admissions(program, records);
+    for (id, output) in results {
+        let (Some(call), Output::Ok(Json::String(text))) = (calls.get(&id), output) else {
+            continue;
+        };
+        let Some(listing) = program.search_of(call.tool) else {
+            continue;
+        };
+        for found in value::found_names(text) {
+            let listed = program.listed(found).filter(|(id, _)| *id == listing);
+            let admitted =
+                listed.and_then(|(_, name)| admitted_fingerprint(&admissions, call, listing, name));
+            if admitted.is_none() {
+                return violation(
+                    Invariant::SearchListed,
+                    format!(
+                        "search {id} ({}) recorded {found:?} as found, which the latest read of listing {} in turn {} did not list",
+                        call.tool, program.listings[listing].name, call.turn
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discovered_before(
+    program: &Program,
+    calls: &BTreeMap<String, Recorded<'_>>,
+    results: &[(String, &Output)],
+    call: &Recorded<'_>,
+    tool: &str,
+) -> bool {
+    results.iter().any(|(id, output)| {
+        let (Some(search), Output::Ok(Json::String(text))) = (calls.get(id), output) else {
+            return false;
+        };
+        search.turn == call.turn
+            && search.seq < call.seq
+            && program.search_of(search.tool).is_some()
+            && value::found_names(text).contains(&tool)
+    })
+}
+
 fn mode_named(mode: Option<&str>) -> String {
     mode.map_or_else(|| "no mode".to_owned(), |mode| format!("mode {mode}"))
 }
@@ -796,6 +907,17 @@ fn tool_admitted(world: &SimWorld<'_>, records: &[Record]) -> Result<BTreeSet<St
         let Some(call) = calls.get(id).filter(|call| call.tool == last.tool) else {
             continue;
         };
+        if program.deferred(listing)
+            && !discovered_before(program, &calls, &results, call, &last.tool)
+        {
+            return violation(
+                Invariant::ToolAdmitted,
+                format!(
+                    "listed call {id} ({}) ran although no search in turn {} found it: listing {} is deferred",
+                    last.tool, call.turn, program.listings[listing].name
+                ),
+            );
+        }
         let admitted = admitted_fingerprint(&admissions, call, listing, name);
         if admitted != last.fingerprint.as_ref() {
             return violation(
@@ -821,6 +943,7 @@ fn refused(
     results: Vec<(String, &Output)>,
 ) -> BTreeSet<String> {
     let mut refused = BTreeSet::new();
+    let results_all = results.clone();
     for (id, output) in results {
         let (Output::Failed(error), Some(call)) = (output, calls.get(&id)) else {
             continue;
@@ -834,9 +957,13 @@ fn refused(
         };
         let expected = invalid.or_else(|| {
             let (listing, name) = program.listed(call.tool)?;
-            admitted_fingerprint(admissions, call, listing, name)
-                .is_none()
-                .then(|| value::not_admitted(call.tool, &program.listings[listing].name, name))
+            let listing_name = &program.listings[listing].name;
+            if admitted_fingerprint(admissions, call, listing, name).is_none() {
+                return Some(value::not_admitted(call.tool, listing_name, name));
+            }
+            (program.deferred(listing)
+                && !discovered_before(program, calls, &results_all, call, call.tool))
+            .then(|| value::not_discovered(call.tool, listing_name))
         });
         if expected.as_ref() == Some(error) {
             refused.insert(id);

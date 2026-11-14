@@ -71,6 +71,8 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         handlers: Vec::new(),
         events: ir::Events::default(),
         cuts: Vec::new(),
+        notice: None,
+        blobs: None,
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -326,6 +328,93 @@ fn window(source: &ast::Program, program: &mut ir::Program, globals: &mut Global
     Ok(())
 }
 
+fn notice(source: &ast::Program, program: &mut ir::Program) {
+    let listed = source
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Listing(_)));
+    if program.model.is_none() || !listed {
+        return;
+    }
+    let entry = &mut program.sums[ir::ENTRY];
+    program.notice = Some(entry.variants.len());
+    entry.variants.push(Variant {
+        name: ir::NOTICE_VARIANT.to_owned(),
+        fields: vec![Type::Text],
+    });
+}
+
+fn blob_bound(source: &ast::Program) -> Checked<Option<&ast::Name>> {
+    let mut found: Option<&ast::Name> = None;
+    for item in &source.items {
+        let Item::Tool(tool) = item else { continue };
+        let TypeExpr::Blob { bytes, .. } = &tool.returns else {
+            continue;
+        };
+        match found {
+            Some(first) if first.text != bytes.text => {
+                return error(
+                    bytes.at,
+                    format!(
+                        "tool '{}' returns blob<{}>, but another tool returns blob<{}>: the blobs a dispatch returns share one bound",
+                        tool.name.text, bytes.text, first.text
+                    ),
+                );
+            }
+            _ => found = Some(bytes),
+        }
+    }
+    Ok(found)
+}
+
+fn blobs(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let Some(name) = blob_bound(source)? else {
+        return Ok(());
+    };
+    if program.model.is_none() {
+        return error(
+            name.at,
+            "a tool that returns a blob needs a model declaration: its blobs reach the model as context entries",
+        );
+    }
+    let bytes = bound(program, globals, name, "the bytes a blob may hold")?;
+    if bytes.value == 0 {
+        return error(name.at, format!("blob bound '{}' is 0 bytes", name.text));
+    }
+    let blob = Type::Blob(bytes.clone());
+    let fields = [
+        vec![Type::Text],
+        vec![Type::Text],
+        Vec::new(),
+        vec![blob.clone()],
+    ];
+    let dispatched = program.sums.len();
+    program.sums.push(Sum {
+        name: ir::DISPATCHED_TYPE.to_owned(),
+        kind: SumKind::Tagged,
+        variants: ir::DISPATCHED_VARIANTS
+            .iter()
+            .zip(fields)
+            .map(|(name, fields)| Variant {
+                name: (*name).to_owned(),
+                fields,
+            })
+            .collect(),
+    });
+    let entry = &mut program.sums[ir::ENTRY];
+    let attached = entry.variants.len();
+    entry.variants.push(Variant {
+        name: ir::ATTACHED_VARIANT.to_owned(),
+        fields: vec![Type::Sum(ir::CALL), blob],
+    });
+    program.blobs = Some(ir::Blobs {
+        bytes,
+        dispatched,
+        attached,
+    });
+    Ok(())
+}
+
 fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals) -> Checked<()> {
     let reply = declared_reply(source);
     program.sums = builtin_sums(program, reply.map(|name| name.text.as_str()));
@@ -335,6 +424,8 @@ fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals)
         }
     }
     window(source, program, globals)?;
+    notice(source, program);
+    blobs(source, program, globals)?;
     let mut declared = Vec::new();
     for item in &source.items {
         let Item::Type(definition) = item else {
@@ -576,7 +667,7 @@ fn text_values(definition: &ast::TypeDef, values: &[ast::Name]) -> Checked<Vec<V
 
 fn contained(ty: &Type, out: &mut Vec<ir::SumId>) {
     match ty {
-        Type::U64 | Type::Bool | Type::Text => {}
+        Type::U64 | Type::Bool | Type::Text | Type::Blob(_) => {}
         Type::Sum(sum) => out.push(*sum),
         Type::List { element, .. } => contained(element, out),
         Type::Known(inner) | Type::Maybe(inner) => contained(inner, out),
@@ -664,7 +755,23 @@ pub fn resolve(program: &ir::Program, globals: &Globals, ty: &TypeExpr) -> Check
         TypeExpr::Maybe { inner, .. } => {
             Ok(Type::Maybe(Box::new(resolve(program, globals, inner)?)))
         }
+        TypeExpr::Blob { bytes, .. } => {
+            let bytes = bound(program, globals, bytes, "the bytes a blob may hold")?;
+            Ok(Type::Blob(bytes))
+        }
     }
+}
+
+fn no_blob(program: &ir::Program, at: Position, ty: &Type, what: &str) -> Checked<()> {
+    if ty.holds_blob(program) {
+        return error(
+            at,
+            format!(
+                "{what} cannot hold a blob: a blob comes from a tool and goes to the model, and stays in state lists between them"
+            ),
+        );
+    }
+    Ok(())
 }
 
 fn variant_names(program: &ir::Program) -> BTreeSet<String> {
@@ -701,12 +808,12 @@ fn tools(
         let params = params(program, globals, &tool.params)?;
         let defaults = defaults(program, globals, &params, &tool.defaults)?;
         let returns = resolve(program, globals, &tool.returns)?;
-        if !matches!(returns, Type::U64 | Type::Bool | Type::Text)
+        if !matches!(returns, Type::U64 | Type::Bool | Type::Text | Type::Blob(_))
             && program.text_enum(&returns).is_none()
         {
             return error(
                 tool.returns.at(),
-                "a tool returns u64, bool, text or a text enum",
+                "a tool returns u64, bool, text, a text enum or a blob",
             );
         }
         globals
@@ -718,6 +825,7 @@ fn tools(
             defaults,
             returns,
             effect: tool.effect,
+            finds: None,
         });
     }
     Ok(())
@@ -737,9 +845,16 @@ fn params(
                 format!("parameter '{}' appears twice", param.name.text),
             );
         }
+        let ty = resolve(program, globals, &param.ty)?;
+        no_blob(
+            program,
+            param.ty.at(),
+            &ty,
+            &format!("parameter '{}'", param.name.text),
+        )?;
         params.push(ir::Field {
             name: param.name.text.clone(),
-            ty: resolve(program, globals, &param.ty)?,
+            ty,
         });
     }
     Ok(params)
@@ -847,6 +962,7 @@ fn listings(
     }
     for item in &source.items {
         let Item::Tool(tool) = item else { continue };
+        finds(program, globals, tool)?;
         if let Some((id, _)) = program.listed(&tool.name.text) {
             return error(
                 tool.name.at,
@@ -857,6 +973,42 @@ fn listings(
             );
         }
     }
+    Ok(())
+}
+
+fn finds(program: &mut ir::Program, globals: &Globals, tool: &ast::Tool) -> Checked<()> {
+    let Some(name) = &tool.finds else {
+        return Ok(());
+    };
+    let Some(&listing) = globals.listings.get(&name.text) else {
+        return error(
+            name.at,
+            format!(
+                "tool '{}' finds tools of '{}', which is not a listing",
+                tool.name.text, name.text
+            ),
+        );
+    };
+    let id = globals.tools[&tool.name.text];
+    if program.tools[id].effect == crate::effect::EffectClass::External {
+        return error(
+            tool.name.at,
+            format!(
+                "tool '{}' finds tools of listing '{}': a search changes nothing, so its effect is none or idempotent",
+                tool.name.text, name.text
+            ),
+        );
+    }
+    if program.tools[id].returns != Type::Text {
+        return error(
+            tool.returns.at(),
+            format!(
+                "tool '{}' finds tools of listing '{}', so it returns text: the names it found, one per line",
+                tool.name.text, name.text
+            ),
+        );
+    }
+    program.tools[id].finds = Some(listing);
     Ok(())
 }
 
@@ -910,6 +1062,19 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         );
     }
     let tools = nested_tools(globals, code)?;
+    if let Some((tool, at)) = tools
+        .iter()
+        .zip(&code.tools)
+        .find(|(tool, _)| matches!(program.tools[**tool].returns, Type::Blob(_)))
+    {
+        return error(
+            at.at,
+            format!(
+                "code '{name}' lists '{}', which returns a blob: a cell's results are text",
+                program.tools[*tool].name
+            ),
+        );
+    }
     let mut limits: BTreeMap<&str, Bound> = BTreeMap::new();
     for field in &code.fields {
         let Some(key) = CODE_FIELDS.iter().find(|key| **key == field.key.text) else {
