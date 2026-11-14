@@ -1,0 +1,107 @@
+harness autoresearch
+
+const cycles_max: u64 = 6
+const trials_max: u64 = 5
+const rounds_max: u64 = 16
+const calls_per_round_max: u64 = 8
+const context_entries_max: u64 = 512
+const cost_max: u64 = 120
+const ledger_max: u64 = 32
+const failures_max: u64 = 3
+const micros_max: u64 = 60000000
+const margin_micros: u64 = 0
+const trial_cost_max: u64 = 1
+const failing_max: u64 = 1000000
+const bash_timeout_ms: u64 = 120000
+
+type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
+
+tool Bash(command: text, timeout: u64 = bash_timeout_ms) -> text effect external
+tool Read(file_path: text) -> text effect none
+tool Edit(file_path: text, old_string: text, new_string: text) -> text effect external
+tool commit(message: text) -> text effect external
+tool restore(revision: text) -> text effect idempotent
+tool bench(revision: text) -> u64 effect idempotent
+tool failing(revision: text) -> u64 effect idempotent
+
+model messages calls calls_per_round_max reply claude_reply
+
+on cancel
+
+state {
+  revision: text
+  ledger: list<cycle, ledger_max>
+  ended: climb_end
+  context: list<entry, context_entries_max>
+}
+
+on prompt(goal: text) -> text {
+  match commit("baseline") {
+    ok(head) => {
+  climb speed over revision from head ledger ledger end ended
+    cycles cycles_max trials trials_max
+    cost cost_max propose rounds_max trial trial_cost_max
+    failures failures_max
+    metric micros lower at most micros_max
+    metric broken lower at most failing_max
+    gate broken == 0
+    accept mean by margin_micros
+  {
+    propose(base) {
+      match restore(base) {
+        ok(_) => {
+          clear context
+          push context user(goal ++ "\n\nThe working tree is at revision " ++ base ++ ".")
+          loop round below rounds_max {
+            if len(context) + 1 + calls_per_round_max < context_entries_max {
+              match messages(context) {
+                ok(reply) => {
+                  push context assistant(reply)
+                  match reply {
+                    answer(words, _) => {
+                      match commit(words) {
+                        ok(candidate) => { yield candidate(candidate, words) }
+                        failed(_) => {}
+                        unknown => {}
+                      }
+                      clear context
+                    }
+                    calls(requested, _, _) => {
+                      for call in requested {
+                        match dispatch(call) {
+                          ok(output) => { push context result(call, output) }
+                          failed(error) => { push context error(call, error) }
+                          unknown => { push context unknown(call) }
+                        }
+                      }
+                    }
+                  }
+                }
+                failed(_) => { clear context }
+              }
+              yield cost 1
+            }
+          }
+        }
+        failed(_) => {}
+      }
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(micros) => {
+          match failing(subject) {
+            ok(count) => { yield score(micros, count) }
+            failed(_) => {}
+          }
+        }
+        failed(_) => {}
+      }
+      yield cost trial_cost_max
+    }
+  }
+    }
+    failed(error) => { return "no baseline: " ++ error }
+    unknown => { return "the baseline commit is unknown" }
+  }
+  return revision
+}
