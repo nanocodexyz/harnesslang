@@ -306,6 +306,7 @@ fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
         ledger: Ledger { file },
         children: None,
         label: format!("hl-agent[{key}]"),
+        jobs: crate::jobs::Jobs::default(),
     };
     let mark = |agent: &mut Agent, kind: &str| {
         agent.ledger.append(Value::object([
