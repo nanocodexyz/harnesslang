@@ -23,6 +23,8 @@ pub struct CodeSpec {
     pub timer_ms: Limit,
     pub journal_bytes: Limit,
     pub yield_ms: Limit,
+    pub waits: Option<&'static str>,
+    pub cancel: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,12 +102,23 @@ impl CellPoint {
 }
 
 pub const UNKNOWN_KEY: &str = "unknown";
+pub const RUNNING_KEY: &str = "running";
+pub const RUNNING_TEXT: &str = "Script running with cell ID ";
+pub const TERMINATED_TEXT: &str = "Script terminated";
+pub const NOT_FOUND_TEXT: &str = "exec cell ID not found";
+pub const STOPPED_TEXT: &str = "Tool execution stopped by the user. The cell was terminated and no nested tool call was left running.";
+pub const STOPPED_UNKNOWN_TEXT: &str = "Tool execution stopped by the user. The cell was terminated while a nested tool call was still running; that call's outcome is unknown. Do not assume it did not run or automatically repeat it.";
+
+pub fn running_text(cell: u64) -> String {
+    format!("{RUNNING_TEXT}{cell}")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellOutcome {
     Done(String),
     Threw(String),
     Unknown(String),
+    Running(String),
 }
 
 impl CellOutcome {
@@ -114,6 +127,7 @@ impl CellOutcome {
             Self::Done(text) => Output::Ok(Json::text(text)),
             Self::Threw(error) => Output::Failed(error.clone()),
             Self::Unknown(text) => Output::Ok(Json::object([(UNKNOWN_KEY, Json::text(text))])),
+            Self::Running(text) => Output::Ok(Json::object([(RUNNING_KEY, Json::text(text))])),
         }
     }
 
@@ -121,10 +135,15 @@ impl CellOutcome {
         match output {
             Output::Ok(Json::String(text)) => Ok(Self::Done(text.clone())),
             Output::Failed(error) => Ok(Self::Threw(error.clone())),
-            Output::Ok(json) => match json.get(UNKNOWN_KEY).and_then(Json::as_str) {
-                Some(text) => Ok(Self::Unknown(text.to_owned())),
-                None => Err(format!("cell output {} is neither text nor unknown", json.encode())),
-            },
+            Output::Ok(json) => {
+                if let Some(text) = json.get(UNKNOWN_KEY).and_then(Json::as_str) {
+                    return Ok(Self::Unknown(text.to_owned()));
+                }
+                match json.get(RUNNING_KEY).and_then(Json::as_str) {
+                    Some(text) => Ok(Self::Running(text.to_owned())),
+                    None => Err(format!("cell output {} is neither text, unknown nor running", json.encode())),
+                }
+            }
         }
     }
 }
@@ -134,6 +153,7 @@ pub enum CellEvent {
     Delivered { cell: u64, id: u64 },
     Diverged { cell: u64, reason: String },
     Finished { cell: u64, outcome: CellOutcome },
+    Yielded { cell: u64 },
 }
 
 pub trait CellHost {
@@ -147,6 +167,8 @@ pub trait CellHost {
     fn random(&mut self) -> u64;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn observe(&mut self, event: &CellEvent);
+    fn cell_cancelled(&mut self, code: usize, drain: bool) -> Result<bool, Stop>;
+    fn abandoned(&mut self, seq: u64, nested: u64);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,6 +185,7 @@ pub struct CellSite<'a> {
     pub script: &'a str,
     pub cell: CellStart<'a>,
     pub nested: &'a BTreeMap<(u64, u64), SiteLog>,
+    pub header_buffered: bool,
 }
 
 pub fn header_tools(code: &CodeSpec) -> Vec<Json> {
@@ -208,6 +231,13 @@ pub fn run_cell(site: CellSite<'_>, host: &mut dyn CellHost) -> Result<CellOutco
     let outcome = match runner.drive() {
         Ok(outcome) => outcome,
         Err(Interrupt::Stop(stop)) => return Err(stop),
+        Err(Interrupt::Stopped(unknown)) => return runner.finish(stopped(unknown)),
+        Err(Interrupt::Yield) => {
+            if runner.host.cell_cancelled(runner.site.code, false)? {
+                return runner.finish(stopped(false));
+            }
+            return Ok(runner.yielded());
+        }
         Err(Interrupt::Threw(error)) => CellOutcome::Threw(error),
         Err(Interrupt::Diverged(reason)) => CellOutcome::Unknown(divergence_text(runner.cell, &reason)),
         Err(Interrupt::Overflow) => {
@@ -218,11 +248,20 @@ pub fn run_cell(site: CellSite<'_>, host: &mut dyn CellHost) -> Result<CellOutco
             CellOutcome::Unknown(divergence_text(runner.cell, &reason))
         }
     };
+    if runner.host.cell_cancelled(runner.site.code, false)? {
+        return runner.finish(stopped(false));
+    }
     runner.finish(outcome)
+}
+
+fn stopped(unknown: bool) -> CellOutcome {
+    CellOutcome::Done(if unknown { STOPPED_UNKNOWN_TEXT } else { STOPPED_TEXT }.to_owned())
 }
 
 enum Interrupt {
     Stop(Stop),
+    Stopped(bool),
+    Yield,
     Threw(String),
     Diverged(String),
     Overflow,
@@ -277,6 +316,7 @@ struct Runner<'a, 'h> {
     timers: BTreeMap<u64, (u64, u64)>,
     armed: u64,
     bytes: u64,
+    deadline: Option<u64>,
 }
 
 impl<'a, 'h> Runner<'a, 'h> {
@@ -321,7 +361,7 @@ impl<'a, 'h> Runner<'a, 'h> {
                 CellStart::Fresh(_) => BTreeMap::new(),
             },
             next_seq,
-            header_unsaved: false,
+            header_unsaved: site.header_buffered,
             header,
             calls: BTreeMap::new(),
             queue: VecDeque::new(),
@@ -329,6 +369,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             timers: BTreeMap::new(),
             armed: 0,
             bytes,
+            deadline: None,
             site,
         }
     }
@@ -352,6 +393,9 @@ impl<'a, 'h> Runner<'a, 'h> {
             return Err(self.diverged("its header holds another script than its call".to_owned()));
         }
         let script = self.script.clone();
+        if self.live {
+            self.arm_deadline();
+        }
         let mut step = self.host.start(self.cell, &script);
         for _ in 0..steps_max(self.code) {
             let input = match step {
@@ -587,6 +631,7 @@ impl<'a, 'h> Runner<'a, 'h> {
         }
         assert_eq!(self.cursor, self.replay.len(), "a cell goes live at its journal's end");
         self.live = true;
+        self.arm_deadline();
         let open: Vec<u64> = self
             .calls
             .iter()
@@ -629,6 +674,9 @@ impl<'a, 'h> Runner<'a, 'h> {
     }
 
     fn dispatch(&mut self, id: u64, fresh: bool) -> Driven<()> {
+        if self.host.cell_cancelled(self.site.code, false)? {
+            return Err(Interrupt::Stopped(false));
+        }
         let call = self.calls[&id].clone();
         let tool = call.tool.expect("a dispatched call names a nested tool");
         let required = tool.effect == EffectClass::External;
@@ -649,6 +697,10 @@ impl<'a, 'h> Runner<'a, 'h> {
             self.header_unsaved = false;
         }
         let output = self.run_tool(id, tool)?;
+        if required && self.host.cell_cancelled(self.site.code, true)? {
+            self.host.abandoned(self.site.seq, id);
+            return Err(Interrupt::Stopped(true));
+        }
         if required {
             self.host.append(Record::NestedResult {
                 turn: self.site.turn,
@@ -733,6 +785,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             .map(|(id, (delay, at))| (at.saturating_add(*delay), *id))
             .min();
         match earliest {
+            Some((until, _)) if self.deadline.is_some_and(|deadline| until > deadline) => Err(Interrupt::Yield),
             Some((until, id)) => self.fire(id, until),
             None => Err(Interrupt::Threw(
                 "the cell waits with no nested call running and no timer armed".to_owned(),
@@ -790,6 +843,9 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn deliver(&mut self, id: u64) -> Driven<Input> {
         if self.calls[&id].output.is_none() {
             self.dispatch(id, false)?;
+            if self.host.cell_cancelled(self.site.code, true)? {
+                return Err(Interrupt::Stopped(false));
+            }
         }
         let (encoded, success) = self.calls[&id].output.clone().expect("a delivered call has its output");
         self.append_entry(Entry::Result {
@@ -817,10 +873,29 @@ impl<'a, 'h> Runner<'a, 'h> {
             delay_ms,
             until_ms,
         })?;
+        if self.host.cell_cancelled(self.site.code, true)? {
+            return Err(Interrupt::Stopped(false));
+        }
         self.timers.remove(&id);
         self.append_entry(Entry::Timer { id })?;
         self.emit(false);
         Ok(Input::Timer { id })
+    }
+
+    fn arm_deadline(&mut self) {
+        if self.code.waits.is_none() {
+            return;
+        }
+        let clock = self.host.clock();
+        self.deadline = Some(clock.saturating_add(self.code.yield_ms.value));
+    }
+
+    fn yielded(mut self) -> CellOutcome {
+        assert!(self.live, "a cell yields only while it runs live");
+        assert!(self.running() == 0, "a cell yields only with no nested call running");
+        self.emit(false);
+        self.host.observe(&CellEvent::Yielded { cell: self.cell });
+        CellOutcome::Running(running_text(self.cell))
     }
 
     fn finish(mut self, outcome: CellOutcome) -> Result<CellOutcome, Stop> {

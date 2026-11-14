@@ -93,6 +93,7 @@ pub struct Session {
     pub cell_origins: BTreeMap<u64, (u64, u64)>,
     pub last_event: u64,
     pub jobs: BTreeMap<String, String>,
+    pub forked: Option<Json>,
 }
 
 impl Session {
@@ -120,7 +121,9 @@ fn call_of(tool: &str, effect: EffectClass, input: &Json) -> Call {
 
 fn nested_call(log: &mut TurnLog, turn: u64, id: (u64, u64), call: Call) -> Result<(), String> {
     let (seq, nested) = id;
-    if !matches!(log.sites.get(&seq), Some(SiteLog::Open(_))) {
+    let continued = log.cells.get(&seq).is_some_and(|cell| !cell.finished)
+        && matches!(log.sites.last_key_value(), Some((_, SiteLog::Open(_))));
+    if !continued && !matches!(log.sites.get(&seq), Some(SiteLog::Open(_))) {
         return Err(format!(
             "nested call {seq}/{nested} of turn {turn} comes from a site that is not running"
         ));
@@ -295,6 +298,11 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
             handler,
             arguments,
         } => {
+            if session.forked.is_some() && !session.checkpoints.contains_key(&ENTRY_REVISION) {
+                return Err(format!(
+                    "turn {turn} is admitted before the forked session's entry checkpoint"
+                ));
+            }
             if let Some((last, log)) = session.turns.last_key_value() {
                 if *turn != last + 1 {
                     return Err(format!("turn {turn} is admitted after turn {last}"));
@@ -475,6 +483,19 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
                 ));
             }
             session.checkpoints.insert(*revision, payload.clone());
+        }
+        Record::Host { key, value } => {
+            let first = session.turns.is_empty()
+                && session.checkpoints.is_empty()
+                && session.forked.is_none()
+                && session.cell_origins.is_empty();
+            if key != crate::ir::FORKED_HOST_KEY || !first {
+                return Err(format!(
+                    "host record '{key}' where only a leading '{}' record is taken",
+                    crate::ir::FORKED_HOST_KEY
+                ));
+            }
+            session.forked = Some(value.clone());
         }
     }
     Ok(())

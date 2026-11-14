@@ -50,6 +50,8 @@ export function eventJson(rt, event) {
       return o([["delivered", o([["cell", BigInt(event.cell)], ["id", BigInt(event.id)]])]]);
     case "diverged":
       return o([["diverged", o([["cell", BigInt(event.cell)], ["reason", event.reason]])]]);
+    case "yielded":
+      return o([["yielded", o([["cell", BigInt(event.cell)]])]]);
     case "finished": {
       const output = rt.cellOutcomeOutput(event.outcome);
       const json = output.tag === "ok" ? o([["ok", output.value]]) : o([["failed", output.error]]);
@@ -94,10 +96,20 @@ export class TracedCells {
     this.memory = new Map();
     this.replaying = new Map();
     this.contexts = new Map();
+    this.generations = new Map();
   }
 
   key(cell) {
-    return `${this.seed.stats.runs}/${cell}`;
+    const base = `${this.seed.stats.runs}/${cell}`;
+    const generation = this.generations.get(base) ?? 0;
+    return generation === 0 ? base : `${base}#${generation}`;
+  }
+
+  continued(cell) {
+    const next = this.check.cursor.peek();
+    if (next?.event !== "cell_start" || next.cell !== BigInt(cell) || !this.memory.has(this.key(cell))) return;
+    const base = `${this.seed.stats.runs}/${cell}`;
+    this.generations.set(base, (this.generations.get(base) ?? 0) + 1);
   }
 
   exchange(cell, kind, detail, live, raw) {
@@ -119,6 +131,7 @@ export class TracedCells {
 
   start(cell, script, context) {
     const { rt, cursor, same } = this.check;
+    this.continued(cell);
     this.contexts.set(this.key(cell), { script, context });
     if (this.check.durable().finished(cell)) throw this.check.failure("cell_finishes_once", `the engine started on cell ${cell}, whose finished update is durable`);
     const key = this.key(cell);

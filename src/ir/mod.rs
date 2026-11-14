@@ -181,6 +181,7 @@ pub struct Program {
     pub notice: Option<VariantId>,
     pub blobs: Option<Blobs>,
     pub idle: Option<Idle>,
+    pub forked: Option<Handler>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -278,9 +279,13 @@ impl Program {
                 .model
                 .as_ref()
                 .map_or_else(Interrupts::default, |model| model.interrupts),
-            SiteKind::Tool(_) | SiteKind::Dispatch => self
-                .tool(tool)
-                .map_or_else(Interrupts::default, |(_, declared)| declared.interrupts),
+            SiteKind::Tool(_) | SiteKind::Dispatch | SiteKind::Cell(_) => {
+                if let Some(code) = self.cell_of(tool) {
+                    return self.codes[code].interrupts;
+                }
+                self.tool(tool)
+                    .map_or_else(Interrupts::default, |(_, declared)| declared.interrupts)
+            }
             _ => Interrupts::default(),
         }
     }
@@ -300,6 +305,13 @@ impl Program {
             .as_ref()
             .is_some_and(|model| model.interrupts.any())
             || self.tools.iter().any(|tool| tool.interrupts.any())
+            || self.codes.iter().any(|code| code.interrupts.any())
+    }
+
+    pub fn cell_of(&self, tool: &str) -> Option<CodeId> {
+        self.code(tool)
+            .map(|(code, _)| code)
+            .or_else(|| self.waits(tool).map(|(code, _)| code))
     }
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
@@ -313,6 +325,12 @@ impl Program {
     pub fn kind_of(&self, handler: &Handler) -> &'static str {
         if self.side(&handler.name).is_some() {
             "side handler"
+        } else if self
+            .forked
+            .as_ref()
+            .is_some_and(|forked| std::ptr::eq(forked, handler))
+        {
+            "hook"
         } else {
             "handler"
         }
@@ -334,6 +352,18 @@ impl Program {
     pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
         self.tool(tool)
             .and_then(|(_, declared)| declared.spawn.as_ref())
+    }
+
+    pub fn fork_of(&self, tool: &str) -> Option<ForkAt> {
+        self.tool(tool).and_then(|(_, declared)| declared.fork)
+    }
+
+    pub fn forks(&self) -> bool {
+        self.tools.iter().any(|tool| tool.fork.is_some())
+    }
+
+    pub fn starts_sessions(&self, tool: &Tool) -> bool {
+        tool.spawn.is_some() || tool.fork.is_some()
     }
 
     pub fn spawns(&self) -> impl Iterator<Item = (&Tool, &Spawn)> {
@@ -375,6 +405,9 @@ impl Program {
         if let Some((_, declared)) = self.tool(tool) {
             return declared.effect;
         }
+        if self.waits(tool).is_some() {
+            return EffectClass::None;
+        }
         self.listed(tool)
             .map_or(EffectClass::undeclared(), |(id, _)| {
                 self.listings[id].effect
@@ -384,6 +417,9 @@ impl Program {
     pub fn input_params(&self, tool: &str) -> Option<&[Field]> {
         if let Some((_, declared)) = self.tool(tool) {
             return Some(&declared.params);
+        }
+        if let Some((_, waits)) = self.waits(tool) {
+            return Some(&waits.params);
         }
         self.listed(tool)
             .map(|(id, _)| self.listings[id].params.as_slice())
@@ -397,6 +433,8 @@ impl Program {
                 "a tool has one default slot per parameter"
             );
             &declared.defaults
+        } else if let Some((_, waits)) = self.waits(tool) {
+            &waits.defaults
         } else {
             let (id, _) = self.listed(tool)?;
             let listing = &self.listings[id];
@@ -440,6 +478,20 @@ impl Program {
             .find(|(_, code)| code.name == name)
     }
 
+    pub fn cells_yield(&self) -> bool {
+        self.codes.iter().any(|code| code.waits.is_some())
+    }
+
+    pub fn waits(&self, tool: &str) -> Option<(CodeId, &Waits)> {
+        self.codes.iter().enumerate().find_map(|(code, declared)| {
+            declared
+                .waits
+                .as_ref()
+                .filter(|waits| waits.name == tool)
+                .map(|waits| (code, waits))
+        })
+    }
+
     pub fn resolve_dispatch(&self, tool: &str) -> Resolved {
         match self.code(tool) {
             Some((code, _)) => Resolved::Cell(code),
@@ -464,6 +516,37 @@ pub struct Code {
     pub timer_ms: Bound,
     pub journal_bytes: Bound,
     pub yield_ms: Bound,
+    pub waits: Option<Waits>,
+    pub interrupts: Interrupts,
+}
+
+pub const WAIT_CELL_ID: &str = "cell_id";
+pub const WAIT_TERMINATE: &str = "terminate";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waits {
+    pub name: String,
+    pub params: Vec<Field>,
+    pub defaults: Vec<Option<Literal>>,
+}
+
+impl Waits {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            params: vec![
+                Field {
+                    name: WAIT_CELL_ID.to_owned(),
+                    ty: Type::Text,
+                },
+                Field {
+                    name: WAIT_TERMINATE.to_owned(),
+                    ty: Type::Bool,
+                },
+            ],
+            defaults: vec![None, Some(Literal::Bool(false))],
+        }
+    }
 }
 
 impl Code {
@@ -494,7 +577,34 @@ pub struct Tool {
     pub interrupts: Interrupts,
     pub jobs: Option<Bound>,
     pub spawn: Option<Spawn>,
+    pub fork: Option<ForkAt>,
     pub finds: Option<ListingId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkAt {
+    Latest,
+    Turn,
+}
+
+impl ForkAt {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Turn => "turn",
+        }
+    }
+}
+
+pub const FORKED_HOST_KEY: &str = "forked";
+pub const FORKED_HOOK: &str = "forked";
+pub const FORK_TURN: &str = "turn";
+pub const FORK_ORIGIN: &str = "origin";
+pub const FORK_DISCARDED: &str = "discarded";
+pub const FORK_STATE: &str = "state";
+
+pub fn fork_missing(turn: u64) -> String {
+    format!("no finished turn {turn} to fork from")
 }
 
 #[derive(Clone, Debug)]
@@ -1142,7 +1252,7 @@ impl Program {
 
     pub fn find_cuts(&self) -> Vec<u64> {
         let mut cuts = Vec::new();
-        for handler in self.handlers.iter().chain(&self.sides) {
+        for handler in self.handlers.iter().chain(&self.sides).chain(&self.forked) {
             block_cuts(&handler.body, &self.constants, &mut cuts);
         }
         cuts.sort_unstable();

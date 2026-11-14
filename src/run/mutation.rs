@@ -77,10 +77,14 @@ pub enum Mutation {
     SettingsDropped,
     RewriteLiveOnly,
     LaneSeqShared,
+    ForkLiveState,
+    ForkHookSkipped,
+    CellLeaks,
+    CellCancelIgnored,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 75] = [
+    pub const ALL: [Self; 79] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -156,6 +160,10 @@ impl Mutation {
         Self::SettingsDropped,
         Self::RewriteLiveOnly,
         Self::LaneSeqShared,
+        Self::ForkLiveState,
+        Self::ForkHookSkipped,
+        Self::CellLeaks,
+        Self::CellCancelIgnored,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -235,6 +243,10 @@ impl Mutation {
             Self::SettingsDropped => "settings_dropped",
             Self::RewriteLiveOnly => "rewrite_live_only",
             Self::LaneSeqShared => "lane_seq_shared",
+            Self::ForkLiveState => "fork_live_state",
+            Self::ForkHookSkipped => "fork_hook_skipped",
+            Self::CellLeaks => "cell_leaks",
+            Self::CellCancelIgnored => "cell_cancel_ignored",
         }
     }
 
@@ -324,7 +336,11 @@ impl Mutation {
             | Self::JobLostAll
             | Self::SettingsDropped
             | Self::RewriteLiveOnly
-            | Self::LaneSeqShared => all,
+            | Self::LaneSeqShared
+            | Self::ForkLiveState
+            | Self::ForkHookSkipped
+            | Self::CellLeaks
+            | Self::CellCancelIgnored => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

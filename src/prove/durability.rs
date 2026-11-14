@@ -26,6 +26,7 @@ enum CellPhase {
     Running,
     Diverged,
     Finished,
+    Yielded,
     Closed,
 }
 
@@ -40,6 +41,7 @@ struct State {
     reopened: BTreeSet<Slot>,
     recorded: BTreeSet<Slot>,
     cells: BTreeMap<SiteId, CellPhase>,
+    yielded: BTreeSet<SiteId>,
     attempt: Option<(Slot, bool)>,
 }
 
@@ -55,6 +57,7 @@ impl State {
             reopened: BTreeSet::new(),
             recorded: BTreeSet::new(),
             cells: BTreeMap::new(),
+            yielded: BTreeSet::new(),
             attempt: None,
         }
     }
@@ -123,7 +126,7 @@ fn acknowledgements(ops: &[Op]) -> usize {
 
 fn has_cells(ops: &[Op]) -> bool {
     ops.iter().any(|op| match op {
-        Op::CloseCell(..) => true,
+        Op::CloseCell(..) | Op::CloseWait(..) => true,
         Op::Choice(arms) => arms.iter().any(|arm| has_cells(&arm.ops)),
         Op::Repeat { body, .. } => has_cells(body),
         _ => false,
@@ -329,6 +332,10 @@ impl Prover<'_> {
                 }
                 BTreeSet::new()
             }
+            Op::ResumeCell(site) => states
+                .into_iter()
+                .flat_map(|state| resumed(&state, *site))
+                .collect(),
             Op::End => {
                 for state in states {
                     if state.phase != Phase::Acknowledged {
@@ -377,8 +384,30 @@ impl Prover<'_> {
             Op::Wait { site, what } => self.wait(*site, what, &state),
             Op::Sleep { slot, what, .. } => self.sleep(*slot, what, &state),
             Op::CloseCell(site, _) => self.close_cell(*site, &mut state),
+            Op::CloseWait(site, _) => self.close_wait(*site, &mut state),
+            Op::CellYields(site) => {
+                if !cell_is(&state, *site, CellPhase::Running) {
+                    self.finding(
+                        "cell_finish_once",
+                        format!(
+                            "{}: a cell that is not running is left running",
+                            self.handler.sites[*site]
+                        ),
+                        None,
+                    );
+                }
+                state.cells.insert(*site, CellPhase::Yielded);
+            }
+            Op::CellLeftRunning(site) => {
+                state.yielded.insert(*site);
+            }
+            Op::StopCells => {
+                for site in std::mem::take(&mut state.yielded) {
+                    state.pending.insert(Record::CellFinished(site));
+                }
+            }
             Op::Acknowledge => self.acknowledge(&mut state),
-            Op::Choice(_) | Op::Repeat { .. } | Op::End | Op::Park { .. } => {
+            Op::Choice(_) | Op::Repeat { .. } | Op::End | Op::Park { .. } | Op::ResumeCell(_) => {
                 unreachable!("structured ops are walked by op")
             }
         }
@@ -411,6 +440,16 @@ impl Prover<'_> {
             }
             Record::BatchResult(_) => {}
             Record::Status => {
+                if let Some(site) = state.yielded.first() {
+                    self.finding(
+                        "cell_settled_at_turn_end",
+                        format!(
+                            "{}: the turn's status is appended while its cell is still running",
+                            self.handler.sites[*site]
+                        ),
+                        Some("the cell is left running past its turn, so a later turn cannot tell it ended".to_owned()),
+                    );
+                }
                 if state.phase != Phase::Running {
                     self.finding(
                         "finish_once",
@@ -466,6 +505,11 @@ impl Prover<'_> {
         let Some(phase) = state.cells.get(&site).copied() else {
             return;
         };
+        if phase == CellPhase::Yielded {
+            state.yielded.insert(site);
+            state.cells.insert(site, CellPhase::Closed);
+            return;
+        }
         if phase != CellPhase::Finished {
             self.finding(
                 "cell_finish_once",
@@ -486,6 +530,20 @@ impl Prover<'_> {
                 "cell_finish_once",
                 format!(
                     "{}: a path leaves the code site without a finished update and a site result",
+                    self.handler.sites[site]
+                ),
+                None,
+            ),
+        }
+    }
+
+    fn close_wait(&mut self, site: SiteId, state: &mut State) {
+        match state.cells.remove(&site) {
+            None | Some(CellPhase::Closed | CellPhase::Recorded) => {}
+            Some(_) => self.finding(
+                "cell_finish_once",
+                format!(
+                    "{}: a path leaves the wait site with its cell neither finished, left running nor recorded",
                     self.handler.sites[site]
                 ),
                 None,
@@ -705,6 +763,22 @@ fn flush(state: &mut State, kept: Option<Record>) {
         state.phase = Phase::StatusDurable;
     }
     state.pending.retain(|record| Some(*record) == kept);
+}
+
+fn resumed(state: &State, site: SiteId) -> Vec<State> {
+    state
+        .yielded
+        .iter()
+        .map(|origin| {
+            let mut next = state.clone();
+            next.yielded.remove(origin);
+            if next.pending.remove(&Record::CellHeader(*origin)) {
+                next.pending.insert(Record::CellHeader(site));
+            }
+            next.cells.insert(site, CellPhase::Running);
+            next
+        })
+        .collect()
 }
 
 fn replaying(state: &State) -> bool {

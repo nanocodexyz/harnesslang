@@ -58,10 +58,12 @@ pub enum Invariant {
     JobOnce,
     JobReported,
     SettingsSent,
+    ForkStateEqual,
+    CellSettledAtTurnEnd,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 45] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -105,6 +107,8 @@ impl Invariant {
         Self::JobOnce,
         Self::JobReported,
         Self::SettingsSent,
+        Self::ForkStateEqual,
+        Self::CellSettledAtTurnEnd,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -152,6 +156,8 @@ impl Invariant {
             Self::JobOnce => "job_once",
             Self::JobReported => "job_reported",
             Self::SettingsSent => "settings_sent",
+            Self::ForkStateEqual => "fork_state_equal",
+            Self::CellSettledAtTurnEnd => "cell_settled_at_turn_end",
         }
     }
 }
@@ -307,6 +313,12 @@ pub fn interrupted_count(program: &Program, records: &[Record]) -> u64 {
             } if error == crate::ir::INTERRUPTED_REASON && program.any_interruptible() => {
                 count += 1;
             }
+            Record::Result { output, .. }
+                if program.codes.iter().any(|code| code.interrupts.cancel)
+                    && crate::run::cell::stopped_output(output) =>
+            {
+                count += 1;
+            }
             _ => {}
         }
     }
@@ -358,7 +370,9 @@ fn interrupt_honored(program: &Program, records: &[Record]) -> Result<(), Violat
                 if replied.remove(&(*turn, *seq)) {
                     continue;
                 }
-                let reason = matches!(output, Output::Failed(error) if error == crate::ir::INTERRUPTED_REASON);
+                let reason = matches!(output, Output::Failed(error) if error == crate::ir::INTERRUPTED_REASON)
+                    || (program.cell_of(&tool).is_some()
+                        && crate::run::cell::stopped_output(output));
                 (
                     *turn,
                     *seq,
@@ -500,8 +514,65 @@ fn nested_reported(world: &SimWorld<'_>, calls: &Calls) -> Result<(), Violation>
     Ok(())
 }
 
+fn cell_settled(records: &[Record]) -> Result<(), Violation> {
+    let mut origins: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut finished: BTreeMap<u64, u64> = BTreeMap::new();
+    for record in records {
+        match record {
+            Record::Cell { cell, update, .. } => {
+                if let Some(header) = &update.header
+                    && let Ok((turn, _, _)) = journal::parse_any_call_id(&header.origin_call_id)
+                {
+                    origins.insert(*cell, turn);
+                }
+                if update.finished {
+                    let count = finished.entry(*cell).or_default();
+                    *count += 1;
+                    if *count > 1 {
+                        return violation(
+                            Invariant::CellFinishesOnce,
+                            format!("cell {cell} has {count} finished updates"),
+                        );
+                    }
+                }
+            }
+            Record::Status { turn, .. } => {
+                if let Some((cell, _)) = origins
+                    .iter()
+                    .find(|(cell, origin)| *origin == turn && !finished.contains_key(cell))
+                {
+                    return violation(
+                        Invariant::CellSettledAtTurnEnd,
+                        format!(
+                            "cell {cell} of turn {turn} has no finished update before the turn's status"
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn tool_class(program: &Program, name: &str) -> EffectClass {
     program.dispatch_class(name)
+}
+
+fn stopped_cell(program: &Program, log: &session::TurnLog, origin: u64, cell: u64) -> bool {
+    let id = cell.to_string();
+    log.sites.iter().any(|(seq, site)| match site {
+        SiteLog::Done(call, output) if crate::run::cell::stopped_output(output) => {
+            *seq == origin
+                || (program.waits(&call.tool).is_some()
+                    && call
+                        .input
+                        .get(crate::ir::WAIT_CELL_ID)
+                        .and_then(Json::as_str)
+                        == Some(id.as_str()))
+        }
+        _ => false,
+    })
 }
 
 fn cells(program: &Program, calls: &Calls, session: &Session) -> Result<(), Violation> {
@@ -569,7 +640,8 @@ fn cells(program: &Program, calls: &Calls, session: &Session) -> Result<(), Viol
                     }
                     continue;
                 }
-                if site_unknown {
+                if site_unknown || (result.is_none() && stopped_cell(program, log, *seq, cell.cell))
+                {
                     continue;
                 }
                 if result.is_none() || delivered_unknown {
@@ -767,6 +839,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     crate::sim::park::check(world, records)?;
     world.inbox.safety(records)?;
     let calls = seq_unique(records)?;
+    cell_settled(records)?;
     nested_reported(world, &calls)?;
     enum_valid(world, records)?;
     nested_enum_valid(world, records)?;
@@ -1203,8 +1276,12 @@ fn tool_admitted(world: &SimWorld<'_>, records: &[Record]) -> Result<BTreeSet<St
     let (calls, admissions, results) = admissions(program, records);
     for (id, executions) in &world.executed {
         for executed in executions {
+            let input = match program.fork_of(&executed.tool) {
+                Some(at) => crate::run::fork::request_of(at, &executed.input),
+                None => executed.input.clone(),
+            };
             if let Some(params) = program.input_params(&executed.tool)
-                && let Err(error) = value::input_fits(program, params, &executed.input)
+                && let Err(error) = value::input_fits(program, params, &input)
             {
                 return violation(
                     Invariant::ToolAdmitted,
@@ -1271,7 +1348,11 @@ fn refused(
                 value::Input::Invalid(invalid) => Some(invalid),
                 value::Input::Untyped | value::Input::Typed(_) => None,
             },
-            _ => None,
+            input => program.fork_of(call.tool).and_then(|at| {
+                input.get(crate::ir::FORK_STATE).is_none().then(|| {
+                    crate::ir::fork_missing(crate::run::fork::requested(at, input).unwrap_or(0))
+                })
+            }),
         };
         let expected = invalid.or_else(|| {
             let (listing, name) = program.listed(call.tool)?;
@@ -1301,6 +1382,7 @@ fn canonical_key(record: &Record) -> (u64, u8, u64, u8) {
         Record::Event { turn, at, .. } => (*turn, 2, *at, 2),
         Record::Status { turn, .. } => (*turn, 3, 0, 0),
         Record::Checkpoint { revision, .. } => (*revision, 4, 0, 0),
+        Record::Host { .. } => (0, 0, 0, 0),
         Record::NestedCall { .. } | Record::NestedResult { .. } | Record::Cell { .. } => {
             panic!("the checker refuses parallel for in a harness with a code tool")
         }

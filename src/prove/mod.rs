@@ -74,7 +74,7 @@ pub enum Mutation {
     DropCellFinish,
 }
 
-const LOWERING_MUTATIONS: [run::mutation::Mutation; 29] = [
+const LOWERING_MUTATIONS: [run::mutation::Mutation; 30] = [
     run::mutation::Mutation::FlushAfterDispatch,
     run::mutation::Mutation::RecoveryRedispatchesExternal,
     run::mutation::Mutation::VercelRetryRedispatches,
@@ -104,6 +104,7 @@ const LOWERING_MUTATIONS: [run::mutation::Mutation; 29] = [
     run::mutation::Mutation::SuspendBeforeFlush,
     run::mutation::Mutation::ResumeReplaysSuspend,
     run::mutation::Mutation::RecoverTrustsLost,
+    run::mutation::Mutation::CellLeaks,
 ];
 
 const PROGRAM_MUTATIONS: [Mutation; 5] = [
@@ -234,8 +235,8 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
 
 fn spawning(program: &Program, kind: crate::ir::SiteKind) -> bool {
     match kind {
-        crate::ir::SiteKind::Tool(tool) => program.tools[tool].spawn.is_some(),
-        crate::ir::SiteKind::Dispatch => program.spawns().next().is_some(),
+        crate::ir::SiteKind::Tool(tool) => program.starts_sessions(&program.tools[tool]),
+        crate::ir::SiteKind::Dispatch => program.spawns().next().is_some() || program.forks(),
         _ => false,
     }
 }
@@ -297,7 +298,11 @@ fn planned_tree(
     if spawns == 0 {
         return Some(tree);
     }
-    let mut widest = PlannedTree::default();
+    let mut widest = PlannedTree {
+        records: 0,
+        requests: 0,
+        sessions: u64::from(program.forks()),
+    };
     for (tool, spawn) in program.spawns() {
         let child_program = &spawn.program;
         let child_plan = lower::lower(child_program, model, descent.mutation);
@@ -559,6 +564,11 @@ fn planned(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Planned> {
             | Op::Wait { .. }
             | Op::Sleep { .. }
             | Op::CloseCell(..)
+            | Op::CloseWait(..)
+            | Op::CellYields(_)
+            | Op::CellLeftRunning(_)
+            | Op::ResumeCell(_)
+            | Op::StopCells
             | Op::Acknowledge => Planned {
                 through: Some(cost(op)),
                 ended: None,
@@ -660,7 +670,7 @@ fn appended(program: &Program, op: &Op) -> Count {
         }
         Op::Append(Record::Timeout(_) | Record::Recovery) => 0,
         Op::Append(_) => 1,
-        Op::CloseCell(_, code) => program.codes[*code]
+        Op::CloseCell(_, code) | Op::CloseWait(_, code) => program.codes[*code]
             .timers
             .value
             .checked_mul(TIMER_UPDATE_RECORDS)

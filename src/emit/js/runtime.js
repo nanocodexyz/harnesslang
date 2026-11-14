@@ -594,6 +594,8 @@ function recordJson(record) {
         ])]])],
         ["turn", turn],
       ])]]);
+    case "host":
+      return object([["host", object([["key", record.key], ["value", record.value]])]]);
     case "checkpoint":
       return object([["checkpoint", object([
         ["payload", record.payload],
@@ -789,6 +791,9 @@ function recordFrom(json) {
     case "checkpoint":
       fields.exact(["payload", "revision", "state"]);
       return { kind: "checkpoint", payload: fields.text("payload"), revision: fields.number("revision"), state: fields.text("state") };
+    case "host":
+      fields.exact(["key", "value"]);
+      return { kind: "host", key: fields.text("key"), value: fields.get("value") };
     case "event":
       fields.exact(["at", "event", "seq", "turn"]);
       return { kind: "event", turn: fields.turn(), seq: fields.number("seq"), at: fields.number("at"), delivery: deliveryFrom(fields.get("event")) };
@@ -942,7 +947,7 @@ function nextSite(log, turn, seq, site) {
 }
 
 function fold(records) {
-  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map(), lastEvent: 0, jobs: new Map() };
+  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map(), lastEvent: 0, jobs: new Map(), forked: null };
   for (const record of records) {
     applyRecord(session, record);
   }
@@ -952,6 +957,7 @@ function fold(records) {
 function applyRecord(session, record) {
   switch (record.kind) {
     case "admitted": {
+      if (session.forked !== null && !session.checkpoints.has(0)) throw new Corrupt("turn " + String(record.turn) + " is admitted before the forked session's entry checkpoint");
       if (session.turns.size > 0) {
         const last = session.lastTurn;
         if (record.turn !== last + 1) throw new Corrupt(`turn ${record.turn} is admitted after turn ${last}`);
@@ -1002,10 +1008,17 @@ function applyRecord(session, record) {
       return;
     case "checkpoint": {
       const log = session.turns.get(record.revision);
-      if (log === undefined || log.finished === null) {
+      const entry = record.revision === 0 && session.turns.size === 0;
+      if (!entry && (log === undefined || log.finished === null)) {
         throw new Corrupt(`checkpoint at revision ${record.revision}, which is not a finished turn`);
       }
       session.checkpoints.set(record.revision, record.payload);
+      return;
+    }
+    case "host": {
+      const first = session.turns.size === 0 && session.checkpoints.size === 0 && session.forked === null && session.cellOrigins.size === 0;
+      if (record.key !== "forked" || !first) throw new Corrupt("host record '" + record.key + "' where only a leading 'forked' record is taken");
+      session.forked = record.value;
       return;
     }
     default:
@@ -1364,9 +1377,19 @@ function listed(tool) {
   return listing < 0 ? null : { listing, name };
 }
 
+function waitsNamed(tool) {
+  const index = PROGRAM.codes.findIndex((code) => code.waits !== null && code.waits.name === tool);
+  return index < 0 ? null : index;
+}
+
+function cellsYield() {
+  return PROGRAM.codes.some((code) => code.waits !== null);
+}
+
 function dispatchClass(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.effect;
+  if (waitsNamed(tool) !== null) return "none";
   const found = listed(tool);
   return found === null ? "external" : PROGRAM.listings[found.listing].effect;
 }
@@ -1377,6 +1400,8 @@ const MODEL_SETTINGS = "settings";
 function inputDefaults(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.defaults;
+  const waits = waitsNamed(tool);
+  if (waits !== null) return PROGRAM.codes[waits].waits.defaults;
   const found = listed(tool);
   return found === null ? null : PROGRAM.listings[found.listing].defaults;
 }
@@ -1384,6 +1409,8 @@ function inputDefaults(tool) {
 function inputParams(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (declared !== undefined) return declared.params;
+  const waits = waitsNamed(tool);
+  if (waits !== null) return PROGRAM.codes[waits].waits.params;
   const found = listed(tool);
   return found === null ? null : PROGRAM.listings[found.listing].params;
 }

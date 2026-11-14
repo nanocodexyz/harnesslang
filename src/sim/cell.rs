@@ -17,6 +17,51 @@ pub const END_THROW_PPM: u64 = 100_000;
 pub const READ_KINDS: u64 = 3;
 pub const SLEEP_MS_MAX: u64 = 1_000;
 pub const DIVERGENCE_PPM: u64 = 10_000;
+pub const YIELD_SLEEP_PPM: u64 = 400_000;
+pub const WAIT_CALL_PPM: u64 = 800_000;
+pub const WAIT_WRONG_ID_PPM: u64 = 100_000;
+pub const WAIT_TERMINATE_PPM: u64 = 150_000;
+pub const WAIT_DEFAULTED_PPM: u64 = 500_000;
+
+pub fn think_ms_max(program: &Program) -> Option<u64> {
+    program
+        .codes
+        .iter()
+        .filter(|code| code.waits.is_some())
+        .map(|code| code.yield_ms.value)
+        .max()
+        .map(|ms| ms.max(1))
+}
+
+pub fn wait_call(
+    program: &Program,
+    yielded: &BTreeSet<u64>,
+    rng: &mut Rng,
+) -> Option<(String, String)> {
+    if yielded.is_empty() || !rng.chance(WAIT_CALL_PPM) {
+        return None;
+    }
+    let waits: Vec<&crate::ir::Waits> = program
+        .codes
+        .iter()
+        .filter_map(|code| code.waits.as_ref())
+        .collect();
+    let waits = waits.get(rng.pick(waits.len())).copied()?;
+    let cell = yielded.iter().nth(rng.pick(yielded.len())).copied()?;
+    let id = if rng.chance(WAIT_WRONG_ID_PPM) {
+        cell.saturating_add(1 + rng.below(2)).to_string()
+    } else {
+        cell.to_string()
+    };
+    let mut input = BTreeMap::new();
+    input.insert(crate::ir::WAIT_CELL_ID.to_owned(), Json::String(id));
+    if rng.chance(WAIT_TERMINATE_PPM) {
+        input.insert(crate::ir::WAIT_TERMINATE.to_owned(), Json::Bool(true));
+    } else if !rng.chance(WAIT_DEFAULTED_PPM) {
+        input.insert(crate::ir::WAIT_TERMINATE.to_owned(), Json::Bool(false));
+    }
+    Some((waits.name.clone(), Json::Object(input).encode()))
+}
 
 const CATCH: &str = ".catch((error) => error)";
 const TOOLS_PREFIX: &str = "tools.";
@@ -200,8 +245,17 @@ impl Plan<'_> {
                 Op::Calls((0..size).map(|_| self.nested_call(rng)).collect())
             } else if roll < OP_CALL_PPM + OP_PARALLEL_PPM + OP_SLEEP_PPM {
                 timers += 1;
+                let long = self.code.waits.is_some()
+                    && self.code.timer_ms.value > self.code.yield_ms.value
+                    && rng.chance(YIELD_SLEEP_PPM);
                 let ms = if over {
                     self.code.timer_ms.value + 1
+                } else if long {
+                    let yield_ms = self.code.yield_ms.value;
+                    rng.range(
+                        yield_ms + 1,
+                        self.code.timer_ms.value.min(2 * yield_ms).max(yield_ms + 1),
+                    )
                 } else {
                     rng.range(1, SLEEP_MS_MAX.min(self.code.timer_ms.value).max(1))
                 };

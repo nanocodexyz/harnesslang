@@ -10,7 +10,10 @@ use crate::ir::{
 use crate::syntax::Position;
 use crate::syntax::ast;
 
+mod forked;
 mod hooks;
+
+pub use forked::forked;
 
 struct Checker<'a> {
     program: &'a ir::Program,
@@ -23,6 +26,7 @@ struct Checker<'a> {
     in_hook: bool,
     spawn_subject: bool,
     side: Option<String>,
+    forked: bool,
     used: std::collections::BTreeSet<ast::HookKind>,
 }
 
@@ -43,6 +47,7 @@ pub fn check(
         in_hook: false,
         spawn_subject: false,
         side: definition.side.then(|| definition.name.text.clone()),
+        forked: false,
         used: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::new();
@@ -127,6 +132,7 @@ pub fn invariant(
         in_hook: false,
         spawn_subject: false,
         side: None,
+        forked: false,
         used: std::collections::BTreeSet::new(),
     };
     let condition = checker.condition(
@@ -346,6 +352,7 @@ impl Checker<'_> {
     }
 
     fn side_writes(&self, statement: &ast::Stmt) -> Checked<()> {
+        self.forked_statement(statement)?;
         let Some(side) = &self.side else {
             return Ok(());
         };
@@ -368,6 +375,7 @@ impl Checker<'_> {
     }
 
     fn side_call(&self, callee: &ast::Name) -> Checked<()> {
+        self.forked_call(callee)?;
         let Some(side) = &self.side else {
             return Ok(());
         };
@@ -671,6 +679,7 @@ impl Checker<'_> {
                 ),
             );
         }
+        self.forked_parallel(at)?;
         if self.dispatch_hooks().contains(&ast::HookKind::BeforeTool) {
             return error(
                 at,
@@ -1626,7 +1635,18 @@ impl Checker<'_> {
                     out,
                 ))
             }
-            _ => self.construct(callee, args, expected, out),
+            _ => {
+                if let Some((code, _)) = self.program.waits(&callee.text) {
+                    return error(
+                        at,
+                        format!(
+                            "wait tool '{}' of code '{}' is called by the model, through dispatch: a handler cannot call it",
+                            callee.text, self.program.codes[code].name
+                        ),
+                    );
+                }
+                self.construct(callee, args, expected, out)
+            }
         }
     }
 

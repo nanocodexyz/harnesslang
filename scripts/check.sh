@@ -379,7 +379,7 @@ for file in $examples docs/snippets/keep.hl docs/snippets/in_flight.hl; do
     queue js-diff js_diff_one "$target" "$file"
   done
 done
-for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl docs/snippets/in_flight.hl; do
+for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl docs/snippets/in_flight.hl docs/snippets/fork.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
   done
@@ -397,9 +397,11 @@ for target in $targets; do
 done
 for target in $rust_targets; do
   queue rust-diff rust_diff_one "$target" docs/snippets/side.hl
+  queue rust-diff rust_diff_one "$target" docs/snippets/fork.hl
 done
 for target in $js_targets; do
   queue js-diff js_diff_one "$target" docs/snippets/side.hl
+  queue js-diff js_diff_one "$target" docs/snippets/fork.hl
 done
 for mutation in $(scripts/mutations.sh --plans); do
   queue mutations mutation_one "$mutation"

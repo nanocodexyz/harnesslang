@@ -91,6 +91,9 @@ pub fn family_with(
         sessions = sessions.max(tree.sessions);
         depth = depth.max(tree.depth);
     }
+    if program.forks() {
+        sessions = sessions.max(1);
+    }
     let mut total = [0; 3];
     for index in 0..3 {
         total[index] = spawns
@@ -345,8 +348,8 @@ fn blob_bytes(program: &Program, kind: SiteKind) -> u64 {
 
 fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
     let spawns = match kind {
-        SiteKind::Tool(tool) => program.tools[tool].spawn.is_some(),
-        SiteKind::Dispatch => program.spawns().next().is_some(),
+        SiteKind::Tool(tool) => program.starts_sessions(&program.tools[tool]),
+        SiteKind::Dispatch => program.spawns().next().is_some() || program.forks(),
         _ => false,
     };
     let plain = |records| {

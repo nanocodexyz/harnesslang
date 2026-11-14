@@ -250,6 +250,7 @@ fn event_json(event: &CellEvent) -> Json {
     match event {
         CellEvent::Delivered { cell, id } => Json::object([("delivered", Json::object([("cell", Json::Number(*cell)), ("id", Json::Number(*id))]))]),
         CellEvent::Diverged { cell, reason } => Json::object([("diverged", Json::object([("cell", Json::Number(*cell)), ("reason", Json::text(reason))]))]),
+        CellEvent::Yielded { cell } => Json::object([("yielded", Json::object([("cell", Json::Number(*cell))]))]),
         CellEvent::Finished { cell, outcome } => Json::object([(
             "finished",
             Json::object([("cell", Json::Number(*cell)), ("output", harness::output_json(&outcome.output()))]),

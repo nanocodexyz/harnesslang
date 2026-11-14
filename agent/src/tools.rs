@@ -546,6 +546,27 @@ pub struct Started {
     stderr: PathBuf,
 }
 
+impl Started {
+    pub fn written_bytes(&self) -> u64 {
+        [&self.stdout, &self.stderr]
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
+    pub fn stdout_tail(&self, bytes: u64) -> Option<String> {
+        use std::io::{Read, Seek};
+        let mut file = std::fs::File::open(&self.stdout).ok()?;
+        let size = file.metadata().ok()?.len();
+        file.seek(std::io::SeekFrom::Start(size.saturating_sub(bytes)))
+            .ok()?;
+        let mut read = Vec::new();
+        file.take(bytes).read_to_end(&mut read).ok()?;
+        Some(String::from_utf8_lossy(&read).into_owned())
+    }
+}
+
 pub enum Waited {
     Done(Shell),
     Moved(Started),
