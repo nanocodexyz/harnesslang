@@ -22,7 +22,7 @@ mkdir -p "$out"
 plant_expression() {
   case "$1" in
     none) echo 's/^$//' ;;
-    flush_after_dispatch) echo 's/const required = flushes(site.durability, call.effect);/const required = false;/' ;;
+    flush_after_dispatch) echo 's/const required = flushes(site.durability, call.effect) || /const required = false \&\& /' ;;
     bound_message) echo 's/new DecodeError(`bound(${type.bound})`)/new DecodeError(`bound ${type.bound}`)/' ;;
     enum_unchecked) echo 's/^function checkedOutput(tool, returns, output) {$/&\n  return output;/' ;;
     default_unfilled) echo 's/if (defaults\[index\] !== null \&\& !Object.hasOwn(input, param.name)) input\[param.name\] = defaults\[index\];/void defaults;/' ;;
