@@ -141,6 +141,7 @@ pub struct Program {
 pub struct Events {
     pub cancel: bool,
     pub steers: Option<Bound>,
+    pub resume: bool,
 }
 
 impl Events {
@@ -406,6 +407,8 @@ pub enum SiteKind {
     Now,
     Random,
     Cell(CodeId),
+    Wait(ConstId),
+    Suspend,
 }
 
 impl SiteKind {
@@ -425,9 +428,18 @@ impl SiteKind {
             Self::Now => "now",
             Self::Random => "random",
             Self::Cell(_) => "cell",
+            Self::Wait(_) => "wait",
+            Self::Suspend => "suspend",
         }
     }
+
+    pub const fn parks(self) -> bool {
+        matches!(self, Self::Wait(_) | Self::Suspend)
+    }
 }
+
+pub const WAIT_TOOL: &str = "wait";
+pub const SUSPEND_TOOL: &str = "suspend";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteClass {
@@ -445,6 +457,13 @@ pub enum Durability {
 }
 
 impl Durability {
+    pub const fn of_site(kind: SiteKind, class: SiteClass) -> Self {
+        if kind.parks() {
+            return Self::FlushBeforeRun;
+        }
+        Self::of(class)
+    }
+
     pub const fn of(class: SiteClass) -> Self {
         match class {
             SiteClass::Fixed(EffectClass::External) => Self::FlushBeforeRun,

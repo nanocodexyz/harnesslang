@@ -1,0 +1,8 @@
+harness wait_literal
+
+type outcome = done(u64)
+
+on nap() -> outcome {
+  let woke = wait(1000)
+  return done(woke)
+}

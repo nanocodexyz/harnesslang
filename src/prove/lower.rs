@@ -52,6 +52,8 @@ pub enum Point {
     Recovery,
     Finish,
     CellWait,
+    Suspend,
+    Resume,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +110,15 @@ pub enum Op {
     Replay(Slot),
     Wait {
         site: SiteId,
+        what: String,
+    },
+    Sleep {
+        slot: Slot,
+        ms: u64,
+        what: String,
+    },
+    Park {
+        slot: Slot,
         what: String,
     },
     CloseCell(SiteId, CodeId),
@@ -689,9 +700,66 @@ impl Lowering<'_> {
         classes.into_iter().collect()
     }
 
+    fn suspend(&self, site: SiteId, what: &str) -> Vec<Op> {
+        let slot = Slot::Site(site);
+        let unflushed = self.run_mutation() == RunMutation::SuspendBeforeFlush
+            || self.mutation == Mutation::DropFlush;
+        let park = |mut ops: Vec<Op>| {
+            if !unflushed {
+                ops.push(Op::Flush(Point::Suspend));
+            }
+            ops.push(Op::Park {
+                slot,
+                what: what.to_owned(),
+            });
+            ops
+        };
+        let resumed = vec![Op::Append(Record::Result(slot)), Op::Flush(Point::Resume)];
+        let mut inline = vec![Op::Append(Record::Call(slot))];
+        if !unflushed {
+            inline.push(Op::Flush(Point::Suspend));
+        }
+        inline.extend(resumed.clone());
+        let replayed = if self.run_mutation() == RunMutation::ResumeReplaysSuspend {
+            park(vec![Op::Append(Record::Call(slot))])
+        } else {
+            vec![Op::Replay(slot)]
+        };
+        vec![Op::Choice(vec![
+            arm(
+                format!("{what} suspends the turn"),
+                Entry::Live,
+                park(vec![Op::Append(Record::Call(slot))]),
+            ),
+            arm(
+                format!("{what} suspends the turn and its resume continues this path"),
+                Entry::Live,
+                inline,
+            ),
+            arm(
+                format!("{what} reopened: a rerun finds it waiting with no resume"),
+                Entry::Reopened(slot),
+                park(Vec::new()),
+            ),
+            arm(
+                format!("{what} reopened: a resume records its answer"),
+                Entry::Reopened(slot),
+                resumed,
+            ),
+            arm(
+                format!("{what} replayed from its recorded answer"),
+                Entry::Recorded(slot),
+                replayed,
+            ),
+        ])]
+    }
+
     fn effect(&self, site: SiteId, args: &[Expr]) -> Vec<Op> {
         let what = self.names.site(site, args);
         let slot = Slot::Site(site);
+        if self.handler.sites[site].kind == SiteKind::Suspend {
+            return self.suspend(site, &what);
+        }
         let classes = match self.handler.sites[site].class {
             SiteClass::Fixed(class) => vec![class],
             SiteClass::Dispatched => self.dispatch_classes(),
@@ -785,15 +853,20 @@ impl Lowering<'_> {
         } else {
             Record::Result(slot)
         };
-        let mut ops = vec![
-            Op::Run {
+        let ran = match (slot, self.handler.sites[slot.site()].kind) {
+            (Slot::Site(_), SiteKind::Wait(constant)) => Op::Sleep {
+                slot,
+                ms: self.program.constants[constant].value,
+                what: what.to_owned(),
+            },
+            _ => Op::Run {
                 slot,
                 class,
                 outbound: self.outbound(slot),
                 what: what.to_owned(),
             },
-            Op::Append(record),
-        ];
+        };
+        let mut ops = vec![ran, Op::Append(record)];
         if step {
             ops.push(Op::Flush(Point::StepCommit));
         }

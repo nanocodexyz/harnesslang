@@ -11,12 +11,13 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 8] = [
-    "dispatch", "now", "random", "len", "contains", "before", "after", "trim",
+pub const BUILTIN_FUNCTIONS: [&str; 10] = [
+    "dispatch", "now", "random", "len", "wait", "suspend", "contains", "before", "after", "trim",
 ];
 pub const WILDCARD: &str = "_";
 pub const EVENT_CANCEL: &str = "cancel";
 pub const EVENT_STEER: &str = "steer";
+pub const EVENT_RESUME: &str = "resume";
 pub const STEER_PARAMETER: &str = "message";
 pub const CANCELLED_READ: &str = "cancelled";
 pub const STEERS_READ: &str = "steers";
@@ -999,11 +1000,12 @@ fn events(
         match event.name.text.as_str() {
             EVENT_CANCEL => cancel_event(event, program, values)?,
             EVENT_STEER => steer_event(event, program, globals)?,
+            EVENT_RESUME => resume_event(event, program)?,
             other => {
                 return error(
                     event.name.at,
                     format!(
-                        "unknown event '{other}': a harness takes '{EVENT_CANCEL}' and '{EVENT_STEER}'"
+                        "unknown event '{other}': a harness takes '{EVENT_CANCEL}', '{EVENT_STEER}' and '{EVENT_RESUME}'"
                     ),
                 );
             }
@@ -1055,6 +1057,25 @@ fn cancel_event(
     };
     claim(values, &read, "the cancel event's read")?;
     program.events.cancel = true;
+    Ok(())
+}
+
+fn resume_event(event: &ast::Event, program: &mut ir::Program) -> Checked<()> {
+    if !event.params.is_empty() || event.bound.is_some() {
+        return error(
+            event.name.at,
+            format!(
+                "event '{EVENT_RESUME}' carries the key of a suspend and a text answer: write 'on {EVENT_RESUME}'"
+            ),
+        );
+    }
+    if program.events.resume {
+        return error(
+            event.name.at,
+            format!("event '{EVENT_RESUME}' is already declared"),
+        );
+    }
+    program.events.resume = true;
     Ok(())
 }
 

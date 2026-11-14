@@ -402,6 +402,7 @@ target cloudflare: runs in a Durable Object; journal: the object's SQLite; flush
   limit memory: 134217728 bytes per isolate (developers.cloudflare.com/durable-objects/platform/limits)
   limit outbound requests: 10000 outbound requests per invocation (developers.cloudflare.com/workers/platform/limits (Workers Paid default))
   limit concurrent requests: 6 requests waiting for response headers per invocation (developers.cloudflare.com/workers/platform/limits (simultaneous open connections; relaxed to the wait for headers on 2026-04-09); a seventh fetch is queued by the runtime)
+  limit waits: 900000 milliseconds of waits per run, checked on the waits of one run, added up (developers.cloudflare.com/durable-objects/platform/limits (an alarm handler's wall time is 15 minutes; a request's is unlimited while its client stays connected); a turn a reset leaves unfinished resumes in the alarm, so its waits must fit one alarm invocation)
   fact: an outbound fetch or a response leaves only after the event's earlier writes commit (blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it)
   fact: writes with no await between them commit together, and none commits while the event runs synchronously (developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields)
   fact: a flush is committed once storage.sync() resolves; an awaited microtask commits nothing (developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit)
@@ -497,7 +498,7 @@ Contextual words: `below` `bound` `calls` `fn` `from` `in` `known` `last` `listi
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `before` `contains` `dispatch` `len` `now` `random` `trim`
+Builtins: `after` `before` `contains` `dispatch` `len` `now` `random` `suspend` `trim` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -1121,6 +1122,10 @@ on ping() -> u64
 ```
 
 ### on (events)
+
+`on resume` declares that a turn ended by `suspend` takes a resume event carrying
+its key and a text answer; [Suspend and resume](#suspend-and-resume) has the
+details. The events below reach a running turn.
 
 `on cancel` and `on steer(message: text) bound N` declare the events a running
 turn takes from outside it: a person cancelling the turn, or steering it with
@@ -1878,8 +1883,8 @@ decision:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation enum_unchecked examples/hooks.hl
-FAIL invariant=enum_valid seed=6 target=native-jsonl profile=clean mutation=enum_unchecked: call 2/10 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("beta-1"))]: a result outside its text enum must be recorded as failed
-replay: hl sim --target native-jsonl --seeds 6..7 --mutation enum_unchecked examples/hooks.hl
+FAIL invariant=enum_valid seed=5 target=native-jsonl profile=lying mutation=enum_unchecked: call 3/45 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("beta-34"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 5..6 --mutation enum_unchecked examples/hooks.hl
 ```
 
 The checker's text enum errors:
@@ -2645,6 +2650,203 @@ on run(requested: list<call, calls_max>) -> u64 {
   return 0
 }
 ```
+
+### Waits
+
+`wait(c)` pauses the turn for `c` milliseconds, where `c` is a named
+constant, and yields the clock at its wake as a `u64`, in the milliseconds
+`now()` reads. It is a `none` effect with a durability point of its own:
+the runtime reads the clock, appends the wait's `call` record with its
+deadline, `{"ms":c,"until":T}`, and flushes every buffered record before it
+sleeps, so a host evicted during a long wait loses nothing that came before
+it (code mode's C2, for a wait at the top level). Its `result` records the
+wake. A rerun after a crash mid-wait finds the call open and sleeps only until
+the recorded `until`; a replay returns the recorded wake at once.
+
+The duration enters the worst case as a fourth measure, the milliseconds of
+waits, multiplied by the loops around each wait, and `hl check --target`
+compares it with the target's wall-time limit (`src/target/mod.rs`, with
+sources):
+
+- cloudflare: a turn a reset leaves unfinished resumes in the object's alarm,
+  whose wall time is 15 minutes, so the waits of one run, added up, must fit
+  900,000 ms. A wait arms the alarm before it sleeps.
+- vercel: a wait's flush ends a Workflow step and the wait runs at the start of
+  the next one, so a step holds at most one wait, which must fit a Function's
+  800 seconds.
+- native-jsonl, native-sqlite and server-postgres set no limit. A Postgres
+  lease shorter than a wait is caller policy and not modelled.
+
+`examples/subagents.hl` waits `wait_agent_ms` before it reads a child's
+status, as nanocode's `wait_agent` blocks with a timeout (30 s by default
+there). At 64 rounds of 16 calls, Cloudflare's alarm leaves 878 ms per wait,
+so the port waits 800 ms; a wait of 600 s in a loop of four is refused there
+and accepted on Vercel, and an hour-long wait is refused by both:
+
+```console
+$ hl check --target cloudflare examples/invalid/over_wait.hl > /dev/null
+examples/invalid/over_wait.hl: error: handler 'watch' on cloudflare: worst_case: worst case 2400000 milliseconds of waits per run exceeds cloudflare's limit of 900000 milliseconds of waits per run; path: poll below polls_max (4)
+examples/invalid/over_wait.hl: error: 1 proof obligation(s) failed for cloudflare
+examples/invalid/over_wait.hl: error: handler 'watch': worst case 2400000 milliseconds of waits exceeds cloudflare's limit of 900000 milliseconds of waits per run; loops: poll below polls_max (4)
+$ hl check --target vercel examples/invalid/over_wait.hl | tail -n 1
+examples/invalid/over_wait.hl: ok for vercel
+$ hl check --target vercel examples/invalid/long_wait.hl 2>&1 > /dev/null | tail -n 1
+examples/invalid/long_wait.hl: error: handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds vercel's limit of 800000 milliseconds per wait
+```
+
+The duration must be a constant, so the checker can bound it:
+
+```console
+$ hl check examples/invalid/wait_literal.hl
+examples/invalid/wait_literal.hl:6:19: error: the duration of 'wait' must be a named constant in milliseconds
+```
+
+The simulator runs a program past the checker too, and `wall_limit` catches a
+run whose waits pass the target's limit or the handler's worst case:
+
+```console
+$ hl sim --target cloudflare --seeds 0..20 examples/invalid/over_wait.hl
+FAIL invariant=wall_limit seed=0 target=cloudflare profile=errors mutation=none: one run of turn 1 waited 1200000 ms by the end of wait 1/6, over cloudflare's limit of 900000 milliseconds of waits per run
+replay: hl sim --target cloudflare --seeds 0..1 examples/invalid/over_wait.hl
+```
+
+### Suspend and resume
+
+`suspend(key)` ends the turn waiting for a person or a process outside it,
+for as long as that takes, and yields the text answer that resumes it. It
+needs `on resume` on the harness. `docs/snippets/park.hl` waits between model
+calls and asks for approval before each tool call, as a permission prompt
+does:
+
+```hl docs/snippets/park.hl
+harness approvals
+
+const steps_max: u64 = 2
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+const poll_ms: u64 = 2000
+
+type outcome = completed(text) | exhausted
+
+tool Bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+on resume
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let woke = wait(poll_ms)
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          let verdict = suspend(call.id)
+          if verdict == "allow" {
+            match dispatch(call) {
+              ok(output) => { push context result(call, output) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          } else {
+            push context error(call, "Denied: " ++ verdict)
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+How it runs:
+
+- The first time a run reaches a suspend, the runtime appends its `call`
+  record, `{"key":K}` with class `none`, flushes every buffered record and
+  ends the run without a `status`: the host learns that turn `T` waits on
+  sequence number `S` with key `K`. The waiting status is the durable open
+  call, which nanocode's fold reads as an open call, as it reads a parked turn.
+- A resume carries a key and a text answer: `Host::resume` in the generated
+  Rust, `POST /resume` with `{"turn","key","answer"}` on the Durable Object,
+  and a workflow hook with token `session:turn:seq:resume` on Vercel. The
+  host runs the turn again with it. The run replays its journal up to the open
+  suspend, which takes the resume there: with the same key it appends the
+  suspend's `result`, `{"ok":answer}`, flushes it, answers the sender and
+  goes on with the answer; with another key it answers unmatched and the turn
+  stays waiting.
+- A run that reaches the open suspend with no resume, after a crash, waits
+  again without appending anything: the call is in the journal. A replay of a
+  finished turn returns the recorded answer.
+- The worst case counts a suspend as one effect and two records, its call and
+  the result its resume writes.
+
+The checker refuses a suspend without the event:
+
+```console
+$ hl check examples/invalid/suspend_undeclared.hl
+examples/invalid/suspend_undeclared.hl:6:16: error: 'suspend' needs 'on resume' on the harness
+```
+
+The prover lowers a suspend to a choice between ending the run there (`Park`,
+which must find nothing buffered and the call durable: `suspend_durable`) and
+taking its resume, and a wait to a sleep that must follow the flush of its call
+and everything before it (`durable_before_wait`):
+
+```console
+$ hl check --target vercel docs/snippets/park.hl | grep -E 'parks|wait'
+    milliseconds of waits: 4000, step below steps_max (2)
+  proved handler prompt on vercel: parks: 1 wait site(s) sleep only after their call and every record before it are durable; 1 suspend site(s) end the run only with nothing buffered and are never appended twice
+  proved handler prompt on vercel: worst_case: 2000 milliseconds in its longest wait <= 800000 milliseconds per wait (step below steps_max (2))
+  limit waits: 800000 milliseconds per wait, checked on each wait, since a wait's flush ends a step and a step holds at most one wait (vercel.com/docs/functions/limitations (a Function's duration, Pro and Enterprise, fluid compute; a Workflow step runs in one invocation, while a workflow sleep() has no limit, vercel.com/docs/workflows/pricing); a wait runs inside the step after its flush)
+  not checked: duration (800 seconds per Function invocation) beyond waits, since other effects' durations are not modelled
+$ hl prove --target native-jsonl --mutation suspend_before_flush docs/snippets/park.hl 2>&1 | grep -m 1 suspend_durable
+docs/snippets/park.hl: error: handler 'prompt' on native-jsonl: suspend_durable: suspend(call.id) ends the run waiting while records are not durable: call of suspend(call.id), result of wait(poll_ms), reply of infer(context); path: loop step below steps_max (2) > match reply: calls > for call in requested (at most calls_max = 2) > suspend(call.id) suspends the turn; counterexample: the waiting status is lost with the process, so no resume can find the turn
+$ hl prove --target native-jsonl --mutation resume_replays_suspend docs/snippets/park.hl 2>&1 | grep -m 1 seq_unique
+docs/snippets/park.hl: error: handler 'prompt' on native-jsonl: seq_unique: suspend(call.id) appends a second call record for an id whose call is already in the journal; path: loop step below steps_max (2) > match reply: calls > for call in requested (at most calls_max = 2) > suspend(call.id) replayed from its recorded answer
+```
+
+The simulator draws the clock from the seed: a wait advances it to the
+deadline, and a resume arrives up to eight hours after the turn reported
+waiting, with another key one time in five. Crashes land while a turn waits
+(before the resume's flush and after it) and in the middle of a wait. Four
+invariants check it, each with a mutation it catches:
+
+| Invariant | Holds | Planted bug |
+| --- | --- | --- |
+| `suspend_durable` | a run reports waiting only once its suspend's call record is durable | `suspend_before_flush` |
+| `resume_matched` | a suspend's result is the answer of a resume sent with its key | `resume_unmatched` |
+| `wait_until` | a wait sleeps until the deadline its durable call record holds, and wakes no earlier | `wait_rerun_skips`, `wait_oversleeps` |
+| `wall_limit` | the waits of one run stay within the handler's worst case and the target's limit | `examples/invalid/over_wait.hl` and `long_wait.hl` past the checker |
+
+A suspend that runs again on resume appends its call twice, and a wait whose
+result is not journaled leaves a finished turn that cannot replay:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..100 docs/snippets/park.hl
+ok target=native-jsonl mutation=none seeds=0..100 (100 seeds): turns=244 runs=1813 crashes=1088 power_losses=137 torn_writes=152 takeovers=0 fenced=0 dispatches=154 unknown=65 sleeps=781 suspensions=481
+$ hl sim --target native-jsonl --seeds 0..100 --mutation resume_replays_suspend docs/snippets/park.hl
+FAIL invariant=seq_unique seed=0 target=native-jsonl profile=errors mutation=resume_replays_suspend: turn 1 records seq 3 after seq 4
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation resume_replays_suspend docs/snippets/park.hl
+$ hl sim --target native-jsonl --seeds 0..100 --mutation wait_unjournaled docs/snippets/park.hl
+FAIL invariant=liveness seed=0 target=native-jsonl profile=errors mutation=wait_unjournaled: turn 4: replay of turn 3 needs seq 1, which the journal does not record
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation wait_unjournaled docs/snippets/park.hl
+```
+
+`examples/hooks.hl` uses both halves: in `"ask"` mode a call other than
+`Read` waits for a person's `"allow"`, and any other answer is the reason the
+call is denied; a Stop hook that blocks or stops the turn gives its reason by
+resuming the suspend at that point.
 
 ### Traps
 

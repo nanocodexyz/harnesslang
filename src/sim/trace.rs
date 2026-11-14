@@ -46,6 +46,7 @@ impl Trace {
         let result = match ran {
             Ok(Ran::Finished(_)) => "finished",
             Ok(Ran::AlreadyFinished(_)) => "already_finished",
+            Ok(Ran::Suspended(_)) => "suspended",
             Err(Exit::Stop(Stop::Crash)) => "crash",
             Err(Exit::Stop(Stop::Fenced)) => "fenced",
             Err(Exit::Corrupt(_)) => "corrupt",

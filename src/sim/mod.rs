@@ -4,6 +4,7 @@ pub mod events;
 pub mod exhaustive;
 pub mod faults;
 pub mod invariants;
+pub mod park;
 pub mod rng;
 pub mod strict;
 pub mod trace;
@@ -26,6 +27,7 @@ use crate::target::Target;
 
 pub const TURNS_PER_SESSION_MAX: u64 = 4;
 pub const RUNS_PER_TURN_MAX: u64 = RESTARTS_PER_TURN_MAX + 2;
+pub const RUNS_PER_SUSPENSION: u64 = 2;
 pub const ARGUMENT_U64_MAX: u64 = u32::MAX as u64;
 pub const ARGUMENT_LIST_LENGTH_MAX: u64 = 4;
 
@@ -111,7 +113,14 @@ fn drive_turn(
     world: &mut SimWorld<'_>,
     request: &TurnRequest,
 ) -> Result<(), Violation> {
-    for _ in 0..RUNS_PER_TURN_MAX {
+    let suspensions_max = program
+        .handler(&request.handler)
+        .expect("a turn request names a handler of the program")
+        .worst
+        .effects
+        .total;
+    let runs_max = RUNS_PER_TURN_MAX + RUNS_PER_SUSPENSION * suspensions_max;
+    for _ in 0..runs_max {
         let (records, epoch) = world.begin_run().map_err(|error| {
             liveness(format!(
                 "turn {}: the journal cannot be read: {error}",
@@ -126,6 +135,7 @@ fn drive_turn(
         }
         match ran {
             Ok(Ran::Finished(_)) => return Ok(()),
+            Ok(Ran::Suspended(suspension)) => world.suspended(&suspension)?,
             Ok(Ran::AlreadyFinished(finish)) => {
                 crate::run::World::acknowledge(world, &finish);
                 return Ok(());
@@ -137,7 +147,7 @@ fn drive_turn(
         }
     }
     Err(liveness(format!(
-        "turn {} did not finish within runs_per_turn_max ({RUNS_PER_TURN_MAX})",
+        "turn {} did not finish within {runs_max} runs: runs_per_turn_max ({RUNS_PER_TURN_MAX}) and {RUNS_PER_SUSPENSION} per suspend its worst case allows",
         request.turn
     )))
 }
@@ -383,6 +393,8 @@ fn add(total: &mut Stats, more: &Stats) {
     total.nested += more.nested;
     total.divergences += more.divergences;
     total.waits += more.waits;
+    total.sleeps += more.sleeps;
+    total.suspensions += more.suspensions;
     total.events = match (total.events, more.events) {
         (None, None) => None,
         (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
@@ -514,7 +526,7 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             stats.dispatches,
             stats.unknown,
             format!(
-                "{}{}",
+                "{}{}{}",
                 if stats.cells > 0 {
                     format!(
                         " cells={} nested={} divergences={} waits={}",
@@ -525,7 +537,12 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                 },
                 stats
                     .events
-                    .map_or_else(String::new, |events| format!(" events={events}"))
+                    .map_or_else(String::new, |events| format!(" events={events}")),
+                if stats.sleeps + stats.suspensions > 0 {
+                    format!(" sleeps={} suspensions={}", stats.sleeps, stats.suspensions)
+                } else {
+                    String::new()
+                }
             ),
         ),
     }

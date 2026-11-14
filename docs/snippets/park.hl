@@ -1,0 +1,49 @@
+harness approvals
+
+const steps_max: u64 = 2
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+const poll_ms: u64 = 2000
+
+type outcome = completed(text) | exhausted
+
+tool Bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+on resume
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let woke = wait(poll_ms)
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          let verdict = suspend(call.id)
+          if verdict == "allow" {
+            match dispatch(call) {
+              ok(output) => { push context result(call, output) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          } else {
+            push context error(call, "Denied: " ++ verdict)
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}

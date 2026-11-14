@@ -42,11 +42,15 @@ pub enum Invariant {
     WorstCase,
     CheckpointCompacted,
     SequentialEqual,
+    SuspendDurable,
+    ResumeMatched,
+    WaitUntil,
+    WallLimit,
     ModeSent,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 32] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -74,6 +78,10 @@ impl Invariant {
         Self::WorstCase,
         Self::CheckpointCompacted,
         Self::SequentialEqual,
+        Self::SuspendDurable,
+        Self::ResumeMatched,
+        Self::WaitUntil,
+        Self::WallLimit,
         Self::ModeSent,
     ];
 
@@ -106,6 +114,10 @@ impl Invariant {
             Self::WorstCase => "worst_case",
             Self::CheckpointCompacted => "checkpoint_compacted",
             Self::SequentialEqual => "sequential_equal",
+            Self::SuspendDurable => "suspend_durable",
+            Self::ResumeMatched => "resume_matched",
+            Self::WaitUntil => "wait_until",
+            Self::WallLimit => "wall_limit",
             Self::ModeSent => "mode_sent",
         }
     }
@@ -488,6 +500,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
         }
     }
     nested_dispatches(world)?;
+    crate::sim::park::check(world, records)?;
     world.inbox.safety(records)?;
     let calls = seq_unique(records)?;
     nested_reported(world, &calls)?;

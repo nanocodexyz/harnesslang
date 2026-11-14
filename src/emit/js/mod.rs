@@ -151,7 +151,13 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Model
         | SiteKind::Now
         | SiteKind::Random
+        | SiteKind::Wait(_)
+        | SiteKind::Suspend
         | SiteKind::Cell(_) => "null".to_owned(),
+    };
+    let ms = match site.kind {
+        SiteKind::Wait(constant) => format!("{}n", program.constants[constant].value),
+        _ => "null".to_owned(),
     };
     let code = match site.kind {
         SiteKind::Cell(code) => code.to_string(),
@@ -172,7 +178,7 @@ fn site_literal(program: &Program, site: &Site) -> String {
         .mode
         .map_or("null".to_owned(), |mode| js_string(program.mode_name(mode)));
     format!(
-        "{{ kind: \"{}\", tool: {tool}, code: {code}, class: \"{class}\", result: {}, durability: \"{durability}\", mode: {mode} }}",
+        "{{ kind: \"{}\", tool: {tool}, code: {code}, ms: {ms}, class: \"{class}\", result: {}, durability: \"{durability}\", mode: {mode} }}",
         site.kind.name(),
         type_literal(&site.result)
     )

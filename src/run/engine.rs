@@ -29,6 +29,26 @@ pub enum Exit {
 enum Halt {
     Exit(Exit),
     Trap(String),
+    Suspend(Suspension),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suspension {
+    pub turn: u64,
+    pub seq: u64,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resume {
+    pub key: String,
+    pub answer: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum End {
+    Finished(Finish),
+    Suspended(Suspension),
 }
 
 impl From<Stop> for Halt {
@@ -159,6 +179,10 @@ pub trait World {
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn waited(&mut self, wait: &Wait) -> bool;
     fn observe(&mut self, event: &CellEvent);
+    fn clock(&mut self) -> u64;
+    fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop>;
+    fn resume(&mut self, suspension: &Suspension) -> Option<Resume>;
+    fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool);
     fn inbox(&mut self, turn: u64) -> Vec<Delivery>;
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]);
     fn read(&mut self, read: &Read);
@@ -306,7 +330,7 @@ enum Flow {
 }
 
 pub struct Ran {
-    pub finish: Finish,
+    pub end: End,
     pub state: Vec<Value>,
     pub retired: u64,
 }
@@ -386,23 +410,54 @@ impl<'a> Engine<'a> {
             Ok(()) => self.block(body),
             Err(halt) => Err(halt),
         };
-        let finish = match flow {
-            Ok(Flow::Return(value)) => self.finish(
-                Outcome::Completed,
-                value::to_json(self.program, &self.handler.returns, &value),
-            ),
+        let end = match flow {
+            Ok(Flow::Return(value)) => self
+                .finish(
+                    Outcome::Completed,
+                    value::to_json(self.program, &self.handler.returns, &value),
+                )
+                .map(End::Finished),
             Ok(Flow::Next) => panic!("the checker proves every handler returns"),
-            Err(Halt::Trap(trap)) => self.finish(
-                Outcome::Failed,
-                Json::object([("trap", Json::String(trap))]),
-            ),
+            Err(Halt::Trap(trap)) => self
+                .finish(
+                    Outcome::Failed,
+                    Json::object([("trap", Json::String(trap))]),
+                )
+                .map(End::Finished),
+            Err(Halt::Suspend(suspension)) => Ok(End::Suspended(suspension)),
             Err(Halt::Exit(exit)) => Err(exit),
         }?;
         Ok(Ran {
-            finish,
+            end,
             state: self.state,
             retired: self.retired,
         })
+    }
+
+    pub fn resume(&mut self, suspension: &Suspension, resume: &Resume) -> Result<bool, Exit> {
+        let Some(SiteLog::Open(call)) = self.sites.get(&suspension.seq).cloned() else {
+            panic!("a resume reaches a turn whose suspend is open");
+        };
+        let matched = resume.key == suspension.key || self.mutation == Mutation::ResumeUnmatched;
+        if matched {
+            let output = Output::Ok(Json::String(resume.answer.clone()));
+            self.append(Record::Result {
+                turn: self.turn,
+                seq: suspension.seq,
+                output: output.clone(),
+            });
+            self.sites
+                .insert(suspension.seq, SiteLog::Done(call, output));
+            self.flush().map_err(halt_exit)?;
+            assert!(
+                self.buffer.is_empty(),
+                "a resume's result is durable before it is answered"
+            );
+        }
+        if let Mode::Live { world, .. } = &mut self.mode {
+            world.resumed(suspension, resume, matched);
+        }
+        Ok(matched)
     }
 
     fn admit(&mut self) -> Result<(), Halt> {
@@ -1144,6 +1199,19 @@ impl<'a> Engine<'a> {
                 effect: EffectClass::None,
                 input: Json::String(args[0].as_text().to_owned()),
             },
+            SiteKind::Wait(constant) => Call {
+                tool: ir::WAIT_TOOL.to_owned(),
+                effect: EffectClass::None,
+                input: Json::object([(
+                    WAIT_MS,
+                    Json::Number(self.program.constants[constant].value),
+                )]),
+            },
+            SiteKind::Suspend => Call {
+                tool: ir::SUSPEND_TOOL.to_owned(),
+                effect: EffectClass::None,
+                input: Json::object([(SUSPEND_KEY, Json::String(args[0].as_text().to_owned()))]),
+            },
         }
     }
 
@@ -1163,6 +1231,12 @@ impl<'a> Engine<'a> {
                 ..call
             };
             return self.cell_site(code, seq, call);
+        }
+        if site.kind == SiteKind::Suspend {
+            return self.suspend_site(site_id, seq, call);
+        }
+        if let SiteKind::Wait(_) = site.kind {
+            return self.wait_site(site_id, seq, call, &args);
         }
         if let SiteClass::Fixed(class) = site.class {
             assert_eq!(
@@ -1226,6 +1300,179 @@ impl<'a> Engine<'a> {
                 self.execute(site_id, seq, &call, &args)
             }
         }
+    }
+
+    fn suspend_site(&mut self, site_id: usize, seq: u64, call: Call) -> Result<Value, Halt> {
+        let live = matches!(self.mode, Mode::Live { .. });
+        match self.sites.get(&seq).cloned() {
+            Some(SiteLog::Done(recorded, output)) => {
+                self.same(seq, &recorded, &call)?;
+                if live && self.mutation == Mutation::ResumeReplaysSuspend {
+                    return self.suspend_fresh(seq, call);
+                }
+                let site = &self.handler.sites[site_id];
+                self.decode(site, &output)
+            }
+            Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                self.require_live(seq)?;
+                if let Some(answer) = self.take_resume(seq, &recorded)? {
+                    let site = &self.handler.sites[site_id];
+                    return self.decode(site, &answer);
+                }
+                self.suspend(seq, &recorded)
+            }
+            Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
+            None => {
+                self.require_live(seq)?;
+                self.suspend_fresh(seq, call)
+            }
+        }
+    }
+
+    fn take_resume(&mut self, seq: u64, call: &Call) -> Result<Option<Output>, Halt> {
+        let key = call
+            .input
+            .get(SUSPEND_KEY)
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let suspension = Suspension {
+            turn: self.turn,
+            seq,
+            key,
+        };
+        let Some(resume) = self.world().resume(&suspension) else {
+            return Ok(None);
+        };
+        if !self.resume(&suspension, &resume).map_err(Halt::Exit)? {
+            return Ok(None);
+        }
+        Ok(Some(Output::Ok(Json::String(resume.answer))))
+    }
+
+    fn suspend_fresh(&mut self, seq: u64, call: Call) -> Result<Value, Halt> {
+        self.append(Record::Call {
+            turn: self.turn,
+            seq,
+            tool: call.tool.clone(),
+            effect: call.effect,
+            input: call.input.clone(),
+        });
+        self.sites.insert(seq, SiteLog::Open(call.clone()));
+        self.suspend(seq, &call)
+    }
+
+    fn suspend(&mut self, seq: u64, call: &Call) -> Result<Value, Halt> {
+        if self.mutation != Mutation::SuspendBeforeFlush {
+            self.flush()?;
+            assert!(
+                self.buffer.is_empty(),
+                "a suspend's call record is durable before the turn waits"
+            );
+        }
+        self.hook(Point::BeforeRun(SiteKind::Suspend, EffectClass::None))?;
+        let key = call
+            .input
+            .get(SUSPEND_KEY)
+            .and_then(Json::as_str)
+            .ok_or_else(|| {
+                Halt::Exit(Exit::Corrupt(format!(
+                    "turn {} seq {seq}: a suspend's input lacks its key",
+                    self.turn
+                )))
+            })?
+            .to_owned();
+        Err(Halt::Suspend(Suspension {
+            turn: self.turn,
+            seq,
+            key,
+        }))
+    }
+
+    fn wait_site(
+        &mut self,
+        site_id: usize,
+        seq: u64,
+        call: Call,
+        args: &[Value],
+    ) -> Result<Value, Halt> {
+        match self.sites.get(&seq).cloned() {
+            Some(SiteLog::Done(recorded, output)) => {
+                self.same(seq, &without_until(&recorded), &call)?;
+                let site = &self.handler.sites[site_id];
+                self.decode(site, &output)
+            }
+            Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
+                self.same(seq, &without_until(&recorded), &call)?;
+                self.require_live(seq)?;
+                if self.mutation == Mutation::WaitRerunSkips {
+                    let clock = self.world().clock();
+                    return self.waited(site_id, seq, &recorded, clock);
+                }
+                self.reopen(site_id, seq, recorded, args)
+            }
+            Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
+            None => {
+                self.require_live(seq)?;
+                let ms = wait_ms(&call.input).expect("a wait's input holds its duration");
+                let clock = self.world().clock();
+                let until = clock.checked_add(ms).ok_or_else(|| {
+                    Halt::Exit(Exit::Corrupt(format!(
+                        "turn {} seq {seq}: the clock {clock} plus the wait's {ms} ms passes u64",
+                        self.turn
+                    )))
+                })?;
+                let mut input = BTreeMap::new();
+                input.insert(WAIT_MS.to_owned(), Json::Number(ms));
+                input.insert(WAIT_UNTIL.to_owned(), Json::Number(until));
+                let call = Call {
+                    input: Json::Object(input),
+                    ..call
+                };
+                self.append(Record::Call {
+                    turn: self.turn,
+                    seq,
+                    tool: call.tool.clone(),
+                    effect: call.effect,
+                    input: call.input.clone(),
+                });
+                self.sites.insert(seq, SiteLog::Open(call.clone()));
+                self.execute(site_id, seq, &call, args)
+            }
+        }
+    }
+
+    fn sleep(&mut self, seq: u64, call: &Call) -> Result<u64, Halt> {
+        let until = wait_until(&call.input).ok_or_else(|| {
+            Halt::Exit(Exit::Corrupt(format!(
+                "turn {} seq {seq}: a wait's input lacks its deadline",
+                self.turn
+            )))
+        })?;
+        let ms = wait_ms(&call.input).unwrap_or(0);
+        let until = if self.mutation == Mutation::WaitOversleeps {
+            until.saturating_add(ms)
+        } else {
+            until
+        };
+        let turn = self.turn;
+        Ok(self.world().sleep(turn, seq, until)?)
+    }
+
+    fn waited(&mut self, site_id: usize, seq: u64, call: &Call, clock: u64) -> Result<Value, Halt> {
+        let output = Output::Ok(Json::Number(clock));
+        if self.mutation != Mutation::WaitUnjournaled {
+            self.append(Record::Result {
+                turn: self.turn,
+                seq,
+                output: output.clone(),
+            });
+            self.sites
+                .insert(seq, SiteLog::Done(call.clone(), output.clone()));
+        }
+        let site = &self.handler.sites[site_id];
+        self.decode(site, &output)
     }
 
     fn cell_site(&mut self, code: crate::ir::CodeId, seq: u64, call: Call) -> Result<Value, Halt> {
@@ -1333,7 +1580,7 @@ impl<'a> Engine<'a> {
     fn world(&mut self) -> &mut dyn World {
         match &mut self.mode {
             Mode::Live { world, .. } => &mut **world,
-            Mode::Replay => unreachable!("cells run only live"),
+            Mode::Replay => unreachable!("cells, waits and resumes run only live"),
         }
     }
 
@@ -1492,6 +1739,13 @@ impl<'a> Engine<'a> {
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
             SiteKind::Random => Output::Ok(Json::Number(world.random())),
             SiteKind::Cell(_) => unreachable!("a cell site runs through the cell runner"),
+            SiteKind::Suspend => unreachable!("a suspend ends the run before it would run"),
+            SiteKind::Wait(_) => {
+                let woke = self.sleep(seq, call)?;
+                self.hook(Point::AfterRun(site.kind, call.effect))?;
+                self.drain_at(Drain::AfterRun)?;
+                return self.waited(site_id, seq, call, woke);
+            }
             SiteKind::Listing(listing) => {
                 let listing = &self.program.listings[listing];
                 let output = world.listing(&ListingRequest {
@@ -1624,6 +1878,7 @@ impl<'a> Engine<'a> {
             return Ok(Value::Variant(ir::OK, vec![Value::U64(tools.len() as u64)]));
         }
         match (&site.result, output) {
+            (Type::Text, Output::Ok(Json::String(text))) => Ok(Value::Text(text.clone())),
             (Type::U64, Output::Ok(json)) => json
                 .as_u64()
                 .map(Value::U64)
@@ -1751,6 +2006,36 @@ fn halt_stop(halt: Halt) -> Stop {
             panic!("a flush cannot find the journal corrupt, found {error}")
         }
         Halt::Trap(trap) => panic!("a flush cannot trap, found {trap}"),
+        Halt::Suspend(_) => panic!("a flush cannot suspend"),
+    }
+}
+
+pub const WAIT_MS: &str = "ms";
+pub const WAIT_UNTIL: &str = "until";
+pub const SUSPEND_KEY: &str = "key";
+
+pub fn wait_ms(input: &Json) -> Option<u64> {
+    input.get(WAIT_MS).and_then(Json::as_u64)
+}
+
+pub fn wait_until(input: &Json) -> Option<u64> {
+    input.get(WAIT_UNTIL).and_then(Json::as_u64)
+}
+
+fn without_until(call: &Call) -> Call {
+    let input = match &call.input {
+        Json::Object(fields) => Json::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != WAIT_UNTIL)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    };
+    Call {
+        input,
+        ..call.clone()
     }
 }
 
@@ -1785,6 +2070,7 @@ fn halt_exit(halt: Halt) -> Exit {
     match halt {
         Halt::Exit(exit) => exit,
         Halt::Trap(trap) => panic!("finishing a turn cannot trap, found {trap}"),
+        Halt::Suspend(_) => panic!("finishing a turn cannot suspend"),
     }
 }
 
