@@ -103,7 +103,7 @@ impl Checker<'_> {
         at: Position,
         out: &mut Vec<Stmt>,
     ) -> Checked<()> {
-        if self.in_hook {
+        if self.in_hook || self.side.is_some() {
             return Ok(());
         }
         let Some(hook) = self.globals.hooks.get(&kind) else {
@@ -289,7 +289,7 @@ impl Checker<'_> {
         arms: &[ast::Arm],
         out: &mut Vec<Stmt>,
     ) -> Checked<Option<bool>> {
-        if self.in_hook {
+        if self.in_hook || self.side.is_some() {
             return Ok(None);
         }
         let ast::Expr::Call {

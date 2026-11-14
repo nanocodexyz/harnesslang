@@ -37,6 +37,14 @@ pub fn open(driver: &mut Driver, epoch: u64, bytes: &[u8], _turn: u64) -> (Start
     (Start::Beginning, opened.records, opened.epoch)
 }
 
+pub fn side_records(driver: &mut Driver, bytes: &[u8]) -> (Start, Vec<Record>) {
+    let text = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| fail("rows are not utf-8"));
+    driver.store.rows = text.lines().map(str::to_owned).collect();
+    let journal = driver.store.journal.clone();
+    let records = harness::sql_load(driver, &journal).unwrap_or_else(|error| fail(&error.to_string()));
+    (Start::Beginning, records)
+}
+
 pub fn flush(driver: &mut Driver, epoch: u64, records: &[Record]) -> Result<(), Stop> {
     let mut journal = driver.store.journal.clone();
     let writes = driver.stats.writes;

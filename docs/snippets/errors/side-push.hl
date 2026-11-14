@@ -1,0 +1,22 @@
+harness notes
+
+const entries_max: u64 = 8
+
+model infer calls entries_max
+
+state {
+  context: list<entry, entries_max>
+}
+
+fn remember(question: text) {
+  push context user(question)
+}
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on side ask(question: text) -> text {
+  remember(question)
+  return question
+}

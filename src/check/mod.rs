@@ -86,6 +86,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
         state: Vec::new(),
         invariants: Vec::new(),
         handlers: Vec::new(),
+        sides: Vec::new(),
         events: ir::Events::default(),
         cuts: Vec::new(),
         notice: None,
@@ -1710,6 +1711,11 @@ fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
             );
         }
         let (checked, ran) = handler::check(program, globals, definition)?;
+        if definition.side {
+            assert!(ran.is_empty(), "no hook runs in a side handler");
+            program.sides.push(checked);
+            continue;
+        }
         used.extend(ran);
         program.handlers.push(checked);
     }

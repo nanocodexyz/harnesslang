@@ -327,6 +327,13 @@ answer as its `result` when the key matches and waits again when it does not.
 A wait reads the clock, appends `{"ms":c,"until":T}`, flushes and sleeps until
 `T`; its `result` is the clock at its wake. [LANGUAGE.md](LANGUAGE.md) has both.
 
+A side handler (`on side name(...)`, `Program::sides`) answers a question as a
+scratch run: a fresh engine over the state at the last finished turn, its
+flushes discarded and its model and tool requests sent with turn `0`, so it
+appends nothing to the session. Hosts ask between runs, and a running turn
+polls `World::side` before each effect it runs fresh; LANGUAGE.md's Side
+questions has the checker's refusals and the simulator's `side_isolated`.
+
 Code mode adds a code site: `SiteKind::Cell` with class `Cell` and durability `Cell`: its
 own `call` record is `none`, and its nested calls follow points 1 to 3 plus
 C1 (header durable before a nested external) and C2 (header durable before a
@@ -662,8 +669,7 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
-- Side questions answered from a snapshot of the transcript, and the
-  simulator at 100K children.
+- The simulator at 100K children.
 - Waits as durable sleeps outside the run: on Vercel a workflow `sleep()`
   between steps and on Cloudflare the object's alarm, so a wait spends no
   Function or alarm time.

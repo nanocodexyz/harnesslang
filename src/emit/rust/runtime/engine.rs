@@ -441,6 +441,10 @@ pub trait World {
     fn scope(&self) -> String {
         String::new()
     }
+    fn side(&mut self, _turn: u64, _seq: u64) -> Option<program::SideArguments> {
+        None
+    }
+    fn sided(&mut self, _side: &program::SideArguments, _answer: &Result<SideAnswer, Exit>) {}
 }
 
 pub trait Host {
@@ -480,6 +484,10 @@ pub trait Host {
     fn scope(&self) -> String {
         String::new()
     }
+    fn side(&mut self, _turn: u64, _seq: u64) -> Option<program::SideArguments> {
+        None
+    }
+    fn sided(&mut self, _side: &program::SideArguments, _answer: &Result<SideAnswer, Exit>) {}
 }
 
 pub struct Sent {
@@ -731,6 +739,7 @@ pub struct Engine<'a> {
     notices: BTreeMap<usize, String>,
     discovered: BTreeMap<usize, std::collections::BTreeSet<String>>,
     blobs: Blobs,
+    snapshot: Option<program::State>,
 }
 
 impl<'a> Engine<'a> {
@@ -753,7 +762,46 @@ impl<'a> Engine<'a> {
             notices: BTreeMap::new(),
             discovered: BTreeMap::new(),
             blobs: Blobs::default(),
+            snapshot: None,
         }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: program::State) -> Self {
+        assert!(program::HAS_SIDES, "only a program with side handlers keeps the snapshot a side question reads");
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn run_side(mut self, mut state: program::State, side: &program::SideArguments) -> Result<Finish, Exit> {
+        match program::run_side_body(&mut self, &mut state, side) {
+            Ok(result) => self.finish(&state, Outcome::Completed, result),
+            Err(Halt::Trap(trap)) => self.finish(
+                &state,
+                Outcome::Failed,
+                Json::object(vec![("trap", Json::String(trap))]),
+            ),
+            Err(Halt::Suspend(_)) => panic!("{SIDE_REFUSED}: a side handler never suspends"),
+            Err(Halt::Exit(exit)) => Err(exit),
+        }
+    }
+
+    fn side_question(&mut self, seq: u64) -> Result<(), Halt> {
+        if !program::HAS_SIDES {
+            return Ok(());
+        }
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("a side question arrives only while a turn runs live")
+        };
+        let Some(side) = world.side(self.turn, seq) else {
+            return Ok(());
+        };
+        let state = self
+            .snapshot
+            .clone()
+            .expect("a live run of a program with side handlers keeps its snapshot");
+        let answer = run_side(&mut **world, state, self.blobs.clone(), &side);
+        world.sided(&side, &answer);
+        Ok(())
     }
 
     pub fn with_blobs(mut self, blobs: Blobs) -> Self {
@@ -1238,6 +1286,7 @@ impl<'a> Engine<'a> {
             }
             None => {
                 self.require_live(seq)?;
+                self.side_question(seq)?;
                 if site.kind != Kind::Model {
                     self.append(Record::Call {
                         turn: self.turn,
@@ -2086,7 +2135,11 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             TurnLog::new(handler.to_owned(), Json::Null)
         }
     };
+    let snapshot = program::HAS_SIDES.then(|| state.clone());
     let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log).with_next_cell(session.next_cell()).with_blobs(blobs);
+    if let Some(snapshot) = snapshot {
+        engine = engine.with_snapshot(snapshot);
+    }
     if let Some(record) = pending {
         engine.append(record);
     }
@@ -2105,6 +2158,132 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             End::Finished(finish) => Ran::Finished(finish),
             End::Suspended(suspension) => Ran::Suspended(suspension),
         })
+}
+
+pub const SIDE_TURN: u64 = 0;
+pub const SIDE_REFUSED: &str = "the checker refuses this effect in a side handler";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SideAnswer {
+    pub outcome: Outcome,
+    pub result: Json,
+}
+
+struct SideWorld<'w> {
+    host: &'w mut dyn World,
+    answered: Option<Finish>,
+}
+
+impl World for SideWorld<'_> {
+    fn hook(&mut self, _point: Point) -> Result<(), Stop> {
+        Ok(())
+    }
+
+    fn flush(&mut self, _epoch: u64, _records: &[Record]) -> Result<(), Stop> {
+        Ok(())
+    }
+
+    fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        assert_eq!(request.turn, SIDE_TURN, "a side question's tool calls carry the side turn");
+        assert!(request.nested.is_none(), "{SIDE_REFUSED}: a side question runs no cell");
+        self.host.tool(request)
+    }
+
+    fn listing(&mut self, _request: &ListingRequest<'_>) -> Output {
+        panic!("{SIDE_REFUSED}: a side question reads no listing")
+    }
+
+    fn tools(&mut self, _requests: &[ToolRequest<'_>], _limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+        panic!("{SIDE_REFUSED}: a side question dispatches no batch")
+    }
+
+    fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        assert_eq!(request.turn, SIDE_TURN, "a side question's model calls carry the side turn");
+        self.host.model(request)
+    }
+
+    fn now(&mut self) -> u64 {
+        panic!("{SIDE_REFUSED}: now")
+    }
+
+    fn random(&mut self) -> u64 {
+        panic!("{SIDE_REFUSED}: random")
+    }
+
+    fn acknowledge(&mut self, finish: &Finish) {
+        assert!(self.answered.is_none(), "a side question is answered once");
+        self.answered = Some(finish.clone());
+    }
+
+    fn cell_start(&mut self, _cell: u64, _script: &str) -> Step {
+        panic!("{SIDE_REFUSED}: a code cell")
+    }
+
+    fn cell_resume(&mut self, _cell: u64, _input: Input) -> Step {
+        panic!("{SIDE_REFUSED}: a code cell")
+    }
+
+    fn wait(&mut self, _wait: &Wait) -> Result<(), Stop> {
+        panic!("{SIDE_REFUSED}: a code cell's timer")
+    }
+
+    fn observe(&mut self, _event: &CellEvent) {
+        panic!("{SIDE_REFUSED}: a code cell")
+    }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        assert_eq!(turn, SIDE_TURN, "a side question reads no turn's inbox");
+        Vec::new()
+    }
+
+    fn answer(&mut self, _turn: u64, _position: u64, _answers: &[(String, EventAnswer)]) {
+        panic!("a side question takes no events, so it answers none")
+    }
+
+    fn clock(&mut self) -> u64 {
+        panic!("{SIDE_REFUSED}: wait")
+    }
+
+    fn sleep(&mut self, _turn: u64, _seq: u64, _until_ms: u64) -> Result<u64, Stop> {
+        panic!("{SIDE_REFUSED}: wait")
+    }
+
+    fn resume(&mut self, _suspension: &Suspension) -> Option<Resume> {
+        panic!("{SIDE_REFUSED}: suspend")
+    }
+
+    fn resumed(&mut self, _suspension: &Suspension, _resume: &Resume, _matched: bool) {
+        panic!("{SIDE_REFUSED}: suspend")
+    }
+}
+
+pub fn run_side(world: &mut dyn World, state: program::State, blobs: Blobs, side: &program::SideArguments) -> Result<SideAnswer, Exit> {
+    let log = TurnLog::new(program::side_name(side).to_owned(), Json::Null);
+    let mut scratch = SideWorld { host: world, answered: None };
+    let engine = Engine::new(Mode::Live { world: &mut scratch, epoch: 0 }, SIDE_TURN, &log).with_blobs(blobs);
+    let finish = engine.run_side(state, side)?;
+    assert_eq!(scratch.answered.as_ref(), Some(&finish), "a side question's finish is its answer");
+    Ok(SideAnswer {
+        outcome: finish.outcome,
+        result: finish.result,
+    })
+}
+
+pub fn last_finished(session: &Session) -> u64 {
+    session
+        .turns
+        .iter()
+        .rev()
+        .find(|(_, log)| log.finished.is_some())
+        .map_or(session.start.first_turn() - 1, |(turn, _)| *turn)
+}
+
+pub fn answer_side(world: &mut dyn World, start: Start, records: &[Record], side: &program::SideArguments) -> Result<SideAnswer, Exit> {
+    let session = fold_from(start, records).map_err(corrupt)?;
+    let state = state_before(&session, last_finished(&session) + 1)?;
+    let blobs = Blobs::of_session(&session).map_err(corrupt)?;
+    blobs.check_state(&state).map_err(corrupt)?;
+    run_side(world, state, blobs, side)
 }
 
 pub fn self_check() {

@@ -3,7 +3,7 @@ use crate::prove::text::Names;
 use crate::prove::{Finding, Report};
 
 pub fn prove(program: &Program, report: &mut Report) {
-    for handler in &program.handlers {
+    for handler in program.handlers.iter().chain(&program.sides) {
         let names = Names::new(program, Some(handler));
         let mut walk = Walk {
             program,
@@ -24,7 +24,8 @@ pub fn prove(program: &Program, report: &mut Report) {
         }
         if clean {
             report.proved.push(format!(
-                "handler {}: finish_once: every path ends in exactly one of {finishes} return(s)",
+                "{} {}: finish_once: every path ends in exactly one of {finishes} return(s)",
+                program.kind_of(handler),
                 handler.name
             ));
         }

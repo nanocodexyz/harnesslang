@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `sessions` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `sessions` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -540,7 +540,7 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | code | spawn | model | state | invariant | function | hook | lifecycle | handler | event ;
+item       = const | type | tool | listing | code | spawn | model | state | invariant | function | hook | lifecycle | handler | side | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
@@ -560,6 +560,7 @@ lifecycle  = "on" ( "session" "start" | "prompt" "submit" | "pre" "compact" | "p
                   | "stop" | "subagent" "start" | "subagent" "stop" ) [ params ] block
            | "on" "session" "end" params "->" type_expr [ "requires" expr ] block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
+side       = "on" "side" name params "->" type_expr [ "requires" expr ] block ;
 event      = "on" name [ params "bound" bound ] ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
 bound      = name ;
@@ -1213,6 +1214,8 @@ kind of turn. Its parameters are the turn's arguments, recorded in the
 false, the turn finishes `failed` with `requires(name)` before the body runs.
 Every path through the body must end in `return`, and nothing may follow a
 `return` in its block.
+`on side name(...)` declares a side handler, which answers a question
+without a turn ([Side questions](#side-questions)).
 
 ```console
 $ hl check docs/snippets/errors/no-return.hl
@@ -3955,6 +3958,193 @@ replay: hl sim --target native-jsonl --seeds 1..2 --mutation family_one_level do
 differential runs use it, so generated Rust and JavaScript record scoped keys
 as the interpreter does (`scripts/check.sh` runs `docs/snippets/tree_planner.hl`
 under `1.1` on every target).
+
+### Side questions
+
+`on side name(param: type, ...) -> type [requires condition] { ... }`
+declares a side handler: it answers a question about the session without
+touching it, as nanocode's `side_question` answers `/btw`. A side handler is
+not a turn. The host asks it between turns, while a turn is parked and while
+one runs; it appends no record anywhere, writes no checkpoint, takes no lease
+and leaves the session's state and sequence numbers as they were. Its model and
+tool requests go to the host with turn `0`, which no turn has, so a host tells
+them from a turn's; a crash loses the question and the host asks again.
+`docs/snippets/side.hl` asks the model with nanocode's
+`SIDE_QUESTION_REMINDER` in front of the question, the entry reaching the model
+through `with`, never pushed:
+
+```hl docs/snippets/side.hl
+harness sidecar
+
+const steps_max: u64 = 2
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+
+type outcome = completed(text) | exhausted
+
+tool Bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+on resume
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          let verdict = suspend(call.id)
+          if verdict == "allow" {
+            match dispatch(call) {
+              ok(output) => { push context result(call, output) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          } else {
+            push context error(call, "Denied: " ++ verdict)
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on side ask(question: text) -> text {
+  let reminder = "<system-reminder>This is a side question from the user. You must answer this question directly in a single response.\nIMPORTANT CONTEXT:\n- You are a separate, lightweight agent spawned to answer this one question\n- The main agent is NOT interrupted - it continues working independently in the background\n- You share the conversation context but are a completely separate instance\n- Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\nCRITICAL CONSTRAINTS:\n- You have NO tools available - you cannot read files, run commands, search, or take any actions\n- Do NOT write tool calls or tool output as text (for example invoke or function_calls XML blocks) - nothing you write here is executed; if answering would need reading files, running commands, or searching, say that can't be checked from a side question and suggest asking in the main conversation\n- This is a one-off response - there will be no follow-up turns\n- You can ONLY provide information based on what you already know from the conversation context\n- NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n- If you don't know the answer, say so - do not offer to look it up or investigate\nSimply answer the question with the information you have.</system-reminder>\n\n"
+  let reply = infer(context with user(reminder ++ question))
+  match reply {
+    answer(words) => { return words }
+    calls(_) => { return "A side question cannot run tools: ask it in the main conversation." }
+  }
+}
+```
+
+It reads the state at the last finished turn: after the latest turn whose
+`status` is durable, which is the state a running or parked turn started from.
+A turn's changes are a function of records that may not be durable yet, so a
+crash can roll them back and an answer from them would have seen a state that
+never existed; a Durable Object request or a Vercel step cannot read another
+run's memory; and this snapshot is the same on every target. Every target makes
+a turn's `status` durable before it acknowledges the turn (durability point 2),
+so the next turn is admitted only after it. This departs from nanocode, which
+shows a side question the running turn's live transcript.
+
+The checker refuses anything that would change the session or need a journal,
+in the side handler and in every fn it calls: assigning, `push`, `clear`, `keep`, a
+parallel for, `take` and `cancelled`, tools of effect `idempotent` or `external`
+(spawn tools among them), `dispatch`, `join`, `suspend`, `wait`, `now()`,
+`random()`, listing reads and code cells. The model and tools of effect `none`
+remain. No hook runs in a side handler. `requires` is checked over the snapshot;
+when it is false the answer is `failed` with `requires(name)`. Its worst case
+counts no journal records, and Cloudflare's limit on outbound requests applies
+to it, since a side question runs in its own invocation:
+
+```console
+$ hl check docs/snippets/side.hl | grep 'side handler'
+docs/snippets/side.hl: harness sidecar: 1 tool(s), 1 state field(s), 1 handler(s), 1 side handler(s)
+  side handler ask: worst case 1 effects, 0 journal records, 1 outbound requests
+  proved side handler ask: finish_once: every path ends in exactly one of 2 return(s)
+  proved side handler ask: no_overflow: 0 arithmetic operation(s) proved in range; invariant_preserved: 3 invariant check(s) at returns and trap points; push_bound: 0 push(es) proved below capacity (6 prover steps)
+$ hl check docs/snippets/errors/side-push.hl
+docs/snippets/errors/side-push.hl:12:3: error: side handler 'ask' cannot push onto 'context': a side question reads the session's state at its last finished turn and changes none of it
+$ hl check docs/snippets/errors/side-dispatch.hl
+docs/snippets/errors/side-dispatch.hl:10:9: error: side handler 'run' cannot call tool 'Bash' of effect external: a side question is journaled nowhere, so it calls only the model and tools of effect none
+```
+
+```hl docs/snippets/errors/side-push.hl
+harness notes
+
+const entries_max: u64 = 8
+
+model infer calls entries_max
+
+state {
+  context: list<entry, entries_max>
+}
+
+fn remember(question: text) {
+  push context user(question)
+}
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on side ask(question: text) -> text {
+  remember(question)
+  return question
+}
+```
+
+```hl docs/snippets/errors/side-dispatch.hl
+harness notes
+
+tool Bash(command: text) -> text effect external
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on side run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "unknown" }
+  }
+}
+```
+
+Each backend runs a side question as a scratch run: a fresh engine over a copy
+of the snapshot whose flushes are discarded. The interpreter answers through
+`run::side::answer` between runs and through `World::side`, which a running
+turn polls before each effect it runs fresh. Generated Rust has
+`JsonlJournal::side`, `sql_side` (which loads the rows without acquiring the
+session) and `Host::side`; the Durable Object answers `POST /side` with
+`{"handler", "arguments"}` from its rows, without queueing behind a running turn
+or writing storage, its output gate holding the answer until rows a finishing
+turn inserted commit; Vercel exports `harnessSide(lines, request)`, which folds
+the run's journal lines outside any step.
+
+The simulator asks side questions only of programs that declare a side handler:
+before an effect a turn runs fresh (`SIDE_AT_EFFECT_PPM` = 100000 per million),
+after each turn (`SIDE_BETWEEN_TURNS_PPM` = 500000) and while a turn is parked
+(`SIDE_PARKED_PPM` = 500000), with replies drawn from generators keyed apart
+from the session's, so no other draw moves. `side_isolated` requires the
+journal, durable and buffered, to be the same after a question as before, and
+the answer to equal an oracle run over the state that replaying the durable
+journal's finished turns gives, with the same replies and the same requests.
+`side_live_state`, a runtime that answers from the running turn's state, and
+`side_journaled`, one that appends the side run's records to the session, are
+caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/side.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=3131 crashes=1610 power_losses=184 torn_writes=286 takeovers=0 fenced=0 dispatches=314 unknown=160 sleeps=0 suspensions=1017 side_questions=947
+$ hl sim --target native-jsonl --seeds 0..200 --mutation side_live_state docs/snippets/side.hl
+FAIL invariant=side_isolated seed=0 target=native-jsonl profile=errors mutation=side_live_state: side question 5 (ask turn 2 before seq 3): the snapshot at the last durable status gives another run: request 1 of the oracle's run is a model call at seq 1 over 4 context entries (crc 1293496392), where the runtime's was a model call at seq 1 over 6 context entries (crc 256348170)
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation side_live_state docs/snippets/side.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation side_journaled docs/snippets/side.hl
+FAIL invariant=side_isolated seed=0 target=native-jsonl profile=errors mutation=side_journaled: side question 1 (ask while turn 1 is parked) changed the session's journal: 443 bytes before it, 878 after
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation side_journaled docs/snippets/side.hl
+```
+
+`side_questions` counts the questions asked, printed only when there are some.
+The differential runs carry them too: generated Rust and JavaScript answer
+every question the interpreter asks, mid-turn and between runs, with the same
+requests and answers.
 
 ### Traps
 

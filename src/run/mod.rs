@@ -7,6 +7,7 @@ pub mod journal;
 pub mod json;
 pub mod mutation;
 pub mod session;
+pub mod side;
 pub mod turn;
 pub mod value;
 

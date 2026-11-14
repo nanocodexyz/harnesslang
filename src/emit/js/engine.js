@@ -7,6 +7,8 @@ const DENY_TOOL = "deny";
 const SPAWN_KEY_SEPARATOR = ".";
 const SPAWN_SCOPE_SEPARATOR = "/";
 const ROOT_SCOPE = "";
+const SIDE_TURN = 0;
+const SIDE_REFUSED = "the checker refuses this effect in a side handler";
 
 function spawnOutput(tool, scope, turn, seq, output) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
@@ -50,6 +52,24 @@ class Engine {
     this.notices = new Map();
     this.discovered = new Map();
     this.blobs = new Blobs();
+    this.snapshot = null;
+  }
+
+  async sideQuestion(seq) {
+    if (PROGRAM.sides.length === 0) return;
+    const world = this.mode.world;
+    if (world.side === undefined) return;
+    const request = await world.side(this.turn, seq);
+    if (request === null) return;
+    assert(this.snapshot !== null, "a live run of a program with side handlers keeps its snapshot");
+    let answer;
+    try {
+      answer = await runSide({ target: this.target, mutation: "none" }, world, this.snapshot, this.blobs, request);
+    } catch (error) {
+      if (!(error instanceof Corrupt)) throw error;
+      answer = { error: error.message };
+    }
+    await world.sided(request, answer);
   }
 
   notice(listing) {
@@ -242,6 +262,7 @@ class Engine {
     const logged = this.sites.get(seq);
     if (logged !== undefined) return this.recorded(siteId, seq, call, args, logged);
     this.requireLive(seq);
+    await this.sideQuestion(seq);
     if (site.kind !== "model") {
       this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
       this.sites.set(seq, { kind: "open", call });
@@ -937,6 +958,7 @@ async function runTurn(setup, world, epoch, records, request) {
   const scope = request.scope === undefined ? ROOT_SCOPE : request.scope;
   assert(typeof scope === "string", "a turn request's scope is text");
   const engine = new Engine(setup, handler, { live: true, world, epoch, scope }, request.turn, state, log);
+  if (PROGRAM.sides.length > 0) engine.snapshot = stateFromJson(stateJson(state));
   engine.nextCell = nextCell(session);
   engine.blobs = blobs;
   for (const record of pending) engine.append(record);
@@ -949,6 +971,150 @@ async function runTurn(setup, world, epoch, records, request) {
   const ran = await engine.run(request.arguments);
   if (ran.suspended !== undefined) return { ran: "suspended", suspension: ran.suspended };
   return { ran: "finished", finish: ran.finish };
+}
+
+class SideWorld {
+  constructor(world) {
+    this.world = world;
+    this.answered = null;
+  }
+
+  append() {}
+
+  async hook() {}
+
+  async beforeExternal() {
+    throw new Panic(SIDE_REFUSED + ": a side question runs no external call");
+  }
+
+  async flush() {}
+
+  async attempt() {
+    throw new Panic(SIDE_REFUSED + ": a side question runs no external call");
+  }
+
+  async nestedAttempt() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  cellStart() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  cellResume() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  async waited() {
+    throw new Panic(SIDE_REFUSED + ": a code cell's timer");
+  }
+
+  async wait() {
+    throw new Panic(SIDE_REFUSED + ": a code cell's timer");
+  }
+
+  async observe() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  tool(request) {
+    assert(request.turn === SIDE_TURN, "a side question's tool calls carry the side turn");
+    return this.world.tool(request);
+  }
+
+  listing() {
+    throw new Panic(SIDE_REFUSED + ": a listing read");
+  }
+
+  async tools() {
+    throw new Panic(SIDE_REFUSED + ": a parallel for");
+  }
+
+  model(request) {
+    assert(request.turn === SIDE_TURN, "a side question's model calls carry the side turn");
+    return this.world.model(request);
+  }
+
+  now() {
+    throw new Panic(SIDE_REFUSED + ": now");
+  }
+
+  random() {
+    throw new Panic(SIDE_REFUSED + ": random");
+  }
+
+  async acknowledge(finish) {
+    assert(this.answered === null, "a side question is answered once");
+    this.answered = finish;
+  }
+
+  async inbox(turn) {
+    assert(turn === SIDE_TURN, "a side question reads no turn's inbox");
+    return [];
+  }
+
+  async answer() {
+    throw new Panic("a side question takes no events, so it answers none");
+  }
+
+  clock() {
+    throw new Panic(SIDE_REFUSED + ": wait");
+  }
+
+  sleep() {
+    throw new Panic(SIDE_REFUSED + ": wait");
+  }
+
+  async resume() {
+    throw new Panic(SIDE_REFUSED + ": suspend");
+  }
+
+  async resumed() {
+    throw new Panic(SIDE_REFUSED + ": suspend");
+  }
+}
+
+function sideNamed(name) {
+  return PROGRAM.sides.find((side) => side.name === name) ?? null;
+}
+
+async function runSide(setup, world, state, blobs, request) {
+  const side = sideNamed(request.handler);
+  assert(side !== null, "a side request names a side handler of the program");
+  const scratch = new SideWorld(world);
+  const engine = new Engine(setup, side, { live: true, world: scratch, epoch: 0 }, SIDE_TURN, stateFromJson(stateJson(state)), newTurnLog(side.name, null));
+  engine.blobs = blobs;
+  const ran = await engine.run(request.arguments);
+  assert(ran.suspended === undefined, SIDE_REFUSED + ": a side handler never suspends");
+  assert(scratch.answered === ran.finish, "a side question's finish is its answer");
+  return { outcome: ran.finish.outcome, result: ran.finish.result };
+}
+
+function lastFinished(session) {
+  let last = 0;
+  for (const [turn, log] of session.turns) {
+    if (log.finished !== null && turn > last) last = turn;
+  }
+  return last;
+}
+
+async function answerSide(setup, world, records, request) {
+  const session = fold(records);
+  const state = await stateBefore(setup, session, lastFinished(session) + 1);
+  const blobs = sessionBlobs(session);
+  blobs.checkState(state);
+  return runSide(setup, world, state, blobs, request);
+}
+
+function sideRequestFromJson(json) {
+  if (!isObject(json) || typeof json.handler !== "string") throw new DecodeError("a side question names its side handler");
+  const side = sideNamed(json.handler);
+  if (side === null) throw new DecodeError(`no side handler '${json.handler}'`);
+  return { handler: json.handler, arguments: argumentsFromJson(side, json.arguments) };
+}
+
+function sideAnswerJson(answer) {
+  return object([["outcome", answer.outcome], ["result", answer.result]]);
 }
 
 function turnRequestFromJson(json) {
@@ -1085,4 +1251,5 @@ const runtime = {
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
   Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
   deliveryJson, deliveryFrom, suspensionJson, suspensionFrom, resumeJson, resumeFrom,
+  SIDE_TURN, answerSide, sideRequestFromJson, sideAnswerJson,
 };

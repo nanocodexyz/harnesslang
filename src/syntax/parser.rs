@@ -543,6 +543,14 @@ impl<'a> Parser<'a> {
 
     fn handler_or_event(&mut self) -> Parsed<Item> {
         self.word("on")?;
+        if self.is_word("side") && matches!(self.peek_second(), Token::Name(_)) {
+            self.word("side")?;
+            let name = self.name("a side handler name")?;
+            let params = self.params()?;
+            let mut handler = self.handler(name, params)?;
+            handler.side = true;
+            return Ok(Item::Handler(handler));
+        }
         if let Some(item) = self.lifecycle()? {
             return Ok(item);
         }
@@ -589,6 +597,7 @@ impl<'a> Parser<'a> {
             requires,
             body,
             ends_session: false,
+            side: false,
         })
     }
 

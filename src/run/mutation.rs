@@ -66,10 +66,12 @@ pub enum Mutation {
     SpawnKeyUnscoped,
     GrandchildUnscoped,
     FamilyOneLevel,
+    SideLiveState,
+    SideJournaled,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 64] = [
+    pub const ALL: [Self; 66] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -134,6 +136,8 @@ impl Mutation {
         Self::SpawnKeyUnscoped,
         Self::GrandchildUnscoped,
         Self::FamilyOneLevel,
+        Self::SideLiveState,
+        Self::SideJournaled,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -202,6 +206,8 @@ impl Mutation {
             Self::SpawnKeyUnscoped => "spawn_key_unscoped",
             Self::GrandchildUnscoped => "grandchild_unscoped",
             Self::FamilyOneLevel => "family_one_level",
+            Self::SideLiveState => "side_live_state",
+            Self::SideJournaled => "side_journaled",
         }
     }
 
@@ -280,7 +286,9 @@ impl Mutation {
             | Self::DenyDispatches
             | Self::SpawnKeyUnscoped
             | Self::GrandchildUnscoped
-            | Self::FamilyOneLevel => all,
+            | Self::FamilyOneLevel
+            | Self::SideLiveState
+            | Self::SideJournaled => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

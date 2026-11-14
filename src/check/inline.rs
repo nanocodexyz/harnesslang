@@ -308,6 +308,7 @@ impl<'a> Inliner<'a> {
             requires: handler.requires.clone(),
             body,
             ends_session: handler.ends_session,
+            side: handler.side,
         })
     }
 

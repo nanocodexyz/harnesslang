@@ -175,6 +175,7 @@ pub struct Program {
     pub state: Vec<Field>,
     pub invariants: Vec<Invariant>,
     pub handlers: Vec<Handler>,
+    pub sides: Vec<Handler>,
     pub events: Events,
     pub cuts: Vec<u64>,
     pub notice: Option<VariantId>,
@@ -221,6 +222,18 @@ impl Program {
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
         self.handlers.iter().find(|handler| handler.name == name)
+    }
+
+    pub fn side(&self, name: &str) -> Option<&Handler> {
+        self.sides.iter().find(|side| side.name == name)
+    }
+
+    pub fn kind_of(&self, handler: &Handler) -> &'static str {
+        if self.side(&handler.name).is_some() {
+            "side handler"
+        } else {
+            "handler"
+        }
     }
 
     pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
@@ -954,7 +967,7 @@ impl Program {
 
     pub fn find_cuts(&self) -> Vec<u64> {
         let mut cuts = Vec::new();
-        for handler in &self.handlers {
+        for handler in self.handlers.iter().chain(&self.sides) {
             block_cuts(&handler.body, &self.constants, &mut cuts);
         }
         cuts.sort_unstable();

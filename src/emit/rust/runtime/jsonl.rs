@@ -407,6 +407,14 @@ impl<H: Host> World for JsonlWorld<'_, H> {
     fn scope(&self) -> String {
         self.host.scope()
     }
+
+    fn side(&mut self, turn: u64, seq: u64) -> Option<program::SideArguments> {
+        self.host.side(turn, seq)
+    }
+
+    fn sided(&mut self, side: &program::SideArguments, answer: &Result<SideAnswer, Exit>) {
+        self.host.sided(side, answer)
+    }
 }
 
 #[derive(Debug)]
@@ -459,6 +467,18 @@ impl<'d> JsonlJournal<'d> {
             Ran::Suspended(_) => self.records.extend(flushed),
         }
         Ok((self, ran))
+    }
+
+    pub fn side<H: Host>(&mut self, host: &mut H, side: &program::SideArguments) -> Result<SideAnswer, RunError> {
+        let mut flushed = Vec::new();
+        let mut world = JsonlWorld {
+            host,
+            disk: &mut *self.disk,
+            flushed: &mut flushed,
+        };
+        let answer = answer_side(&mut world, self.start, &self.records, side).map_err(RunError::Exit)?;
+        assert!(flushed.is_empty(), "a side question writes nothing");
+        Ok(answer)
     }
 
     fn advance(&mut self, turn: u64, mut flushed: Vec<Record>) {
