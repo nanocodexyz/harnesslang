@@ -329,6 +329,7 @@ fn open(out: &Path, turns: u64) -> Result<(), String> {
     if !out.exists() {
         return Err(format!("{}: no log to open", out.display()));
     }
+    let cpu_started = cpu_ms();
     let started = Instant::now();
     let host = Arc::new(FileLog::open(out)?);
     let log = ready(TurnLog::open(host, SCOPE)).map_err(|error| error.to_string())?;
@@ -346,6 +347,7 @@ fn open(out: &Path, turns: u64) -> Result<(), String> {
         (finished, state)
     }));
     let elapsed = started.elapsed();
+    let cpu = cpu_ms() - cpu_started;
     let state = state.map_err(|error| format!("a checkpoint payload is not JSON: {error}"))?;
     if finished != turns {
         return Err(format!(
@@ -354,7 +356,7 @@ fn open(out: &Path, turns: u64) -> Result<(), String> {
     }
     let collected = ready(log.stats()).collected;
     println!(
-        "open open_ms={:.3} checkpoints={} state_bytes={} collected={collected}",
+        "open open_ms={:.3} open_cpu_ms={cpu:.3} checkpoints={} state_bytes={} collected={collected}",
         milliseconds(elapsed),
         state.len(),
         state

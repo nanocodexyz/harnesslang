@@ -181,6 +181,7 @@ fn run(path: &std::path::Path, turns: u64) {
 }
 
 fn open(path: &std::path::Path, turns: u64) {
+    let cpu_started = cpu_ms();
     let started = std::time::Instant::now();
     let opened = store::open(path);
     let session =
@@ -192,6 +193,7 @@ fn open(path: &std::path::Path, turns: u64) {
     let state = harness::state_before(&session, next)
         .unwrap_or_else(|exit| panic!("the state before turn {next} builds: {exit:?}"));
     let elapsed = started.elapsed();
+    let cpu = cpu_ms() - cpu_started;
     let encoded = program::state_json(&state).encode();
     for turn in 1..=turns {
         let finished = session
@@ -206,7 +208,7 @@ fn open(path: &std::path::Path, turns: u64) {
         "the journal holds exactly the bench's turns"
     );
     println!(
-        "open open_ms={:.3} records={} state_bytes={} {}",
+        "open open_ms={:.3} open_cpu_ms={cpu:.3} records={} state_bytes={} {}",
         milliseconds(elapsed),
         opened.records.len(),
         encoded.len(),
