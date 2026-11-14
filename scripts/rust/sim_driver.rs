@@ -6,7 +6,7 @@ mod store;
 use std::io::BufRead;
 
 use harness::program;
-use harness::{CellEvent, CellPoint, Delivery, EventAnswer, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Resume, Step, Stop, Suspension, ToolRequest, TurnRequest, Wait, World};
+use harness::{CellEvent, CellPoint, Delivery, EventAnswer, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Resume, SideAnswer, Step, Stop, Suspension, ToolRequest, TurnRequest, Wait, World};
 
 pub struct Events {
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
@@ -94,6 +94,7 @@ pub struct Stats {
     pub waits: u64,
     pub sleeps: u64,
     pub resumes: u64,
+    pub sides: u64,
 }
 
 pub struct Driver {
@@ -146,6 +147,32 @@ impl Driver {
         let _ = nested;
     }
 
+    fn side_arguments(&mut self) -> program::SideArguments {
+        let event = self.events.next("side");
+        program::decode_side_arguments(text(&event, "handler"), field(&event, "arguments"))
+            .unwrap_or_else(|error| fail(&format!("side arguments do not decode: {error:?}")))
+    }
+
+    fn side_answered(&mut self, answer: &Result<SideAnswer, Exit>) {
+        let event = self.events.next("side_answer");
+        match answer {
+            Ok(answer) => {
+                expect(&event, "outcome", &Json::text(answer.outcome.name()));
+                expect(&event, "result", &answer.result);
+            }
+            Err(exit) => fail(&format!("event {}: the generated code did not answer a side question: {exit:?}", self.events.index)),
+        }
+        self.stats.sides += 1;
+    }
+
+    fn side_between(&mut self, event: &Json) {
+        let bytes = self.opened_bytes(event);
+        let (start, records) = store::side_records(self, &bytes);
+        let side = self.side_arguments();
+        let answer = harness::answer_side(self, start, &records, &side);
+        self.side_answered(&answer);
+    }
+
     fn seed(&mut self) {
         loop {
             let event = match self.events.peek() {
@@ -162,6 +189,10 @@ impl Driver {
                 "run" => {
                     self.events.next("run");
                     self.run(&event, false);
+                }
+                "side_open" => {
+                    self.events.next("side_open");
+                    self.side_between(&event);
                 }
                 "end" => {
                     self.events.next("end");
@@ -276,6 +307,13 @@ impl World for Driver {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        if request.turn == harness::SIDE_TURN {
+            let event = self.events.next("side_tool");
+            expect(&event, "seq", &Json::Number(request.seq));
+            expect(&event, "tool", &Json::text(request.tool));
+            expect(&event, "input", request.input);
+            return harness::output_from(field(&event, "output")).unwrap_or_else(|error| fail(&error));
+        }
         let event = self.events.next("tool");
         expect(&event, "turn", &Json::Number(request.turn));
         expect(&event, "seq", &Json::Number(request.seq));
@@ -336,10 +374,13 @@ impl World for Driver {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
-        let event = self.events.next("model");
-        expect(&event, "turn", &Json::Number(request.turn));
+        let side = request.turn == harness::SIDE_TURN;
+        let event = self.events.next(if side { "side_model" } else { "model" });
+        if !side {
+            expect(&event, "turn", &Json::Number(request.turn));
+            expect(&event, "calls_max", &Json::Number(request.calls_max));
+        }
         expect(&event, "seq", &Json::Number(request.seq));
-        expect(&event, "calls_max", &Json::Number(request.calls_max));
         let traced = event.get("mode").map(|mode| mode.as_str().expect("a traced mode is text"));
         assert_eq!(traced, request.mode, "model mode at {}/{}", request.turn, request.seq);
         let context = (request.context)().encode();
@@ -440,6 +481,20 @@ impl World for Driver {
         self.stats.resumes += 1;
     }
 
+    fn side(&mut self, turn: u64, seq: u64) -> Option<program::SideArguments> {
+        let event = self.events.peek()?.clone();
+        if event.get("event").and_then(Json::as_str) != Some("side") {
+            return None;
+        }
+        expect(&event, "turn", &Json::Number(turn));
+        expect(&event, "seq", &Json::Number(seq));
+        Some(self.side_arguments())
+    }
+
+    fn sided(&mut self, _side: &program::SideArguments, answer: &Result<SideAnswer, Exit>) {
+        self.side_answered(answer);
+    }
+
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]) {
         let event = self.events.next("answer");
         expect(&event, "turn", &Json::Number(turn));
@@ -486,7 +541,7 @@ fn main() {
     }
     let stats = &driver.stats;
     println!(
-        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={} sleeps={} resumes={}",
+        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={} sleeps={} resumes={}{}",
         program::TARGET,
         program::HARNESS_NAME,
         stats.seeds,
@@ -505,6 +560,7 @@ fn main() {
         stats.nested,
         stats.waits,
         stats.sleeps,
-        stats.resumes
+        stats.resumes,
+        if program::HAS_SIDES { format!(" side_questions={}", stats.sides) } else { String::new() }
     );
 }

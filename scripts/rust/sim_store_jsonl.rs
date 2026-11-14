@@ -21,6 +21,17 @@ pub fn open(driver: &mut Driver, epoch: u64, bytes: &[u8], turn: u64) -> (Start,
     (opened.start, opened.records, epoch.min(0))
 }
 
+pub fn side_records(driver: &mut Driver, bytes: &[u8]) -> (Start, Vec<Record>) {
+    driver.store.contents = bytes.to_vec();
+    driver.store.opening = true;
+    let opened = harness::jsonl_open(driver).unwrap_or_else(|error| fail(&error.to_string()));
+    driver.store.opening = false;
+    if opened.dropped_bytes != 0 {
+        fail("a side question read a journal with a torn tail, where every line it reads is durable");
+    }
+    (opened.start, opened.records)
+}
+
 pub fn flush(driver: &mut Driver, _epoch: u64, records: &[Record]) -> Result<(), Stop> {
     harness::jsonl_flush(driver, records)
 }

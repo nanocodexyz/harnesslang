@@ -180,10 +180,17 @@ impl SimWorld<'_> {
         if !rng.chance(SIDE_AT_EFFECT_PPM) {
             return None;
         }
-        self.side_open(format!("turn {turn} before seq {seq}"), buffered, &mut rng)
+        let at = format!("turn {turn} before seq {seq}");
+        self.side_open(at, Some((turn, seq)), buffered, &mut rng)
     }
 
-    fn side_open(&mut self, at: String, buffered: &[Record], rng: &mut Rng) -> Option<SideRequest> {
+    fn side_open(
+        &mut self,
+        at: String,
+        point: Option<(u64, u64)>,
+        buffered: &[Record],
+        rng: &mut Rng,
+    ) -> Option<SideRequest> {
         let durable = self.medium.durable().ok()?;
         let program = self.program;
         let side = &program.sides[rng.pick(program.sides.len())];
@@ -212,7 +219,10 @@ impl SimWorld<'_> {
             durable,
         });
         self.record("side", || {
+            let number = |value: Option<u64>| value.map_or(Json::Null, Json::Number);
             vec![
+                ("turn", number(point.map(|(turn, _)| turn))),
+                ("seq", number(point.map(|(_, seq)| seq))),
                 ("handler", Json::text(&request.handler)),
                 ("arguments", side_arguments(program, &request)),
             ]
@@ -331,9 +341,13 @@ impl SimWorld<'_> {
         }
         self.sides.polls += 1;
         let mut rng = Rng::derive_keyed(self.seed, "side between", &[self.sides.polls]);
-        if rng.chance(ppm)
-            && let Some(request) = self.side_open(at, &[], &mut rng)
-        {
+        if !rng.chance(ppm) || self.medium.durable().is_err() {
+            return self.side_fault();
+        }
+        let epoch = self.run_epoch;
+        let bytes = self.trace.as_ref().map(|_| durable_bytes(&self.medium));
+        self.opened("side_open", epoch, bytes);
+        if let Some(request) = self.side_open(at, None, &[], &mut rng) {
             let program = self.program;
             let target = self.target;
             let setup = Setup {
@@ -348,7 +362,6 @@ impl SimWorld<'_> {
                 .expect("opened above")
                 .durable
                 .clone();
-            let epoch = self.run_epoch;
             let answer = side::answer(setup, self, epoch, &durable, &request);
             self.side_answered(&request, &answer, &[]);
         }
@@ -430,6 +443,13 @@ impl SimWorld<'_> {
             output: output.clone(),
         });
         output
+    }
+}
+
+fn durable_bytes(medium: &Medium) -> Vec<u8> {
+    match medium {
+        Medium::Jsonl(file) => file.written[..file.synced].to_vec(),
+        Medium::Rows(_) => medium.bytes(),
     }
 }
 

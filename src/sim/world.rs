@@ -348,7 +348,7 @@ impl<'a> SimWorld<'a> {
         }
     }
 
-    fn opened(&mut self, name: &str, epoch: u64, bytes: Option<Vec<u8>>) {
+    pub(crate) fn opened(&mut self, name: &str, epoch: u64, bytes: Option<Vec<u8>>) {
         if let (Some(trace), Some(bytes)) = (&mut self.trace, bytes) {
             trace.opened(name, epoch, &bytes);
         }
