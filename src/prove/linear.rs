@@ -1,4 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+mod system;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::prove::linear::system::{
+    Hashing, Row, cheapest, contradiction, eliminate, prepare, project_rows, variables,
+};
 
 pub type Var = usize;
 
@@ -23,10 +29,21 @@ pub enum Extent {
 
 pub struct Budget {
     pub steps_left: u64,
-    pub constraints_max: usize,
+    constraints_max: usize,
+    memo: Memo,
+    memo_entries_max: usize,
 }
 
 impl Budget {
+    pub fn new(steps_max: u64, constraints_max: usize, memo_entries_max: usize) -> Self {
+        Self {
+            steps_left: steps_max,
+            constraints_max,
+            memo: Memo::default(),
+            memo_entries_max,
+        }
+    }
+
     fn spend(&mut self) -> Result<(), Unsure> {
         if self.steps_left == 0 {
             return Err(Unsure::Budget);
@@ -46,7 +63,7 @@ pub fn ceil_div(numerator: i128, denominator: i128) -> Option<i128> {
     Some(-(numerator.checked_neg()?.div_euclid(denominator)))
 }
 
-fn gcd(mut left: i128, mut right: i128) -> i128 {
+pub(super) fn gcd(mut left: i128, mut right: i128) -> i128 {
     left = left.abs();
     right = right.abs();
     while right != 0 {
@@ -126,17 +143,6 @@ impl Linear {
         }
         Some(total)
     }
-
-    fn normalized(mut self) -> Option<Self> {
-        let divisor = self.terms.values().fold(0, |acc, value| gcd(acc, *value));
-        if divisor > 1 {
-            for coefficient in self.terms.values_mut() {
-                *coefficient /= divisor;
-            }
-            self.constant = ceil_div(self.constant, divisor)?;
-        }
-        Some(self)
-    }
 }
 
 pub fn at_most(left: &Linear, right: &Linear) -> Option<Linear> {
@@ -151,135 +157,65 @@ pub fn negation(constraint: &Linear) -> Option<Linear> {
     constraint.scale(-1)?.plus(1)
 }
 
-fn variables(constraints: &BTreeSet<Linear>) -> BTreeSet<Var> {
-    constraints
-        .iter()
-        .flat_map(|constraint| constraint.terms.keys().copied())
-        .collect()
+type Memo = HashMap<Projection, Outcome, Hashing>;
+
+#[derive(PartialEq, Eq, Hash)]
+struct Projection {
+    rows: Vec<Row>,
+    doomed: Vec<Var>,
 }
 
-fn contradiction(constraints: &BTreeSet<Linear>) -> bool {
-    constraints
-        .iter()
-        .any(|constraint| constraint.terms.is_empty() && constraint.constant > 0)
+struct Outcome {
+    projected: Result<Vec<Row>, Unsure>,
+    steps: u64,
 }
 
-fn subsume(constraints: BTreeSet<Linear>) -> BTreeSet<Linear> {
-    let mut strongest: BTreeMap<BTreeMap<Var, i128>, i128> = BTreeMap::new();
-    for constraint in constraints {
-        let entry = strongest
-            .entry(constraint.terms)
-            .or_insert(constraint.constant);
-        *entry = (*entry).max(constraint.constant);
-    }
-    let set: BTreeSet<Linear> = strongest
-        .into_iter()
-        .map(|(terms, constant)| Linear { terms, constant })
-        .collect();
-    let bounds = boxed(&set);
-    set.into_iter()
-        .filter(|constraint| constraint.terms.len() < 2 || !box_implies(&bounds, constraint))
-        .collect()
-}
-
-fn boxed(constraints: &BTreeSet<Linear>) -> BTreeMap<Var, Interval> {
-    let mut bounds: BTreeMap<Var, Interval> = BTreeMap::new();
-    for constraint in constraints {
-        let [(var, coefficient)] = constraint.terms.iter().collect::<Vec<_>>()[..] else {
-            continue;
+impl Budget {
+    fn projected(&mut self, rows: Vec<Row>, doomed: Vec<Var>) -> Result<Vec<Row>, Unsure> {
+        let names = variables(&rows);
+        let key = Projection {
+            rows: rows.iter().map(|row| row.renamed(&names)).collect(),
+            doomed: doomed
+                .iter()
+                .map(|var| {
+                    names
+                        .binary_search(var)
+                        .expect("a doomed variable is named")
+                })
+                .collect(),
         };
-        let entry = bounds.entry(*var).or_insert((None, None));
-        if *coefficient > 0 {
-            let Some(negated) = constraint.constant.checked_neg() else {
-                continue;
+        let restore = |rows: Vec<Row>| rows.iter().map(|row| row.restored(&names)).collect();
+        if let Some(outcome) = self.memo.get(&key)
+            && outcome.steps <= self.steps_left
+        {
+            self.steps_left -= outcome.steps;
+            return outcome.projected.clone().map(restore);
+        }
+        let steps_before = self.steps_left;
+        let projected = project_rows(key.rows.clone(), key.doomed.clone(), self);
+        let steps = steps_before - self.steps_left;
+        if projected != Err(Unsure::Budget) && self.memo.len() < self.memo_entries_max {
+            let outcome = Outcome {
+                projected: projected.clone(),
+                steps,
             };
-            let high = floor_div(negated, *coefficient);
-            entry.1 = Some(entry.1.map_or(high, |current| current.min(high)));
-        } else if let Some(low) = ceil_div(constraint.constant, -*coefficient) {
-            entry.0 = Some(entry.0.map_or(low, |current| current.max(low)));
+            self.memo.insert(key, outcome);
         }
+        projected.map(restore)
     }
-    bounds
 }
 
-fn box_implies(bounds: &BTreeMap<Var, Interval>, constraint: &Linear) -> bool {
-    let mut highest = Some(constraint.constant);
-    for (var, coefficient) in &constraint.terms {
-        let (low, high) = bounds.get(var).copied().unwrap_or((None, None));
-        let extreme = if *coefficient > 0 { high } else { low };
-        highest = highest
-            .zip(extreme)
-            .and_then(|(total, value)| total.checked_add(coefficient.checked_mul(value)?));
-    }
-    highest.is_some_and(|value| value <= 0)
-}
-
-fn prepare(constraints: &[Linear]) -> Result<BTreeSet<Linear>, Unsure> {
-    let mut set = BTreeSet::new();
-    for constraint in constraints {
-        let normalized = constraint.clone().normalized().ok_or(Unsure::Overflow)?;
-        if normalized.terms.is_empty() && normalized.constant <= 0 {
-            continue;
-        }
-        set.insert(normalized);
-    }
-    Ok(subsume(set))
-}
-
-pub fn eliminate(
-    constraints: &BTreeSet<Linear>,
-    var: Var,
+fn projected_rows(
+    constraints: &[Linear],
+    keep: &BTreeSet<Var>,
     budget: &mut Budget,
-) -> Result<BTreeSet<Linear>, Unsure> {
-    let mut kept = BTreeSet::new();
-    let mut above = Vec::new();
-    let mut below = Vec::new();
-    for constraint in constraints {
-        match constraint.terms.get(&var).copied() {
-            None => {
-                kept.insert(constraint.clone());
-            }
-            Some(coefficient) if coefficient > 0 => above.push((constraint, coefficient)),
-            Some(coefficient) => below.push((constraint, -coefficient)),
-        }
-    }
-    for (upper, upper_coefficient) in &above {
-        for (lower, lower_coefficient) in &below {
-            budget.spend()?;
-            let combined = upper
-                .scale(*lower_coefficient)
-                .and_then(|scaled| scaled.add(&lower.scale(*upper_coefficient)?))
-                .and_then(Linear::normalized)
-                .ok_or(Unsure::Overflow)?;
-            assert!(
-                !combined.terms.contains_key(&var),
-                "a combination cancels the eliminated variable"
-            );
-            if combined.terms.is_empty() && combined.constant <= 0 {
-                continue;
-            }
-            kept.insert(combined);
-            if kept.len() > budget.constraints_max {
-                return Err(Unsure::Budget);
-            }
-        }
-    }
-    Ok(subsume(kept))
-}
-
-fn cheapest(constraints: &BTreeSet<Linear>, candidates: &BTreeSet<Var>) -> Option<Var> {
-    candidates.iter().copied().min_by_key(|var| {
-        let mut above = 0_usize;
-        let mut below = 0_usize;
-        for constraint in constraints {
-            match constraint.terms.get(var) {
-                Some(coefficient) if *coefficient > 0 => above += 1,
-                Some(_) => below += 1,
-                None => {}
-            }
-        }
-        above.saturating_mul(below)
-    })
+) -> Result<Vec<Row>, Unsure> {
+    let rows = prepare(constraints)?;
+    let doomed = variables(&rows)
+        .into_iter()
+        .filter(|var| !keep.contains(var))
+        .collect();
+    budget.projected(rows, doomed)
 }
 
 pub fn project(
@@ -287,27 +223,13 @@ pub fn project(
     keep: &BTreeSet<Var>,
     budget: &mut Budget,
 ) -> Result<Vec<Linear>, Unsure> {
-    let mut set = prepare(constraints)?;
-    let mut doomed: BTreeSet<Var> = variables(&set).difference(keep).copied().collect();
-    let rounds_max = doomed.len();
-    for _ in 0..rounds_max {
-        if contradiction(&set) {
-            break;
-        }
-        let Some(var) = cheapest(&set, &doomed) else {
-            break;
-        };
-        doomed.remove(&var);
-        set = eliminate(&set, var, budget)?;
-    }
-    Ok(set.into_iter().collect())
+    let rows = projected_rows(constraints, keep, budget)?;
+    Ok(rows.iter().map(Row::linear).collect())
 }
 
 pub fn feasible(constraints: &[Linear], budget: &mut Budget) -> Result<bool, Unsure> {
-    let projected = project(constraints, &BTreeSet::new(), budget)?;
-    Ok(!projected
-        .iter()
-        .any(|constraint| constraint.terms.is_empty() && constraint.constant > 0))
+    let projected = projected_rows(constraints, &BTreeSet::new(), budget)?;
+    Ok(!contradiction(&projected))
 }
 
 pub fn implies(facts: &[Linear], goal: &Linear, budget: &mut Budget) -> Result<bool, Unsure> {
@@ -333,19 +255,19 @@ pub fn upper(
     let mut system = facts.to_vec();
     let pinned = equal(&Linear::var(fresh), expression).ok_or(Unsure::Overflow)?;
     system.extend(pinned);
-    let projected = project(&system, &BTreeSet::from([fresh]), budget)?;
+    let projected = projected_rows(&system, &BTreeSet::from([fresh]), budget)?;
     let mut best: Option<i128> = None;
-    for constraint in &projected {
-        if constraint.terms.is_empty() {
-            if constraint.constant > 0 {
+    for row in &projected {
+        if row.terms.is_empty() {
+            if row.constant > 0 {
                 return Ok(Extent::Infeasible);
             }
             continue;
         }
-        let coefficient = constraint.terms[&fresh];
+        let coefficient = row.coefficient(fresh).expect("only the measure is left");
         if coefficient > 0 {
             let bound = floor_div(
-                constraint.constant.checked_neg().ok_or(Unsure::Overflow)?,
+                row.constant.checked_neg().ok_or(Unsure::Overflow)?,
                 coefficient,
             );
             best = Some(best.map_or(bound, |current| current.min(bound)));
@@ -367,22 +289,22 @@ pub fn lower(
     })
 }
 
-type Interval = (Option<i128>, Option<i128>);
+pub type Interval = (Option<i128>, Option<i128>);
 
-fn bounds_of(
-    constraints: &BTreeSet<Linear>,
-    var: Var,
-    values: &BTreeMap<Var, i128>,
-) -> Option<Interval> {
+fn bounds_of(rows: &[Row], var: Var, values: &BTreeMap<Var, i128>) -> Option<Interval> {
     let mut low: Option<i128> = None;
     let mut high: Option<i128> = None;
-    for constraint in constraints {
-        let Some(&coefficient) = constraint.terms.get(&var) else {
+    for row in rows {
+        let Some(coefficient) = row.coefficient(var) else {
             continue;
         };
-        let mut rest = constraint.clone();
-        rest.terms.remove(&var);
-        let rest = rest.evaluate(values)?;
+        let mut rest = row.constant;
+        for (other, other_coefficient) in &row.terms {
+            if *other != var {
+                let value = values.get(other).copied().unwrap_or(0);
+                rest = rest.checked_add(other_coefficient.checked_mul(value)?)?;
+            }
+        }
         if coefficient > 0 {
             let bound = floor_div(rest.checked_neg()?, coefficient);
             high = Some(high.map_or(bound, |current| current.min(bound)));
@@ -411,22 +333,22 @@ fn candidate(
     constraints: &[Linear],
     budget: &mut Budget,
 ) -> Result<Option<BTreeMap<Var, i128>>, Unsure> {
-    let mut set = prepare(constraints)?;
+    let mut rows = prepare(constraints)?;
     let mut stages = Vec::new();
-    let mut remaining = variables(&set);
+    let mut remaining = variables(&rows);
     let rounds_max = remaining.len();
     for _ in 0..rounds_max {
-        if contradiction(&set) {
+        if contradiction(&rows) {
             return Ok(None);
         }
-        let Some(var) = cheapest(&set, &remaining) else {
+        let Some(var) = cheapest(&rows, &remaining) else {
             break;
         };
-        remaining.remove(&var);
-        let next = eliminate(&set, var, budget)?;
-        stages.push((var, std::mem::replace(&mut set, next)));
+        remaining.retain(|candidate| *candidate != var);
+        let next = eliminate(&rows, var, budget)?;
+        stages.push((var, std::mem::replace(&mut rows, next)));
     }
-    if contradiction(&set) {
+    if contradiction(&rows) {
         return Ok(None);
     }
     let mut values = BTreeMap::new();
