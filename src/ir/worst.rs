@@ -7,9 +7,11 @@ pub const EFFECT_RECORDS: u64 = 2;
 pub const MODEL_RECORDS: u64 = 1;
 pub const CELL_HEADER_RECORDS: u64 = 1;
 pub const CELL_FINISH_RECORDS: u64 = 1;
-pub const NESTED_UPDATE_RECORDS: u64 = 2;
-pub const NESTED_EXTERNAL_RECORDS: u64 = 2;
-pub const TIMER_UPDATE_RECORDS: u64 = 2;
+pub const ENTRY_UPDATE_RECORDS: u64 = 1;
+pub const NESTED_LOG_RECORDS: u64 = 1;
+pub const NESTED_UPDATE_RECORDS: u64 = 2 * ENTRY_UPDATE_RECORDS;
+pub const NESTED_EXTERNAL_RECORDS: u64 = 2 * NESTED_LOG_RECORDS;
+pub const TIMER_UPDATE_RECORDS: u64 = 2 * ENTRY_UPDATE_RECORDS;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Factor {

@@ -105,7 +105,7 @@ pub enum Op {
         site: SiteId,
         what: String,
     },
-    CloseCell(SiteId),
+    CloseCell(SiteId, CodeId),
     Acknowledge,
     Choice(Vec<Arm>),
     Repeat {
@@ -703,7 +703,7 @@ impl Lowering<'_> {
                     recorded,
                 ),
             ]),
-            Op::CloseCell(site),
+            Op::CloseCell(site, code),
         ]
     }
 

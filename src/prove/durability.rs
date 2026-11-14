@@ -119,7 +119,7 @@ fn acknowledgements(ops: &[Op]) -> usize {
 
 fn has_cells(ops: &[Op]) -> bool {
     ops.iter().any(|op| match op {
-        Op::CloseCell(_) => true,
+        Op::CloseCell(..) => true,
         Op::Choice(arms) => arms.iter().any(|arm| has_cells(&arm.ops)),
         Op::Repeat { body, .. } => has_cells(body),
         _ => false,
@@ -356,7 +356,7 @@ impl Prover<'_> {
                 );
             }
             Op::Wait { site, what } => self.wait(*site, what, &state),
-            Op::CloseCell(site) => self.close_cell(*site, &mut state),
+            Op::CloseCell(site, _) => self.close_cell(*site, &mut state),
             Op::Acknowledge => self.acknowledge(&mut state),
             Op::Choice(_) | Op::Repeat { .. } | Op::End => {
                 unreachable!("structured ops are walked by op")

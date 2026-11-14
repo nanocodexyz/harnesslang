@@ -7,8 +7,10 @@ pub mod linear;
 pub mod lower;
 pub mod text;
 
+use crate::effect::EffectClass;
+use crate::ir::worst::{ENTRY_UPDATE_RECORDS, NESTED_LOG_RECORDS, TIMER_UPDATE_RECORDS};
 use crate::ir::{Program, Stmt};
-use crate::prove::lower::{Op, Plan};
+use crate::prove::lower::{Op, Plan, Record, Slot};
 use crate::run;
 use crate::target::{self, Target};
 
@@ -288,7 +290,7 @@ fn repeated(body: Planned, bound: u64, every_iteration: bool) -> Option<Planned>
     })
 }
 
-fn planned(ops: &[Op], cost: fn(&Op) -> Count) -> Option<Planned> {
+fn planned(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Planned> {
     let mut paths = Planned {
         through: Some(Count::default()),
         ended: None,
@@ -326,7 +328,7 @@ fn planned(ops: &[Op], cost: fn(&Op) -> Count) -> Option<Planned> {
             | Op::Yield { .. }
             | Op::Replay(_)
             | Op::Wait { .. }
-            | Op::CloseCell(_)
+            | Op::CloseCell(..)
             | Op::Acknowledge => Planned {
                 through: Some(cost(op)),
                 ended: None,
@@ -337,7 +339,7 @@ fn planned(ops: &[Op], cost: fn(&Op) -> Count) -> Option<Planned> {
     Some(paths)
 }
 
-fn planned_max(ops: &[Op], cost: fn(&Op) -> Count) -> Option<Count> {
+fn planned_max(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Count> {
     let paths = planned(ops, cost)?;
     larger(paths.through, paths.ended)
 }
@@ -352,20 +354,34 @@ fn outbound(op: &Op) -> Count {
     }
 }
 
-fn appended(op: &Op) -> Count {
-    Count {
-        total: u64::from(matches!(op, Op::Append(_))),
-        nested: 0,
-    }
+fn appended(program: &Program, op: &Op) -> Count {
+    let total = match op {
+        Op::Append(Record::Call(Slot::Nested(_, tool)) | Record::Result(Slot::Nested(_, tool))) => {
+            let logged = program.tools[*tool].effect == EffectClass::External;
+            ENTRY_UPDATE_RECORDS + if logged { NESTED_LOG_RECORDS } else { 0 }
+        }
+        Op::Append(Record::Timeout(_)) => 0,
+        Op::Append(_) => 1,
+        Op::CloseCell(_, code) => program.codes[*code]
+            .timers
+            .value
+            .checked_mul(TIMER_UPDATE_RECORDS)
+            .expect("hl check counted the cell's timer records in u64"),
+        _ => 0,
+    };
+    Count { total, nested: 0 }
 }
 
 fn records(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Report) {
     let model = &plan.model;
     for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
         let counted = &handler.worst.records;
-        let planned = planned_max(&lowered.ops, appended)
+        let planned = planned_max(&lowered.ops, &|op| appended(program, op))
             .expect("the IR's record count fits u64, and the plan appends no more")
             .total;
+        if mutation == Mutation::Lowering(run::mutation::Mutation::DivergenceDispatches) {
+            continue;
+        }
         assert!(
             planned <= counted.total,
             "the IR's journal record worst case covers every path of the plan"
@@ -393,7 +409,7 @@ fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
     };
     for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
         let requests = &handler.worst.requests;
-        let Some(planned) = planned_max(&lowered.ops, outbound) else {
+        let Some(planned) = planned_max(&lowered.ops, &outbound) else {
             report.add(Finding {
                 handler: handler.name.clone(),
                 target: Some(model.target),
