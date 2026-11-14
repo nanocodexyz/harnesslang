@@ -5423,7 +5423,7 @@ lets cells run on after a cancel:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 docs/snippets/code_stop.hl
-ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1980 crashes=1476 power_losses=100 torn_writes=140 takeovers=0 fenced=0 dispatches=1481 unknown=334 cells=359 nested=402 divergences=5 waits=63 events=44 interrupted=18 yields=23
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1978 crashes=1474 power_losses=100 torn_writes=140 takeovers=0 fenced=0 dispatches=1481 unknown=334 cells=359 nested=403 divergences=5 waits=63 events=44 interrupted=18 yields=23
 $ hl sim --target native-jsonl --seeds 0..200 --mutation cell_cancel_ignored docs/snippets/code_stop.hl
 FAIL invariant=interrupt_honored seed=12 target=native-jsonl profile=async mutation=cell_cancel_ignored: 2/4 is interruptible by cancel and an event that interrupts it was recorded before its outcome, yet it records a finished outcome
 replay: hl sim --target native-jsonl --seeds 12..13 --mutation cell_cancel_ignored docs/snippets/code_stop.hl
