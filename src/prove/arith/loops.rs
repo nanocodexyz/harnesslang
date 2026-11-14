@@ -32,8 +32,15 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
         Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
             fields.iter().any(|field| reads(field, quantities))
         }
-        Expr::Binary { left, right, .. } => reads(left, quantities) || reads(right, quantities),
-        Expr::Not(operand) | Expr::Len(operand) => reads(operand, quantities),
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        } => reads(left, quantities) || reads(right, quantities),
+        Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand)
+        | Expr::Truncate { text: operand, .. } => reads(operand, quantities),
     }
 }
 
@@ -87,7 +94,7 @@ impl Prover<'_> {
     fn quantity_max(&self, quantity: Quantity) -> i128 {
         let handler = self.handler.expect("a loop belongs to a handler");
         match quantity {
-            Quantity::Field(_) | Quantity::Local(_) => U64_MAX,
+            Quantity::Field(_) | Quantity::Local(_) | Quantity::TextLen(_) => U64_MAX,
             Quantity::FieldLen(field) => {
                 capacity(&self.program.state[field].ty).expect("a list has a capacity")
             }

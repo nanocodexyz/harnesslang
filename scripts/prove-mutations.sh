@@ -191,9 +191,10 @@ for target in native-jsonl native-sqlite server-postgres vercel; do
     exit 1
   fi
 done
-expect_error examples/invalid/over_wait.hl "handler 'watch' on cloudflare: worst_case: worst case 2400000 milliseconds of waits per run exceeds cloudflare's limit of 900000 milliseconds of waits per run; path: poll below polls_max (4)"
+expect_error examples/invalid/long_wait.hl "handler 'nap' on cloudflare: worst_case: worst case 3600000 milliseconds in its longest wait exceeds cloudflare's limit of 900000 milliseconds per wait; path: no loops"
+expect_error examples/invalid/wait_uncapped.hl "handler 'poll': wait_bound: wait(after_ms) may sleep past its cap retry_cap_ms and trap with bound(retry_cap_ms); path: match status(job): ok; counterexample: after_ms = 32001"
 expect_error examples/invalid/long_wait.hl "handler 'nap' on vercel: worst_case: worst case 3600000 milliseconds in its longest wait exceeds vercel's limit of 800000 milliseconds per wait; path: no loops"
-for target in native-jsonl native-sqlite server-postgres vercel; do
+for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do
   if ! "$hl" prove --target "$target" examples/invalid/over_wait.hl > /dev/null 2> "$scratch/stderr"; then
     echo "examples/invalid/over_wait.hl must prove on $target:" >&2
     cat "$scratch/stderr" >&2

@@ -47,6 +47,24 @@ impl Prover<'_> {
                 self.value(state, list);
                 self.linear_of(state, value)
             }
+            Expr::TextLen(text) => {
+                self.value(state, text);
+                if let Expr::Truncate { tokens, .. } = &**text {
+                    let max = self.cut_max(*tokens);
+                    let name = self.names.expr(value);
+                    return Some(Linear::var(self.fresh(state, &name, max)));
+                }
+                self.linear_of(state, value)
+            }
+            Expr::Truncate { text: operand, .. } => {
+                self.value(state, operand);
+                None
+            }
+            Expr::With { list, entry } => {
+                self.value(state, list);
+                self.value(state, entry);
+                None
+            }
             Expr::U64(_) | Expr::Constant(_) | Expr::Local(_) | Expr::Field(_) => {
                 self.linear_of(state, value)
             }

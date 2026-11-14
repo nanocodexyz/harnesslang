@@ -401,9 +401,14 @@ impl<'a> Inliner<'a> {
                 walk.reference(&self.declared, list)?;
                 Ok(statement.clone())
             }
-            Stmt::Keep { list, count, .. } => {
+            Stmt::Keep {
+                list, count, first, ..
+            } => {
                 walk.reference(&self.declared, list)?;
                 self.expr(walk, count)?;
+                if let Some(first) = first {
+                    self.expr(walk, first)?;
+                }
                 Ok(statement.clone())
             }
             Stmt::Return { value, .. } => {
@@ -570,7 +575,12 @@ impl<'a> Inliner<'a> {
                     walk.reference(&self.declared, callee)?;
                     pending.extend(args.iter().rev());
                 }
-                Expr::Binary { left, right, .. } => {
+                Expr::Binary { left, right, .. }
+                | Expr::With {
+                    list: left,
+                    entry: right,
+                    ..
+                } => {
                     pending.push(right);
                     pending.push(left);
                 }

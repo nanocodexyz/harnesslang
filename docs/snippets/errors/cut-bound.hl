@@ -1,0 +1,16 @@
+harness cuts
+
+const tokens_max: u64 = 10
+const cut_units_max: u64 = 78
+
+state {
+  cut_units: u64
+}
+
+invariant cut_bounded: cut_units <= cut_units_max
+
+on ask(said: text) -> u64 {
+  let cut = truncate_middle(said, tokens_max)
+  cut_units = len(cut)
+  return cut_units
+}

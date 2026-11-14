@@ -57,7 +57,10 @@ wait_unjournaled docs/snippets/park.hl --twice idempotent_known|liveness
 wait_rerun_skips docs/snippets/park.hl --twice wait_until
 wait_oversleeps docs/snippets/park.hl --twice wait_until
 deny_dispatches docs/snippets/hooks.hl --twice denied_unrun
-spawn_key_unscoped docs/snippets/spawn.hl --twice child_scoped"
+spawn_key_unscoped docs/snippets/spawn.hl --twice child_scoped
+truncate_uncut docs/snippets/recovery.hl --twice checkpoint_compacted
+usage_unchecked docs/snippets/recovery.hl --twice replay_equal
+retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

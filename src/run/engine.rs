@@ -1093,14 +1093,43 @@ impl<'a> Engine<'a> {
     }
 
     fn shrink(&mut self, field: usize, kept: &Kept) -> Result<(), Halt> {
-        let count = match kept {
-            Kept::Nothing => 0,
-            Kept::Last(count) => self.eval(count)?.as_u64(),
+        let (count, first) = match kept {
+            Kept::Nothing => (0, None),
+            Kept::Last(count) => (self.eval(count)?.as_u64(), None),
+            Kept::LastAfter { count, first } => {
+                (self.eval(count)?.as_u64(), Some(self.eval(first)?))
+            }
         };
+        let Type::List { capacity, .. } = &self.program.state[field].ty else {
+            panic!("the checker clears and keeps only lists");
+        };
+        let capacity = capacity.value;
         let Value::List(items) = &mut self.state[field] else {
             panic!("the checker clears and keeps only lists");
         };
         let length = items.len() as u64;
+        if let Some(first) = first {
+            if count.min(length) >= capacity {
+                return Err(Halt::Trap(format!(
+                    "bound({})",
+                    self.program.state[field].name
+                )));
+            }
+            let dropped =
+                usize::try_from(length - count.min(length)).expect("a list's length fits usize");
+            let retired: Vec<Value> = items.drain(..dropped).collect();
+            items.insert(0, first);
+            assert_eq!(
+                items.len() as u64,
+                count.min(length) + 1,
+                "keep after leaves the first entry and at most the last count entries"
+            );
+            self.retired += retired.len() as u64;
+            if self.mutation == Mutation::RetireSkipped {
+                self.unretired.entry(field).or_default().extend(retired);
+            }
+            return Ok(());
+        }
         if count >= length {
             return Ok(());
         }
@@ -1125,7 +1154,11 @@ impl<'a> Engine<'a> {
         } else {
             None
         };
-        evaluate(self.program, &self.state, &self.locals, cancelled, expr).map_err(Halt::Trap)
+        let reads = Reads {
+            cancelled,
+            uncut: self.mutation == Mutation::TruncateUncut,
+        };
+        evaluate_with(self.program, &self.state, &self.locals, reads, expr).map_err(Halt::Trap)
     }
 
     fn resolve(&self, site: &Site, args: &[Value]) -> Call {
@@ -1191,13 +1224,10 @@ impl<'a> Engine<'a> {
                 effect: EffectClass::None,
                 input: Json::String(args[0].as_text().to_owned()),
             },
-            SiteKind::Wait(constant) => Call {
+            SiteKind::Wait(_) => Call {
                 tool: ir::WAIT_TOOL.to_owned(),
                 effect: EffectClass::None,
-                input: Json::object([(
-                    WAIT_MS,
-                    Json::Number(self.program.constants[constant].value),
-                )]),
+                input: Json::object([(WAIT_MS, Json::Number(args[0].as_u64()))]),
             },
             SiteKind::Suspend => Call {
                 tool: ir::SUSPEND_TOOL.to_owned(),
@@ -1234,6 +1264,12 @@ impl<'a> Engine<'a> {
 
     fn effect(&mut self, site_id: usize, args: Vec<Value>) -> Result<Value, Halt> {
         let site = &self.handler.sites[site_id];
+        if let SiteKind::Wait(cap) = site.kind {
+            let cap = &self.program.constants[cap];
+            if args[0].as_u64() > cap.value {
+                return Err(Halt::Trap(format!("bound({})", cap.name)));
+            }
+        }
         self.seq += 1;
         let seq = self.seq;
         let call = self.resolve(site, &args);
@@ -1743,14 +1779,18 @@ impl<'a> Engine<'a> {
                 if self.reply_unrecorded(&response) {
                     return self.reply(&response);
                 }
+                let recorded = if self.mutation == Mutation::RetryAfterUnjournaled {
+                    value::without_retry_after(&response)
+                } else {
+                    response.clone()
+                };
                 self.append(Record::Model {
                     turn: self.turn,
                     seq,
-                    response: response.clone(),
+                    response: recorded.clone(),
                     mode: mode.clone(),
                 });
-                self.sites
-                    .insert(seq, SiteLog::Reply(response.clone(), mode));
+                self.sites.insert(seq, SiteLog::Reply(recorded, mode));
                 return self.reply(&response);
             }
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
@@ -1901,8 +1941,13 @@ impl<'a> Engine<'a> {
             .model
             .as_ref()
             .expect("the checker admits model calls only with a model");
-        if model.declared() {
-            return Ok(value::model_outcome(self.program, response));
+        match model.outcome() {
+            ir::ModelOutcome::Attempt => {
+                let checked = self.mutation != Mutation::UsageUnchecked;
+                return Ok(value::attempt(self.program, response, checked));
+            }
+            ir::ModelOutcome::Known => return Ok(value::model_outcome(self.program, response)),
+            ir::ModelOutcome::Trap => {}
         }
         value::from_json(self.program, &Type::Sum(ir::REPLY), response)
             .map_err(|error| Halt::Trap(format!("model reply: {error}")))
@@ -2163,10 +2208,23 @@ fn reads_cancelled(expr: &Expr) -> bool {
         | Expr::Field(_) => false,
         Expr::Member { base, .. } => reads_cancelled(base),
         Expr::Construct { fields, .. } => fields.iter().any(reads_cancelled),
-        Expr::Binary { left, right, .. } => reads_cancelled(left) || reads_cancelled(right),
-        Expr::Not(operand) | Expr::Len(operand) => reads_cancelled(operand),
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        } => reads_cancelled(left) || reads_cancelled(right),
+        Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand)
+        | Expr::Truncate { text: operand, .. } => reads_cancelled(operand),
         Expr::TextBuiltin { args, .. } => args.iter().any(reads_cancelled),
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct Reads {
+    pub cancelled: Option<bool>,
+    pub uncut: bool,
 }
 
 pub fn evaluate(
@@ -2176,7 +2234,22 @@ pub fn evaluate(
     cancelled: Option<bool>,
     expr: &Expr,
 ) -> Result<Value, String> {
-    let eval = |expr: &Expr| evaluate(program, state, locals, cancelled, expr);
+    let reads = Reads {
+        cancelled,
+        uncut: false,
+    };
+    evaluate_with(program, state, locals, reads, expr)
+}
+
+pub fn evaluate_with(
+    program: &Program,
+    state: &[Value],
+    locals: &[Option<Value>],
+    reads: Reads,
+    expr: &Expr,
+) -> Result<Value, String> {
+    let cancelled = reads.cancelled;
+    let eval = |expr: &Expr| evaluate_with(program, state, locals, reads, expr);
     Ok(match expr {
         Expr::U64(value) => Value::U64(*value),
         Expr::Bool(value) => Value::Bool(*value),
@@ -2203,6 +2276,24 @@ pub fn evaluate(
         Expr::Len(operand) => match eval(operand)? {
             Value::List(items) => Value::U64(items.len() as u64),
             other => panic!("the checker types len's operand as a list, found {other:?}"),
+        },
+        Expr::TextLen(operand) => Value::U64(ir::utf16_len(eval(operand)?.as_text())),
+        Expr::Truncate { text, tokens } => {
+            let text = eval(text)?;
+            if reads.uncut {
+                return Ok(text);
+            }
+            Value::Text(ir::truncate_middle(
+                text.as_text(),
+                program.constants[*tokens].value,
+            ))
+        }
+        Expr::With { list, entry } => match eval(list)? {
+            Value::List(mut items) => {
+                items.push(eval(entry)?);
+                Value::List(items)
+            }
+            other => panic!("the checker types a context as a list, found {other:?}"),
         },
         Expr::TextBuiltin { op, args } => {
             let mut values = Vec::with_capacity(args.len());

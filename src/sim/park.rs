@@ -227,7 +227,6 @@ impl SimWorld<'_> {
         }
         if let Some(WaitLimit { limit, scope }) = self.target.limits.wait_ms {
             let (measured, what) = match scope {
-                WaitScope::Run => (waited, format!("one run of turn {turn} waited")),
                 WaitScope::Step => (slept, format!("wait {id} waited")),
             };
             if measured > limit.value {

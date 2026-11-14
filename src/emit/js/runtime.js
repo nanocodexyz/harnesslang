@@ -115,6 +115,72 @@ function modelOutcome(response) {
   }
 }
 
+const ATTEMPT_OK = "ok";
+const ATTEMPT_REJECTED = 3;
+const ATTEMPT_USAGE = 2;
+const USAGE_FIELDS = ["input", "output", "cache_read", "cache_write"];
+
+function usageOver(response, window) {
+  const pair = tagged(response);
+  if (pair === null || pair[0] !== ATTEMPT_OK || !Array.isArray(pair[1])) return null;
+  for (let index = 0; index < USAGE_FIELDS.length; index += 1) {
+    const used = pair[1][ATTEMPT_USAGE + index];
+    if (typeof used === "bigint" && used > window) {
+      return `model reply: ${USAGE_FIELDS[index]} usage of ${used} tokens exceeds the window of ${window} tokens`;
+    }
+  }
+  return null;
+}
+
+function attemptOutcome(response) {
+  const window = PROGRAM.model.window;
+  let attempt;
+  try {
+    attempt = fromJson({ sum: window.attempt }, response);
+  } catch (error) {
+    if (!(error instanceof DecodeError)) throw error;
+    return variant(ATTEMPT_REJECTED, [`model reply: ${error.message}`]);
+  }
+  const over = usageOver(response, window.tokens);
+  return over === null ? attempt : variant(ATTEMPT_REJECTED, [over]);
+}
+
+const UTF16_UNITS_PER_TOKEN = 4n;
+const TRUNCATION_OPEN = "\u2026";
+const TRUNCATION_CLOSE = " tokens truncated\u2026";
+
+function truncateMiddle(text, tokensMax) {
+  const total = (BigInt(text.length) + UTF16_UNITS_PER_TOKEN - 1n) / UTF16_UNITS_PER_TOKEN;
+  if (total <= tokensMax) return text;
+  const side = tokensMax * (UTF16_UNITS_PER_TOKEN / 2n);
+  const characters = Array.from(text);
+  let units = 0n;
+  let head = text.length;
+  let offset = 0;
+  for (const character of characters) {
+    units += BigInt(character.length);
+    if (units > side) {
+      head = offset;
+      break;
+    }
+    offset += character.length;
+  }
+  units = 0n;
+  let tail = 0;
+  offset = text.length;
+  for (let index = characters.length - 1; index >= 0; index -= 1) {
+    const character = characters[index];
+    units += BigInt(character.length);
+    if (units > side) {
+      tail = offset;
+      break;
+    }
+    offset -= character.length;
+  }
+  if (tail < head) tail = head;
+  return `${text.slice(0, head)}${TRUNCATION_OPEN}${total - tokensMax}${TRUNCATION_CLOSE}${text.slice(tail)}`;
+}
+
 const textEncoder = new TextEncoder();
 const ASCII_ONLY = /^[\x00-\x7f]*$/;
 

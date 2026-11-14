@@ -156,9 +156,12 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Deny
         | SiteKind::Cell(_) => "null".to_owned(),
     };
-    let ms = match site.kind {
-        SiteKind::Wait(constant) => format!("{}n", program.constants[constant].value),
-        _ => "null".to_owned(),
+    let (ms, cap) = match site.kind {
+        SiteKind::Wait(constant) => (
+            format!("{}n", program.constants[constant].value),
+            js_string(&program.constants[constant].name),
+        ),
+        _ => ("null".to_owned(), "null".to_owned()),
     };
     let code = match site.kind {
         SiteKind::Cell(code) => code.to_string(),
@@ -179,7 +182,7 @@ fn site_literal(program: &Program, site: &Site) -> String {
         .mode
         .map_or("null".to_owned(), |mode| js_string(program.mode_name(mode)));
     format!(
-        "{{ kind: \"{}\", tool: {tool}, code: {code}, ms: {ms}, class: \"{class}\", result: {}, durability: \"{durability}\", mode: {mode} }}",
+        "{{ kind: \"{}\", tool: {tool}, code: {code}, ms: {ms}, cap: {cap}, class: \"{class}\", result: {}, durability: \"{durability}\", mode: {mode} }}",
         site.kind.name(),
         type_literal(&site.result)
     )
@@ -252,8 +255,14 @@ fn program_literal(program: &Program) -> String {
         .expect("writing to a string succeeds");
     }
     let model = program.model.as_ref().map_or("null".to_owned(), |model| {
+        let window = model.window.as_ref().map_or("null".to_owned(), |window| {
+            format!(
+                "{{ tokens: {}n, attempt: {} }}",
+                window.tokens.value, window.attempt
+            )
+        });
         format!(
-            "{{ name: {}, calls: {}n, declared: {} }}",
+            "{{ name: {}, calls: {}n, declared: {}, window: {window} }}",
             js_string(&model.name),
             model.calls.value,
             model.declared()
@@ -398,13 +407,17 @@ impl Writer<'_> {
             Stmt::Push { field, value } => {
                 self.line(&format!("rt.push({field}, {});", expr(program, value)))
             }
-            Stmt::Shrink { field, kept } => {
-                let count = match kept {
-                    Kept::Nothing => "0n".to_owned(),
-                    Kept::Last(count) => expr(program, count),
-                };
-                self.line(&format!("rt.keep({field}, {count});"));
-            }
+            Stmt::Shrink { field, kept } => match kept {
+                Kept::Nothing => self.line(&format!("rt.keep({field}, 0n);")),
+                Kept::Last(count) => {
+                    self.line(&format!("rt.keep({field}, {});", expr(program, count)));
+                }
+                Kept::LastAfter { count, first } => self.line(&format!(
+                    "rt.keepAfter({field}, {}, {});",
+                    expr(program, count),
+                    expr(program, first)
+                )),
+            },
             Stmt::If {
                 condition,
                 then,
@@ -553,7 +566,17 @@ fn expr(program: &Program, expression: &Expr) -> String {
             op, left, right, ..
         } => binary(*op, expr(program, left), expr(program, right)),
         Expr::Not(operand) => format!("!({})", expr(program, operand)),
-        Expr::Len(operand) => format!("BigInt(({}).length)", expr(program, operand)),
+        Expr::Len(operand) | Expr::TextLen(operand) => {
+            format!("BigInt(({}).length)", expr(program, operand))
+        }
+        Expr::Truncate { text, tokens } => format!(
+            "truncateMiddle({}, constant_{})",
+            expr(program, text),
+            program.constants[*tokens].name
+        ),
+        Expr::With { list, entry } => {
+            format!("[...({}), {}]", expr(program, list), expr(program, entry))
+        }
         Expr::TextBuiltin { op, args } => {
             let args: Vec<String> = args.iter().map(|arg| expr(program, arg)).collect();
             format!("text_{}({})", op.name(), args.join(", "))

@@ -92,8 +92,21 @@ impl<'a, 'p> Body<'a, 'p> {
             Stmt::Shrink { field, kept } => {
                 let count = match kept {
                     Kept::Nothing => "0_u64".to_owned(),
-                    Kept::Last(count) => self.expr(count),
+                    Kept::Last(count) | Kept::LastAfter { count, .. } => self.expr(count),
                 };
+                if let Kept::LastAfter { first, .. } = kept {
+                    let first = self.expr(first);
+                    let Type::List { capacity, .. } = &self.program.state[*field].ty else {
+                        panic!("the checker keeps only lists");
+                    };
+                    let capacity = constant(&capacity.name);
+                    let name = &self.program.state[*field].name;
+                    let field = self.field(*field);
+                    self.line(&format!(
+                        "keep_last_after(&mut state.{field}, {count}, {first}, {capacity}, {name:?})?;"
+                    ));
+                    return;
+                }
                 let field = self.field(*field);
                 self.line(&format!("keep_last(&mut state.{field}, {count});"));
             }
@@ -369,22 +382,42 @@ impl<'a, 'p> Body<'a, 'p> {
                     "Run::Model {{ calls_max: {}, context: &context }}",
                     constant(&model.calls.name)
                 );
-                let decode = match result {
-                    Type::Known(inner) => {
+                let decode = match (result, &model.window) {
+                    (Type::Sum(attempt), Some(window)) => {
+                        assert_eq!(
+                            *attempt, window.attempt,
+                            "a model with a window yields an attempt"
+                        );
+                        let rejected = format!(
+                            "{}::{}",
+                            super::types::sum_name(self.program, *attempt),
+                            variant_ident(ir::ATTEMPT_VARIANTS[ir::ATTEMPT_REJECTED])
+                        );
+                        format!(
+                            "attempt_reply(answer, {}, {}, {rejected})",
+                            self.types.from_json(result),
+                            constant(&window.tokens.name)
+                        )
+                    }
+                    (Type::Known(inner), _) => {
                         format!("known_reply(answer, {})", self.types.from_json(inner))
                     }
-                    other => format!("reply(answer, {})?", self.types.from_json(other)),
+                    (other, _) => format!("reply(answer, {})?", self.types.from_json(other)),
                 };
                 ("Model", run, decode)
             }
             SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
             SiteKind::Wait(constant_id) => {
+                let cap = &self.program.constants[constant_id].name;
                 self.line(&format!(
-                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number({}))]) }};",
+                    "let argument0 = wait_capped(argument0, {}, {cap:?})?;",
+                    constant(cap)
+                ));
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
                     ir::WAIT_TOOL,
                     EffectClass::None,
-                    crate::run::engine::WAIT_MS,
-                    constant(&self.program.constants[constant_id].name)
+                    crate::run::engine::WAIT_MS
                 ));
                 (
                     "Wait",
@@ -440,9 +473,10 @@ impl<'a, 'p> Body<'a, 'p> {
 
     fn type_of(&self, expr: &Expr) -> Type {
         match expr {
-            Expr::U64(_) | Expr::Constant(_) | Expr::Len(_) => Type::U64,
+            Expr::U64(_) | Expr::Constant(_) | Expr::Len(_) | Expr::TextLen(_) => Type::U64,
             Expr::Bool(_) | Expr::Not(_) | Expr::Cancelled => Type::Bool,
-            Expr::Text(_) | Expr::Member { .. } => Type::Text,
+            Expr::Text(_) | Expr::Member { .. } | Expr::Truncate { .. } => Type::Text,
+            Expr::With { list, .. } => self.type_of(list),
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
             Expr::Construct { ty, .. } => ty.clone(),
@@ -498,6 +532,15 @@ impl<'a, 'p> Body<'a, 'p> {
             } => self.binary(*op, left, right),
             Expr::Not(operand) => format!("(!{})", self.expr(operand)),
             Expr::Len(operand) => format!("({}.len() as u64)", self.expr(operand)),
+            Expr::TextLen(operand) => format!("utf16_len(&{})", self.expr(operand)),
+            Expr::Truncate { text, tokens } => format!(
+                "truncate_middle(&{}, {})",
+                self.expr(text),
+                constant(&self.program.constants[*tokens].name)
+            ),
+            Expr::With { list, entry } => {
+                format!("with_entry({}, {})", self.expr(list), self.expr(entry))
+            }
             Expr::TextBuiltin { op, args } => {
                 let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
                 format!("text_{}({})", op.name(), args.join(", "))

@@ -128,16 +128,14 @@ pub struct Fact {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitScope {
-    Run,
     Step,
 }
 
 impl WaitScope {
     pub const fn describe(self) -> &'static str {
         match self {
-            Self::Run => "the waits of one run, added up",
             Self::Step => {
-                "each wait, since a wait's flush ends a step and a step holds at most one wait"
+                "each wait on its own, since the run that holds it may be cut and resumed at a wait"
             }
         }
     }
@@ -200,10 +198,10 @@ const CLOUDFLARE_LIMITS: Limits = Limits {
     wait_ms: Some(WaitLimit {
         limit: Limit {
             value: CLOUDFLARE_ALARM_WALL_SECONDS_MAX * MILLISECONDS_PER_SECOND,
-            unit: "milliseconds of waits per run",
-            source: "developers.cloudflare.com/durable-objects/platform/limits (an alarm handler's wall time is 15 minutes; a request's is unlimited while its client stays connected); a turn a reset leaves unfinished resumes in the alarm, so its waits must fit one alarm invocation",
+            unit: "milliseconds per wait",
+            source: "developers.cloudflare.com/durable-objects/platform/limits (an alarm handler's wall time is 15 minutes; a request's is unlimited while its client stays connected); a turn a reset leaves unfinished resumes in the alarm, and a run cut at that wall time resumes from the alarm the turn keeps armed, past every wait whose deadline it recorded, so each wait must fit one alarm invocation",
         },
-        scope: WaitScope::Run,
+        scope: WaitScope::Step,
     }),
     outbound_requests_per_invocation: Some(Limit {
         value: CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX,
@@ -408,13 +406,7 @@ pub fn check_waits(program: &Program, model: &Model) -> Vec<String> {
     };
     let mut errors = Vec::new();
     for handler in &program.handlers {
-        let waited = &handler.worst.wait_ms;
         let over = match scope {
-            WaitScope::Run if waited.total > limit.value => Some((
-                format!("worst case {} milliseconds of waits", waited.total),
-                format!("; loops: {}", waited.describe_loops()),
-            )),
-            WaitScope::Run => None,
             WaitScope::Step => longest_wait(program, handler)
                 .filter(|(_, value)| *value > limit.value)
                 .map(|(name, value)| {

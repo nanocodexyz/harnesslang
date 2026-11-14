@@ -52,8 +52,9 @@ case "$mode" in
     {
       printf '['
       for step in $(seq 1 "$steps"); do
-        printf '{"text":"Step %d.","calls":[{"name":"Bash","input":{"command":"echo step%d >> effects.log && sleep %s","description":"Record step %d"}},{"name":"Read","input":{"file_path":"effects.log"}}]},' "$step" "$step" "$tool_sleep" "$step"
+        printf '{"text":"Step %d.","throttle":%d,"calls":[{"name":"Bash","input":{"command":"echo step%d >> effects.log && sleep %s","description":"Record step %d"}},{"name":"Read","input":{"file_path":"effects.log"}}]},' "$step" "$(( step == 1 ))" "$step" "$tool_sleep" "$step"
       done
+      printf '{"text":"Writing done.txt n","stop":"max_tokens"},'
       printf '{"calls":[{"name":"Write","input":{"file_path":"done.txt","content":"done\\n"}}]},'
       printf '{"answer":"All steps ran."}]\n'
     } > "$out/script.json"

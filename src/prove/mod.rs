@@ -475,7 +475,6 @@ fn waits(program: &Program, plan: &Plan, report: &mut Report) {
             "the IR's wait worst case covers every path of the plan"
         );
         let (measured, what) = match scope {
-            crate::target::WaitScope::Run => (planned.total, "milliseconds of waits per run"),
             crate::target::WaitScope::Step => (
                 crate::target::longest_wait(program, handler).map_or(0, |(_, value)| value),
                 "milliseconds in its longest wait",

@@ -70,7 +70,7 @@ expect_caught() {
   echo "caught $file with $*: $invariant"
 }
 
-expect_caught examples/invalid/over_wait.hl wall_limit --target cloudflare
+expect_caught examples/invalid/long_wait.hl wall_limit --target cloudflare
 expect_caught examples/invalid/long_wait.hl wall_limit --target vercel
 
 for mode in "--strict" "--strict --any-state"; do

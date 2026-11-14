@@ -42,6 +42,7 @@ pub const KEYWORDS: [&str; 27] = [
 const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'code', 'spawn', 'model', 'state', 'invariant', 'fn', 'before', 'after' or 'on'";
 pub const SESSION_END_HANDLER: &str = "session_end";
 pub const CODE_TOOLS_FIELD: &str = "tools";
+pub const WAIT_BUILTIN: &str = "wait";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -363,6 +364,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let window = if self.is_word("window") {
+            self.advance();
+            Some(self.bound("the model's context window in tokens")?)
+        } else {
+            None
+        };
         let mut modes = Vec::new();
         if self.is_word("modes") {
             self.advance();
@@ -377,6 +384,7 @@ impl<'a> Parser<'a> {
             calls,
             reply,
             modes,
+            window,
         })
     }
 
@@ -704,7 +712,18 @@ impl<'a> Parser<'a> {
                 let list = self.name("a list to keep the end of")?;
                 self.word("last")?;
                 let count = self.expr()?;
-                Ok(Stmt::Keep { at, list, count })
+                let first = if self.is_word("after") {
+                    self.advance();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                Ok(Stmt::Keep {
+                    at,
+                    list,
+                    count,
+                    first,
+                })
             }
             "if" => self.if_statement(),
             "match" => self.match_statement(),
@@ -830,9 +849,23 @@ impl<'a> Parser<'a> {
 
     pub fn expr(&mut self) -> Parsed<Expr> {
         self.enter()?;
-        let parsed = self.or();
+        let parsed = self.with();
         self.leave();
         parsed
+    }
+
+    fn with(&mut self) -> Parsed<Expr> {
+        let list = self.or()?;
+        if !self.is_word("with") {
+            return Ok(list);
+        }
+        let at = self.advance().at;
+        let entry = self.or()?;
+        Ok(Expr::With {
+            at,
+            list: Box::new(list),
+            entry: Box::new(entry),
+        })
     }
 
     fn binary_chain(
@@ -975,7 +1008,12 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Name(callee));
                 }
                 self.advance();
-                let args = self.arguments()?;
+                let mut args = self.arguments()?;
+                if callee.text == WAIT_BUILTIN && self.is_word("at") {
+                    self.advance();
+                    self.word("most")?;
+                    args.push(Expr::Name(self.bound("the most a wait sleeps")?));
+                }
                 let mode = if self.is_word("mode") && matches!(self.peek_second(), Token::Name(_)) {
                     self.advance();
                     Some(self.name("a model call mode")?)

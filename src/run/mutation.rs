@@ -54,12 +54,15 @@ pub enum Mutation {
     WaitOversleeps,
     DefaultUnfilled,
     ModeDropped,
+    RetryAfterUnjournaled,
+    TruncateUncut,
+    UsageUnchecked,
     DenyDispatches,
     SpawnKeyUnscoped,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 57] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -112,6 +115,9 @@ impl Mutation {
         Self::WaitOversleeps,
         Self::DefaultUnfilled,
         Self::ModeDropped,
+        Self::RetryAfterUnjournaled,
+        Self::TruncateUncut,
+        Self::UsageUnchecked,
         Self::DenyDispatches,
         Self::SpawnKeyUnscoped,
     ];
@@ -170,6 +176,9 @@ impl Mutation {
             Self::WaitOversleeps => "wait_oversleeps",
             Self::DefaultUnfilled => "default_unfilled",
             Self::ModeDropped => "mode_dropped",
+            Self::RetryAfterUnjournaled => "retry_after_unjournaled",
+            Self::TruncateUncut => "truncate_uncut",
+            Self::UsageUnchecked => "usage_unchecked",
             Self::DenyDispatches => "deny_dispatches",
             Self::SpawnKeyUnscoped => "spawn_key_unscoped",
         }
@@ -239,6 +248,9 @@ impl Mutation {
             | Self::WaitOversleeps
             | Self::DefaultUnfilled
             | Self::ModeDropped
+            | Self::RetryAfterUnjournaled
+            | Self::TruncateUncut
+            | Self::UsageUnchecked
             | Self::DenyDispatches
             | Self::SpawnKeyUnscoped => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
