@@ -37,7 +37,14 @@ impl Profile {
     pub fn of(seed: u64, target: Target) -> Self {
         let mut rng = Rng::derive(seed, "profile");
         let roll = rng.below(PROFILE_ROLLS);
-        let mut profile = Self { name: "clean", crash_ppm: 0, torn_ppm: 0, unsynced_crash_ppm: 0, power_loss: PowerLoss::Never, lease_ppm: 0 };
+        let mut profile = Self {
+            name: "clean",
+            crash_ppm: 0,
+            torn_ppm: 0,
+            unsynced_crash_ppm: 0,
+            power_loss: PowerLoss::Never,
+            lease_ppm: 0,
+        };
         if roll < CLEAN_ROLLS_END {
             return profile;
         }
@@ -47,12 +54,16 @@ impl Profile {
             Target::NativeJsonl => {
                 profile.torn_ppm = rng.range(0, TORN_PPM_MAX);
                 profile.unsynced_crash_ppm = rng.range(0, UNSYNCED_CRASH_PPM_MAX);
-                if roll >= ERRORS_ROLLS_END && roll < ASYNC_ROLLS_END {
+                if (ERRORS_ROLLS_END..ASYNC_ROLLS_END).contains(&roll) {
                     profile.name = "async";
-                    profile.power_loss = PowerLoss::Prefix { ppm: rng.range(POWER_LOSS_PPM_MIN, POWER_LOSS_PPM_MAX) };
+                    profile.power_loss = PowerLoss::Prefix {
+                        ppm: rng.range(POWER_LOSS_PPM_MIN, POWER_LOSS_PPM_MAX),
+                    };
                 } else if roll >= ASYNC_ROLLS_END {
                     profile.name = "lying";
-                    profile.power_loss = PowerLoss::Sectors { ppm: rng.range(POWER_LOSS_PPM_MIN, POWER_LOSS_PPM_MAX) };
+                    profile.power_loss = PowerLoss::Sectors {
+                        ppm: rng.range(POWER_LOSS_PPM_MIN, POWER_LOSS_PPM_MAX),
+                    };
                 }
             }
             Target::ServerPostgres => {

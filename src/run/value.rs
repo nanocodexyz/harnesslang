@@ -64,9 +64,12 @@ pub fn to_json(program: &Program, ty: &Type, value: &Value) -> Json {
         (Type::U64, Value::U64(number)) => Json::Number(*number),
         (Type::Bool, Value::Bool(flag)) => Json::Bool(*flag),
         (Type::Text, Value::Text(text)) => Json::String(text.clone()),
-        (Type::List { element, .. }, Value::List(items)) => {
-            Json::Array(items.iter().map(|item| to_json(program, element, item)).collect())
-        }
+        (Type::List { element, .. }, Value::List(items)) => Json::Array(
+            items
+                .iter()
+                .map(|item| to_json(program, element, item))
+                .collect(),
+        ),
         (Type::Sum(ir::CALL), Value::Variant(_, fields)) => {
             let mut map = BTreeMap::new();
             for (name, field) in ir::CALL_FIELDS.iter().zip(fields) {
@@ -75,13 +78,22 @@ pub fn to_json(program: &Program, ty: &Type, value: &Value) -> Json {
             Json::Object(map)
         }
         (_, Value::Variant(variant, fields)) => {
-            let variants = ty.variants(program).expect("a variant value has a sum type");
+            let variants = ty
+                .variants(program)
+                .expect("a variant value has a sum type");
             let definition = &variants[*variant];
-            assert_eq!(definition.fields.len(), fields.len(), "a variant value carries its fields");
+            assert_eq!(
+                definition.fields.len(),
+                fields.len(),
+                "a variant value carries its fields"
+            );
             let name = definition.name.clone();
             match fields.len() {
                 0 => Json::String(name),
-                1 => Json::Object(BTreeMap::from([(name, to_json(program, &definition.fields[0], &fields[0]))])),
+                1 => Json::Object(BTreeMap::from([(
+                    name,
+                    to_json(program, &definition.fields[0], &fields[0]),
+                )])),
                 _ => {
                     let items = definition
                         .fields
@@ -99,12 +111,18 @@ pub fn to_json(program: &Program, ty: &Type, value: &Value) -> Json {
 
 pub fn from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value, String> {
     match ty {
-        Type::U64 => json.as_u64().map(Value::U64).ok_or_else(|| format!("expected u64, found {}", json.encode())),
+        Type::U64 => json
+            .as_u64()
+            .map(Value::U64)
+            .ok_or_else(|| format!("expected u64, found {}", json.encode())),
         Type::Bool => match json {
             Json::Bool(flag) => Ok(Value::Bool(*flag)),
             other => Err(format!("expected bool, found {}", other.encode())),
         },
-        Type::Text => json.as_str().map(|text| Value::Text(text.to_owned())).ok_or_else(|| format!("expected text, found {}", json.encode())),
+        Type::Text => json
+            .as_str()
+            .map(|text| Value::Text(text.to_owned()))
+            .ok_or_else(|| format!("expected text, found {}", json.encode())),
         Type::List { element, capacity } => {
             let Json::Array(items) = json else {
                 return Err(format!("expected a list, found {}", json.encode()));
@@ -121,7 +139,10 @@ pub fn from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value, Str
         Type::Sum(ir::CALL) => {
             let mut fields = Vec::new();
             for name in ir::CALL_FIELDS {
-                let field = json.get(name).and_then(Json::as_str).ok_or_else(|| format!("call lacks text field '{name}'"))?;
+                let field = json
+                    .get(name)
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| format!("call lacks text field '{name}'"))?;
                 fields.push(Value::Text(field.to_owned()));
             }
             if !matches!(json, Json::Object(map) if map.len() == ir::CALL_FIELDS.len()) {
@@ -139,7 +160,13 @@ fn variant_from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value,
         Json::String(name) => (name.as_str(), None),
         other => match other.tagged() {
             Some((name, payload)) => (name, Some(payload)),
-            None => return Err(format!("expected a variant of {}, found {}", ty.name(program), json.encode())),
+            None => {
+                return Err(format!(
+                    "expected a variant of {}, found {}",
+                    ty.name(program),
+                    json.encode()
+                ));
+            }
         },
     };
     let Some(index) = variants.iter().position(|variant| variant.name == name) else {
@@ -162,7 +189,11 @@ fn variant_from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value,
 }
 
 pub fn state_json(program: &Program, state: &[Value]) -> Json {
-    assert_eq!(state.len(), program.state.len(), "the state has one value per field");
+    assert_eq!(
+        state.len(),
+        program.state.len(),
+        "the state has one value per field"
+    );
     let mut map = BTreeMap::new();
     for (field, value) in program.state.iter().zip(state) {
         map.insert(field.name.clone(), to_json(program, &field.ty, value));
@@ -175,7 +206,10 @@ pub fn state_text_hashed(program: &Program, state: &[Value]) -> String {
     for (field, value) in program.state.iter().zip(state) {
         fields.insert(&field.name, to_json(program, &field.ty, value));
     }
-    let entries: Vec<String> = fields.iter().map(|(name, value)| format!("{}:{}", Json::text(name).encode(), value.encode())).collect();
+    let entries: Vec<String> = fields
+        .iter()
+        .map(|(name, value)| format!("{}:{}", Json::text(name).encode(), value.encode()))
+        .collect();
     format!("{{{}}}", entries.join(","))
 }
 
@@ -184,11 +218,17 @@ pub fn state_from_json(program: &Program, json: &Json) -> Result<Vec<Value>, Str
         return Err("state is not an object".to_owned());
     };
     if map.len() != program.state.len() {
-        return Err(format!("state has {} fields, the program has {}", map.len(), program.state.len()));
+        return Err(format!(
+            "state has {} fields, the program has {}",
+            map.len(),
+            program.state.len()
+        ));
     }
     let mut state = Vec::new();
     for field in &program.state {
-        let json = map.get(&field.name).ok_or_else(|| format!("state lacks field '{}'", field.name))?;
+        let json = map
+            .get(&field.name)
+            .ok_or_else(|| format!("state lacks field '{}'", field.name))?;
         state.push(from_json(program, &field.ty, json)?);
     }
     Ok(state)
@@ -198,6 +238,8 @@ pub fn initial_state(program: &Program) -> Vec<Value> {
     program
         .state
         .iter()
-        .map(|field| Value::zero(&field.ty).expect("the checker admits only state fields with a zero value"))
+        .map(|field| {
+            Value::zero(&field.ty).expect("the checker admits only state fields with a zero value")
+        })
         .collect()
 }

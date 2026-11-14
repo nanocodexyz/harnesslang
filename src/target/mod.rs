@@ -12,7 +12,13 @@ pub enum Target {
 }
 
 impl Target {
-    pub const ALL: [Self; 5] = [Self::NativeJsonl, Self::NativeSqlite, Self::ServerPostgres, Self::Cloudflare, Self::Vercel];
+    pub const ALL: [Self; 5] = [
+        Self::NativeJsonl,
+        Self::NativeSqlite,
+        Self::ServerPostgres,
+        Self::Cloudflare,
+        Self::Vercel,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -97,7 +103,35 @@ pub struct Model {
     pub limits: Limits,
 }
 
-const NO_LIMITS: Limits = Limits { memory: None, outbound_requests_per_invocation: None, duration_per_invocation: None };
+const NO_LIMITS: Limits = Limits {
+    memory: None,
+    outbound_requests_per_invocation: None,
+    duration_per_invocation: None,
+};
+
+const CLOUDFLARE_LIMITS: Limits = Limits {
+    memory: Some(Limit {
+        value: CLOUDFLARE_ISOLATE_MEMORY_BYTES_MAX,
+        unit: "bytes per isolate",
+        source: "developers.cloudflare.com/durable-objects/platform/limits",
+    }),
+    outbound_requests_per_invocation: Some(Limit {
+        value: CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX,
+        unit: "outbound requests per invocation",
+        source: "developers.cloudflare.com/workers/platform/limits (Workers Paid default)",
+    }),
+    duration_per_invocation: None,
+};
+
+const VERCEL_LIMITS: Limits = Limits {
+    memory: None,
+    outbound_requests_per_invocation: None,
+    duration_per_invocation: Some(Limit {
+        value: VERCEL_FUNCTION_DURATION_SECONDS_MAX,
+        unit: "seconds per Function invocation",
+        source: "vercel.com/docs/functions/limitations (Pro and Enterprise, fluid compute)",
+    }),
+};
 
 pub const fn model(target: Target) -> Model {
     match target {
@@ -143,19 +177,7 @@ pub const fn model(target: Target) -> Model {
             others: Others::AlarmAfterReset,
             recovery: Recovery::AtLoad,
             gate_before_outbound: true,
-            limits: Limits {
-                memory: Some(Limit {
-                    value: CLOUDFLARE_ISOLATE_MEMORY_BYTES_MAX,
-                    unit: "bytes per isolate",
-                    source: "developers.cloudflare.com/durable-objects/platform/limits",
-                }),
-                outbound_requests_per_invocation: Some(Limit {
-                    value: CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX,
-                    unit: "outbound requests per invocation",
-                    source: "developers.cloudflare.com/workers/platform/limits (Workers Paid default)",
-                }),
-                duration_per_invocation: None,
-            },
+            limits: CLOUDFLARE_LIMITS,
         },
         Target::Vercel => Model {
             target,
@@ -164,17 +186,11 @@ pub const fn model(target: Target) -> Model {
             flush: Flush::StepBoundary,
             atomic: AtomicUnit::Step,
             others: Others::RetriedStep,
-            recovery: Recovery::InStep { attempts_max: VERCEL_STEP_ATTEMPTS_MAX },
-            gate_before_outbound: false,
-            limits: Limits {
-                memory: None,
-                outbound_requests_per_invocation: None,
-                duration_per_invocation: Some(Limit {
-                    value: VERCEL_FUNCTION_DURATION_SECONDS_MAX,
-                    unit: "seconds per Function invocation",
-                    source: "vercel.com/docs/functions/limitations (Pro and Enterprise, fluid compute)",
-                }),
+            recovery: Recovery::InStep {
+                attempts_max: VERCEL_STEP_ATTEMPTS_MAX,
             },
+            gate_before_outbound: false,
+            limits: VERCEL_LIMITS,
         },
     }
 }
@@ -213,12 +229,18 @@ pub fn describe(model: &Model) -> String {
     )];
     let limits = [
         ("memory", model.limits.memory),
-        ("outbound requests", model.limits.outbound_requests_per_invocation),
+        (
+            "outbound requests",
+            model.limits.outbound_requests_per_invocation,
+        ),
         ("duration", model.limits.duration_per_invocation),
     ];
     for (what, limit) in limits {
         if let Some(limit) = limit {
-            lines.push(format!("  limit {what}: {} {} ({})", limit.value, limit.unit, limit.source));
+            lines.push(format!(
+                "  limit {what}: {} {} ({})",
+                limit.value, limit.unit, limit.source
+            ));
         }
     }
     lines.join("\n")

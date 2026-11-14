@@ -4,7 +4,6 @@ use crate::effect::EffectClass;
 use crate::run::crc::crc32;
 use crate::run::json::{self, Json};
 
-
 pub const FIRST_SEQ: u64 = 1;
 pub const CRC32_CHECK_INPUT: &[u8] = b"123456789";
 pub const CRC32_CHECK: u32 = 0xcbf4_3926;
@@ -95,9 +94,15 @@ pub fn call_id(turn: u64, seq: u64) -> String {
 }
 
 fn parse_call_id(text: &str) -> Result<(u64, u64), String> {
-    let (turn, seq) = text.split_once('/').ok_or_else(|| format!("call id {text:?} is not turn/seq"))?;
-    let turn = turn.parse().map_err(|_| format!("call id {text:?} has no turn number"))?;
-    let seq = seq.parse().map_err(|_| format!("call id {text:?} has no sequence number"))?;
+    let (turn, seq) = text
+        .split_once('/')
+        .ok_or_else(|| format!("call id {text:?} is not turn/seq"))?;
+    let turn = turn
+        .parse()
+        .map_err(|_| format!("call id {text:?} has no turn number"))?;
+    let seq = seq
+        .parse()
+        .map_err(|_| format!("call id {text:?} has no sequence number"))?;
     Ok((turn, seq))
 }
 
@@ -112,9 +117,25 @@ fn output_json(output: &Output) -> Json {
     }
 }
 
+fn status_json(turn: u64, last: u64, outcome: Outcome, result: &Json) -> Json {
+    let finished = Json::object([
+        ("last", Json::Number(last)),
+        ("outcome", Json::text(outcome.name())),
+        ("result", result.clone()),
+    ]);
+    Json::object([
+        ("status", Json::object([("finished", finished)])),
+        ("turn", turn_text(turn)),
+    ])
+}
+
 pub fn to_json(record: &Record) -> Json {
     let (tag, body) = match record {
-        Record::Admitted { turn, handler, arguments } => (
+        Record::Admitted {
+            turn,
+            handler,
+            arguments,
+        } => (
             "admitted",
             Json::object([
                 ("digest", Json::text(handler)),
@@ -125,7 +146,13 @@ pub fn to_json(record: &Record) -> Json {
                 ("turn", turn_text(*turn)),
             ]),
         ),
-        Record::Call { turn, seq, tool, effect, input } => (
+        Record::Call {
+            turn,
+            seq,
+            tool,
+            effect,
+            input,
+        } => (
             "call",
             Json::object([
                 ("call_id", Json::String(call_id(*turn, *seq))),
@@ -144,7 +171,11 @@ pub fn to_json(record: &Record) -> Json {
                 ("seq", Json::Number(*seq)),
             ]),
         ),
-        Record::Model { turn, seq, response } => (
+        Record::Model {
+            turn,
+            seq,
+            response,
+        } => (
             "model",
             Json::object([
                 ("call_id", Json::String(call_id(*turn, *seq))),
@@ -153,32 +184,37 @@ pub fn to_json(record: &Record) -> Json {
                 ("turn", turn_text(*turn)),
             ]),
         ),
-        Record::Recovery { turn, attempt, unknown } => (
+        Record::Recovery {
+            turn,
+            attempt,
+            unknown,
+        } => (
             "recovery",
             Json::object([
                 ("attempt", Json::Number(*attempt)),
                 ("turn", turn_text(*turn)),
-                ("unknown", Json::Array(unknown.iter().map(|seq| Json::String(call_id(*turn, *seq))).collect())),
-            ]),
-        ),
-        Record::Status { turn, last, outcome, result } => (
-            "status",
-            Json::object([
                 (
-                    "status",
-                    Json::object([(
-                        "finished",
-                        Json::object([
-                            ("last", Json::Number(*last)),
-                            ("outcome", Json::text(outcome.name())),
-                            ("result", result.clone()),
-                        ]),
-                    )]),
+                    "unknown",
+                    Json::Array(
+                        unknown
+                            .iter()
+                            .map(|seq| Json::String(call_id(*turn, *seq)))
+                            .collect(),
+                    ),
                 ),
-                ("turn", turn_text(*turn)),
             ]),
         ),
-        Record::Checkpoint { revision, state, payload } => (
+        Record::Status {
+            turn,
+            last,
+            outcome,
+            result,
+        } => ("status", status_json(*turn, *last, *outcome, result)),
+        Record::Checkpoint {
+            revision,
+            state,
+            payload,
+        } => (
             "checkpoint",
             Json::object([
                 ("payload", Json::String(payload.clone())),
@@ -197,32 +233,47 @@ struct Fields<'a> {
 
 impl<'a> Fields<'a> {
     fn get(&self, key: &str) -> Result<&'a Json, String> {
-        self.map.get(key).ok_or_else(|| format!("{} record lacks '{key}'", self.tag))
+        self.map
+            .get(key)
+            .ok_or_else(|| format!("{} record lacks '{key}'", self.tag))
     }
 
     fn number(&self, key: &str) -> Result<u64, String> {
-        self.get(key)?.as_u64().ok_or_else(|| format!("{} record's '{key}' is not a number", self.tag))
+        self.get(key)?
+            .as_u64()
+            .ok_or_else(|| format!("{} record's '{key}' is not a number", self.tag))
     }
 
     fn text(&self, key: &str) -> Result<&'a str, String> {
-        self.get(key)?.as_str().ok_or_else(|| format!("{} record's '{key}' is not text", self.tag))
+        self.get(key)?
+            .as_str()
+            .ok_or_else(|| format!("{} record's '{key}' is not text", self.tag))
     }
 
     fn turn(&self) -> Result<u64, String> {
-        self.text("turn")?.parse().map_err(|_| format!("{} record's turn is not a number", self.tag))
+        self.text("turn")?
+            .parse()
+            .map_err(|_| format!("{} record's turn is not a number", self.tag))
     }
 
     fn call(&self) -> Result<(u64, u64), String> {
         let (turn, seq) = parse_call_id(self.text("call_id")?)?;
         if self.number("seq")? != seq {
-            return Err(format!("{} record's seq disagrees with its call id", self.tag));
+            return Err(format!(
+                "{} record's seq disagrees with its call id",
+                self.tag
+            ));
         }
         Ok((turn, seq))
     }
 
     fn exact(&self, keys: &[&str]) -> Result<(), String> {
         if self.map.len() != keys.len() || keys.iter().any(|key| !self.map.contains_key(*key)) {
-            return Err(format!("{} record has fields {:?}, expected {keys:?}", self.tag, self.map.keys().collect::<Vec<_>>()));
+            return Err(format!(
+                "{} record has fields {:?}, expected {keys:?}",
+                self.tag,
+                self.map.keys().collect::<Vec<_>>()
+            ));
         }
         Ok(())
     }
@@ -245,7 +296,11 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
         "admitted" => {
             fields.exact(&["digest", "first", "hand", "metadata", "prompt", "turn"])?;
             let handler = fields.text("digest")?.to_owned();
-            Ok(Record::Admitted { turn: fields.turn()?, handler, arguments: fields.get("prompt")?.clone() })
+            Ok(Record::Admitted {
+                turn: fields.turn()?,
+                handler,
+                arguments: fields.get("prompt")?.clone(),
+            })
         }
         "call" => {
             fields.exact(&["call_id", "effect", "input", "seq", "tool", "turn"])?;
@@ -253,18 +308,33 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
             if fields.turn()? != turn {
                 return Err("call record's turn disagrees with its call id".to_owned());
             }
-            let effect = EffectClass::parse(fields.text("effect")?).ok_or("call record has an unknown effect class")?;
-            Ok(Record::Call { turn, seq, tool: fields.text("tool")?.to_owned(), effect, input: fields.get("input")?.clone() })
+            let effect = EffectClass::parse(fields.text("effect")?)
+                .ok_or("call record has an unknown effect class")?;
+            Ok(Record::Call {
+                turn,
+                seq,
+                tool: fields.text("tool")?.to_owned(),
+                effect,
+                input: fields.get("input")?.clone(),
+            })
         }
         "result" => {
             fields.exact(&["call_id", "output", "seq"])?;
             let (turn, seq) = fields.call()?;
-            Ok(Record::Result { turn, seq, output: output_from(fields.get("output")?)? })
+            Ok(Record::Result {
+                turn,
+                seq,
+                output: output_from(fields.get("output")?)?,
+            })
         }
         "model" => {
             fields.exact(&["call_id", "response", "seq", "turn"])?;
             let (turn, seq) = fields.call()?;
-            Ok(Record::Model { turn, seq, response: fields.get("response")?.clone() })
+            Ok(Record::Model {
+                turn,
+                seq,
+                response: fields.get("response")?.clone(),
+            })
         }
         "recovery" => {
             fields.exact(&["attempt", "turn", "unknown"])?;
@@ -274,19 +344,30 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
             };
             let mut unknown = Vec::new();
             for item in items {
-                let (call_turn, seq) = parse_call_id(item.as_str().ok_or("recovery lists a call id that is not text")?)?;
+                let (call_turn, seq) = parse_call_id(
+                    item.as_str()
+                        .ok_or("recovery lists a call id that is not text")?,
+                )?;
                 if call_turn != turn {
                     return Err("recovery lists a call of another turn".to_owned());
                 }
                 unknown.push(seq);
             }
-            Ok(Record::Recovery { turn, attempt: fields.number("attempt")?, unknown })
+            Ok(Record::Recovery {
+                turn,
+                attempt: fields.number("attempt")?,
+                unknown,
+            })
         }
         "status" => status_from(&fields),
         "checkpoint" => {
             fields.exact(&["payload", "revision", "state"])?;
             let payload = fields.text("payload")?.to_owned();
-            Ok(Record::Checkpoint { revision: fields.number("revision")?, state: fields.text("state")?.to_owned(), payload })
+            Ok(Record::Checkpoint {
+                revision: fields.number("revision")?,
+                state: fields.text("state")?.to_owned(),
+                payload,
+            })
         }
         other => Err(format!("unknown record '{other}'")),
     }
@@ -297,20 +378,31 @@ fn status_from(fields: &Fields<'_>) -> Result<Record, String> {
     let Some(("finished", Json::Object(finished))) = fields.get("status")?.tagged() else {
         return Err("status record is not finished".to_owned());
     };
-    let inner = Fields { tag: "finished", map: finished };
+    let inner = Fields {
+        tag: "finished",
+        map: finished,
+    };
     inner.exact(&["last", "outcome", "result"])?;
     let outcome = match inner.text("outcome")? {
         "completed" => Outcome::Completed,
         "failed" => Outcome::Failed,
         other => return Err(format!("unknown outcome '{other}'")),
     };
-    Ok(Record::Status { turn: fields.turn()?, last: inner.number("last")?, outcome, result: inner.get("result")?.clone() })
+    Ok(Record::Status {
+        turn: fields.turn()?,
+        last: inner.number("last")?,
+        outcome,
+        result: inner.get("result")?.clone(),
+    })
 }
 
 pub fn encode_line(record: &Record, checksum: bool) -> String {
     let body = to_json(record).encode();
     let line = if checksum {
-        format!("{LINE_PREFIX}{}{LINE_MIDDLE}{body}{LINE_SUFFIX}", crc32(body.as_bytes()))
+        format!(
+            "{LINE_PREFIX}{}{LINE_MIDDLE}{body}{LINE_SUFFIX}",
+            crc32(body.as_bytes())
+        )
     } else {
         body
     };
@@ -321,10 +413,18 @@ pub fn encode_line(record: &Record, checksum: bool) -> String {
 
 pub fn decode_line(line: &str, checksum: bool) -> Result<Record, String> {
     let body = if checksum {
-        let rest = line.strip_prefix(LINE_PREFIX).ok_or("line does not start with its checksum")?;
-        let (crc, rest) = rest.split_once(LINE_MIDDLE).ok_or("line has no record after its checksum")?;
-        let body = rest.strip_suffix(LINE_SUFFIX).ok_or("line does not end its envelope")?;
-        let crc: u32 = crc.parse().map_err(|_| "line's checksum is not a number".to_owned())?;
+        let rest = line
+            .strip_prefix(LINE_PREFIX)
+            .ok_or("line does not start with its checksum")?;
+        let (crc, rest) = rest
+            .split_once(LINE_MIDDLE)
+            .ok_or("line has no record after its checksum")?;
+        let body = rest
+            .strip_suffix(LINE_SUFFIX)
+            .ok_or("line does not end its envelope")?;
+        let crc: u32 = crc
+            .parse()
+            .map_err(|_| "line's checksum is not a number".to_owned())?;
         if crc32(body.as_bytes()) != crc {
             return Err("line's checksum does not match its record".to_owned());
         }
@@ -358,12 +458,19 @@ pub fn decode_lines(bytes: &[u8], checksum: bool) -> Result<Decoded, String> {
         let Some(length) = bytes[offset..].iter().position(|byte| *byte == LINE_END) else {
             if !checksum {
                 let text = String::from_utf8_lossy(&bytes[offset..]);
-                return Err(format!("line {} is not terminated: {text:?}", records.len() + 1).chars().take(160).collect());
+                return Err(
+                    format!("line {} is not terminated: {text:?}", records.len() + 1)
+                        .chars()
+                        .take(160)
+                        .collect(),
+                );
             }
             break;
         };
         let line = &bytes[offset..offset + length];
-        let decoded = std::str::from_utf8(line).map_err(|_| "line is not utf-8".to_owned()).and_then(|line| decode_line(line, checksum));
+        let decoded = std::str::from_utf8(line)
+            .map_err(|_| "line is not utf-8".to_owned())
+            .and_then(|line| decode_line(line, checksum));
         match decoded {
             Ok(record) => records.push(record),
             Err(_) if checksum => break,
@@ -371,5 +478,9 @@ pub fn decode_lines(bytes: &[u8], checksum: bool) -> Result<Decoded, String> {
         }
         offset += length + 1;
     }
-    Ok(Decoded { records, valid_bytes: offset, dropped_bytes: bytes.len() - offset })
+    Ok(Decoded {
+        records,
+        valid_bytes: offset,
+        dropped_bytes: bytes.len() - offset,
+    })
 }

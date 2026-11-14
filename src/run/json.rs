@@ -65,7 +65,10 @@ impl Json {
     }
 
     fn write(&self, out: &mut String, depth: u32) {
-        assert!(depth <= JSON_DEPTH_MAX, "values we encode are nested at most json_depth_max deep");
+        assert!(
+            depth <= JSON_DEPTH_MAX,
+            "values we encode are nested at most json_depth_max deep"
+        );
         match self {
             Self::Null => out.push_str("null"),
             Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
@@ -136,7 +139,10 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn whitespace(&mut self) {
-        while matches!(self.bytes.get(self.offset), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        while matches!(
+            self.bytes.get(self.offset),
+            Some(b' ' | b'\t' | b'\n' | b'\r')
+        ) {
             self.offset += 1;
         }
     }
@@ -155,7 +161,9 @@ impl Parser<'_> {
 
     fn value(&mut self, depth: u32) -> Result<Json, String> {
         if depth > JSON_DEPTH_MAX {
-            return self.fail(&format!("nesting deeper than json_depth_max ({JSON_DEPTH_MAX})"));
+            return self.fail(&format!(
+                "nesting deeper than json_depth_max ({JSON_DEPTH_MAX})"
+            ));
         }
         match self.bytes.get(self.offset) {
             None => self.fail("unexpected end"),
@@ -173,7 +181,11 @@ impl Parser<'_> {
     fn number(&mut self) -> Result<Json, String> {
         let start = self.offset;
         let mut value: u64 = 0;
-        while let Some(byte) = self.bytes.get(self.offset).filter(|byte| byte.is_ascii_digit()) {
+        while let Some(byte) = self
+            .bytes
+            .get(self.offset)
+            .filter(|byte| byte.is_ascii_digit())
+        {
             value = value
                 .checked_mul(10)
                 .and_then(|value| value.checked_add(u64::from(byte - b'0')))
@@ -190,9 +202,13 @@ impl Parser<'_> {
     }
 
     fn hex4(&mut self) -> Result<u32, String> {
-        let digits = self.bytes.get(self.offset..self.offset + 4).ok_or("truncated \\u escape")?;
+        let digits = self
+            .bytes
+            .get(self.offset..self.offset + 4)
+            .ok_or("truncated \\u escape")?;
         let text = std::str::from_utf8(digits).map_err(|_| "invalid \\u escape".to_owned())?;
-        let code = u32::from_str_radix(text, 16).map_err(|_| format!("invalid \\u escape at offset {}", self.offset))?;
+        let code = u32::from_str_radix(text, 16)
+            .map_err(|_| format!("invalid \\u escape at offset {}", self.offset))?;
         self.offset += 4;
         Ok(code)
     }
@@ -226,7 +242,8 @@ impl Parser<'_> {
                 } else {
                     high
                 };
-                char::from_u32(code).ok_or_else(|| format!("invalid code point at offset {}", self.offset))?
+                char::from_u32(code)
+                    .ok_or_else(|| format!("invalid code point at offset {}", self.offset))?
             }
             _ => return self.fail("unknown escape"),
         };
@@ -245,7 +262,8 @@ impl Parser<'_> {
                 }
                 self.offset += 1;
             }
-            let run = std::str::from_utf8(&self.bytes[start..self.offset]).map_err(|_| format!("string is not utf-8 at offset {start}"))?;
+            let run = std::str::from_utf8(&self.bytes[start..self.offset])
+                .map_err(|_| format!("string is not utf-8 at offset {start}"))?;
             out.push_str(run);
             match self.bytes.get(self.offset) {
                 Some(b'"') => {

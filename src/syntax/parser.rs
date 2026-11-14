@@ -100,7 +100,10 @@ impl<'a> Parser<'a> {
 
     fn bound(&mut self, what: &str) -> Parsed<Name> {
         if let Token::Number(value) = self.peek().token {
-            return Err(Diagnostic::new(self.at(), format!("{what} must be a named constant, found number {value}")));
+            return Err(Diagnostic::new(
+                self.at(),
+                format!("{what} must be a named constant, found number {value}"),
+            ));
         }
         self.name(&format!("a named constant for {what}"))
     }
@@ -128,7 +131,10 @@ impl<'a> Parser<'a> {
         while self.peek().token != Token::End {
             items.push(self.item()?);
         }
-        assert_eq!(self.depth, 0, "a whole program leaves every nesting it enters");
+        assert_eq!(
+            self.depth, 0,
+            "a whole program leaves every nesting it enters"
+        );
         Ok(Program { name, items })
     }
 
@@ -203,7 +209,13 @@ impl<'a> Parser<'a> {
             _ => None,
         }
         .ok_or_else(|| {
-            Diagnostic::new(at, format!("expected 'none', 'idempotent' or 'external', found {}", self.peek().token.describe()))
+            Diagnostic::new(
+                at,
+                format!(
+                    "expected 'none', 'idempotent' or 'external', found {}",
+                    self.peek().token.describe()
+                ),
+            )
         })?;
         self.advance();
         Ok(Tool {
@@ -280,7 +292,10 @@ impl<'a> Parser<'a> {
             self.symbol(Symbol::Less)?;
             let element = Box::new(self.type_expr()?);
             if self.is_symbol(Symbol::Greater) {
-                return Err(Diagnostic::new(self.at(), "a list needs a capacity: write list<T, constant>"));
+                return Err(Diagnostic::new(
+                    self.at(),
+                    "a list needs a capacity: write list<T, constant>",
+                ));
             }
             self.symbol(Symbol::Comma)?;
             let capacity = self.bound("a list's capacity")?;
@@ -316,7 +331,10 @@ impl<'a> Parser<'a> {
         let mut statements = Vec::new();
         while !self.is_symbol(Symbol::RightBrace) {
             if self.peek().token == Token::End {
-                return Err(Diagnostic::new(at, "block is not closed before the end of the file"));
+                return Err(Diagnostic::new(
+                    at,
+                    "block is not closed before the end of the file",
+                ));
             }
             statements.push(self.statement()?);
         }
@@ -479,11 +497,15 @@ impl<'a> Parser<'a> {
     }
 
     fn or(&mut self) -> Parsed<Expr> {
-        self.binary_chain(Self::and, |parser| parser.is_word("or").then_some(BinaryOp::Or))
+        self.binary_chain(Self::and, |parser| {
+            parser.is_word("or").then_some(BinaryOp::Or)
+        })
     }
 
     fn and(&mut self) -> Parsed<Expr> {
-        self.binary_chain(Self::not, |parser| parser.is_word("and").then_some(BinaryOp::And))
+        self.binary_chain(Self::not, |parser| {
+            parser.is_word("and").then_some(BinaryOp::And)
+        })
     }
 
     fn not(&mut self) -> Parsed<Expr> {

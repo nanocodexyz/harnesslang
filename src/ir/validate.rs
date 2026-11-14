@@ -26,8 +26,16 @@ fn handler(program: &Program, handler: &Handler) {
             );
         }
         if site.kind == SiteKind::Dispatch {
-            assert_eq!(site.class, SiteClass::Dispatched, "a dispatch resolves its class at run time");
-            assert_eq!(site.result, Type::Maybe(Box::new(Type::Text)), "dispatch yields maybe<text>");
+            assert_eq!(
+                site.class,
+                SiteClass::Dispatched,
+                "a dispatch resolves its class at run time"
+            );
+            assert_eq!(
+                site.result,
+                Type::Maybe(Box::new(Type::Text)),
+                "dispatch yields maybe<text>"
+            );
         }
     }
     for param in &handler.params {
@@ -35,7 +43,11 @@ fn handler(program: &Program, handler: &Handler) {
     }
     block(program, handler, &handler.body, &mut used);
     for (site, count) in used.iter().enumerate() {
-        assert_eq!(*count, 1, "site {site} of {} is placed exactly once", handler.name);
+        assert_eq!(
+            *count, 1,
+            "site {site} of {} is placed exactly once",
+            handler.name
+        );
     }
 }
 
@@ -47,7 +59,10 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 expr(handler, value);
             }
             Stmt::Assign { field, value } | Stmt::Push { field, value } => {
-                assert!(*field < program.state.len(), "assignments target state fields");
+                assert!(
+                    *field < program.state.len(),
+                    "assignments target state fields"
+                );
                 expr(handler, value);
             }
             Stmt::If {
@@ -62,7 +77,11 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
             Stmt::Match { subject, ty, arms } => {
                 expr(handler, subject);
                 let variants = ty.variants(program).expect("a match subject is a sum");
-                assert_eq!(arms.len(), variants.len(), "a match has one arm per variant");
+                assert_eq!(
+                    arms.len(),
+                    variants.len(),
+                    "a match has one arm per variant"
+                );
                 for (index, arm) in arms.iter().enumerate() {
                     assert_eq!(arm.variant, index, "arms are in variant order");
                     assert_eq!(

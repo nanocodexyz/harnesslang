@@ -179,8 +179,8 @@ fn name(cursor: &mut Cursor<'_>) -> Token {
     {
         cursor.bump();
     }
-    let text = std::str::from_utf8(&cursor.bytes[start..cursor.offset])
-        .expect("an ascii run is utf-8");
+    let text =
+        std::str::from_utf8(&cursor.bytes[start..cursor.offset]).expect("an ascii run is utf-8");
     Token::Name(text.to_owned())
 }
 
@@ -204,7 +204,10 @@ fn number(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
         .peek(0)
         .is_some_and(|byte| byte.is_ascii_alphabetic())
     {
-        return Err(Diagnostic::new(cursor.at(), "a number is followed by a letter"));
+        return Err(Diagnostic::new(
+            cursor.at(),
+            "a number is followed by a letter",
+        ));
     }
     Ok(Token::Number(value))
 }
@@ -214,7 +217,10 @@ fn text(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
     let mut bytes = Vec::new();
     loop {
         let Some(byte) = cursor.peek(0) else {
-            return Err(Diagnostic::new(at, "text literal is not closed before the end of the file"));
+            return Err(Diagnostic::new(
+                at,
+                "text literal is not closed before the end of the file",
+            ));
         };
         match byte {
             b'"' => {
@@ -222,7 +228,10 @@ fn text(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
                 break;
             }
             b'\n' => {
-                return Err(Diagnostic::new(at, "text literal is not closed before the end of its line"));
+                return Err(Diagnostic::new(
+                    at,
+                    "text literal is not closed before the end of its line",
+                ));
             }
             b'\\' => {
                 let escape_at = cursor.at();
@@ -247,7 +256,8 @@ fn text(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
             }
         }
     }
-    let text = String::from_utf8(bytes).map_err(|_| Diagnostic::new(at, "text literal is not utf-8"))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| Diagnostic::new(at, "text literal is not utf-8"))?;
     Ok(Token::Text(text))
 }
 
@@ -267,5 +277,8 @@ fn symbol(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
     }
     let rest = std::str::from_utf8(&cursor.bytes[cursor.offset..]).unwrap_or("");
     let shown = rest.chars().next().unwrap_or('?');
-    Err(Diagnostic::new(at, format!("unexpected character {shown:?}")))
+    Err(Diagnostic::new(
+        at,
+        format!("unexpected character {shown:?}"),
+    ))
 }

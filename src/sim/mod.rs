@@ -42,7 +42,10 @@ pub fn supported(program: &Program) -> Result<(), String> {
         for local in &handler.params {
             let param = &handler.locals[*local];
             if contains_list(&param.ty) {
-                return Err(format!("handler '{}': the simulator cannot generate the list argument '{}'", handler.name, param.name));
+                return Err(format!(
+                    "handler '{}': the simulator cannot generate the list argument '{}'",
+                    handler.name, param.name
+                ));
             }
         }
     }
@@ -66,19 +69,35 @@ pub fn generate(program: &Program, ty: &Type, rng: &mut Rng) -> Value {
         Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => {
             let variants = ty.variants(program).expect("a sum has variants");
             let variant = rng.pick(variants.len());
-            let fields = variants[variant].fields.iter().map(|field| generate(program, field, rng)).collect();
+            let fields = variants[variant]
+                .fields
+                .iter()
+                .map(|field| generate(program, field, rng))
+                .collect();
             Value::Variant(variant, fields)
         }
     }
 }
 
 fn liveness(detail: String) -> Violation {
-    Violation { invariant: Invariant::Liveness, detail }
+    Violation {
+        invariant: Invariant::Liveness,
+        detail,
+    }
 }
 
-fn drive_turn(program: &Program, world: &mut SimWorld<'_>, request: &TurnRequest) -> Result<(), Violation> {
+fn drive_turn(
+    program: &Program,
+    world: &mut SimWorld<'_>,
+    request: &TurnRequest,
+) -> Result<(), Violation> {
     for _ in 0..RUNS_PER_TURN_MAX {
-        let (records, epoch) = world.begin_run().map_err(|error| liveness(format!("turn {}: the journal cannot be read: {error}", request.turn)))?;
+        let (records, epoch) = world.begin_run().map_err(|error| {
+            liveness(format!(
+                "turn {}: the journal cannot be read: {error}",
+                request.turn
+            ))
+        })?;
         let model = world.target;
         let mutation = world.mutation;
         match run_turn(program, &model, mutation, world, epoch, &records, request) {
@@ -88,10 +107,15 @@ fn drive_turn(program: &Program, world: &mut SimWorld<'_>, request: &TurnRequest
                 return Ok(());
             }
             Err(Exit::Stop(_)) => {}
-            Err(Exit::Corrupt(error)) => return Err(liveness(format!("turn {}: {error}", request.turn))),
+            Err(Exit::Corrupt(error)) => {
+                return Err(liveness(format!("turn {}: {error}", request.turn)));
+            }
         }
     }
-    Err(liveness(format!("turn {} did not finish within runs_per_turn_max ({RUNS_PER_TURN_MAX})", request.turn)))
+    Err(liveness(format!(
+        "turn {} did not finish within runs_per_turn_max ({RUNS_PER_TURN_MAX})",
+        request.turn
+    )))
 }
 
 pub fn run_seed(program: &Program, target: Target, mutation: Mutation, seed: u64) -> SeedRun {
@@ -103,8 +127,16 @@ pub fn run_seed(program: &Program, target: Target, mutation: Mutation, seed: u64
     let mut result = Ok(());
     for turn in 1..=turns {
         let handler = &program.handlers[workload.pick(program.handlers.len())];
-        let arguments = handler.params.iter().map(|local| generate(program, &handler.locals[*local].ty, &mut workload)).collect();
-        let request = TurnRequest { turn, handler: handler.name.clone(), arguments };
+        let arguments = handler
+            .params
+            .iter()
+            .map(|local| generate(program, &handler.locals[*local].ty, &mut workload))
+            .collect();
+        let request = TurnRequest {
+            turn,
+            handler: handler.name.clone(),
+            arguments,
+        };
         world.begin_turn(&request, faulty);
         if let Err(violation) = drive_turn(program, &mut world, &request) {
             let specific = match world.medium.durable() {
@@ -119,12 +151,20 @@ pub fn run_seed(program: &Program, target: Target, mutation: Mutation, seed: u64
     if result.is_ok() {
         result = match &records {
             Ok(records) => invariants::check(program, &world, turns, records),
-            Err(error) => Err(liveness(format!("the final journal cannot be read: {error}"))),
+            Err(error) => Err(liveness(format!(
+                "the final journal cannot be read: {error}"
+            ))),
         };
     }
     let mut stats = world.stats.clone();
     stats.unknown = records.map_or(0, |records| unknown_count(&records));
-    SeedRun { journal: world.medium.bytes(), acks: world.acks.clone(), stats, profile, result }
+    SeedRun {
+        journal: world.medium.bytes(),
+        acks: world.acks.clone(),
+        stats,
+        profile,
+        result,
+    }
 }
 
 fn unknown_count(records: &[Record]) -> u64 {
@@ -173,12 +213,28 @@ pub fn sweep(program: &Program, options: &Options) -> Summary {
         if result.is_ok() && options.twice {
             let second = run_seed(program, options.target, options.mutation, seed);
             if second.journal != first.journal || second.acks != first.acks {
-                let offset = first.journal.iter().zip(&second.journal).position(|(left, right)| left != right).unwrap_or(first.journal.len().min(second.journal.len()));
-                result = Err(Violation { invariant: Invariant::ReplayEqual, detail: format!("two runs of seed {seed} wrote journals of {} and {} bytes that first differ at byte {offset}", first.journal.len(), second.journal.len()) });
+                let offset = first
+                    .journal
+                    .iter()
+                    .zip(&second.journal)
+                    .position(|(left, right)| left != right)
+                    .unwrap_or(first.journal.len().min(second.journal.len()));
+                result = Err(Violation {
+                    invariant: Invariant::ReplayEqual,
+                    detail: format!(
+                        "two runs of seed {seed} wrote journals of {} and {} bytes that first differ at byte {offset}",
+                        first.journal.len(),
+                        second.journal.len()
+                    ),
+                });
             }
         }
         if let Err(violation) = result {
-            summary.failure = Some(Failure { seed, profile: first.profile, violation });
+            summary.failure = Some(Failure {
+                seed,
+                profile: first.profile,
+                violation,
+            });
             return summary;
         }
     }
@@ -189,7 +245,12 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
     let stats = &summary.stats;
     match &summary.failure {
         Some(failure) => {
-            let mut replay = format!("hl sim --target {} --seeds {}..{}", options.target.name(), failure.seed, failure.seed + 1);
+            let mut replay = format!(
+                "hl sim --target {} --seeds {}..{}",
+                options.target.name(),
+                failure.seed,
+                failure.seed + 1
+            );
             if options.twice {
                 replay.push_str(" --twice");
             }

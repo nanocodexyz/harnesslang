@@ -13,7 +13,11 @@ struct Checker<'a> {
     returns: Type,
 }
 
-pub fn check(program: &ir::Program, globals: &Globals, definition: &ast::Handler) -> Checked<ir::Handler> {
+pub fn check(
+    program: &ir::Program,
+    globals: &Globals,
+    definition: &ast::Handler,
+) -> Checked<ir::Handler> {
     let returns = resolve(program, globals, &definition.returns)?;
     let mut checker = Checker {
         program,
@@ -32,7 +36,10 @@ pub fn check(program: &ir::Program, globals: &Globals, definition: &ast::Handler
     if !returned {
         return error(
             definition.body.at,
-            format!("handler '{}' can reach its end without returning", definition.name.text),
+            format!(
+                "handler '{}' can reach its end without returning",
+                definition.name.text
+            ),
         );
     }
     let mut handler = ir::Handler {
@@ -51,7 +58,11 @@ pub fn check(program: &ir::Program, globals: &Globals, definition: &ast::Handler
                 "handler '{}': worst-case {} overflow u64 (loops: {})",
                 definition.name.text,
                 overflow.measure,
-                ir::worst::Cost { total: 0, loops: overflow.loops }.describe_loops()
+                ir::worst::Cost {
+                    total: 0,
+                    loops: overflow.loops
+                }
+                .describe_loops()
             ),
         )
     })?;
@@ -74,24 +85,46 @@ impl Checker<'_> {
 
     fn declare(&mut self, name: &ast::Name, ty: Type) -> Checked<LocalId> {
         if name.text.starts_with(WILDCARD) {
-            return error(name.at, format!("'{}': names starting with '_' are reserved", name.text));
+            return error(
+                name.at,
+                format!("'{}': names starting with '_' are reserved", name.text),
+            );
         }
         if self.lookup(&name.text).is_some() {
-            return error(name.at, format!("'{}' is already bound in this handler", name.text));
+            return error(
+                name.at,
+                format!("'{}' is already bound in this handler", name.text),
+            );
         }
-        if self.globals.fields.contains_key(&name.text) || self.globals.constants.contains_key(&name.text) {
-            return error(name.at, format!("'{}' is already a state field or constant", name.text));
+        if self.globals.fields.contains_key(&name.text)
+            || self.globals.constants.contains_key(&name.text)
+        {
+            return error(
+                name.at,
+                format!("'{}' is already a state field or constant", name.text),
+            );
         }
-        if self.globals.tools.contains_key(&name.text) || self.globals.model.as_deref() == Some(name.text.as_str()) {
-            return error(name.at, format!("'{}' is already a tool or model", name.text));
+        if self.globals.tools.contains_key(&name.text)
+            || self.globals.model.as_deref() == Some(name.text.as_str())
+        {
+            return error(
+                name.at,
+                format!("'{}' is already a tool or model", name.text),
+            );
         }
         Ok(self.bind(name.text.clone(), ty))
     }
 
     fn bind(&mut self, name: String, ty: Type) -> LocalId {
         let local = self.locals.len();
-        self.locals.push(ir::Field { name: name.clone(), ty });
-        self.scopes.last_mut().expect("a handler always has a scope").push((name, local));
+        self.locals.push(ir::Field {
+            name: name.clone(),
+            ty,
+        });
+        self.scopes
+            .last_mut()
+            .expect("a handler always has a scope")
+            .push((name, local));
         local
     }
 
@@ -117,7 +150,10 @@ impl Checker<'_> {
             let mut returned = false;
             for statement in &block.statements {
                 if returned {
-                    return error(statement_at(statement), "statement is unreachable after a return");
+                    return error(
+                        statement_at(statement),
+                        "statement is unreachable after a return",
+                    );
                 }
                 returned = checker.statement(statement, &mut out)?;
             }
@@ -129,7 +165,14 @@ impl Checker<'_> {
         if wanted == found {
             return Ok(());
         }
-        error(at, format!("expected {}, found {}", self.type_name(wanted), self.type_name(found)))
+        error(
+            at,
+            format!(
+                "expected {}, found {}",
+                self.type_name(wanted),
+                self.type_name(found)
+            ),
+        )
     }
 
     fn state_field(&self, name: &ast::Name, action: &str) -> Checked<ir::FieldId> {
@@ -137,9 +180,18 @@ impl Checker<'_> {
             return Ok(*field);
         }
         if self.lookup(&name.text).is_some() {
-            return error(name.at, format!("cannot {action} '{}': it is a local binding, and only state fields change", name.text));
+            return error(
+                name.at,
+                format!(
+                    "cannot {action} '{}': it is a local binding, and only state fields change",
+                    name.text
+                ),
+            );
         }
-        error(name.at, format!("cannot {action} '{}': unknown state field", name.text))
+        error(
+            name.at,
+            format!("cannot {action} '{}': unknown state field", name.text),
+        )
     }
 
     fn statement(&mut self, statement: &ast::Stmt, out: &mut Vec<Stmt>) -> Checked<bool> {
@@ -162,7 +214,10 @@ impl Checker<'_> {
             ast::Stmt::Push { list, value, .. } => {
                 let field = self.state_field(list, "push onto")?;
                 let Type::List { element, .. } = self.program.state[field].ty.clone() else {
-                    return error(list.at, format!("cannot push onto '{}': it is not a list", list.text));
+                    return error(
+                        list.at,
+                        format!("cannot push onto '{}': it is not a list", list.text),
+                    );
                 };
                 let at = value.at();
                 let (value, ty) = self.expr(value, Some(&element), out)?;
@@ -175,54 +230,17 @@ impl Checker<'_> {
                 then,
                 otherwise,
                 ..
-            } => {
-                let at = condition.at();
-                let (condition, ty) = self.expr(condition, Some(&Type::Bool), out)?;
-                self.expect(at, &Type::Bool, &ty)?;
-                let (then, then_returns) = self.block(then)?;
-                let (otherwise, otherwise_returns) = match otherwise {
-                    Some(block) => self.block(block)?,
-                    None => (Vec::new(), false),
-                };
-                out.push(Stmt::If {
-                    condition,
-                    then,
-                    otherwise,
-                });
-                Ok(then_returns && otherwise_returns)
-            }
+            } => self.if_statement(condition, then, otherwise.as_ref(), out),
             ast::Stmt::Match { at, subject, arms } => self.match_statement(*at, subject, arms, out),
-            ast::Stmt::Loop { name, bound: limit, body, .. } => {
-                let limit = bound(self.program, self.globals, limit, &format!("loop '{}'", name.text))?;
-                let (index, body) = self.scoped(|checker| {
-                    let index = checker.declare(name, Type::U64)?;
-                    Ok((index, checker.block(body)?.0))
-                })?;
-                out.push(Stmt::Loop {
-                    index,
-                    bound: limit,
-                    body,
-                });
-                Ok(false)
-            }
-            ast::Stmt::For { name, list, body, .. } => {
-                let at = list.at();
-                let (list, ty) = self.expr(list, None, out)?;
-                let Type::List { element, capacity } = ty else {
-                    return error(at, format!("'for' walks a list, not {}", self.type_name(&ty)));
-                };
-                let (item, body) = self.scoped(|checker| {
-                    let item = checker.declare(name, *element)?;
-                    Ok((item, checker.block(body)?.0))
-                })?;
-                out.push(Stmt::For {
-                    item,
-                    list,
-                    bound: capacity,
-                    body,
-                });
-                Ok(false)
-            }
+            ast::Stmt::Loop {
+                name,
+                bound: limit,
+                body,
+                ..
+            } => self.loop_statement(name, limit, body, out),
+            ast::Stmt::For {
+                name, list, body, ..
+            } => self.for_statement(name, list, body, out),
             ast::Stmt::Return { value, .. } => {
                 let wanted = self.returns.clone();
                 let at = value.at();
@@ -234,23 +252,129 @@ impl Checker<'_> {
         }
     }
 
-    fn match_statement(&mut self, at: Position, subject: &ast::Expr, arms: &[ast::Arm], out: &mut Vec<Stmt>) -> Checked<bool> {
+    fn if_statement(
+        &mut self,
+        condition: &ast::Expr,
+        then: &ast::Block,
+        otherwise: Option<&ast::Block>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let at = condition.at();
+        let (condition, ty) = self.expr(condition, Some(&Type::Bool), out)?;
+        self.expect(at, &Type::Bool, &ty)?;
+        let (then, then_returns) = self.block(then)?;
+        let (otherwise, otherwise_returns) = match otherwise {
+            Some(block) => self.block(block)?,
+            None => (Vec::new(), false),
+        };
+        out.push(Stmt::If {
+            condition,
+            then,
+            otherwise,
+        });
+        Ok(then_returns && otherwise_returns)
+    }
+
+    fn loop_statement(
+        &mut self,
+        name: &ast::Name,
+        limit: &ast::Name,
+        body: &ast::Block,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let limit = bound(
+            self.program,
+            self.globals,
+            limit,
+            &format!("loop '{}'", name.text),
+        )?;
+        let (index, body) = self.scoped(|checker| {
+            let index = checker.declare(name, Type::U64)?;
+            Ok((index, checker.block(body)?.0))
+        })?;
+        out.push(Stmt::Loop {
+            index,
+            bound: limit,
+            body,
+        });
+        Ok(false)
+    }
+
+    fn for_statement(
+        &mut self,
+        name: &ast::Name,
+        list: &ast::Expr,
+        body: &ast::Block,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let at = list.at();
+        let (list, ty) = self.expr(list, None, out)?;
+        let Type::List { element, capacity } = ty else {
+            return error(
+                at,
+                format!("'for' walks a list, not {}", self.type_name(&ty)),
+            );
+        };
+        let (item, body) = self.scoped(|checker| {
+            let item = checker.declare(name, *element)?;
+            Ok((item, checker.block(body)?.0))
+        })?;
+        out.push(Stmt::For {
+            item,
+            list,
+            bound: capacity,
+            body,
+        });
+        Ok(false)
+    }
+
+    fn match_statement(
+        &mut self,
+        at: Position,
+        subject: &ast::Expr,
+        arms: &[ast::Arm],
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
         let subject_at = subject.at();
         let (subject, ty) = self.expr(subject, None, out)?;
         let Some(variants) = ty.variants(self.program) else {
-            return error(subject_at, format!("'match' needs a sum type, found {}", self.type_name(&ty)));
+            return error(
+                subject_at,
+                format!("'match' needs a sum type, found {}", self.type_name(&ty)),
+            );
         };
         let mut checked: Vec<Option<(ir::Arm, bool)>> = vec![None; variants.len()];
         for arm in arms {
-            let Some(index) = variants.iter().position(|variant| variant.name == arm.variant.text) else {
-                return error(arm.variant.at, format!("'{}' is not a variant of {}", arm.variant.text, self.type_name(&ty)));
+            let Some(index) = variants
+                .iter()
+                .position(|variant| variant.name == arm.variant.text)
+            else {
+                return error(
+                    arm.variant.at,
+                    format!(
+                        "'{}' is not a variant of {}",
+                        arm.variant.text,
+                        self.type_name(&ty)
+                    ),
+                );
             };
             if checked[index].is_some() {
-                return error(arm.variant.at, format!("variant '{}' is matched twice", arm.variant.text));
+                return error(
+                    arm.variant.at,
+                    format!("variant '{}' is matched twice", arm.variant.text),
+                );
             }
             let fields = &variants[index].fields;
             if arm.bindings.len() != fields.len() {
-                return error(arm.variant.at, format!("variant '{}' has {} field(s), the pattern binds {}", arm.variant.text, fields.len(), arm.bindings.len()));
+                return error(
+                    arm.variant.at,
+                    format!(
+                        "variant '{}' has {} field(s), the pattern binds {}",
+                        arm.variant.text,
+                        fields.len(),
+                        arm.bindings.len()
+                    ),
+                );
             }
             let arm_checked = self.scoped(|checker| {
                 let mut bindings = Vec::new();
@@ -262,7 +386,14 @@ impl Checker<'_> {
                     });
                 }
                 let (body, returned) = checker.block(&arm.body)?;
-                Ok((ir::Arm { variant: index, bindings, body }, returned))
+                Ok((
+                    ir::Arm {
+                        variant: index,
+                        bindings,
+                        body,
+                    },
+                    returned,
+                ))
             })?;
             checked[index] = Some(arm_checked);
         }
@@ -273,11 +404,24 @@ impl Checker<'_> {
             .map(|(variant, _)| variant.name.as_str())
             .collect();
         if missing.contains(&ir::OUTCOME_VARIANTS[ir::UNKNOWN]) && matches!(ty, Type::Maybe(_)) {
-            return error(at, format!("match on {} is missing 'unknown': an external effect whose result was not recorded has an unknown outcome", self.type_name(&ty)));
+            return error(
+                at,
+                format!(
+                    "match on {} is missing 'unknown': an external effect whose result was not recorded has an unknown outcome",
+                    self.type_name(&ty)
+                ),
+            );
         }
         if !missing.is_empty() {
-            let listed = missing.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(", ");
-            return error(at, format!("match on {} is missing {listed}", self.type_name(&ty)));
+            let listed = missing
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return error(
+                at,
+                format!("match on {} is missing {listed}", self.type_name(&ty)),
+            );
         }
         let mut all_return = true;
         let mut out_arms = Vec::new();
@@ -286,11 +430,22 @@ impl Checker<'_> {
             all_return &= returned;
             out_arms.push(arm);
         }
-        out.push(Stmt::Match { subject, ty, arms: out_arms });
+        out.push(Stmt::Match {
+            subject,
+            ty,
+            arms: out_arms,
+        });
         Ok(all_return)
     }
 
-    fn site(&mut self, kind: SiteKind, class: SiteClass, result: Type, args: Vec<Expr>, out: &mut Vec<Stmt>) -> (Expr, Type) {
+    fn site(
+        &mut self,
+        kind: SiteKind,
+        class: SiteClass,
+        result: Type,
+        args: Vec<Expr>,
+        out: &mut Vec<Stmt>,
+    ) -> (Expr, Type) {
         let site = self.sites.len();
         self.sites.push(Site {
             kind,
@@ -299,13 +454,31 @@ impl Checker<'_> {
             durability: Durability::of(class),
         });
         let local = self.temporary(site, result.clone());
-        out.push(Stmt::Effect { site, args, result: local });
+        out.push(Stmt::Effect {
+            site,
+            args,
+            result: local,
+        });
         (Expr::Local(local), result)
     }
 
-    fn args(&mut self, at: Position, what: &str, args: &[ast::Expr], wanted: &[Type], out: &mut Vec<Stmt>) -> Checked<Vec<Expr>> {
+    fn args(
+        &mut self,
+        at: Position,
+        what: &str,
+        args: &[ast::Expr],
+        wanted: &[Type],
+        out: &mut Vec<Stmt>,
+    ) -> Checked<Vec<Expr>> {
         if args.len() != wanted.len() {
-            return error(at, format!("{what} takes {} argument(s), found {}", wanted.len(), args.len()));
+            return error(
+                at,
+                format!(
+                    "{what} takes {} argument(s), found {}",
+                    wanted.len(),
+                    args.len()
+                ),
+            );
         }
         let mut checked = Vec::new();
         for (arg, wanted) in args.iter().zip(wanted) {
@@ -316,53 +489,121 @@ impl Checker<'_> {
         Ok(checked)
     }
 
-    fn call(&mut self, callee: &ast::Name, args: &[ast::Expr], expected: Option<&Type>, out: &mut Vec<Stmt>) -> Checked<(Expr, Type)> {
+    fn call(
+        &mut self,
+        callee: &ast::Name,
+        args: &[ast::Expr],
+        expected: Option<&Type>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
         let at = callee.at;
         if let Some(&tool_id) = self.globals.tools.get(&callee.text) {
             let tool = &self.program.tools[tool_id];
             let wanted: Vec<Type> = tool.params.iter().map(|param| param.ty.clone()).collect();
             let args = self.args(at, &format!("tool '{}'", callee.text), args, &wanted, out)?;
             let inner = Box::new(tool.returns.clone());
-            let result = if tool.effect.may_be_unknown() { Type::Maybe(inner) } else { Type::Known(inner) };
-            return Ok(self.site(SiteKind::Tool(tool_id), SiteClass::Fixed(tool.effect), result, args, out));
+            let result = if tool.effect.may_be_unknown() {
+                Type::Maybe(inner)
+            } else {
+                Type::Known(inner)
+            };
+            return Ok(self.site(
+                SiteKind::Tool(tool_id),
+                SiteClass::Fixed(tool.effect),
+                result,
+                args,
+                out,
+            ));
         }
         if self.globals.model.as_deref() == Some(callee.text.as_str()) {
             let [context] = args else {
-                return error(at, format!("model '{}' takes the context list as its one argument", callee.text));
+                return error(
+                    at,
+                    format!(
+                        "model '{}' takes the context list as its one argument",
+                        callee.text
+                    ),
+                );
             };
             let context_at = context.at();
             let (value, ty) = self.expr(context, None, out)?;
-            let is_context = matches!(&ty, Type::List { element, .. } if **element == Type::Sum(ir::ENTRY));
+            let is_context =
+                matches!(&ty, Type::List { element, .. } if **element == Type::Sum(ir::ENTRY));
             if !is_context {
-                return error(context_at, format!("model '{}' reads a list<entry, _>, found {}", callee.text, self.type_name(&ty)));
+                return error(
+                    context_at,
+                    format!(
+                        "model '{}' reads a list<entry, _>, found {}",
+                        callee.text,
+                        self.type_name(&ty)
+                    ),
+                );
             }
-            return Ok(self.site(SiteKind::Model, SiteClass::Fixed(EffectClass::Idempotent), Type::Sum(ir::REPLY), vec![value], out));
+            return Ok(self.site(
+                SiteKind::Model,
+                SiteClass::Fixed(EffectClass::Idempotent),
+                Type::Sum(ir::REPLY),
+                vec![value],
+                out,
+            ));
         }
         match callee.text.as_str() {
             "dispatch" => {
                 let args = self.args(at, "dispatch", args, &[Type::Sum(ir::CALL)], out)?;
-                Ok(self.site(SiteKind::Dispatch, SiteClass::Dispatched, Type::Maybe(Box::new(Type::Text)), args, out))
+                Ok(self.site(
+                    SiteKind::Dispatch,
+                    SiteClass::Dispatched,
+                    Type::Maybe(Box::new(Type::Text)),
+                    args,
+                    out,
+                ))
             }
             "now" | "random" => {
                 self.args(at, &callee.text, args, &[], out)?;
-                let kind = if callee.text == "now" { SiteKind::Now } else { SiteKind::Random };
-                Ok(self.site(kind, SiteClass::Fixed(EffectClass::None), Type::U64, Vec::new(), out))
+                let kind = if callee.text == "now" {
+                    SiteKind::Now
+                } else {
+                    SiteKind::Random
+                };
+                Ok(self.site(
+                    kind,
+                    SiteClass::Fixed(EffectClass::None),
+                    Type::U64,
+                    Vec::new(),
+                    out,
+                ))
             }
             _ => self.construct(callee, args, expected, out),
         }
     }
 
-    fn variant_of(&self, name: &ast::Name, expected: Option<&Type>) -> Checked<(Type, ir::VariantId, Vec<Type>)> {
+    fn variant_of(
+        &self,
+        name: &ast::Name,
+        expected: Option<&Type>,
+    ) -> Checked<(Type, ir::VariantId, Vec<Type>)> {
         if let Some(expected) = expected
             && let Some(variants) = expected.variants(self.program)
-            && let Some(index) = variants.iter().position(|variant| variant.name == name.text)
+            && let Some(index) = variants
+                .iter()
+                .position(|variant| variant.name == name.text)
         {
             return Ok((expected.clone(), index, variants[index].fields.clone()));
         }
         let usable = |sum: usize| !self.program.sums[sum].variants.is_empty();
         let mut candidates = Vec::new();
-        for (sum_id, sum) in self.program.sums.iter().enumerate().filter(|(id, _)| usable(*id)) {
-            if let Some(index) = sum.variants.iter().position(|variant| variant.name == name.text) {
+        for (sum_id, sum) in self
+            .program
+            .sums
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| usable(*id))
+        {
+            if let Some(index) = sum
+                .variants
+                .iter()
+                .position(|variant| variant.name == name.text)
+            {
                 candidates.push((Type::Sum(sum_id), index, sum.variants[index].fields.clone()));
             }
         }
@@ -371,23 +612,57 @@ impl Checker<'_> {
             (1, false) => Ok(candidates.remove(0)),
             (0, false) => error(name.at, format!("unknown name '{}'", name.text)),
             _ => {
-                let mut owners: Vec<String> = candidates.iter().map(|(ty, ..)| self.type_name(ty)).collect();
+                let mut owners: Vec<String> = candidates
+                    .iter()
+                    .map(|(ty, ..)| self.type_name(ty))
+                    .collect();
                 if generic {
                     owners.push("known<T>".to_owned());
                     owners.push("maybe<T>".to_owned());
                 }
-                error(name.at, format!("cannot tell which type '{}' builds here: it is a variant of {}", name.text, owners.join(", ")))
+                error(
+                    name.at,
+                    format!(
+                        "cannot tell which type '{}' builds here: it is a variant of {}",
+                        name.text,
+                        owners.join(", ")
+                    ),
+                )
             }
         }
     }
 
-    fn construct(&mut self, name: &ast::Name, args: &[ast::Expr], expected: Option<&Type>, out: &mut Vec<Stmt>) -> Checked<(Expr, Type)> {
+    fn construct(
+        &mut self,
+        name: &ast::Name,
+        args: &[ast::Expr],
+        expected: Option<&Type>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
         let (ty, variant, fields) = self.variant_of(name, expected)?;
-        let fields = self.args(name.at, &format!("variant '{}'", name.text), args, &fields, out)?;
-        Ok((Expr::Construct { ty: ty.clone(), variant, fields }, ty))
+        let fields = self.args(
+            name.at,
+            &format!("variant '{}'", name.text),
+            args,
+            &fields,
+            out,
+        )?;
+        Ok((
+            Expr::Construct {
+                ty: ty.clone(),
+                variant,
+                fields,
+            },
+            ty,
+        ))
     }
 
-    fn expr(&mut self, expr: &ast::Expr, expected: Option<&Type>, out: &mut Vec<Stmt>) -> Checked<(Expr, Type)> {
+    fn expr(
+        &mut self,
+        expr: &ast::Expr,
+        expected: Option<&Type>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
         match expr {
             ast::Expr::Number(value, _) => Ok((Expr::U64(*value), Type::U64)),
             ast::Expr::Text(text, _) => Ok((Expr::Text(text.clone()), Type::Text)),
@@ -397,12 +672,26 @@ impl Checker<'_> {
                 let (base, ty) = self.expr(base, None, out)?;
                 let index = ir::CALL_FIELDS.iter().position(|name| *name == field.text);
                 match (&ty, index) {
-                    (Type::Sum(ir::CALL), Some(index)) => Ok((Expr::Member { base: Box::new(base), index }, Type::Text)),
-                    _ => error(field.at, format!("{} has no field '{}'", self.type_name(&ty), field.text)),
+                    (Type::Sum(ir::CALL), Some(index)) => Ok((
+                        Expr::Member {
+                            base: Box::new(base),
+                            index,
+                        },
+                        Type::Text,
+                    )),
+                    _ => error(
+                        field.at,
+                        format!("{} has no field '{}'", self.type_name(&ty), field.text),
+                    ),
                 }
             }
             ast::Expr::Call { callee, args } => self.call(callee, args, expected, out),
-            ast::Expr::Binary { at, op, left, right } => self.binary(*at, *op, left, right, out),
+            ast::Expr::Binary {
+                at,
+                op,
+                left,
+                right,
+            } => self.binary(*at, *op, left, right, out),
             ast::Expr::Not { operand, .. } => {
                 let operand_at = operand.at();
                 let (operand, ty) = self.expr(operand, Some(&Type::Bool), out)?;
@@ -412,7 +701,12 @@ impl Checker<'_> {
         }
     }
 
-    fn name(&mut self, name: &ast::Name, expected: Option<&Type>, out: &mut Vec<Stmt>) -> Checked<(Expr, Type)> {
+    fn name(
+        &mut self,
+        name: &ast::Name,
+        expected: Option<&Type>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
         if let Some(local) = self.lookup(&name.text) {
             return Ok((Expr::Local(local), self.locals[local].ty.clone()));
         }
@@ -422,24 +716,39 @@ impl Checker<'_> {
         if let Some(&constant) = self.globals.constants.get(&name.text) {
             return Ok((Expr::Constant(constant), Type::U64));
         }
-        if self.globals.tools.contains_key(&name.text) || self.globals.model.as_deref() == Some(name.text.as_str()) {
-            return error(name.at, format!("'{}' is an effect: call it with arguments", name.text));
+        if self.globals.tools.contains_key(&name.text)
+            || self.globals.model.as_deref() == Some(name.text.as_str())
+        {
+            return error(
+                name.at,
+                format!("'{}' is an effect: call it with arguments", name.text),
+            );
         }
         self.construct(name, &[], expected, out)
     }
 
-    fn binary(&mut self, at: Position, op: BinaryOp, left: &ast::Expr, right: &ast::Expr, out: &mut Vec<Stmt>) -> Checked<(Expr, Type)> {
+    fn binary(
+        &mut self,
+        at: Position,
+        op: BinaryOp,
+        left: &ast::Expr,
+        right: &ast::Expr,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
         let (operand, result) = match op {
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => (Some(Type::U64), Type::U64),
             BinaryOp::Concat => (Some(Type::Text), Type::Text),
-            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => (Some(Type::U64), Type::Bool),
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                (Some(Type::U64), Type::Bool)
+            }
             BinaryOp::And | BinaryOp::Or => (Some(Type::Bool), Type::Bool),
             BinaryOp::Equal | BinaryOp::NotEqual => (None, Type::Bool),
         };
         let left_at = left.at();
         let right_at = right.at();
         let (left, left_type) = self.expr(left, operand.as_ref(), out)?;
-        let (right, right_type) = self.expr(right, Some(operand.as_ref().unwrap_or(&left_type)), out)?;
+        let (right, right_type) =
+            self.expr(right, Some(operand.as_ref().unwrap_or(&left_type)), out)?;
         let operand = match operand {
             Some(wanted) => {
                 self.expect(left_at, &wanted, &left_type)?;
@@ -448,13 +757,28 @@ impl Checker<'_> {
             }
             None => {
                 if !matches!(left_type, Type::U64 | Type::Bool | Type::Text) {
-                    return error(at, format!("'{}' compares u64, bool or text, not {}", op.symbol(), self.type_name(&left_type)));
+                    return error(
+                        at,
+                        format!(
+                            "'{}' compares u64, bool or text, not {}",
+                            op.symbol(),
+                            self.type_name(&left_type)
+                        ),
+                    );
                 }
                 self.expect(right_at, &left_type, &right_type)?;
                 left_type
             }
         };
-        Ok((Expr::Binary { op, operand, left: Box::new(left), right: Box::new(right) }, result))
+        Ok((
+            Expr::Binary {
+                op,
+                operand,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            result,
+        ))
     }
 }
 

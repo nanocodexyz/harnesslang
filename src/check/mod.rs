@@ -55,13 +55,25 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
 
 fn claim(values: &mut BTreeMap<String, Position>, name: &ast::Name, what: &str) -> Checked<()> {
     if name.text.starts_with(WILDCARD) {
-        return error(name.at, format!("{what} '{}': names starting with '_' are reserved", name.text));
+        return error(
+            name.at,
+            format!(
+                "{what} '{}': names starting with '_' are reserved",
+                name.text
+            ),
+        );
     }
     if BUILTIN_FUNCTIONS.contains(&name.text.as_str()) {
-        return error(name.at, format!("{what} '{}' has the name of a builtin", name.text));
+        return error(
+            name.at,
+            format!("{what} '{}' has the name of a builtin", name.text),
+        );
     }
     if let Some(previous) = values.get(&name.text) {
-        return error(name.at, format!("'{}' is already declared at {previous}", name.text));
+        return error(
+            name.at,
+            format!("'{}' is already declared at {previous}", name.text),
+        );
     }
     values.insert(name.text.clone(), name.at);
     Ok(())
@@ -74,13 +86,17 @@ fn constants(
     values: &mut BTreeMap<String, Position>,
 ) -> Checked<()> {
     for item in &source.items {
-        let Item::Const(constant) = item else { continue };
+        let Item::Const(constant) = item else {
+            continue;
+        };
         claim(values, &constant.name, "constant")?;
         match &constant.ty {
             TypeExpr::Named(name) if name.text == "u64" => {}
             other => return error(other.at(), "constants are u64"),
         }
-        globals.constants.insert(constant.name.text.clone(), program.constants.len());
+        globals
+            .constants
+            .insert(constant.name.text.clone(), program.constants.len());
         program.constants.push(ir::Constant {
             name: constant.name.text.clone(),
             value: constant.value,
@@ -95,7 +111,13 @@ fn bound(program: &ir::Program, globals: &Globals, name: &ast::Name, what: &str)
             name: name.text.clone(),
             value: program.constants[*id].value,
         }),
-        None => error(name.at, format!("{what} must be a named constant: '{}' is not a constant", name.text)),
+        None => error(
+            name.at,
+            format!(
+                "{what} must be a named constant: '{}' is not a constant",
+                name.text
+            ),
+        ),
     }
 }
 
@@ -108,7 +130,13 @@ fn model(
     for item in &source.items {
         let Item::Model(model) = item else { continue };
         if let Some(previous) = &program.model {
-            return error(model.name.at, format!("a harness has one model; '{}' is already declared", previous.name));
+            return error(
+                model.name.at,
+                format!(
+                    "a harness has one model; '{}' is already declared",
+                    previous.name
+                ),
+            );
         }
         claim(values, &model.name, "model")?;
         let calls = bound(program, globals, &model.calls, "the model's calls bound")?;
@@ -134,7 +162,11 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
             name: name.to_owned(),
             variants: Vec::new(),
         };
-        return vec![call, placeholder(BUILTIN_SUM_NAMES[ir::REPLY]), placeholder(BUILTIN_SUM_NAMES[ir::ENTRY])];
+        return vec![
+            call,
+            placeholder(BUILTIN_SUM_NAMES[ir::REPLY]),
+            placeholder(BUILTIN_SUM_NAMES[ir::ENTRY]),
+        ];
     };
     let variant = |name: &str, fields: Vec<Type>| Variant {
         name: name.to_owned(),
@@ -146,7 +178,10 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
     };
     let reply = Sum {
         name: BUILTIN_SUM_NAMES[ir::REPLY].to_owned(),
-        variants: vec![variant("answer", vec![Type::Text]), variant("calls", vec![calls])],
+        variants: vec![
+            variant("answer", vec![Type::Text]),
+            variant("calls", vec![calls]),
+        ],
     };
     let call_type = Type::Sum(ir::CALL);
     let entry = Sum {
@@ -169,10 +204,15 @@ fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals)
     }
     let mut declared = Vec::new();
     for item in &source.items {
-        let Item::Type(definition) = item else { continue };
+        let Item::Type(definition) = item else {
+            continue;
+        };
         let name = &definition.name;
         if BUILTIN_TYPES.contains(&name.text.as_str()) || globals.types.contains_key(&name.text) {
-            return error(name.at, format!("type '{}' is already declared or builtin", name.text));
+            return error(
+                name.at,
+                format!("type '{}' is already declared or builtin", name.text),
+            );
         }
         globals.types.insert(name.text.clone(), program.sums.len());
         program.sums.push(Sum {
@@ -187,7 +227,13 @@ fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals)
         let mut variants = Vec::new();
         for variant in &definition.variants {
             if !seen.insert(variant.name.text.clone()) {
-                return error(variant.name.at, format!("variant '{}' appears twice in '{}'", variant.name.text, definition.name.text));
+                return error(
+                    variant.name.at,
+                    format!(
+                        "variant '{}' appears twice in '{}'",
+                        variant.name.text, definition.name.text
+                    ),
+                );
             }
             let mut fields = Vec::new();
             for field in &variant.fields {
@@ -214,19 +260,33 @@ fn contained(ty: &Type, out: &mut Vec<ir::SumId>) {
 
 fn acyclic(source: &ast::Program, program: &ir::Program, globals: &Globals) -> Checked<()> {
     for item in &source.items {
-        let Item::Type(definition) = item else { continue };
+        let Item::Type(definition) = item else {
+            continue;
+        };
         let start = globals.types[&definition.name.text];
         let mut stack = vec![start];
         let mut visited = BTreeSet::new();
         while let Some(sum) = stack.pop() {
-            assert!(visited.len() <= program.sums.len(), "a walk visits each sum at most once");
+            assert!(
+                visited.len() <= program.sums.len(),
+                "a walk visits each sum at most once"
+            );
             let mut next = Vec::new();
             for variant in &program.sums[sum].variants {
-                variant.fields.iter().for_each(|field| contained(field, &mut next));
+                variant
+                    .fields
+                    .iter()
+                    .for_each(|field| contained(field, &mut next));
             }
             for inner in next {
                 if inner == start {
-                    return error(definition.name.at, format!("type '{}' contains itself, so its values have no bound", definition.name.text));
+                    return error(
+                        definition.name.at,
+                        format!(
+                            "type '{}' contains itself, so its values have no bound",
+                            definition.name.text
+                        ),
+                    );
                 }
                 if visited.insert(inner) {
                     stack.push(inner);
@@ -245,7 +305,12 @@ pub fn resolve(program: &ir::Program, globals: &Globals, ty: &TypeExpr) -> Check
             "text" => Ok(Type::Text),
             other => match globals.types.get(other) {
                 Some(&sum) if (sum == ir::REPLY || sum == ir::ENTRY) && program.model.is_none() => {
-                    error(name.at, format!("type '{other}' needs a model declaration: its replies are bounded by the model's calls"))
+                    error(
+                        name.at,
+                        format!(
+                            "type '{other}' needs a model declaration: its replies are bounded by the model's calls"
+                        ),
+                    )
                 }
                 Some(&sum) => Ok(Type::Sum(sum)),
                 None => error(name.at, format!("unknown type '{other}'")),
@@ -257,13 +322,20 @@ pub fn resolve(program: &ir::Program, globals: &Globals, ty: &TypeExpr) -> Check
             element: Box::new(resolve(program, globals, element)?),
             capacity: bound(program, globals, capacity, "a list's capacity")?,
         }),
-        TypeExpr::Known { inner, .. } => Ok(Type::Known(Box::new(resolve(program, globals, inner)?))),
-        TypeExpr::Maybe { inner, .. } => Ok(Type::Maybe(Box::new(resolve(program, globals, inner)?))),
+        TypeExpr::Known { inner, .. } => {
+            Ok(Type::Known(Box::new(resolve(program, globals, inner)?)))
+        }
+        TypeExpr::Maybe { inner, .. } => {
+            Ok(Type::Maybe(Box::new(resolve(program, globals, inner)?)))
+        }
     }
 }
 
 fn variant_names(program: &ir::Program) -> BTreeSet<String> {
-    let mut names: BTreeSet<String> = ir::OUTCOME_VARIANTS.iter().map(|name| (*name).to_owned()).collect();
+    let mut names: BTreeSet<String> = ir::OUTCOME_VARIANTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
     for sum in &program.sums {
         names.extend(sum.variants.iter().map(|variant| variant.name.clone()));
     }
@@ -281,13 +353,19 @@ fn tools(
         let Item::Tool(tool) = item else { continue };
         claim(values, &tool.name, "tool")?;
         if variants.contains(&tool.name.text) {
-            return error(tool.name.at, format!("tool '{}' has the name of a variant", tool.name.text));
+            return error(
+                tool.name.at,
+                format!("tool '{}' has the name of a variant", tool.name.text),
+            );
         }
         let mut params = Vec::new();
         let mut seen = BTreeSet::new();
         for param in &tool.params {
             if !seen.insert(param.name.text.clone()) {
-                return error(param.name.at, format!("parameter '{}' appears twice", param.name.text));
+                return error(
+                    param.name.at,
+                    format!("parameter '{}' appears twice", param.name.text),
+                );
             }
             params.push(ir::Field {
                 name: param.name.text.clone(),
@@ -298,7 +376,9 @@ fn tools(
         if !matches!(returns, Type::U64 | Type::Bool | Type::Text) {
             return error(tool.returns.at(), "a tool returns u64, bool or text");
         }
-        globals.tools.insert(tool.name.text.clone(), program.tools.len());
+        globals
+            .tools
+            .insert(tool.name.text.clone(), program.tools.len());
         program.tools.push(ir::Tool {
             name: tool.name.text.clone(),
             params,
@@ -319,17 +399,31 @@ fn state(
     for item in &source.items {
         let Item::State(state) = item else { continue };
         if let Some(previous) = seen_state {
-            return error(state.at, format!("a harness has one state block; one is already declared at {previous}"));
+            return error(
+                state.at,
+                format!("a harness has one state block; one is already declared at {previous}"),
+            );
         }
         seen_state = Some(state.at);
         for field in &state.fields {
             claim(values, &field.name, "state field")?;
             let ty = resolve(program, globals, &field.ty)?;
             if crate::run::value::Value::zero(&ty).is_none() {
-                return error(field.ty.at(), format!("state field '{}' has no initial value: state fields are u64, bool, text or lists", field.name.text));
+                return error(
+                    field.ty.at(),
+                    format!(
+                        "state field '{}' has no initial value: state fields are u64, bool, text or lists",
+                        field.name.text
+                    ),
+                );
             }
-            globals.fields.insert(field.name.text.clone(), program.state.len());
-            program.state.push(ir::Field { name: field.name.text.clone(), ty });
+            globals
+                .fields
+                .insert(field.name.text.clone(), program.state.len());
+            program.state.push(ir::Field {
+                name: field.name.text.clone(),
+                ty,
+            });
         }
     }
     Ok(())
@@ -338,15 +432,26 @@ fn state(
 fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
     let mut names: BTreeMap<String, Position> = BTreeMap::new();
     for item in &source.items {
-        let Item::Handler(definition) = item else { continue };
+        let Item::Handler(definition) = item else {
+            continue;
+        };
         if let Some(previous) = names.insert(definition.name.text.clone(), definition.name.at) {
-            return error(definition.name.at, format!("handler '{}' is already declared at {previous}", definition.name.text));
+            return error(
+                definition.name.at,
+                format!(
+                    "handler '{}' is already declared at {previous}",
+                    definition.name.text
+                ),
+            );
         }
         let checked = handler::check(program, globals, definition)?;
         program.handlers.push(checked);
     }
     if program.handlers.is_empty() {
-        return error(source.name.at, format!("harness '{}' has no handler", source.name.text));
+        return error(
+            source.name.at,
+            format!("harness '{}' has no handler", source.name.text),
+        );
     }
     Ok(())
 }

@@ -19,7 +19,9 @@ pub const OVER_CAPACITY_PPM: u64 = 5_000;
 pub const TOOL_FAILURE_PPM: u64 = 150_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
-pub const WORDS: [&str; 8] = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+pub const WORDS: [&str; 8] = [
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Dispatched {
@@ -65,7 +67,13 @@ pub struct SimWorld<'a> {
 }
 
 impl<'a> SimWorld<'a> {
-    pub fn new(program: &'a Program, target: Target, mutation: Mutation, seed: u64, faults: bool) -> Self {
+    pub fn new(
+        program: &'a Program,
+        target: Target,
+        mutation: Mutation,
+        seed: u64,
+        faults: bool,
+    ) -> Self {
         let profile = Profile::of(seed, target);
         Self {
             program,
@@ -113,7 +121,10 @@ impl<'a> SimWorld<'a> {
     }
 
     fn crash(&mut self) -> Stop {
-        assert!(self.faults_left > 0, "a crash spends the turn's fault budget");
+        assert!(
+            self.faults_left > 0,
+            "a crash spends the turn's fault budget"
+        );
         self.faults_left -= 1;
         self.stats.crashes += 1;
         let power_loss = self.profile.power_loss;
@@ -134,7 +145,9 @@ impl<'a> SimWorld<'a> {
             }
             PowerLoss::Sectors { ppm } => {
                 if self.rng.chance(ppm) {
-                    let persisted: Vec<bool> = (0..file.unsynced_sectors()).map(|_| self.rng.chance(SECTOR_PERSISTED_PPM)).collect();
+                    let persisted: Vec<bool> = (0..file.unsynced_sectors())
+                        .map(|_| self.rng.chance(SECTOR_PERSISTED_PPM))
+                        .collect();
                     file.lose_unsynced_sectors(&persisted);
                     self.stats.power_losses += 1;
                 }
@@ -161,7 +174,8 @@ impl<'a> SimWorld<'a> {
         let records = match self.medium.open() {
             Ok(records) => records,
             Err(error) => {
-                self.owner_faults.push(format!("second owner could not read the journal: {error}"));
+                self.owner_faults
+                    .push(format!("second owner could not read the journal: {error}"));
                 return;
             }
         };
@@ -171,12 +185,18 @@ impl<'a> SimWorld<'a> {
         match ran {
             Ok(Ran::Finished(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => self.acknowledge(&finish),
-            Err(exit) => self.owner_faults.push(format!("second owner stopped: {exit:?}")),
+            Err(exit) => self
+                .owner_faults
+                .push(format!("second owner stopped: {exit:?}")),
         }
     }
 
     pub fn generated_text(rng: &mut Rng) -> String {
-        format!("{}-{}", WORDS[rng.pick(WORDS.len())], rng.below(WORDS.len() as u64 * WORDS.len() as u64))
+        format!(
+            "{}-{}",
+            WORDS[rng.pick(WORDS.len())],
+            rng.below(WORDS.len() as u64 * WORDS.len() as u64)
+        )
     }
 
     fn tool_value(rng: &mut Rng, returns: &Type) -> Json {
@@ -211,7 +231,8 @@ impl World for SimWorld<'_> {
     }
 
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
-        let fence = self.mutation != Mutation::PostgresNoFence && self.target.target == Target::ServerPostgres;
+        let fence = self.mutation != Mutation::PostgresNoFence
+            && self.target.target == Target::ServerPostgres;
         if let Medium::Rows(rows) = &mut self.medium {
             if fence && rows.fenced(epoch) {
                 self.stats.fenced += 1;
@@ -260,11 +281,18 @@ impl World for SimWorld<'_> {
         self.stats.dispatches += 1;
         let mut rng = Rng::derive_keyed(self.seed, "tool", &[request.turn, request.seq, count]);
         let output = if rng.chance(TOOL_FAILURE_PPM) {
-            Output::Failed(format!("{} failed: {}", request.tool, Self::generated_text(&mut rng)))
+            Output::Failed(format!(
+                "{} failed: {}",
+                request.tool,
+                Self::generated_text(&mut rng)
+            ))
         } else {
             Output::Ok(Self::tool_value(&mut rng, request.returns))
         };
-        let entry = self.dispatched.get_mut(&journal::call_id(request.turn, request.seq)).expect("inserted above");
+        let entry = self
+            .dispatched
+            .get_mut(&journal::call_id(request.turn, request.seq))
+            .expect("inserted above");
         if request.effect == EffectClass::External {
             entry.outputs.push(output.clone());
         }
@@ -272,25 +300,43 @@ impl World for SimWorld<'_> {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
-        let count = self.model_calls.entry((request.turn, request.seq)).or_insert(0);
+        let count = self
+            .model_calls
+            .entry((request.turn, request.seq))
+            .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
         if rng.chance(ANSWER_PPM) {
             return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
         }
         let over = rng.chance(OVER_CAPACITY_PPM);
-        let count = if over { request.calls_max + 1 } else { rng.range(1, request.calls_max.max(1)) };
+        let count = if over {
+            request.calls_max + 1
+        } else {
+            rng.range(1, request.calls_max.max(1))
+        };
         let mut calls = Vec::new();
         for index in 0..count {
             let tool = if self.program.tools.is_empty() || rng.chance(UNDECLARED_TOOL_PPM) {
                 UNDECLARED_TOOLS[rng.pick(UNDECLARED_TOOLS.len())].to_owned()
             } else {
-                self.program.tools[rng.pick(self.program.tools.len())].name.clone()
+                self.program.tools[rng.pick(self.program.tools.len())]
+                    .name
+                    .clone()
             };
             let mut fields = BTreeMap::new();
-            fields.insert(ir::CALL_FIELDS[ir::CALL_ID].to_owned(), Json::String(format!("c{}-{}-{index}", request.turn, request.seq)));
-            fields.insert(ir::CALL_FIELDS[ir::CALL_TOOL].to_owned(), Json::String(tool));
-            fields.insert(ir::CALL_FIELDS[ir::CALL_INPUT].to_owned(), Json::String(Self::generated_text(&mut rng)));
+            fields.insert(
+                ir::CALL_FIELDS[ir::CALL_ID].to_owned(),
+                Json::String(format!("c{}-{}-{index}", request.turn, request.seq)),
+            );
+            fields.insert(
+                ir::CALL_FIELDS[ir::CALL_TOOL].to_owned(),
+                Json::String(tool),
+            );
+            fields.insert(
+                ir::CALL_FIELDS[ir::CALL_INPUT].to_owned(),
+                Json::String(Self::generated_text(&mut rng)),
+            );
             calls.push(Json::Object(fields));
         }
         Json::object([("calls", Json::Array(calls))])
@@ -309,7 +355,13 @@ impl World for SimWorld<'_> {
         let durable = self.durable_status(finish.turn);
         let agrees = matches!(&durable, Some(Record::Status { outcome, result, .. }) if *outcome == finish.outcome && *result == finish.result);
         if !agrees {
-            self.ack_faults.push(format!("turn {} was acknowledged {} {} while its durable status was {:?}", finish.turn, finish.outcome.name(), finish.result.encode(), durable.map(|record| journal::to_json(&record).encode())));
+            self.ack_faults.push(format!(
+                "turn {} was acknowledged {} {} while its durable status was {:?}",
+                finish.turn,
+                finish.outcome.name(),
+                finish.result.encode(),
+                durable.map(|record| journal::to_json(&record).encode())
+            ));
         }
         self.acks.push(finish.clone());
     }

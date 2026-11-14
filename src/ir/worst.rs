@@ -53,7 +53,11 @@ impl Cost {
     }
 
     fn or(self, other: Self) -> Self {
-        if other.total > self.total { other } else { self }
+        if other.total > self.total {
+            other
+        } else {
+            self
+        }
     }
 
     fn times(self, factor: &Factor) -> Option<Self> {
@@ -72,7 +76,12 @@ impl Cost {
         }
         self.loops
             .iter()
-            .map(|factor| format!("{} below {} ({})", factor.name, factor.bound.name, factor.bound.value))
+            .map(|factor| {
+                format!(
+                    "{} below {} ({})",
+                    factor.name, factor.bound.name, factor.bound.value
+                )
+            })
             .collect::<Vec<_>>()
             .join(" x ")
     }
@@ -129,7 +138,11 @@ fn statement_cost(handler: &Handler, statement: &Stmt) -> Result<Costs, Overflow
             } else {
                 EFFECT_RECORDS
             };
-            Ok([Cost::of(1), Cost::of(records), Cost::of(u64::from(kind.outbound()))])
+            Ok([
+                Cost::of(1),
+                Cost::of(records),
+                Cost::of(u64::from(kind.outbound())),
+            ])
         }
         Stmt::Finish { .. } => Ok([Cost::of(0), Cost::of(FINISH_RECORDS), Cost::of(0)]),
         Stmt::If {

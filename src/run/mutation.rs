@@ -50,7 +50,9 @@ impl Mutation {
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|mutation| mutation.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|mutation| mutation.name() == name)
     }
 
     pub fn names() -> String {
@@ -61,15 +63,34 @@ impl Mutation {
         let all = Target::ALL.to_vec();
         match self {
             Self::None => all,
-            Self::FlushAfterDispatch => vec![Target::NativeJsonl, Target::NativeSqlite, Target::ServerPostgres],
-            Self::RecoveryRedispatchesExternal => vec![Target::NativeJsonl, Target::NativeSqlite, Target::ServerPostgres, Target::Cloudflare],
+            Self::FlushAfterDispatch => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+            ],
+            Self::RecoveryRedispatchesExternal => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Cloudflare,
+            ],
             Self::VercelRetryRedispatches => vec![Target::Vercel],
             Self::PostgresNoFence => vec![Target::ServerPostgres],
             Self::JsonlNoChecksum => vec![Target::NativeJsonl],
-            Self::FinishBeforeFlush => vec![Target::NativeJsonl, Target::NativeSqlite, Target::ServerPostgres, Target::Vercel],
+            Self::FinishBeforeFlush => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Vercel,
+            ],
             Self::IdempotentReportedUnknown => vec![Target::NativeJsonl, Target::Cloudflare],
             Self::GateReleasesEarly => vec![Target::Cloudflare],
-            Self::RecoveryReportsFailed => vec![Target::NativeJsonl, Target::NativeSqlite, Target::ServerPostgres, Target::Cloudflare],
+            Self::RecoveryReportsFailed => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Cloudflare,
+            ],
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
             Self::CheckpointHashOrder => all,
         }

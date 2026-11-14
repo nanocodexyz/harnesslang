@@ -21,12 +21,18 @@ impl JsonlFile {
     }
 
     pub fn unsynced(&self) -> usize {
-        assert!(self.synced <= self.written.len(), "synced bytes were written");
+        assert!(
+            self.synced <= self.written.len(),
+            "synced bytes were written"
+        );
         self.written.len() - self.synced
     }
 
     pub fn lose_unsynced_prefix(&mut self, kept: usize) {
-        assert!(kept <= self.unsynced(), "a power loss keeps at most the unsynced bytes");
+        assert!(
+            kept <= self.unsynced(),
+            "a power loss keeps at most the unsynced bytes"
+        );
         self.written.truncate(self.synced + kept);
     }
 
@@ -37,7 +43,11 @@ impl JsonlFile {
     }
 
     pub fn lose_unsynced_sectors(&mut self, persisted: &[bool]) {
-        assert_eq!(persisted.len(), self.unsynced_sectors(), "one decision per unsynced sector");
+        assert_eq!(
+            persisted.len(),
+            self.unsynced_sectors(),
+            "one decision per unsynced sector"
+        );
         let first = self.synced / BLOCK_DEVICE_SECTOR_BYTES;
         let mut length = self.synced;
         for (index, kept) in persisted.iter().enumerate() {
@@ -98,7 +108,10 @@ impl Rows {
     pub fn open(&self) -> Result<Vec<Record>, String> {
         let mut records = Vec::with_capacity(self.committed.len());
         for (index, line) in self.committed.iter().enumerate() {
-            records.push(journal::decode_line(line, false).map_err(|error| format!("row {}: {error}", index + 1))?);
+            records.push(
+                journal::decode_line(line, false)
+                    .map_err(|error| format!("row {}: {error}", index + 1))?,
+            );
         }
         Ok(records)
     }
@@ -113,8 +126,13 @@ pub enum Medium {
 impl Medium {
     pub fn new(target: Target, mutation: Mutation) -> Self {
         match target {
-            Target::NativeJsonl => Self::Jsonl(JsonlFile { checksum: mutation != Mutation::JsonlNoChecksum, ..JsonlFile::default() }),
-            Target::NativeSqlite | Target::ServerPostgres | Target::Cloudflare | Target::Vercel => Self::Rows(Rows::default()),
+            Target::NativeJsonl => Self::Jsonl(JsonlFile {
+                checksum: mutation != Mutation::JsonlNoChecksum,
+                ..JsonlFile::default()
+            }),
+            Target::NativeSqlite | Target::ServerPostgres | Target::Cloudflare | Target::Vercel => {
+                Self::Rows(Rows::default())
+            }
         }
     }
 
