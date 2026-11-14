@@ -190,6 +190,44 @@ fn recover(log: &mut TurnLog, mutation: Mutation) -> Vec<u64> {
     unknown
 }
 
+fn recover_nested(log: &mut TurnLog, mutation: Mutation) -> Vec<(u64, u64)> {
+    if matches!(
+        mutation,
+        Mutation::CellRecoveryRedispatchesExternal | Mutation::RecoverySkipped
+    ) {
+        return Vec::new();
+    }
+    let unknown = log.open_nested(|class| class.may_be_unknown());
+    for id in &unknown {
+        let site = log
+            .nested
+            .get_mut(id)
+            .expect("an open nested call has a site");
+        let SiteLog::Open(call) = site else {
+            panic!("open_nested returns open calls");
+        };
+        *site = SiteLog::Unknown(call.clone());
+    }
+    unknown
+}
+
+fn assume_nested_failed(log: &mut TurnLog, ids: Vec<(u64, u64)>) -> Vec<((u64, u64), String)> {
+    let mut assumed = Vec::new();
+    for id in ids {
+        let site = log
+            .nested
+            .get_mut(&id)
+            .expect("a recovered nested call has a site");
+        let SiteLog::Unknown(call) = site else {
+            panic!("recover_nested marks open calls unknown");
+        };
+        let error = format!("{} was lost in a crash", call.tool);
+        *site = SiteLog::Done(call.clone(), Output::Failed(error.clone()));
+        assumed.push((id, error));
+    }
+    assumed
+}
+
 fn assume_failed(log: &mut TurnLog, seqs: Vec<u64>) -> Vec<(u64, String)> {
     let mut assumed = Vec::new();
     for seq in seqs {
@@ -234,6 +272,8 @@ pub fn run_turn(
     let mut pending = Vec::new();
     let mut unknown = Vec::new();
     let mut assumed = Vec::new();
+    let mut nested = Vec::new();
+    let mut nested_assumed = Vec::new();
     let log = match session.turns.get(&request.turn) {
         Some(log) => {
             if log.handler != request.handler || log.arguments != arguments {
@@ -246,6 +286,10 @@ pub fn run_turn(
             let mut log = log.clone();
             if matches!(target.recovery, target::Recovery::AtLoad) {
                 unknown = recover(&mut log, mutation);
+                nested = recover_nested(&mut log, mutation);
+            }
+            if mutation == Mutation::CellRecoveryReportsFailed {
+                nested_assumed = assume_nested_failed(&mut log, std::mem::take(&mut nested));
             }
             if mutation == Mutation::RecoveryReportsFailed {
                 assumed = assume_failed(&mut log, std::mem::take(&mut unknown));
@@ -268,14 +312,7 @@ pub fn run_turn(
                 handler: request.handler.clone(),
                 arguments,
             });
-            TurnLog {
-                handler: request.handler.clone(),
-                arguments: Json::Null,
-                sites: Default::default(),
-                attempts: 0,
-                finished: None,
-                events: Vec::new(),
-            }
+            TurnLog::new(request.handler.clone(), Json::Null)
         }
     };
     let setup = Setup {
@@ -290,16 +327,26 @@ pub fn run_turn(
         request.turn,
         state,
         &log,
-    );
+    )
+    .with_next_cell(session.next_cell());
     for record in pending {
         engine.append(record);
     }
-    if !unknown.is_empty() {
+    if !unknown.is_empty() || !nested.is_empty() {
         let attempt = engine.next_attempt();
         engine.append(Record::Recovery {
             turn: request.turn,
             attempt,
             unknown,
+            nested,
+        });
+    }
+    for ((seq, inner), error) in nested_assumed {
+        engine.append(Record::NestedResult {
+            turn: request.turn,
+            seq,
+            nested: inner,
+            output: Output::Failed(error),
         });
     }
     for (seq, error) in assumed {

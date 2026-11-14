@@ -488,7 +488,7 @@ Symbols: `{` `}` `(` `)` `<` `<=` `>` `>=` `,` `:` `=` `==` `!=` `->` `=>` `+` `
 
 Keywords, which cannot be used as names:
 
-Keywords: `harness` `const` `type` `tool` `model` `state` `on` `let` `push` `clear` `keep` `if` `else` `match` `loop` `for` `return` `true` `false` `and` `or` `not` `list` `effect` `invariant` `requires`
+Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `push` `clear` `keep` `if` `else` `match` `loop` `for` `return` `true` `false` `and` `or` `not` `list` `effect` `invariant` `requires`
 
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
@@ -539,13 +539,14 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | model | state | invariant | function | handler | event ;
+item       = const | type | tool | listing | code | model | state | invariant | function | handler | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
 listing    = "tools" "from" "listing" "(" name "," bound ")" params "effect" effect_class ;
+code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
 model      = "model" name "calls" bound [ "reply" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
@@ -2643,18 +2644,46 @@ and the kill -9 drill of generated code.
 | `hl check [--target T] FILE` | parse, type-check, report each handler's worst case and prove it; with a target, also check the target's limits |
 | `hl prove [--target T] [--mutation M] FILE` | the proofs alone; a mutation plants a lowering bug the proofs must catch |
 | `hl sim --target T --seeds A..B [--twice] [--strict [--any-state]] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs; `--strict` also checks what the proofs promise (no trap but requires and model replies, invariants after every turn, the worst case within the target's limit), and `--any-state` starts each session from a drawn state that satisfies the invariants |
-| `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal` |
+| `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session, cell hooks included; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal`, and refuses `--mutation divergence_dispatches`, since it injects no engine divergence |
 | `hl run FILE --handler NAME [--arg VALUE]... [--seed S]` | run one turn in the interpreter and print the journal |
 | `hl emit --target T FILE` | print the generated program |
 
 `check`, `prove` and `sim` exit 1 when something fails and 2 on a usage error.
 
-## Code mode (in progress)
+## Code mode
 
 Code mode lets the model answer with a JavaScript cell that calls the
 harness's tools as nested calls, as nanocode's Code Mode does. A `code`
-declaration names the tool, the tools a cell may call and the engine's
-limits; a nested external call is journaled with the cell's header before it
-runs and is never dispatched twice. It is specified in
-[CODE_MODE.md](CODE_MODE.md) and being built; the parser does not accept
-`code` yet, so this reference does not document it.
+declaration names the tool, the tools a cell may call (`tools`, a comma
+separated list) and the engine's limits, each a named constant: `calls`,
+`parallel`, `timers`, `timer_ms`, `journal_bytes` and `yield_ms`, in any order,
+each once. The checker requires a model, a non-empty set of declared tools that
+are not code tools, `parallel` at least 1 and at most `calls`. Calling the tool
+(`exec(script)`) or reaching it through `dispatch` yields `maybe<text>`:
+`unknown` only when the cell could not be resumed. A nested external call is
+journaled and flushed with the cell's header before it runs and is never
+dispatched twice. `examples/code_agent.hl` is a complete harness, and
+[CODE_MODE.md](CODE_MODE.md) the whole design.
+
+A nested tool returning a text enum is checked where the cell receives its
+result, as a direct call is: a value outside the enum reaches the script as
+the call's failure and is journaled so. `examples/code_tasks.hl` lists
+`lookup(ticket: text) -> status` among its cell's tools, and shares its model
+loop between two handlers through a fn, so each handler keeps its own cell
+site. The planted bug `nested_enum_unchecked` takes the unlisted value as the
+enum's last one instead:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation nested_enum_unchecked examples/code_tasks.hl
+FAIL invariant=nested_enum_valid seed=10 target=native-jsonl profile=async mutation=nested_enum_unchecked: nested call 1/6/code-2 (lookup) records "blocked", but the tool returned [Ok(String("beta-44"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 10..11 --mutation nested_enum_unchecked examples/code_tasks.hl
+```
+
+A harness with a code tool dispatches a reply's calls with a sequential
+`for`: a dispatch there may run a cell, whose nested calls, timers and journal
+updates run one cell at a time, so the checker refuses a parallel for:
+
+```console
+$ hl check examples/invalid/code_parallel_for.hl
+examples/invalid/code_parallel_for.hl:39:7: error: a parallel for dispatches tool calls at once, but code 'exec' makes a dispatch able to run a cell, which runs one at a time with its journal: use a sequential for
+```

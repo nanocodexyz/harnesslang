@@ -17,6 +17,7 @@ impl Default for State {
                 owner: "rust".to_owned(),
                 lease_ms: 0,
                 head: 0,
+                last_turn: 0,
             },
             rows: Vec::new(),
             epoch: 0,

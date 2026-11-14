@@ -1,0 +1,49 @@
+harness code_parallel_for
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+const cell_calls_max: u64 = 8
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 60000
+const cell_journal_bytes_max: u64 = 33554432
+const cell_yield_ms: u64 = 10000
+
+tool read(path: text) -> text effect none
+
+code exec {
+  tools read
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+}
+
+model infer calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> text
+  requires len(context) + 2 + calls_max <= context_max
+{
+  push context user(question)
+  let reply = infer(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => {
+      for call in requested parallel {
+        match dispatch(call) {
+          ok(output) => { push context result(call, output) }
+          failed(error) => { push context error(call, error) }
+          unknown => { push context unknown(call) }
+        }
+      }
+      return "ran the calls"
+    }
+  }
+}

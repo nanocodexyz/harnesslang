@@ -12,6 +12,9 @@ class Engine {
     this.attempts = log.attempts;
     this.buffer = [];
     this.acknowledged = false;
+    this.cells = new Map([...log.cells].map(([seq, cell]) => [seq, cellLogClone(cell)]));
+    this.nested = new Map(log.nested);
+    this.nextCell = 0;
     this.events = log.events.slice();
     this.taken = 0;
     this.admitted = new Map();
@@ -151,6 +154,8 @@ class Engine {
       case "model":
         assert(PROGRAM.model !== null, "the checker admits model calls only with a model");
         return { tool: PROGRAM.model.name, effect: "idempotent", input: null };
+      case "cell":
+        return { tool: PROGRAM.codes[site.code].name, effect: "none", input: args[0] };
       default:
         return { tool: site.kind, effect: "none", input: null };
     }
@@ -161,6 +166,8 @@ class Engine {
     this.seq += 1;
     const seq = this.seq;
     const call = this.resolve(site, args);
+    const code = site.kind === "cell" ? site.code : site.kind === "dispatch" ? codeNamed(call.tool) : null;
+    if (code !== null) return this.cellSite(code, seq, { ...call, effect: "none" });
     if (site.class !== "dispatched") {
       assert(site.class === call.effect, "a fixed site runs with its declared class");
     }
@@ -196,6 +203,71 @@ class Engine {
     }
   }
 
+  async cellSite(code, seq, call) {
+    const logged = this.sites.get(seq);
+    if (logged !== undefined) {
+      switch (logged.kind) {
+        case "done": {
+          this.same(seq, logged.call, call);
+          const log = this.cells.get(seq);
+          if (this.mutation === "cell_rerun_after_finish" && this.mode.live && log !== undefined) {
+            await this.mode.world.cellStart(log.cell, log.header.script);
+          }
+          return this.decodeCell(logged.output);
+        }
+        case "unknown":
+          this.same(seq, logged.call, call);
+          return variant(VARIANT_UNKNOWN, []);
+        case "reply":
+          throw this.diverged(seq, "a model reply", call.tool);
+        case "open":
+          this.same(seq, logged.call, call);
+          this.requireLive(seq);
+          break;
+        default:
+          throw new Panic(`unknown site log ${logged.kind}`);
+      }
+    } else {
+      this.requireLive(seq);
+      this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
+      this.sites.set(seq, { kind: "open", call });
+    }
+    const outcome = await this.runCell(code, seq, call);
+    const output = cellOutcomeOutput(outcome);
+    this.append({ kind: "result", turn: this.turn, seq, output });
+    this.sites.set(seq, { kind: "done", call, output });
+    return this.decodeCell(output);
+  }
+
+  async runCell(code, seq, call) {
+    assert(typeof call.input === "string", "a cell's input is its script");
+    const existing = this.cells.get(seq);
+    if (existing !== undefined && existing.finished) {
+      return { kind: "unknown", text: divergenceText(existing.cell, "it finished but its result was lost with the journal's tail") };
+    }
+    assert(this.nextCell > 0, "a live turn knows its session's next cell id");
+    const site = {
+      code,
+      target: this.target,
+      mutation: this.mutation,
+      session: PROGRAM.name,
+      turn: this.turn,
+      seq,
+      script: call.input,
+      cell: existing === undefined ? { kind: "fresh", id: this.nextCell } : { kind: "existing", log: existing },
+      nested: new Map(this.nested),
+    };
+    if (existing === undefined) this.nextCell += 1;
+    return runCell(site, new EngineCellHost(this));
+  }
+
+  decodeCell(output) {
+    const outcome = decodeOrCorrupt(() => cellOutcomeFrom(output));
+    if (outcome.kind === "done") return variant(VARIANT_OK, [outcome.text]);
+    if (outcome.kind === "threw") return variant(VARIANT_FAILED, [outcome.text]);
+    return variant(VARIANT_UNKNOWN, []);
+  }
+
   requireLive(seq) {
     if (!this.mode.live) {
       throw new Corrupt(`replay of turn ${this.turn} needs seq ${seq}, which the journal does not record`);
@@ -215,7 +287,7 @@ class Engine {
 
   async unknown(seq, call) {
     const attempt = this.nextAttempt();
-    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: [seq] });
+    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: [seq], nested: [] });
     this.sites.set(seq, { kind: "unknown", call });
     await this.flush();
     return variant(VARIANT_UNKNOWN, []);
@@ -456,6 +528,89 @@ class Engine {
   }
 }
 
+class EngineCellHost {
+  constructor(engine) {
+    assert(engine.mode.live, "cells run only live");
+    this.engine = engine;
+    this.world = engine.mode.world;
+  }
+
+  append(record) {
+    this.engine.append(record);
+  }
+
+  flush() {
+    return this.engine.flush();
+  }
+
+  async flushWithholding(cell) {
+    const engine = this.engine;
+    const withheld = engine.buffer.filter((record) => record.kind === "cell" && record.cell === cell);
+    engine.buffer = engine.buffer.filter((record) => !(record.kind === "cell" && record.cell === cell));
+    try {
+      await engine.flush();
+    } finally {
+      engine.buffer.push(...withheld);
+    }
+  }
+
+  hook(point) {
+    return this.world.hook(point);
+  }
+
+  start(cell, script, context) {
+    return this.world.cellStart(cell, script, context);
+  }
+
+  resume(cell, input) {
+    return this.world.cellResume(cell, input);
+  }
+
+  tool(request) {
+    return this.world.tool(request);
+  }
+
+  attempt(seq, nested) {
+    return this.world.nestedAttempt(this.engine.turn, seq, nested);
+  }
+
+  async recovered(seq, nested) {
+    const engine = this.engine;
+    engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]] });
+    const key = nestedKey(seq, nested);
+    const site = engine.nested.get(key);
+    if (site !== undefined && site.kind === "open") engine.nested.set(key, { kind: "unknown", call: site.call });
+    await engine.flush();
+  }
+
+  clock() {
+    return this.world.now();
+  }
+
+  random() {
+    return this.world.random();
+  }
+
+  armResume() {
+    return this.world.beforeExternal();
+  }
+
+  async waitTimer(wait) {
+    if (await this.world.waited(wait)) return;
+    await this.world.hook(CELL_POINT_WAITING);
+    await this.world.wait(wait);
+  }
+
+  observe(event) {
+    return this.world.observe(event);
+  }
+}
+
+function codeNamed(name) {
+  const index = PROGRAM.codes.findIndex((code) => code.name === name);
+  return index < 0 ? null : index;
+}
+
 async function closeInbox(world, turn, position, events) {
   const arrived = await world.inbox(turn);
   if (arrived.length === 0) return;
@@ -505,7 +660,18 @@ async function stateBefore(setup, session, turn) {
   return state;
 }
 
-function recoverAtLoad(log) {
+function assumeNestedFailed(log, ids) {
+  return ids.map(([seq, nested]) => {
+    const key = nestedKey(seq, nested);
+    const site = log.nested.get(key);
+    assert(site.kind === "unknown", "at-load recovery marks open nested calls unknown");
+    const output = { tag: "failed", error: `${site.call.tool} was lost in a crash` };
+    log.nested.set(key, { kind: "done", call: site.call, output });
+    return [seq, nested, output];
+  });
+}
+
+function recoverAtLoad(log, mutation) {
   const unknown = [];
   for (const [seq, site] of log.sites) {
     if (site.kind === "open" && mayBeUnknown(site.call.effect)) unknown.push(seq);
@@ -513,11 +679,22 @@ function recoverAtLoad(log) {
   for (const seq of unknown) {
     log.sites.set(seq, { kind: "unknown", call: log.sites.get(seq).call });
   }
-  return unknown;
+  const nested = [];
+  const skipped = mutation === "cell_recovery_redispatches_external" || mutation === "recovery_skipped";
+  for (const [key, site] of skipped ? [] : log.nested) {
+    if (site.kind === "open" && mayBeUnknown(site.call.effect)) nested.push(key.split("/").map(Number));
+  }
+  nested.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  for (const [seq, id] of nested) {
+    const key = nestedKey(seq, id);
+    log.nested.set(key, { kind: "unknown", call: log.nested.get(key).call });
+  }
+  return { unknown, nested };
 }
 
 function cloneLog(log) {
-  return { ...log, sites: new Map(log.sites), events: log.events.slice() };
+  const cells = new Map([...log.cells].map(([seq, cell]) => [seq, cellLogClone(cell)]));
+  return { ...log, sites: new Map(log.sites), nested: new Map(log.nested), lastNested: new Map(log.lastNested), cells, events: log.events.slice() };
 }
 
 async function runTurn(setup, world, epoch, records, request) {
@@ -532,7 +709,7 @@ async function runTurn(setup, world, epoch, records, request) {
   }
   const state = await stateBefore(setup, session, request.turn);
   const pending = [];
-  let unknown = [];
+  let unknown = { unknown: [], nested: [] };
   let log;
   if (existing !== undefined) {
     if (existing.handler !== request.handler || !jsonEqual(existing.arguments, args)) {
@@ -540,17 +717,22 @@ async function runTurn(setup, world, epoch, records, request) {
     }
     checkEvents(request.turn, existing);
     log = cloneLog(existing);
-    if (setup.target.recovery === "at_load") unknown = recoverAtLoad(log);
+    if (setup.target.recovery === "at_load") unknown = recoverAtLoad(log, setup.mutation);
   } else {
     const next = session.turns.size === 0 ? 1 : session.lastTurn + 1;
     if (request.turn !== next) throw new Corrupt(`turn ${request.turn} is requested when turn ${next} is next`);
     pending.push({ kind: "admitted", turn: request.turn, handler: request.handler, arguments: args });
     log = newTurnLog(request.handler, null);
   }
+  const assumed = setup.mutation === "cell_recovery_reports_failed" ? assumeNestedFailed(log, unknown.nested.splice(0)) : [];
   const engine = new Engine(setup, handler, { live: true, world, epoch }, request.turn, state, log);
+  engine.nextCell = nextCell(session);
   for (const record of pending) engine.append(record);
-  if (unknown.length > 0) {
-    engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown });
+  if (unknown.unknown.length > 0 || unknown.nested.length > 0) {
+    engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown: unknown.unknown, nested: unknown.nested });
+  }
+  for (const [seq, nested, output] of assumed) {
+    engine.append({ kind: "nested_result", turn: request.turn, seq, nested, output });
   }
   const ran = await engine.run(request.arguments);
   return { ran: "finished", finish: ran.finish };
@@ -577,6 +759,7 @@ function toolRequestJson(request) {
   const entries = [
     ["effect", request.effect],
     ["input", request.input],
+    ["nested", request.nested === undefined || request.nested === null ? null : BigInt(request.nested.id)],
     ["returns", typeName(request.returns)],
     ["seq", BigInt(request.seq)],
     ["tool", request.tool],
@@ -630,6 +813,11 @@ function defaultHost(config) {
       assert(typeof value === "bigint" && value >= 0n && value <= U64_MAX, "random yields a u64");
       return value;
     },
+    async wait(wait) {
+      const left = Number(wait.untilMs) - Number(config.now());
+      if (left > 0) await new Promise((resolve) => setTimeout(resolve, left));
+    },
+    async observe() {},
   };
 }
 
@@ -641,5 +829,6 @@ const runtime = {
   Panic, Trap, Corrupt, DecodeError, HostError,
   encodeJson, decodeJson, crc32, encodeLine, decodeLine, encodeLines, decodeLines,
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
+  Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
   deliveryJson, deliveryFrom,
 };

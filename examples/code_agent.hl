@@ -1,0 +1,71 @@
+harness code_agent
+
+const turn_steps_max: u64 = 16
+const calls_per_step_max: u64 = 4
+const context_entries_max: u64 = 4096
+const turns_max: u64 = 1000000
+const cell_calls_max: u64 = 8
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 600000
+const cell_journal_bytes_max: u64 = 33554432
+const cell_yield_ms: u64 = 10000
+
+type outcome = completed(text) | failed(text) | exhausted
+
+tool read(path: text) -> text effect none
+tool edit(path: text, body: text) -> text effect idempotent
+tool bash(command: text) -> text effect external
+
+code exec {
+  tools read, edit, bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+}
+
+model infer calls calls_per_step_max
+
+state {
+  context: list<entry, context_entries_max>
+  turns: u64
+}
+
+invariant turns_bounded: turns <= turns_max
+invariant context_bounded: len(context) <= context_entries_max
+
+on prompt(input: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+{
+  push context user(input)
+  turns = turns + 1
+  loop step below turn_steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on cell(script: text) -> outcome {
+  match exec(script) {
+    ok(output) => { return completed(output) }
+    failed(error) => { return failed(error) }
+    unknown => { return exhausted }
+  }
+}

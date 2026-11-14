@@ -1,4 +1,4 @@
-use crate::target::{Fact, Target};
+use crate::target::{About, Fact, Target};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Drain {
@@ -15,6 +15,7 @@ pub struct Inbound {
 }
 
 const STD_CHANNEL: Fact = Fact {
+    about: About::Inbound,
     claim: "a receiver's try_recv never blocks, and each sender's messages arrive in the order it sent them",
     source: "doc.rust-lang.org/std/sync/mpsc (Receiver::try_recv, Sender)",
 };
@@ -24,6 +25,7 @@ const NATIVE_FACTS: &[Fact] = &[STD_CHANNEL];
 const POSTGRES_FACTS: &[Fact] = &[
     STD_CHANNEL,
     Fact {
+        about: About::Inbound,
         claim: "only the lease owner's flush commits, so an event recorded by a fenced owner is never answered",
         source: "the fenced transaction of this target's model (src/target/mod.rs); scripts/rust-sql-drill.sh takeover drill",
     },
@@ -31,10 +33,12 @@ const POSTGRES_FACTS: &[Fact] = &[
 
 const CLOUDFLARE_FACTS: &[Fact] = &[
     Fact {
+        about: About::Inbound,
         claim: "every request for one object id reaches the one live instance of that object",
         source: "developers.cloudflare.com/durable-objects (what are Durable Objects: one instance per id)",
     },
     Fact {
+        about: About::Inbound,
         claim: "an event's fetch enters the object while the turn awaits a tool or the model",
         source: "blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (input gates); oracle/cloudflare/storage.mjs event_enters_at_await",
     },
@@ -42,10 +46,12 @@ const CLOUDFLARE_FACTS: &[Fact] = &[
 
 const VERCEL_FACTS: &[Fact] = &[
     Fact {
+        about: About::Inbound,
         claim: "resumeHook(token, payload) resolves only once the payload is durably recorded as hook_received in the run's event log",
         source: "workflow-sdk.dev (hooks: createHook, resumeHook), read through a web search summary on 2026-11-14",
     },
     Fact {
+        about: About::Inbound,
         claim: "a replayed workflow function receives each hook payload once, at the same place among its step results",
         source: "workflow-sdk.dev (event sourcing and replay; hook_received deduplicated by resumeId), read through a web search summary on 2026-11-14; assumed, not measured",
     },

@@ -1,5 +1,9 @@
 const U64_MAX = (1n << 64n) - 1n;
 const JSON_DEPTH_MAX = 128;
+const FRACTION_BITS = 32n;
+const FRACTION_DIGITS = 32;
+const FRACTION_SCALE = 5n ** FRACTION_BITS;
+const FRACTION_NUMERATOR_MAX = (1n << FRACTION_BITS) - 1n;
 const FIRST_SEQ = 1;
 const CRC32_POLYNOMIAL_REFLECTED = 0xedb88320;
 const CRC32_CHECK_INPUT = "123456789";
@@ -7,6 +11,7 @@ const CRC32_CHECK = 0xcbf43926;
 const BYTE_VALUES = 256;
 const BITS_PER_BYTE = 8;
 const LINE_END = "\n";
+const NESTED_ID_INFIX = "/code-";
 const LINE_PREFIX = "{\"crc\":";
 const LINE_MIDDLE = ",\"record\":";
 const LINE_SUFFIX = "}";
@@ -35,6 +40,28 @@ class Trap {
 class Corrupt extends Error {}
 
 class DecodeError extends Error {}
+
+class Fraction {
+  constructor(numerator) {
+    assert(typeof numerator === "bigint" && numerator >= 0n && numerator <= FRACTION_NUMERATOR_MAX, "a fraction's numerator fits in fraction_bits");
+    this.numerator = numerator;
+  }
+}
+
+function fractionText(numerator) {
+  const digits = (numerator * FRACTION_SCALE).toString().padStart(FRACTION_DIGITS, "0");
+  assert(digits.length === FRACTION_DIGITS, "a fraction below one has fraction_digits decimals");
+  const trimmed = digits.replace(/0+$/, "");
+  return "0." + (trimmed === "" ? "0" : trimmed);
+}
+
+function fractionFrom(digits) {
+  if (digits.length === 0 || digits.length > FRACTION_DIGITS) return null;
+  const scaled = BigInt(digits.padEnd(FRACTION_DIGITS, "0"));
+  if (scaled % FRACTION_SCALE !== 0n) return null;
+  const numerator = scaled / FRACTION_SCALE;
+  return numerator <= FRACTION_NUMERATOR_MAX ? new Fraction(numerator) : null;
+}
 
 class StepEnd {
   constructor(records) {
@@ -140,7 +167,8 @@ function writeJson(json, out, depth) {
   else if (typeof json === "bigint") {
     assert(json >= 0n && json <= U64_MAX, "a json number is a u64");
     out.push(json.toString());
-  } else if (typeof json === "string") out.push(quote(json));
+  } else if (json instanceof Fraction) out.push(fractionText(json.numerator));
+  else if (typeof json === "string") out.push(quote(json));
   else if (Array.isArray(json)) {
     out.push("[");
     for (let index = 0; index < json.length; index++) {
@@ -163,6 +191,9 @@ function writeJson(json, out, depth) {
 
 function jsonEqual(left, right) {
   if (left === right) return true;
+  if (left instanceof Fraction || right instanceof Fraction) {
+    return left instanceof Fraction && right instanceof Fraction && left.numerator === right.numerator;
+  }
   if (Array.isArray(left)) {
     return Array.isArray(right) && left.length === right.length && left.every((item, index) => jsonEqual(item, right[index]));
   }
@@ -219,8 +250,21 @@ class JsonParser {
     const value = BigInt(digits);
     if (value > U64_MAX) throw new DecodeError(`number does not fit in u64 at offset ${start}`);
     if (digits.length > 1 && digits[0] === "0") throw new DecodeError(`number has a leading zero at offset ${start}`);
+    if (digits === "0" && this.text[this.offset] === ".") return this.fraction();
     if (".eE-".includes(this.text[this.offset] ?? "x")) this.fail("only unsigned integers are numbers here");
     return value;
+  }
+
+  fraction() {
+    this.offset += 1;
+    const start = this.offset;
+    while (this.offset < this.text.length && this.text[this.offset] >= "0" && this.text[this.offset] <= "9") {
+      this.offset += 1;
+    }
+    if ("eE".includes(this.text[this.offset] ?? "x")) this.fail("a fraction has no exponent here");
+    const fraction = fractionFrom(this.text.slice(start, this.offset));
+    if (fraction === null) this.fail(`a fraction here is a multiple of 2^-${FRACTION_BITS} below one`);
+    return fraction;
   }
 
   hex4() {
@@ -371,6 +415,17 @@ function callId(turn, seq) {
   return `${turn}/${seq}`;
 }
 
+function nestedId(turn, seq, nested) {
+  return `${callId(turn, seq)}${NESTED_ID_INFIX}${nested}`;
+}
+
+function recoveryIds(record) {
+  const keyed = record.unknown.map((seq) => [seq, 0, callId(record.turn, seq)]);
+  for (const [seq, nested] of record.nested) keyed.push([seq, nested, nestedId(record.turn, seq, nested)]);
+  keyed.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  return keyed.map((item) => item[2]);
+}
+
 function mayBeUnknown(effect) {
   return effect === "external";
 }
@@ -417,7 +472,29 @@ function recordJson(record) {
       return object([["recovery", object([
         ["attempt", BigInt(record.attempt)],
         ["turn", turn],
-        ["unknown", record.unknown.map((seq) => callId(record.turn, seq))],
+        ["unknown", recoveryIds(record)],
+      ])]]);
+    case "nested_call":
+      return object([["call", object([
+        ["call_id", nestedId(record.turn, record.seq, record.nested)],
+        ["effect", record.effect],
+        ["input", record.input],
+        ["seq", BigInt(record.seq)],
+        ["tool", record.tool],
+        ["turn", turn],
+      ])]]);
+    case "nested_result":
+      return object([["result", object([
+        ["call_id", nestedId(record.turn, record.seq, record.nested)],
+        ["output", outputJson(record.output)],
+        ["seq", BigInt(record.seq)],
+      ])]]);
+    case "cell":
+      return object([["cell", object([
+        ["cell", BigInt(record.cell)],
+        ["fresh", record.fresh],
+        ["session", record.session],
+        ["update", cellUpdateJson(record.update)],
       ])]]);
     case "status":
       return object([["status", object([
@@ -486,6 +563,14 @@ function parseDecimal(text, what) {
   return Number(value);
 }
 
+function parseAnyCallId(text) {
+  const infix = text.indexOf(NESTED_ID_INFIX);
+  if (infix < 0) return [...parseCallId(text), null];
+  const [turn, seq] = parseCallId(text.slice(0, infix));
+  const nested = parseDecimal(text.slice(infix + NESTED_ID_INFIX.length), `call id ${JSON.stringify(text)} has no nested call number`);
+  return [turn, seq, nested];
+}
+
 function parseCallId(text) {
   const slash = text.indexOf("/");
   if (slash < 0) throw new DecodeError(`call id ${JSON.stringify(text)} is not turn/seq`);
@@ -520,9 +605,15 @@ class Fields {
   }
 
   call() {
-    const [turn, seq] = parseCallId(this.text("call_id"));
+    const [turn, seq, nested] = parseAnyCallId(this.text("call_id"));
     if (this.number("seq") !== seq) throw new DecodeError(`${this.tag} record's seq disagrees with its call id`);
-    return [turn, seq];
+    return [turn, seq, nested];
+  }
+
+  boolean(key) {
+    const value = this.get(key);
+    if (typeof value !== "boolean") throw new DecodeError(`${this.tag} record's '${key}' is not a bool`);
+    return value;
   }
 
   exact(keys) {
@@ -550,24 +641,23 @@ function recordFrom(json) {
     case "admitted":
       fields.exact(["digest", "first", "hand", "metadata", "prompt", "turn"]);
       return { kind: "admitted", turn: fields.turn(), handler: fields.text("digest"), arguments: fields.get("prompt") };
-    case "call": {
-      fields.exact(["call_id", "effect", "input", "seq", "tool", "turn"]);
-      const [turn, seq] = fields.call();
-      if (fields.turn() !== turn) throw new DecodeError("call record's turn disagrees with its call id");
-      const effect = fields.text("effect");
-      if (!EFFECT_CLASSES.includes(effect)) throw new DecodeError("call record has an unknown effect class");
-      return { kind: "call", turn, seq, tool: fields.text("tool"), effect, input: fields.get("input") };
-    }
+    case "call":
+      return callFrom(fields);
     case "result": {
       fields.exact(["call_id", "output", "seq"]);
-      const [turn, seq] = fields.call();
-      return { kind: "result", turn, seq, output: outputFrom(fields.get("output")) };
+      const [turn, seq, nested] = fields.call();
+      const output = outputFrom(fields.get("output"));
+      if (nested === null) return { kind: "result", turn, seq, output };
+      return { kind: "nested_result", turn, seq, nested, output };
     }
     case "model": {
       fields.exact(["call_id", "response", "seq", "turn"]);
-      const [turn, seq] = fields.call();
+      const [turn, seq, nested] = fields.call();
+      if (nested !== null) throw new DecodeError("a model reply has a nested call id");
       return { kind: "model", turn, seq, response: fields.get("response") };
     }
+    case "cell":
+      return cellFrom(fields);
     case "recovery":
       return recoveryFrom(fields);
     case "status":
@@ -583,19 +673,55 @@ function recordFrom(json) {
   }
 }
 
+function callFrom(fields) {
+  fields.exact(["call_id", "effect", "input", "seq", "tool", "turn"]);
+  const [turn, seq, nested] = fields.call();
+  if (fields.turn() !== turn) throw new DecodeError("call record's turn disagrees with its call id");
+  const effect = fields.text("effect");
+  if (!EFFECT_CLASSES.includes(effect)) throw new DecodeError("call record has an unknown effect class");
+  const call = { turn, seq, tool: fields.text("tool"), effect, input: fields.get("input") };
+  if (nested === null) return { kind: "call", ...call };
+  return { kind: "nested_call", ...call, nested };
+}
+
+function cellFrom(fields) {
+  fields.exact(["cell", "fresh", "session", "update"]);
+  const cell = fields.number("cell");
+  const fresh = fields.boolean("fresh");
+  const session = fields.text("session");
+  const update = cellUpdateFrom(fields.get("update"));
+  if (update.cellId !== cell || update.sessionId !== session) {
+    throw new DecodeError("cell record's cell or session disagrees with its update");
+  }
+  if ((update.header !== null) !== fresh) {
+    throw new DecodeError("cell record is fresh exactly when its update carries the header");
+  }
+  return { kind: "cell", cell, fresh, session, update };
+}
+
 function recoveryFrom(fields) {
   fields.exact(["attempt", "turn", "unknown"]);
   const turn = fields.turn();
   const items = fields.get("unknown");
   if (!Array.isArray(items)) throw new DecodeError("recovery record's unknown is not a list");
   const unknown = [];
+  const nested = [];
   for (const item of items) {
     if (typeof item !== "string") throw new DecodeError("recovery lists a call id that is not text");
-    const [callTurn, seq] = parseCallId(item);
+    const [callTurn, seq, inner] = parseAnyCallId(item);
     if (callTurn !== turn) throw new DecodeError("recovery lists a call of another turn");
-    unknown.push(seq);
+    if (inner === null) unknown.push(seq);
+    else nested.push([seq, inner]);
   }
-  return { kind: "recovery", turn, attempt: fields.number("attempt"), unknown };
+  unknown.sort((left, right) => left - right);
+  nested.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  if (unknown.some((seq, index) => index > 0 && unknown[index - 1] === seq)
+    || nested.some((pair, index) => index > 0 && nested[index - 1][0] === pair[0] && nested[index - 1][1] === pair[1])) {
+    throw new DecodeError("recovery lists a call twice");
+  }
+  const record = { kind: "recovery", turn, attempt: fields.number("attempt"), unknown, nested };
+  if (!jsonEqual(recoveryIds(record), items)) throw new DecodeError("recovery lists its calls out of order");
+  return record;
 }
 
 function statusFrom(fields) {
@@ -657,7 +783,7 @@ function decodeLines(text, checksum) {
 }
 
 function newTurnLog(handler, args) {
-  return { handler, arguments: args, sites: new Map(), lastSeq: 0, attempts: 0, finished: null, events: [] };
+  return { handler, arguments: args, sites: new Map(), lastSeq: 0, attempts: 0, finished: null, nested: new Map(), lastNested: new Map(), cells: new Map(), events: [] };
 }
 
 function runningLog(session, turn, what) {
@@ -676,7 +802,7 @@ function nextSite(log, turn, seq, site) {
 }
 
 function fold(records) {
-  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), lastEvent: 0 };
+  const session = { turns: new Map(), lastTurn: 0, checkpoints: new Map(), cellOrigins: new Map(), lastEvent: 0 };
   for (const record of records) {
     applyRecord(session, record);
   }
@@ -713,6 +839,15 @@ function applyRecord(session, record) {
       nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response });
       return;
     }
+    case "nested_call":
+      nestedCallFold(runningLog(session, record.turn, "a nested call"), record);
+      return;
+    case "nested_result":
+      nestedResultFold(runningLog(session, record.turn, "a nested result"), record);
+      return;
+    case "cell":
+      cellFold(session, record);
+      return;
     case "recovery":
       applyRecovery(session, record);
       return;
@@ -801,6 +936,7 @@ function checkEvents(turn, log) {
 
 function applyRecovery(session, record) {
   const log = runningLog(session, record.turn, "a recovery");
+  for (const [seq, nested] of record.nested) nestedRecoverFold(log, record.turn, seq, nested);
   if (record.attempt <= log.attempts) {
     throw new Corrupt(`recovery attempt ${record.attempt} of turn ${record.turn} follows attempt ${log.attempts}`);
   }

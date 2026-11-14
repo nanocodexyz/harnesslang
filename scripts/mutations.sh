@@ -32,7 +32,22 @@ event_ack_early examples/claude_agent.hl --twice event_kept
 event_read_unstamped examples/claude_agent.hl --twice event_before_read
 event_drain_on_replay examples/claude_agent.hl --twice event_replay_equal
 batch_drains_replayed examples/claude_agent.hl --twice event_replay_equal
-loop_past_bound examples/sound/full_loop.hl --strict worst_case"
+loop_past_bound examples/sound/full_loop.hl --strict worst_case
+cell_header_rides_past_external examples/code_agent.hl --twice nested_external_once 0..300
+nested_flush_after_dispatch examples/code_agent.hl --twice nested_external_once 0..300
+cell_recovery_redispatches_external examples/code_agent.hl --twice nested_external_once 0..300
+cell_recovery_reports_failed examples/code_agent.hl --twice unknown_nested_reported 0..300
+cell_replay_ignores_journal examples/code_agent.hl --twice nested_external_once|seq_unique 0..300
+cell_rerun_after_finish examples/code_agent.hl --twice cell_finishes_once 0..300
+timeout_rides examples/code_agent.hl --twice header_before_wait 0..300
+divergence_dispatches examples/code_agent.hl --twice cell_replay_equal 0..300
+nested_ids_restart examples/code_agent.hl --twice seq_unique|unknown_nested_reported 0..300
+cell_limit_unchecked examples/code_agent.hl --twice cell_bounded 0..300
+vercel_nested_retry_redispatches examples/code_agent.hl --twice nested_external_once 0..300
+cell_gate_releases_early examples/code_agent.hl --twice nested_external_once 0..300
+postgres_cell_unfenced examples/code_agent.hl --twice seq_unique 0..300
+nested_idempotent_reported_unknown examples/code_agent.hl --twice nested_known 0..300
+nested_enum_unchecked examples/code_tasks.hl --twice nested_enum_valid 0..300"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
@@ -41,6 +56,9 @@ rust double_fsync examples/agent.hl native-jsonl backend_equal
 rust batch_seq_from_zero examples/agent.hl native-sqlite,server-postgres backend_equal
 rust recovery_skipped examples/agent.hl native-jsonl,native-sqlite,server-postgres panic
 rust enum_unchecked examples/hooks.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust nested_flush_after_dispatch examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js flush_after_dispatch examples/agent.hl vercel backend_equal
 js bound_message examples/agent.hl cloudflare,vercel backend_equal
 js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic"
@@ -96,11 +114,12 @@ census() {
 }
 
 run_one() {
-  local mutation=$1 file mode expected target status output invariant applied=0 seen=""
-  read -r _ file mode expected <<< "$(grep "^$mutation " <<< "$plans")"
+  local mutation=$1 file mode expected range target status output invariant applied=0 seen=""
+  read -r _ file mode expected range <<< "$(grep "^$mutation " <<< "$plans")"
+  range=${range:-$seeds}
   for target in $targets; do
     set +e
-    output=$("$hl" sim --target "$target" --seeds "$seeds" "$mode" --mutation "$mutation" "$file" 2>&1)
+    output=$("$hl" sim --target "$target" --seeds "$range" "$mode" --mutation "$mutation" "$file" 2>&1)
     status=$?
     set -e
     if [ "$status" -eq 2 ]; then
@@ -109,7 +128,7 @@ run_one() {
     applied=$((applied + 1))
     invariant=$(sed -n 's/^FAIL invariant=\([a-z_]*\) .*/\1/p' <<< "$output" | head -n 1)
     if [ "$status" -ne 1 ] || [ -z "$invariant" ]; then
-      echo "mutation $mutation on $target was not caught in seeds $seeds:" >&2
+      echo "mutation $mutation on $target was not caught in seeds $range:" >&2
       echo "$output" >&2
       exit 1
     fi

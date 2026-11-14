@@ -21,7 +21,10 @@ plant_expression() {
     double_fsync) echo 's/^    disk.sync().map_err(|_| Stop::Crash)?;$/    disk.sync().map_err(|_| Stop::Crash)?;\n    disk.sync().map_err(|_| Stop::Crash)?;/' ;;
     batch_seq_from_zero) echo 's/("seq", Json::Number(head + 1 + index as u64))/("seq", Json::Number(head + index as u64))/' ;;
     recovery_skipped) echo 's/SiteLog::Open(call) if call.effect.may_be_unknown() => Some(\*seq),/SiteLog::Open(call) if false => Some(*seq),/' ;;
+    nested_flush_after_dispatch) echo 's/if tool.effect.may_be_unknown() {/if false \&\& tool.effect.may_be_unknown() {/' ;;
+    timeout_rides) echo 's/if self.header_unsaved {/if false \&\& self.header_unsaved {/' ;;
     enum_unchecked) echo 's/checked_output(&call.tool, returns, output)$/output/' ;;
+    nested_enum_unchecked) echo 's/Ok(checked_output(tool.name, tool.returns, output))$/Ok(output)/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

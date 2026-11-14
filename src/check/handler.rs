@@ -67,7 +67,7 @@ pub fn check(
         body,
         worst: ir::worst::WorstCase::default(),
     };
-    handler.worst = ir::worst::compute(&handler).map_err(|overflow| {
+    handler.worst = ir::worst::compute(program, &handler).map_err(|overflow| {
         crate::syntax::Diagnostic::new(
             definition.name.at,
             format!(
@@ -513,6 +513,14 @@ impl Checker<'_> {
         body: &ast::Block,
         out: &mut Vec<Stmt>,
     ) -> Checked<bool> {
+        if let Some(code) = self.globals.codes.keys().next() {
+            return error(
+                at,
+                format!(
+                    "a parallel for dispatches tool calls at once, but code '{code}' makes a dispatch able to run a cell, which runs one at a time with its journal: use a sequential for"
+                ),
+            );
+        }
         let list_at = list.at();
         let (list, ty) = self.expr(list, None, out)?;
         let Type::List { element, capacity } = ty else {
@@ -833,6 +841,22 @@ impl Checker<'_> {
                 SiteKind::Tool(tool_id),
                 SiteClass::Fixed(tool.effect),
                 result,
+                args,
+                out,
+            ));
+        }
+        if let Some(&code) = self.globals.codes.get(&callee.text) {
+            let args = self.args(
+                at,
+                &format!("code tool '{}'", callee.text),
+                args,
+                &[Type::Text],
+                out,
+            )?;
+            return Ok(self.site(
+                SiteKind::Cell(code),
+                SiteClass::Cell,
+                Type::Maybe(Box::new(Type::Text)),
                 args,
                 out,
             ));

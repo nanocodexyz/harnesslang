@@ -18,6 +18,7 @@ pub enum Item {
     Const(Const),
     Type(TypeDef),
     Tool(Tool),
+    Code(Code),
     Listing(Listing),
     Model(Model),
     State(State),
@@ -71,6 +72,19 @@ pub struct Tool {
     pub params: Vec<Param>,
     pub returns: TypeExpr,
     pub effect: EffectClass,
+}
+
+#[derive(Clone, Debug)]
+pub struct Code {
+    pub name: Name,
+    pub tools: Vec<Name>,
+    pub fields: Vec<CodeField>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodeField {
+    pub key: Name,
+    pub value: Name,
 }
 
 #[derive(Clone, Debug)]

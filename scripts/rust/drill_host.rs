@@ -1,3 +1,5 @@
+#[path = "drill_cells.rs"]
+mod drill_cells;
 #[path = "sql_drill_checks.rs"]
 mod checks;
 #[path = "harness.rs"]
@@ -6,8 +8,8 @@ mod harness;
 use checks::{append_synced, open_append};
 use harness::program::{self, Arguments};
 use harness::{
-    Disk, FileDisk, Finish, Host, Json, JsonlJournal, ModelRequest, Output, Ran, Returns, RunError,
-    Start, ToolRequest, TurnRequest, call_id,
+    CellEngine, Disk, EffectClass, FileDisk, Finish, Host, Json, JsonlJournal, ModelRequest, Output,
+    Ran, Record, Returns, RunError, Start, ToolRequest, TurnRequest, call_id, nested_call_id,
 };
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -46,6 +48,7 @@ struct Drill {
     acks: std::fs::File,
     rng: Rng,
     clock: u64,
+    engine: drill_cells::ScriptEngine,
     tag: String,
 }
 
@@ -58,7 +61,15 @@ impl Host for Drill {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
-        let id = call_id(request.turn, request.seq);
+        let id = match request.nested {
+            Some(nested) => nested_call_id(&call_id(request.turn, request.seq), nested.id),
+            None => call_id(request.turn, request.seq),
+        };
+        if let Some(nested) = request.nested
+            && request.effect == EffectClass::External
+        {
+            drill_cells::check_c1(&self.engine.journal, request.turn, request.seq, nested.id, request.tool);
+        }
         let line = checks::dispatch_line(&id, request.tool, request.effect, &self.tag);
         append_synced(&mut self.ledger, &line);
         if self.rng.chance(TOOL_FAILURE_PPM) {
@@ -85,6 +96,16 @@ impl Host for Drill {
         let count = 1 + self.rng.below(request.calls_max);
         let mut calls = Vec::new();
         for index in 0..count {
+            if !program::CODES.is_empty() && self.rng.chance(drill_cells::CELL_REPLY_PPM) {
+                let code = self.rng.below(program::CODES.len() as u64) as usize;
+                let script = drill_cells::script(&mut self.rng, code, request.turn, request.seq);
+                calls.push(Json::object(vec![
+                    ("id", Json::String(format!("c{}-{}-{index}", request.turn, request.seq))),
+                    ("tool", Json::text(program::CODES[code].name)),
+                    ("input", Json::String(script)),
+                ]));
+                continue;
+            }
             let tool = if self.rng.chance(UNDECLARED_TOOL_PPM) {
                 UNDECLARED_TOOLS[self.rng.below(UNDECLARED_TOOLS.len() as u64) as usize]
             } else {
@@ -122,6 +143,10 @@ impl Host for Drill {
             ),
         );
     }
+
+    fn cells(&mut self) -> Option<&mut dyn CellEngine> {
+        Some(&mut self.engine)
+    }
 }
 
 fn request(seed: u64, turn: u64) -> TurnRequest {
@@ -141,6 +166,7 @@ fn run(journal: &str, ledger: &str, acks: &str, seed: u64, turns: u64) {
         acks: open_append(acks),
         rng: Rng(seed ^ started),
         clock: 0,
+        engine: drill_cells::ScriptEngine::new(journal),
         tag: checks::run_tag(RUN_OWNER),
     };
     let run_line = checks::run_line(&drill.tag);
@@ -183,8 +209,10 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
         harness::fold(&opened.records).unwrap_or_else(|error| panic!("the journal folds: {error}"));
     let verified = checks::check_all(&opened.records, ledger, acks, turns, 0);
     let tail = check_tail(journal, &session);
+    let lines = checks::read_ledger(ledger);
+    let cells = drill_cells::check_cells(&session, &opened.records, &lines);
     println!(
-        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={} other_dispatches_lost_in_a_kill={} acks={} {tail} torn_bytes_dropped={}",
+        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={} other_dispatches_lost_in_a_kill={} acks={} {tail} torn_bytes_dropped={} cells={} cells_threw={} nested_external={} nested_unknown={} nested_other={}",
         verified.runs,
         opened.records.len(),
         verified.external,
@@ -193,18 +221,20 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
         verified.dispatches,
         verified.other_lost,
         verified.acks,
-        opened.dropped_bytes
+        opened.dropped_bytes,
+        cells.cells,
+        cells.threw,
+        cells.external,
+        cells.unknown,
+        cells.other
     );
 }
 
 fn check_tail(journal: &str, whole: &harness::Session) -> String {
     let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
     let tail = harness::jsonl_open_tail(&mut disk).expect("the journal's tail reads");
-    assert_eq!(
-        tail.dropped_bytes, 0,
-        "the whole open already dropped the torn tail"
-    );
-    let Start::Checkpoint(revision) = tail.start else {
+    assert_eq!(tail.dropped_bytes, 0, "the whole open already dropped the torn tail");
+    let Start::Checkpoint { revision, next_cell } = tail.start else {
         assert!(
             whole.turns.len() <= 1,
             "a journal of finished turns has a trusted checkpoint"
@@ -235,13 +265,17 @@ fn check_tail(journal: &str, whole: &harness::Session) -> String {
         whole.checkpoints.get(&revision),
         "the tail starts at the whole journal's checkpoint"
     );
-    let older =
-        harness::jsonl_open_for(&mut disk, revision).expect("the journal reads for an older turn");
-    assert_eq!(
-        older.start,
-        Start::Beginning,
-        "an older turn reads the whole journal"
-    );
+    let cells_before = whole
+        .cell_origins
+        .iter()
+        .filter(|(_, (turn, _))| *turn <= revision)
+        .map(|(cell, _)| cell + 1)
+        .max()
+        .unwrap_or(harness::FIRST_CELL);
+    assert_eq!(next_cell, cells_before, "the tail's next cell follows every cell before its checkpoint");
+    assert_eq!(session.next_cell(), whole.next_cell(), "the tail and the whole journal agree on the next cell");
+    let older = harness::jsonl_open_for(&mut disk, revision).expect("the journal reads for an older turn");
+    assert_eq!(older.start, Start::Beginning, "an older turn reads the whole journal");
     format!("tail_from={revision} tail_records={}", tail.records.len())
 }
 
@@ -311,6 +345,7 @@ fn bench(journal: &str, ledger: &str, acks: &str, turns: u64, mode: &str) {
         acks: open_append(acks),
         rng: Rng(turns),
         clock: 0,
+        engine: drill_cells::ScriptEngine::new(journal),
         tag: checks::run_tag(RUN_OWNER),
     };
     let started = std::time::Instant::now();

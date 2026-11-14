@@ -122,12 +122,13 @@ Cloudflare's request limit (`hl check` refuses it instead). The platform
 limits in `src/target/` come from summaries of vendor documentation and are
 marked unverified in `DECISIONS.md`.
 
-## Code mode (in progress)
+## Code mode
 
 Code mode lets the model answer with a JavaScript cell that calls the
 harness's tools as nested calls, journaled so that a nested external call is
 never dispatched twice. It is specified in [docs/CODE_MODE.md](docs/CODE_MODE.md)
-and being built.
+and runs on every target: the simulator, the prover, both generated backends
+and the nanocode oracle cover it.
 
 ## Use
 

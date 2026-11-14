@@ -62,7 +62,8 @@ The model reaches it like any tool, through `dispatch(call)`, whose type
 stays `maybe<text>`, or a handler calls it directly: `let out = exec(script)`
 has type `maybe<text>`:
 
-- `ok(output)`: the cell finished; `output` is what it returned and printed.
+- `ok(output)`: the cell finished; `output` is what it printed, one line per
+  `console.log`, as djs gives it (a script's return value is not part of it).
 - `failed(error)`: the script threw, or a limit stopped it.
 - `unknown`: the cell could not be resumed (a divergence, or its journal
   passed `journal_bytes`); nested calls it made may have run. The text the
@@ -74,14 +75,14 @@ the script receives it as a failed call carrying nanocode's
 
 Inside the cell the script sees `tools.<name>(input)` for each listed tool
 (a promise of its text, or a rejection with the tool's error), `setTimeout`,
-`Date.now()`, `performance.now()`, `Math.random()` and
-`crypto.getRandomValues`, each journaled, and no network, file or process
+`Date.now()`, `performance.now()` and `Math.random()`, each journaled, and no network, file or process
 access of its own: every effect is a nested call. A program may declare more
 than one `code` tool, each with its own tool set.
 
 Checker rules: the nested set is non-empty, names declared tools only and
 not a `code` tool; every limit is a named constant; `parallel <= calls`;
-`code` needs a `model`; a target whose model says `cells: unsupported`
+`code` needs a `model`; a harness with a `code` tool has no parallel for,
+since a dispatch may run a cell and cells run one at a time; a target whose model says `cells: unsupported`
 refuses the declaration with the reason the target model gives.
 
 ## IR
@@ -116,9 +117,14 @@ journal protocol, so djs fits it as nanocode uses it:
     start(cell_id, script) -> Step
     resume(cell_id, input: Input) -> Step
     Step = Call { id, name, input } | Timeout { id, delay_ms } | Clock
-         | Monotonic | Random | Bytes { length } | Done { output } | Threw { error }
-    Input = Result { id, encoded, success } | Timer { id } | Clock { value }
-          | Monotonic { value } | Random { value } | Bytes { data }
+         | Monotonic | Random | Bytes { length } | Idle | Done { output } | Threw { error }
+    Input = Issued | Refused { error } | Result { id, encoded, success } | Timer { id }
+          | Clock { value } | Monotonic { value } | Random { value } | Bytes { data }
+
+After a Call or Timeout step the runner answers Issued and the script runs
+on (a Promise.all issues several calls this way); Idle means the script
+awaits, answered with the next Result or Timer; Refused answers a
+setTimeout past timers or timer_ms, which throws in the script.
 
 Each step is one `JournalEntry` (`code-mode-engine/src/journal.rs`); the
 runner journals it, answers it from the journal on replay or runs it live.
@@ -152,7 +158,7 @@ in the session from 1. `session` is the session's name.
 | header | the cell starts | `cell` with `fresh` and `header`, `seq` 0 | rides the next flush, which C1 and C2 force |
 | nested call | a nested call starts | a `Call` entry and its `running` `JournaledCall`; for an `external` tool also harnesslang's `call` record, id `<origin>/code-<id>`, effect `external` | external: flushed before dispatch (C1); none and idempotent: ride |
 | nested result | a nested call returns | a `Result` entry and the call `completed`; for an `external` tool also a `result` record for its id | rides the next flush |
-| queued | a call over `parallel` | the call `queued`, no entry yet; its `Call` entry is written when it starts | rides |
+| queued | a call over `parallel` | its `Call` entry, written when the script issues the call as nanocode's engine does, and the call `queued`; it turns `running` when a slot frees, and an external one gets its `call` record and C1 then | rides |
 | timeout | the script arms a timer | a `Timeout { id, delay_ms, at_ms }` entry, `at_ms` from the world clock | flushed before the cell waits when the header is not yet durable (C2), else rides |
 | timer | a timer fires | a `Timer { id }` entry | rides |
 | clock, random | the script reads one | `Clock`, `Monotonic`, `Random`, `Bytes` entries | ride |
@@ -246,17 +252,24 @@ Worker Loader binding exists and needs workerd's `--experimental` flag, an
 object stub in the loaded Worker's `env` carries nested calls into the
 object, `globalOutbound: null` makes `fetch()` and `connect()` throw, and
 every nested call's outbound request left the object only after its call row
-committed. Still unverified, to be recorded in `src/target/mod.rs` when
-cells land: production availability (an open beta on Workers Paid, per a
+committed. These facts, and the vendor statements below them, are written in
+`src/target/mod.rs` as each target's cell facts (`About::Cells`), with their
+sources, and `hl check --target T` prints them under the cell placement for a
+program with a `code` tool; `scripts/cloudflare-drill.sh` fails when a
+`loader.mjs` fact it cites was not printed by that run. Still unverified:
+production availability (an open beta on Workers Paid, per a
 search summary of the vendor docs) and how subrequests are counted, which
 local workerd does not enforce at all. The vendor's limits page counts
 Durable Object RPC as subrequests to internal services, under the same
 per-invocation limit as outbound requests, so the model counts a cell's
 nested calls as `calls` internal subrequests of the loaded Worker's
 invocation and each nested call's outbound request against the RPC event
-that makes it, not none as first assumed. Unverified for Vercel: whether
-the workflow sandbox lets the engine compile a script (`node:vm` or an
-equivalent) and the longest workflow sleep. Where a fact turns out false the target says
+that makes it, not none as first assumed. On Vercel the generated code runs
+the engine inside a step, which the vendor documents as having the full
+Node.js runtime (so `node:vm` is there), and replays the cell from the run's
+journal in each step; a timer is a durable `sleep()`. Unverified for Vercel:
+those vendor statements on a real deployment (read from a search summary) and
+the longest workflow sleep. Where a fact turns out false the target says
 `cells: unsupported` and `hl check` refuses `code` there; at-most-once is
 never weakened to make a target fit.
 
@@ -293,10 +306,22 @@ Invariants, beside the existing ones (each counts per nested call id):
 | `cell_replay_equal` | a replay without the divergence fault matches its journal step for step; under the fault the cell finishes `unknown` and nothing after the divergence is dispatched |
 | `header_before_wait` | whenever a cell waits on a timer, its header is durable |
 | `cell_bounded` | nested calls, running calls, timers and journal bytes stay within the declaration's bounds; reaching one is the typed refusal the script sees, never a dropped call |
+| `nested_enum_valid` | every nested result a cell journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not; the script sees the same failure, in the interpreter, the generated Rust and the generated JavaScript alike |
 
 `seq_unique` extends to nested ids, and `external_once`,
-`unknown_reported` and `idempotent_known` keep counting top-level calls
-only, so a failure names the level it happened at.
+`unknown_reported`, `idempotent_known` and `enum_valid` keep counting
+top-level calls only, so a failure names the level it happened at.
+
+`hl sim --exhaustive` explores cell sites too: every cell hook is a crash
+point it enumerates, nested calls draw their results from the seed, and the
+simulator's cell bookkeeping (nested dispatches, running calls, timers) is
+part of the state it deduplicates. It enumerates crashes, torn writes and
+lease expiries but injects no engine divergence, so it refuses
+`--mutation divergence_dispatches` (exit 2); scripts over a cell's limits are a
+0.5% draw (policy) its small workloads rarely reach, so `cell_limit_unchecked`
+is left to the seeded sweep. `scripts/exhaustive.sh` explores
+`examples/code_tasks.hl` at depth 1 on every target and requires every other
+cell mutation to fail there with its invariant.
 
 ## Proofs
 
@@ -313,7 +338,15 @@ diverged). Obligations:
 | `header_before_wait` | every wait in the plan follows a flush that included the header |
 | `cell_finish_once` | every path through the cell site, divergence and limits included, appends one `finished` and one site `result`, and a replayed finished cell runs nothing |
 | `worst_case` | a cell site's outbound requests (`calls` times the nested tools that leave the process) and records (header, two entries and two records per nested external, one entry and one record per other call, two entries per timer, one finish) are inside the target's limits; Cloudflare counts nested outbound requests per invocation |
-| `cell_bounds` | `parallel <= calls`, `timer_ms` within the target's sleep limit, `journal_bytes` at most `JOURNAL_LIMIT_BYTES` |
+| `cell_bounds` | `parallel <= calls`, `timer_ms` within the target's sleep limit, `journal_bytes` at most `JOURNAL_LIMIT_BYTES` and at least `ENTRY_BYTES` per entry of `calls` nested calls and `timers` timers |
+| `cell_replay_equal` | nothing is dispatched after a divergence |
+| `unknown_nested_reported`, `nested_known` | a reopened nested external reaches the script as the unknown outcome, after a `recovery` record lists it, and the cell runs on; a reopened none or idempotent nested call runs again |
+
+No target model gives a sleep limit yet, so `timer_ms` is reported, not
+checked; `parallel <= calls` is the checker's, asserted by the prover.
+`nested_ids_restart`, `postgres_cell_unfenced` and `cell_limit_unchecked`
+are checks of the lowering, like `liveness`: the plan abstracts nested ids
+and owners away.
 
 The arithmetic proofs see a cell's result as an unconstrained `maybe<text>`,
 so a handler that pushes a cell's output needs room for one entry per cell,
@@ -331,15 +364,17 @@ them with the property each must fail with.
 | `nested_flush_after_dispatch` | jsonl, sqlite, postgres | `nested_external_once` |
 | `cell_recovery_redispatches_external` | jsonl, sqlite, postgres, cloudflare | `nested_external_once` |
 | `cell_recovery_reports_failed` (a plain failure instead of the unknown outcome) | jsonl, sqlite, postgres, cloudflare | `unknown_nested_reported` |
-| `cell_replay_ignores_journal` (rerun the script live) | all | `nested_external_once` |
+| `cell_replay_ignores_journal` (rerun the script live) | all | `nested_external_once` or `seq_unique`, whichever a seed reaches first |
 | `cell_rerun_after_finish` | all | `cell_finishes_once` |
-| `timeout_rides` (C2 removed) | jsonl, sqlite, postgres, vercel | `header_before_wait` |
+| `timeout_rides` (C2 removed) | jsonl, sqlite, postgres (Cloudflare's event and Vercel's sleep flush before every wait) | `header_before_wait` |
+| `nested_idempotent_reported_unknown` | all | `nested_known` |
+| `nested_enum_unchecked` (a nested result outside its text enum taken as the enum's last value) | all | `nested_enum_valid` |
 | `divergence_dispatches` (dispatch the divergent call) | all | `cell_replay_equal` |
-| `nested_ids_restart` (ids from 1 on every run) | all | `seq_unique` |
+| `nested_ids_restart` (ids from 1 on every run) | all | `seq_unique` or `unknown_nested_reported`, whichever a seed reaches first |
 | `cell_limit_unchecked` | all | `cell_bounded` |
 | `vercel_nested_retry_redispatches` | vercel | `nested_external_once` |
 | `cell_gate_releases_early` | cloudflare | `nested_external_once` |
-| `postgres_cell_unfenced` | postgres | `nested_external_once` |
+| `postgres_cell_unfenced` | postgres | `seq_unique` (an unfenced owner's rows lose a call its result follows) |
 
 ## Oracle
 

@@ -169,7 +169,7 @@ impl<'a, 'p> Body<'a, 'p> {
             "    let {call}::Call(_, tool, raw) = item.clone();"
         ));
         self.line("    let effect = dispatch_class(&tool);");
-        self.line("    let input = match tool_input(&tool, &raw) { Input::Typed(input) => input, Input::Untyped | Input::Invalid(_) => Json::String(raw) };");
+        self.line("    let input = match tool_input(&tool, &raw) { ToolInput::Typed(input) => input, ToolInput::Untyped | ToolInput::Invalid(_) => Json::String(raw) };");
         self.line("    Call { tool, effect, input }");
         self.line("}).collect();");
         self.line(&format!(
@@ -241,10 +241,22 @@ impl<'a, 'p> Body<'a, 'p> {
             let value = self.expr(arg);
             self.line(&format!("let argument{index} = {value};"));
         }
+        if let SiteKind::Cell(code) = site.kind {
+            assert_eq!(
+                site.durability,
+                Durability::Cell,
+                "a cell site has cell durability"
+            );
+            self.cell_site(code, &site.result);
+            self.depth -= 1;
+            self.line("};");
+            return;
+        }
         let durability = match site.durability {
             Durability::RidesNextFlush => "Durability::RidesNextFlush",
             Durability::FlushBeforeRun => "Durability::FlushBeforeRun",
             Durability::FlushBeforeRunWhenExternal => "Durability::FlushBeforeRunWhenExternal",
+            Durability::Cell => panic!("only a cell site has cell durability"),
         };
         let maybe = matches!(site.result, Type::Maybe(_));
         let (kind, run, decode) = self.site_call(site.kind, &site.result, args);
@@ -255,6 +267,21 @@ impl<'a, 'p> Body<'a, 'p> {
         self.line(&decode);
         self.depth -= 1;
         self.line("};");
+    }
+
+    fn cell_site(&mut self, code: ir::CodeId, result: &Type) {
+        assert_eq!(
+            result,
+            &Type::Maybe(Box::new(Type::Text)),
+            "a cell site yields maybe<text>"
+        );
+        self.line(&format!(
+            "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::String(argument0) }};",
+            self.program.codes[code].name,
+            EffectClass::None
+        ));
+        self.line(&format!("let answer = engine.cell({code}, call)?;"));
+        self.line("maybe(engine, answer, parse_text)?");
     }
 
     fn site_call(
@@ -293,7 +320,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 let call = super::types::sum_name(self.program, ir::CALL);
                 self.line(&format!("let {call}::Call(_, tool, raw) = argument0;"));
                 self.line("let effect = dispatch_class(&tool);");
-                self.line("let input = match tool_input(&tool, &raw) { Input::Typed(input) => input, Input::Untyped | Input::Invalid(_) => Json::String(raw) };");
+                self.line("let input = match tool_input(&tool, &raw) { ToolInput::Typed(input) => input, ToolInput::Untyped | ToolInput::Invalid(_) => Json::String(raw) };");
                 self.line("let call = Call { tool, effect, input };");
                 let run = format!("Run::Tool({})", returns(self.types, result));
                 ("Dispatch", run, decode(self.types))
@@ -339,6 +366,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 };
                 ("Model", run, decode)
             }
+            SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
             SiteKind::Now | SiteKind::Random => {
                 let (name, variant) = if kind == SiteKind::Now {
                     ("now", "Now")

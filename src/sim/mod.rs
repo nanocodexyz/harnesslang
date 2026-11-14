@@ -1,3 +1,4 @@
+pub mod cell;
 pub mod dump;
 pub mod events;
 pub mod exhaustive;
@@ -44,6 +45,29 @@ pub struct SeedRun {
     pub stats: Stats,
     pub profile: &'static str,
     pub result: Result<(), Violation>,
+}
+
+pub fn supported(program: &Program) -> Result<(), String> {
+    for code in &program.codes {
+        for tool in &code.tools {
+            let tool = &program.tools[*tool];
+            if let Some(param) = tool.params.iter().find(|param| contains_list(&param.ty)) {
+                return Err(format!(
+                    "code '{}': the simulator cannot generate the list input '{}' of nested tool '{}'",
+                    code.name, param.name, tool.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn contains_list(ty: &Type) -> bool {
+    match ty {
+        Type::List { .. } => true,
+        Type::Known(inner) | Type::Maybe(inner) => contains_list(inner),
+        Type::U64 | Type::Bool | Type::Text | Type::Sum(_) => false,
+    }
 }
 
 pub fn generate(program: &Program, ty: &Type, rng: &mut Rng, edges: Option<&Edges>) -> Value {
@@ -323,7 +347,9 @@ fn unknown_count(records: &[Record]) -> u64 {
     records
         .iter()
         .map(|record| match record {
-            Record::Recovery { unknown, .. } => unknown.len() as u64,
+            Record::Recovery {
+                unknown, nested, ..
+            } => (unknown.len() + nested.len()) as u64,
             _ => 0,
         })
         .sum()
@@ -353,6 +379,10 @@ fn add(total: &mut Stats, more: &Stats) {
     total.takeovers += more.takeovers;
     total.dispatches += more.dispatches;
     total.unknown += more.unknown;
+    total.cells += more.cells;
+    total.nested += more.nested;
+    total.divergences += more.divergences;
+    total.waits += more.waits;
     total.events = match (total.events, more.events) {
         (None, None) => None,
         (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
@@ -483,9 +513,20 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             stats.fenced,
             stats.dispatches,
             stats.unknown,
-            stats
-                .events
-                .map_or_else(String::new, |events| format!(" events={events}"))
+            format!(
+                "{}{}",
+                if stats.cells > 0 {
+                    format!(
+                        " cells={} nested={} divergences={} waits={}",
+                        stats.cells, stats.nested, stats.divergences, stats.waits
+                    )
+                } else {
+                    String::new()
+                },
+                stats
+                    .events
+                    .map_or_else(String::new, |events| format!(" events={events}"))
+            ),
         ),
     }
 }

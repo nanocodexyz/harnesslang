@@ -24,6 +24,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "djs-core"
+version = "0.0.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "djs-libm",
+]
+
+[[package]]
+name = "djs-embed"
+version = "0.1.1"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "djs-core",
+ "djs-prelude",
+]
+
+[[package]]
+name = "djs-libm"
+version = "0.0.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+
+[[package]]
+name = "djs-lzrc"
+version = "0.0.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+
+[[package]]
+name = "djs-prelude"
+version = "0.0.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "djs-core",
+ "djs-lzrc",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,7 +95,10 @@ name = "hl-oracle"
 version = "0.1.0"
 dependencies = [
  "crc",
+ "nanocode-code-mode",
+ "nanocode-code-mode-engine",
  "nanocode-durability-core",
+ "nanocode-platform",
  "nanocode-turnlog",
  "serde",
  "serde_json",
@@ -95,6 +134,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-audio"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-digest",
+ "nanocode-sync",
+ "nanocode-sys",
+ "nanocode-trace",
+]
+
+[[package]]
+name = "nanocode-code-mode"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "futures-util",
+ "nanocode-audio",
+ "nanocode-code-mode-engine",
+ "nanocode-digest",
+ "nanocode-image",
+ "nanocode-platform",
+ "nanocode-sync",
+ "nanocode-tool-contracts",
+ "nanocode-tools",
+ "nanocode-trace",
+ "nanocode-types-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "nanocode-code-mode-engine"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "djs-embed",
+ "nanocode-digest",
+ "nanocode-platform",
+ "nanocode-sync",
+ "nanocode-sys",
+ "nanocode-tool-contracts",
+ "nanocode-trace",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "nanocode-compression"
 version = "0.7.0"
 source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
@@ -125,6 +213,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-gif"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+
+[[package]]
+name = "nanocode-image"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "memchr",
+ "nanocode-compression",
+ "nanocode-digest",
+ "nanocode-durability-core",
+ "nanocode-gif",
+ "nanocode-jpeg",
+ "nanocode-platform",
+ "nanocode-png",
+ "nanocode-sync",
+ "nanocode-sys",
+ "nanocode-trace",
+ "nanocode-types-core",
+ "nanocode-webp",
+]
+
+[[package]]
+name = "nanocode-jpeg"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-sys",
+]
+
+[[package]]
 name = "nanocode-macro-support"
 version = "0.7.0"
 source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
@@ -139,6 +260,14 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "nanocode-png"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-compression",
 ]
 
 [[package]]
@@ -163,6 +292,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-tool-contracts"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-types-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-tools"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-tool-contracts",
+ "nanocode-tools-macros",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-tools-macros"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "nanocode-trace"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "pin-project-lite",
+]
+
+[[package]]
 name = "nanocode-turnlog"
 version = "0.7.0"
 source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
@@ -176,10 +344,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-types-core"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-sys",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-webp"
+version = "0.7.0"
+source = "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293"
+dependencies = [
+ "nanocode-sys",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "proc-macro2"
+version = "1.0.106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
+dependencies = [
+ "unicode-ident",
+]
+
+[[package]]
+name = "quote"
+version = "1.0.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
+dependencies = [
+ "proc-macro2",
+]
 
 [[package]]
 name = "rustls-pki-types"
@@ -247,6 +451,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "2.0.119"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "tokio"
 version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -259,6 +474,12 @@ dependencies = [
  "socket2",
  "windows-sys",
 ]
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "wasi"

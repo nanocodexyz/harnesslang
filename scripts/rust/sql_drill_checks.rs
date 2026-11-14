@@ -56,6 +56,12 @@ pub struct Dispatch {
     pub tag: String,
 }
 
+impl Dispatch {
+    pub fn nested(&self) -> bool {
+        self.id.contains(harness::NESTED_ID_INFIX)
+    }
+}
+
 pub enum Line {
     Run(String),
     Acquired(String, u64),
@@ -107,7 +113,7 @@ pub fn read_ledger(ledger: &str) -> Vec<Line> {
     lines
 }
 
-fn dispatches(lines: &[Line]) -> impl Iterator<Item = &Dispatch> {
+pub fn dispatches(lines: &[Line]) -> impl Iterator<Item = &Dispatch> {
     lines.iter().filter_map(|line| match line {
         Line::Dispatch(dispatch) => Some(dispatch),
         _ => None,
@@ -203,7 +209,7 @@ pub fn check_finished(session: &harness::Session, calls: &Calls, turns: u64) {
 
 pub fn check_external(calls: &Calls, lines: &[Line]) {
     let mut dispatched: BTreeMap<&str, u64> = BTreeMap::new();
-    for dispatch in dispatches(lines).filter(|dispatch| dispatch.external) {
+    for dispatch in dispatches(lines).filter(|dispatch| dispatch.external && !dispatch.nested()) {
         *dispatched.entry(&dispatch.id).or_default() += 1;
         let logged = calls.external.get(&dispatch.id);
         assert!(
@@ -253,7 +259,9 @@ fn finished_tags(lines: &[Line]) -> BTreeSet<&str> {
 pub fn check_other(calls: &Calls, lines: &[Line]) {
     let finished = finished_tags(lines);
     for dispatch in dispatches(lines)
-        .filter(|dispatch| !dispatch.external && finished.contains(dispatch.tag.as_str()))
+        .filter(|dispatch| {
+            !dispatch.external && !dispatch.nested() && finished.contains(dispatch.tag.as_str())
+        })
     {
         let logged = calls.other.get(&dispatch.id);
         assert!(
@@ -274,7 +282,9 @@ pub fn check_other(calls: &Calls, lines: &[Line]) {
         .collect();
     for (id, logged) in &calls.other {
         assert!(logged.done, "idempotent_known: {id} ends without a result");
-        if !BUILTIN_EFFECTS.contains(&logged.tool.as_str()) {
+        if !BUILTIN_EFFECTS.contains(&logged.tool.as_str())
+            && harness::program::code_of(&logged.tool).is_none()
+        {
             assert!(
                 ran.contains(&(id.as_str(), logged.tool.as_str())),
                 "{id} has a result without a dispatch of {}",
@@ -288,6 +298,7 @@ fn lost_other(calls: &Calls, lines: &[Line]) -> usize {
     dispatches(lines)
         .filter(|dispatch| {
             !dispatch.external
+                && !dispatch.nested()
                 && !calls
                     .other
                     .get(&dispatch.id)

@@ -1,0 +1,53 @@
+harness cell_over_cloudflare
+
+const turn_steps_max: u64 = 16
+const calls_per_step_max: u64 = 4
+const context_entries_max: u64 = 4096
+const cell_calls_max: u64 = 256
+const cell_parallel_max: u64 = 16
+const cell_timers_max: u64 = 4
+const cell_timer_ms_max: u64 = 600000
+const cell_journal_bytes_max: u64 = 33554432
+const cell_yield_ms: u64 = 10000
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model infer calls calls_per_step_max
+
+code exec {
+  tools read, bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+}
+
+state {
+  context: list<entry, context_entries_max>
+}
+
+on prompt(input: text) -> text
+  requires len(context) + 1 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+{
+  push context user(input)
+  loop step below turn_steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return words }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return "exhausted"
+}

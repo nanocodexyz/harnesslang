@@ -1,4 +1,5 @@
 pub mod arith;
+pub mod cells;
 pub mod cli;
 pub mod durability;
 pub mod finish;
@@ -6,8 +7,10 @@ pub mod linear;
 pub mod lower;
 pub mod text;
 
+use crate::effect::EffectClass;
+use crate::ir::worst::{ENTRY_UPDATE_RECORDS, NESTED_LOG_RECORDS, TIMER_UPDATE_RECORDS};
 use crate::ir::{Program, Stmt};
-use crate::prove::lower::{Op, Plan};
+use crate::prove::lower::{Op, Plan, Record, Slot};
 use crate::run;
 use crate::target::{self, Target};
 
@@ -68,9 +71,10 @@ pub enum Mutation {
     DropFinish,
     DropRequires,
     RepeatAssign,
+    DropCellFinish,
 }
 
-const LOWERING_MUTATIONS: [run::mutation::Mutation; 12] = [
+const LOWERING_MUTATIONS: [run::mutation::Mutation; 26] = [
     run::mutation::Mutation::FlushAfterDispatch,
     run::mutation::Mutation::RecoveryRedispatchesExternal,
     run::mutation::Mutation::VercelRetryRedispatches,
@@ -83,13 +87,28 @@ const LOWERING_MUTATIONS: [run::mutation::Mutation; 12] = [
     run::mutation::Mutation::RerunRewritesCall,
     run::mutation::Mutation::CheckpointHashOrder,
     run::mutation::Mutation::RecoverySkipped,
+    run::mutation::Mutation::CellHeaderRidesPastExternal,
+    run::mutation::Mutation::NestedFlushAfterDispatch,
+    run::mutation::Mutation::CellRecoveryRedispatchesExternal,
+    run::mutation::Mutation::CellRecoveryReportsFailed,
+    run::mutation::Mutation::CellReplayIgnoresJournal,
+    run::mutation::Mutation::CellRerunAfterFinish,
+    run::mutation::Mutation::TimeoutRides,
+    run::mutation::Mutation::DivergenceDispatches,
+    run::mutation::Mutation::NestedIdsRestart,
+    run::mutation::Mutation::CellLimitUnchecked,
+    run::mutation::Mutation::VercelNestedRetryRedispatches,
+    run::mutation::Mutation::CellGateReleasesEarly,
+    run::mutation::Mutation::PostgresCellUnfenced,
+    run::mutation::Mutation::NestedIdempotentReportedUnknown,
 ];
 
-const PROGRAM_MUTATIONS: [Mutation; 4] = [
+const PROGRAM_MUTATIONS: [Mutation; 5] = [
     Mutation::DropFlush,
     Mutation::DropFinish,
     Mutation::DropRequires,
     Mutation::RepeatAssign,
+    Mutation::DropCellFinish,
 ];
 
 impl Mutation {
@@ -108,6 +127,7 @@ impl Mutation {
             Self::DropFinish => "drop_finish",
             Self::DropRequires => "drop_requires",
             Self::RepeatAssign => "repeat_assign",
+            Self::DropCellFinish => "drop_cell_finish",
         }
     }
 
@@ -180,7 +200,10 @@ pub fn mutate(program: &Program, mutation: Mutation) -> Program {
             }
             Mutation::DropRequires => handler.requires = None,
             Mutation::RepeatAssign => repeat_assignments(&mut handler.body),
-            Mutation::None | Mutation::Lowering(_) | Mutation::DropFlush => {}
+            Mutation::None
+            | Mutation::Lowering(_)
+            | Mutation::DropFlush
+            | Mutation::DropCellFinish => {}
         }
     }
     program
@@ -191,6 +214,7 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
     let mut report = Report::default();
     finish::prove(&program, &mut report);
     arith::prove(&program, &mut report);
+    cells::prove(&program, &mut report);
     for target in targets {
         let model = target::model(*target);
         let plan = lower::lower(&program, &model, mutation);
@@ -201,13 +225,35 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
     report
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Planned {
-    through: Option<u64>,
-    ended: Option<u64>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Count {
+    total: u64,
+    nested: u64,
 }
 
-fn larger(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+impl Count {
+    fn plus(self, other: Self) -> Option<Self> {
+        Some(Self {
+            total: self.total.checked_add(other.total)?,
+            nested: self.nested.checked_add(other.nested)?,
+        })
+    }
+
+    fn times(self, bound: u64) -> Option<Self> {
+        Some(Self {
+            total: self.total.checked_mul(bound)?,
+            nested: self.nested.checked_mul(bound)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Planned {
+    through: Option<Count>,
+    ended: Option<Count>,
+}
+
+fn larger(left: Option<Count>, right: Option<Count>) -> Option<Count> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (left, None) => left,
@@ -215,9 +261,9 @@ fn larger(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
-fn after(before: u64, cost: Option<u64>) -> Option<Option<u64>> {
+fn after(before: Count, cost: Option<Count>) -> Option<Option<Count>> {
     match cost {
-        Some(cost) => Some(Some(before.checked_add(cost)?)),
+        Some(cost) => Some(Some(before.plus(cost)?)),
         None => Some(None),
     }
 }
@@ -235,25 +281,25 @@ fn then(first: Planned, second: Planned) -> Option<Planned> {
 fn repeated(body: Planned, bound: u64, every_iteration: bool) -> Option<Planned> {
     if bound == 0 {
         return Some(Planned {
-            through: Some(0),
+            through: Some(Count::default()),
             ended: None,
         });
     }
     let through = match body.through {
-        Some(each) => Some(each.checked_mul(bound)?),
+        Some(each) => Some(each.times(bound)?),
         None if every_iteration => None,
-        None => Some(0),
+        None => Some(Count::default()),
     };
-    let before = body.through.unwrap_or(0).checked_mul(bound - 1)?;
+    let before = body.through.unwrap_or_default().times(bound - 1)?;
     Some(Planned {
         through,
         ended: after(before, body.ended)?,
     })
 }
 
-fn planned(ops: &[Op], cost: fn(&Op) -> u64) -> Option<Planned> {
+fn planned(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Planned> {
     let mut paths = Planned {
-        through: Some(0),
+        through: Some(Count::default()),
         ended: None,
     };
     for op in ops {
@@ -280,42 +326,69 @@ fn planned(ops: &[Op], cost: fn(&Op) -> u64) -> Option<Planned> {
             } => repeated(planned(body, cost)?, *bound, *every_iteration)?,
             Op::End => Planned {
                 through: None,
-                ended: Some(0),
+                ended: Some(Count::default()),
             },
-            Op::Append(_) | Op::Flush(_) | Op::Run { .. } | Op::Yield { .. } | Op::Acknowledge => {
-                Planned {
-                    through: Some(cost(op)),
-                    ended: None,
-                }
-            }
+            Op::Append(_)
+            | Op::Flush(_)
+            | Op::FlushExcept(..)
+            | Op::Run { .. }
+            | Op::Yield { .. }
+            | Op::Replay(_)
+            | Op::Wait { .. }
+            | Op::CloseCell(..)
+            | Op::Acknowledge => Planned {
+                through: Some(cost(op)),
+                ended: None,
+            },
         };
         paths = then(paths, step)?;
     }
     Some(paths)
 }
 
-fn planned_max(ops: &[Op], cost: fn(&Op) -> u64) -> Option<u64> {
+fn planned_max(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Count> {
     let paths = planned(ops, cost)?;
     larger(paths.through, paths.ended)
 }
 
-fn outbound(op: &Op) -> u64 {
+fn outbound(op: &Op) -> Count {
     match op {
-        Op::Run { outbound, .. } => u64::from(*outbound),
-        _ => 0,
+        Op::Run { slot, outbound, .. } => Count {
+            total: u64::from(*outbound),
+            nested: u64::from(*outbound && slot.nested()),
+        },
+        _ => Count::default(),
     }
 }
 
-fn appended(op: &Op) -> u64 {
-    u64::from(matches!(op, Op::Append(_)))
+fn appended(program: &Program, op: &Op) -> Count {
+    let total = match op {
+        Op::Append(Record::Call(Slot::Nested(_, tool)) | Record::Result(Slot::Nested(_, tool))) => {
+            let logged = program.tools[*tool].effect == EffectClass::External;
+            ENTRY_UPDATE_RECORDS + if logged { NESTED_LOG_RECORDS } else { 0 }
+        }
+        Op::Append(Record::Timeout(_)) => 0,
+        Op::Append(_) => 1,
+        Op::CloseCell(_, code) => program.codes[*code]
+            .timers
+            .value
+            .checked_mul(TIMER_UPDATE_RECORDS)
+            .expect("hl check counted the cell's timer records in u64"),
+        _ => 0,
+    };
+    Count { total, nested: 0 }
 }
 
 fn records(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Report) {
     let model = &plan.model;
     for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
         let counted = &handler.worst.records;
-        let planned = planned_max(&lowered.ops, appended)
-            .expect("the IR's record count fits u64, and the plan appends no more");
+        let planned = planned_max(&lowered.ops, &|op| appended(program, op))
+            .expect("the IR's record count fits u64, and the plan appends no more")
+            .total;
+        if mutation == Mutation::Lowering(run::mutation::Mutation::DivergenceDispatches) {
+            continue;
+        }
         assert!(
             planned <= counted.total,
             "the IR's journal record worst case covers every path of the plan"
@@ -343,7 +416,7 @@ fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
     };
     for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
         let requests = &handler.worst.requests;
-        let Some(planned) = planned_max(&lowered.ops, outbound) else {
+        let Some(planned) = planned_max(&lowered.ops, &outbound) else {
             report.add(Finding {
                 handler: handler.name.clone(),
                 target: Some(model.target),
@@ -354,6 +427,12 @@ fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
             });
             continue;
         };
+        let nested = if planned.nested == 0 {
+            String::new()
+        } else {
+            format!(" ({} of them nested calls in cells)", planned.nested)
+        };
+        let planned = planned.total;
         assert!(
             planned <= requests.total,
             "the IR's worst case covers every path of the plan"
@@ -364,7 +443,7 @@ fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
                 target: Some(model.target),
                 property: "worst_case",
                 message: format!(
-                    "worst case {} outbound requests exceeds {}'s limit of {} {}",
+                    "worst case {} outbound requests{nested} exceeds {}'s limit of {} {}",
                     planned,
                     model.target.name(),
                     limit.value,
@@ -376,7 +455,7 @@ fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
             continue;
         }
         report.proved.push(format!(
-            "handler {} on {}: worst_case: {} outbound requests <= {} {} ({})",
+            "handler {} on {}: worst_case: {} outbound requests{nested} <= {} {} ({})",
             handler.name,
             model.target.name(),
             planned,

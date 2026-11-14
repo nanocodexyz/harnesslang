@@ -1,23 +1,47 @@
 use std::collections::BTreeSet;
 
 use crate::effect::EffectClass;
-use crate::ir::{BinaryOp, Expr, Handler, Kept, Parallel, Program, SiteId, SiteKind, Stmt, Type};
+use crate::ir::{
+    BinaryOp, CodeId, Expr, Handler, Kept, Parallel, Program, SiteClass, SiteId, SiteKind, Stmt,
+    ToolId, Type,
+};
 use crate::prove::Mutation;
 use crate::prove::text::Names;
 use crate::run::mutation::Mutation as RunMutation;
 use crate::target::{self, AtomicUnit, Flush, Recovery};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Slot {
+    Site(SiteId),
+    Nested(SiteId, ToolId),
+}
+
+impl Slot {
+    pub const fn site(self) -> SiteId {
+        match self {
+            Self::Site(site) | Self::Nested(site, _) => site,
+        }
+    }
+
+    pub const fn nested(self) -> bool {
+        matches!(self, Self::Nested(..))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Record {
     Admitted,
     Recovery,
-    Call(SiteId),
-    Result(SiteId),
+    Call(Slot),
+    Result(Slot),
     Model(SiteId),
     BatchCall(SiteId),
     BatchResult(SiteId),
     Status,
     Checkpoint,
+    CellHeader(SiteId),
+    Timeout(SiteId),
+    CellFinished(SiteId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +51,7 @@ pub enum Point {
     StepCommit,
     Recovery,
     Finish,
+    CellWait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,11 +66,19 @@ pub enum Entry {
     Live,
     Rerun,
     Replayed,
-    Reopened(SiteId),
+    Reopened(Slot),
     ReopenedInBatch(SiteId),
     Has(SiteId),
-    FirstAttempt(SiteId),
-    LaterAttempt(SiteId),
+    FirstAttempt(Slot),
+    LaterAttempt(Slot),
+    Recorded(Slot),
+    CellRecorded(SiteId),
+    CellResumed(SiteId),
+    CellRunning(SiteId),
+    CellStopped(SiteId),
+    Diverged(SiteId),
+    HeaderPending(SiteId),
+    HeaderDurable(SiteId),
 }
 
 #[derive(Clone, Debug)]
@@ -59,18 +92,25 @@ pub struct Arm {
 pub enum Op {
     Append(Record),
     Flush(Point),
+    FlushExcept(Point, Record),
     Run {
-        site: SiteId,
+        slot: Slot,
         class: EffectClass,
         outbound: bool,
         what: String,
     },
     Yield {
-        site: SiteId,
+        slot: Slot,
         class: EffectClass,
         seen: Seen,
         what: String,
     },
+    Replay(Slot),
+    Wait {
+        site: SiteId,
+        what: String,
+    },
+    CloseCell(SiteId, CodeId),
     Acknowledge,
     Choice(Vec<Arm>),
     Repeat {
@@ -112,9 +152,13 @@ impl Batched {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub model: target::Model,
+    pub tools: Vec<String>,
     pub fenced: bool,
     pub checksummed: bool,
     pub checkpoint_sorted: bool,
+    pub cells_fenced: bool,
+    pub nested_ids_continue: bool,
+    pub cell_limits_checked: bool,
     pub handlers: Vec<HandlerPlan>,
 }
 
@@ -145,10 +189,15 @@ pub fn lower(program: &Program, model: &target::Model, mutation: Mutation) -> Pl
         .collect();
     Plan {
         model: *model,
+        tools: program.tools.iter().map(|tool| tool.name.clone()).collect(),
         fenced: model.flush == Flush::FencedTransaction && run != RunMutation::PostgresNoFence,
         checksummed: model.atomic == AtomicUnit::ChecksummedRecord
             && run != RunMutation::JsonlNoChecksum,
         checkpoint_sorted: run != RunMutation::CheckpointHashOrder,
+        cells_fenced: model.flush == Flush::FencedTransaction
+            && run != RunMutation::PostgresCellUnfenced,
+        nested_ids_continue: run != RunMutation::NestedIdsRestart,
+        cell_limits_checked: run != RunMutation::CellLimitUnchecked,
         handlers,
     }
 }
@@ -518,7 +567,7 @@ impl Lowering<'_> {
                 format!("{what} reported unknown by recovery"),
                 Entry::Replayed,
                 vec![Op::Yield {
-                    site,
+                    slot: Slot::Site(site),
                     class,
                     seen: Seen::Unknown,
                     what: what.to_owned(),
@@ -541,7 +590,7 @@ impl Lowering<'_> {
             group.push(Op::Flush(Point::OutputGate));
         }
         group.push(Op::Run {
-            site: other,
+            slot: Slot::Site(other),
             class: EffectClass::None,
             outbound: true,
             what: format!("{what} in a group of none and idempotent calls"),
@@ -557,7 +606,7 @@ impl Lowering<'_> {
         let alone = if self.in_step() {
             vec![Op::Choice(vec![arm(
                 format!("external {what} reads attempt 1"),
-                Entry::FirstAttempt(external),
+                Entry::FirstAttempt(Slot::Site(external)),
                 alone,
             )])]
         } else {
@@ -576,17 +625,17 @@ impl Lowering<'_> {
             ops.push(Op::Choice(vec![
                 arm(
                     format!("reopened {what} reads attempt 1: the crash came before its dispatch"),
-                    Entry::FirstAttempt(reopened),
+                    Entry::FirstAttempt(Slot::Site(reopened)),
                     self.batch_external(reopened, what, true),
                 ),
                 arm(
                     format!("reopened {what} reads attempt 2 or later"),
-                    Entry::LaterAttempt(reopened),
+                    Entry::LaterAttempt(Slot::Site(reopened)),
                     vec![
                         Op::Append(Record::Recovery),
                         Op::Flush(Point::Recovery),
                         Op::Yield {
-                            site: reopened,
+                            slot: Slot::Site(reopened),
                             class: EffectClass::External,
                             seen: Seen::Unknown,
                             what: what.to_owned(),
@@ -619,7 +668,7 @@ impl Lowering<'_> {
         let label = if reopened { "reopened " } else { "" };
         let mut ops = vec![
             Op::Run {
-                site,
+                slot: Slot::Site(site),
                 class: EffectClass::External,
                 outbound: true,
                 what: format!("{label}{what}"),
@@ -640,32 +689,43 @@ impl Lowering<'_> {
 
     fn effect(&self, site: SiteId, args: &[Expr]) -> Vec<Op> {
         let what = self.names.site(site, args);
+        let slot = Slot::Site(site);
         let classes = match self.handler.sites[site].class {
-            crate::ir::SiteClass::Fixed(class) => vec![class],
-            crate::ir::SiteClass::Dispatched => self.dispatch_classes(),
+            SiteClass::Fixed(class) => vec![class],
+            SiteClass::Dispatched => self.dispatch_classes(),
+            SiteClass::Cell => {
+                let SiteKind::Cell(code) = self.handler.sites[site].kind else {
+                    unreachable!("a site of the cell class is a cell site")
+                };
+                return self.cell(site, code, &what);
+            }
         };
         if let [class] = classes.as_slice() {
-            return self.resolved(site, *class, &what);
+            return self.resolved(slot, *class, &what);
         }
-        let arms = classes
+        let mut arms: Vec<Arm> = classes
             .into_iter()
             .map(|class| {
                 let label = format!("{what} resolves to a tool with effect {}", class.name());
-                arm(label, Entry::Plain, self.resolved(site, class, &what))
+                arm(label, Entry::Plain, self.resolved(slot, class, &what))
             })
             .collect();
+        for (code, declared) in self.program.codes.iter().enumerate() {
+            let label = format!("{what} resolves to code tool {}", declared.name);
+            arms.push(arm(label, Entry::Plain, self.cell(site, code, &what)));
+        }
         vec![Op::Choice(arms)]
     }
 
-    fn resolved(&self, site: SiteId, class: EffectClass, what: &str) -> Vec<Op> {
-        let fresh = self.fresh(site, class, what);
-        let reopenable = self.reopenable(site, &fresh);
+    fn resolved(&self, slot: Slot, class: EffectClass, what: &str) -> Vec<Op> {
+        let fresh = self.fresh(slot, class, what);
+        let reopenable = self.reopenable(slot, &fresh);
         let mut arms = vec![arm(format!("{what} runs"), Entry::Live, fresh)];
         if reopenable {
             arms.push(arm(
                 format!("{what} reopened after a crash left its call open"),
-                Entry::Reopened(site),
-                self.reopen(site, class, what),
+                Entry::Reopened(slot),
+                self.reopen(slot, class, what),
             ));
         }
         arms.push(arm(
@@ -676,11 +736,22 @@ impl Lowering<'_> {
         vec![Op::Choice(arms)]
     }
 
-    fn reopenable(&self, site: SiteId, fresh: &[Op]) -> bool {
-        if self.handler.sites[site].kind == SiteKind::Model {
+    fn is_model(&self, slot: Slot) -> bool {
+        matches!(slot, Slot::Site(site) if self.handler.sites[site].kind == SiteKind::Model)
+    }
+
+    fn outbound(&self, slot: Slot) -> bool {
+        match slot {
+            Slot::Site(site) => self.handler.sites[site].kind.outbound(),
+            Slot::Nested(..) => true,
+        }
+    }
+
+    fn reopenable(&self, slot: Slot, fresh: &[Op]) -> bool {
+        if self.is_model(slot) {
             return false;
         }
-        if self.model.atomic == AtomicUnit::ChecksummedRecord {
+        if slot.nested() || self.model.atomic == AtomicUnit::ChecksummedRecord {
             return true;
         }
         let mut called = false;
@@ -695,27 +766,28 @@ impl Lowering<'_> {
         false
     }
 
-    fn gated(&self, site: SiteId) -> bool {
+    fn gated(&self, slot: Slot) -> bool {
         self.model.gate_before_outbound
-            && self.handler.sites[site].kind.outbound()
+            && self.outbound(slot)
             && self.mutation != Mutation::DropFlush
     }
 
-    fn required(&self, site: SiteId, class: EffectClass) -> bool {
-        self.handler.sites[site].durability.flushes(class) && self.mutation != Mutation::DropFlush
+    fn required(&self, slot: Slot, class: EffectClass) -> bool {
+        self.handler.sites[slot.site()].durability.flushes(class)
+            && self.mutation != Mutation::DropFlush
     }
 
-    fn run(&self, site: SiteId, class: EffectClass, what: &str, step: bool) -> Vec<Op> {
-        let record = if self.handler.sites[site].kind == SiteKind::Model {
-            Record::Model(site)
+    fn run(&self, slot: Slot, class: EffectClass, what: &str, step: bool) -> Vec<Op> {
+        let record = if self.is_model(slot) {
+            Record::Model(slot.site())
         } else {
-            Record::Result(site)
+            Record::Result(slot)
         };
         let mut ops = vec![
             Op::Run {
-                site,
+                slot,
                 class,
-                outbound: self.handler.sites[site].kind.outbound(),
+                outbound: self.outbound(slot),
                 what: what.to_owned(),
             },
             Op::Append(record),
@@ -726,14 +798,31 @@ impl Lowering<'_> {
         ops
     }
 
-    fn fresh(&self, site: SiteId, class: EffectClass, what: &str) -> Vec<Op> {
-        let gate = self.gated(site);
-        let required = self.required(site, class);
-        let late = match self.run_mutation() {
-            RunMutation::FlushAfterDispatch => required && !gate,
-            RunMutation::GateReleasesEarly => gate,
+    fn late(&self, slot: Slot, required: bool, gate: bool) -> bool {
+        match (self.run_mutation(), slot.nested()) {
+            (RunMutation::FlushAfterDispatch, false)
+            | (RunMutation::NestedFlushAfterDispatch, true) => required && !gate,
+            (RunMutation::GateReleasesEarly, false)
+            | (RunMutation::CellGateReleasesEarly, true) => gate,
             _ => false,
-        };
+        }
+    }
+
+    fn before_run(&self, slot: Slot, point: Point) -> Op {
+        let rides = self.run_mutation() == RunMutation::CellHeaderRidesPastExternal
+            && slot.nested()
+            && point == Point::BeforeExternal;
+        if rides {
+            Op::FlushExcept(point, Record::CellHeader(slot.site()))
+        } else {
+            Op::Flush(point)
+        }
+    }
+
+    fn fresh(&self, slot: Slot, class: EffectClass, what: &str) -> Vec<Op> {
+        let gate = self.gated(slot);
+        let required = self.required(slot, class);
+        let late = self.late(slot, required, gate);
         let step = self.in_step() && class.may_be_unknown();
         let point = if gate {
             Point::OutputGate
@@ -741,20 +830,20 @@ impl Lowering<'_> {
             Point::BeforeExternal
         };
         let mut ops = Vec::new();
-        if self.handler.sites[site].kind != SiteKind::Model {
-            ops.push(Op::Append(Record::Call(site)));
+        if !self.is_model(slot) {
+            ops.push(Op::Append(Record::Call(slot)));
         }
         if (required || gate) && !late {
-            ops.push(Op::Flush(point));
+            ops.push(self.before_run(slot, point));
         }
-        let mut run = self.run(site, class, what, step);
+        let mut run = self.run(slot, class, what, step);
         if late {
             run.push(Op::Flush(point));
         }
         if step {
             ops.push(Op::Choice(vec![arm(
                 format!("{what} reads attempt 1"),
-                Entry::FirstAttempt(site),
+                Entry::FirstAttempt(slot),
                 run,
             )]));
         } else {
@@ -763,68 +852,324 @@ impl Lowering<'_> {
         ops
     }
 
-    fn rerun(&self, site: SiteId, class: EffectClass, what: &str) -> Vec<Op> {
+    fn rerun(&self, slot: Slot, class: EffectClass, what: &str) -> Vec<Op> {
         let mut ops = Vec::new();
-        if self.required(site, class) || self.gated(site) {
-            let point = if self.gated(site) {
+        if self.required(slot, class) || self.gated(slot) {
+            let point = if self.gated(slot) {
                 Point::OutputGate
             } else {
                 Point::BeforeExternal
             };
             ops.push(Op::Flush(point));
         }
-        ops.extend(self.run(site, class, what, false));
+        ops.extend(self.run(slot, class, what, false));
         ops
     }
 
-    fn reopen(&self, site: SiteId, class: EffectClass, what: &str) -> Vec<Op> {
+    fn mutated(&self, slot: Slot, top: RunMutation, nested: RunMutation) -> bool {
+        let wanted = if slot.nested() { nested } else { top };
+        wanted != RunMutation::None && self.run_mutation() == wanted
+    }
+
+    fn reopen_in_step(&self, slot: Slot, class: EffectClass, what: &str) -> Vec<Op> {
+        let redispatches = self.mutated(
+            slot,
+            RunMutation::VercelRetryRedispatches,
+            RunMutation::VercelNestedRetryRedispatches,
+        );
+        let retry = if redispatches {
+            self.run(slot, class, what, true)
+        } else {
+            vec![
+                Op::Append(Record::Recovery),
+                Op::Flush(Point::Recovery),
+                Op::Yield {
+                    slot,
+                    class,
+                    seen: Seen::Unknown,
+                    what: what.to_owned(),
+                },
+            ]
+        };
+        let mut ops = Vec::new();
+        if self.required(slot, class) {
+            ops.push(self.before_run(slot, Point::BeforeExternal));
+        }
+        ops.push(Op::Choice(vec![
+            arm(
+                format!("{what} reads attempt 1: the crash came before its dispatch"),
+                Entry::FirstAttempt(slot),
+                self.run(slot, class, what, true),
+            ),
+            arm(
+                format!("{what} reads attempt 2 or later"),
+                Entry::LaterAttempt(slot),
+                retry,
+            ),
+        ]));
+        ops
+    }
+
+    fn reopen(&self, slot: Slot, class: EffectClass, what: &str) -> Vec<Op> {
         let unknown = |seen| Op::Yield {
-            site,
+            slot,
             class,
             seen,
             what: what.to_owned(),
         };
         if self.in_step() && class.may_be_unknown() {
-            let retry = if self.run_mutation() == RunMutation::VercelRetryRedispatches {
-                self.run(site, class, what, true)
-            } else {
-                vec![
-                    Op::Append(Record::Recovery),
-                    Op::Flush(Point::Recovery),
-                    unknown(Seen::Unknown),
-                ]
-            };
-            return vec![Op::Choice(vec![
-                arm(
-                    format!("{what} reads attempt 1: the crash came before its dispatch"),
-                    Entry::FirstAttempt(site),
-                    self.run(site, class, what, true),
-                ),
-                arm(
-                    format!("{what} reads attempt 2 or later"),
-                    Entry::LaterAttempt(site),
-                    retry,
-                ),
-            ])];
+            return self.reopen_in_step(slot, class, what);
         }
         if class.may_be_unknown() {
-            return match self.run_mutation() {
-                RunMutation::RecoveryRedispatchesExternal | RunMutation::RecoverySkipped => {
-                    self.rerun(site, class, what)
-                }
-                RunMutation::RecoveryReportsFailed => vec![unknown(Seen::Failed)],
-                _ => vec![unknown(Seen::Unknown)],
-            };
+            let redispatches = self.run_mutation() == RunMutation::RecoverySkipped
+                || self.mutated(
+                    slot,
+                    RunMutation::RecoveryRedispatchesExternal,
+                    RunMutation::CellRecoveryRedispatchesExternal,
+                );
+            if redispatches {
+                return self.rerun(slot, class, what);
+            }
+            let failed = self.mutated(
+                slot,
+                RunMutation::RecoveryReportsFailed,
+                RunMutation::CellRecoveryReportsFailed,
+            );
+            return vec![unknown(if failed { Seen::Failed } else { Seen::Unknown })];
         }
-        let maybe = matches!(self.handler.sites[site].result, Type::Maybe(_));
-        if self.run_mutation() == RunMutation::IdempotentReportedUnknown && maybe {
+        let maybe =
+            slot.nested() || matches!(self.handler.sites[slot.site()].result, Type::Maybe(_));
+        let reported = self.mutated(
+            slot,
+            RunMutation::IdempotentReportedUnknown,
+            RunMutation::NestedIdempotentReportedUnknown,
+        );
+        if reported && maybe {
             return vec![unknown(Seen::Unknown)];
         }
         let mut ops = Vec::new();
-        if self.run_mutation() == RunMutation::RerunRewritesCall {
-            ops.push(Op::Append(Record::Call(site)));
+        if self.mutated(slot, RunMutation::RerunRewritesCall, RunMutation::None) {
+            ops.push(Op::Append(Record::Call(slot)));
         }
-        ops.extend(self.rerun(site, class, what));
+        ops.extend(self.rerun(slot, class, what));
         ops
+    }
+
+    fn cell(&self, site: SiteId, code: CodeId, what: &str) -> Vec<Op> {
+        let body = self.cell_body(site, code, what);
+        let mut restarted = vec![Op::Append(Record::CellHeader(site))];
+        restarted.extend(body.iter().cloned());
+        let mut fresh = vec![Op::Append(Record::Call(Slot::Site(site)))];
+        fresh.extend(restarted.iter().cloned());
+        let recorded = if self.run_mutation() == RunMutation::CellRerunAfterFinish {
+            restarted.clone()
+        } else {
+            Vec::new()
+        };
+        vec![
+            Op::Choice(vec![
+                arm(format!("{what} starts a cell"), Entry::Live, fresh),
+                arm(
+                    format!("{what} reopened without a durable header: its cell starts again"),
+                    Entry::Reopened(Slot::Site(site)),
+                    restarted,
+                ),
+                arm(
+                    format!("{what} resumed from its durable header: its cell is replayed"),
+                    Entry::CellResumed(site),
+                    body,
+                ),
+                arm(
+                    format!("{what} replayed from its recorded result"),
+                    Entry::CellRecorded(site),
+                    recorded,
+                ),
+            ]),
+            Op::CloseCell(site, code),
+        ]
+    }
+
+    fn cell_body(&self, site: SiteId, code: CodeId, what: &str) -> Vec<Op> {
+        let declared = &self.program.codes[code];
+        let waits = Op::Repeat {
+            label: format!(
+                "timers of {what} (at most {} = {})",
+                declared.timers.name, declared.timers.value
+            ),
+            bound: declared.timers.value,
+            every_iteration: false,
+            body: vec![Op::Choice(vec![
+                arm(format!("{what} arms no timer"), Entry::Plain, Vec::new()),
+                arm(
+                    format!("the cell of {what} waits on a timer"),
+                    Entry::CellRunning(site),
+                    self.wait(site, what),
+                ),
+            ])],
+        };
+        let step = vec![Op::Choice(self.cell_steps(site, code, what)), waits.clone()];
+        let finished = if self.mutation == Mutation::DropCellFinish {
+            Vec::new()
+        } else {
+            vec![Op::Append(Record::CellFinished(site))]
+        };
+        vec![
+            waits,
+            Op::Repeat {
+                label: format!(
+                    "nested calls of {what} (at most {} = {})",
+                    declared.calls.name, declared.calls.value
+                ),
+                bound: declared.calls.value,
+                every_iteration: false,
+                body: step,
+            },
+            Op::Choice(vec![
+                arm(
+                    format!("the cell of {what} returns or throws"),
+                    Entry::CellRunning(site),
+                    finished,
+                ),
+                arm(
+                    format!("the cell of {what} was stopped"),
+                    Entry::CellStopped(site),
+                    Vec::new(),
+                ),
+            ]),
+            Op::Append(Record::Result(Slot::Site(site))),
+        ]
+    }
+
+    fn wait(&self, site: SiteId, what: &str) -> Vec<Op> {
+        let mut ops = vec![Op::Append(Record::Timeout(site))];
+        if self.model.wait_flushes() {
+            ops.push(Op::Flush(Point::OutputGate));
+        } else {
+            let saves = if self.run_mutation() == RunMutation::TimeoutRides {
+                Vec::new()
+            } else {
+                vec![Op::Flush(Point::CellWait)]
+            };
+            ops.push(Op::Choice(vec![
+                arm(
+                    format!("the header of {what}'s cell is not yet durable"),
+                    Entry::HeaderPending(site),
+                    saves,
+                ),
+                arm(
+                    format!("the header of {what}'s cell is durable"),
+                    Entry::HeaderDurable(site),
+                    Vec::new(),
+                ),
+            ]));
+        }
+        ops.push(Op::Wait {
+            site,
+            what: format!("the cell of {what}"),
+        });
+        ops
+    }
+
+    fn cell_steps(&self, site: SiteId, code: CodeId, what: &str) -> Vec<Arm> {
+        let declared = &self.program.codes[code];
+        let mut arms: Vec<Arm> = declared
+            .tools
+            .iter()
+            .map(|tool| {
+                let name = &self.program.tools[*tool].name;
+                arm(
+                    format!("the cell of {what} calls tools.{name}"),
+                    Entry::CellRunning(site),
+                    vec![Op::Choice(self.nested(site, *tool, what))],
+                )
+            })
+            .collect();
+        let mut diverged = Vec::new();
+        if self.run_mutation() == RunMutation::DivergenceDispatches {
+            let widest = self.widest_tool(code);
+            diverged.extend(self.fresh(
+                Slot::Nested(site, widest),
+                self.program.tools[widest].effect,
+                &self.nested_what(widest, what),
+            ));
+        }
+        diverged.push(Op::Append(Record::CellFinished(site)));
+        arms.push(arm(
+            format!("the cell of {what} diverges from its journal on replay"),
+            Entry::Diverged(site),
+            diverged,
+        ));
+        arms.push(arm(
+            format!(
+                "the cell journal of {what} passes {} = {} bytes",
+                declared.journal_bytes.name, declared.journal_bytes.value
+            ),
+            Entry::CellRunning(site),
+            vec![Op::Append(Record::CellFinished(site))],
+        ));
+        arms
+    }
+
+    fn widest_tool(&self, code: CodeId) -> ToolId {
+        let declared = &self.program.codes[code];
+        let class = declared.worst_class(self.program);
+        *declared
+            .tools
+            .iter()
+            .find(|tool| self.program.tools[**tool].effect == class)
+            .expect("the worst class is some nested tool's class")
+    }
+
+    fn nested_what(&self, tool: ToolId, what: &str) -> String {
+        format!(
+            "tools.{} in the cell of {what}",
+            self.program.tools[tool].name
+        )
+    }
+
+    fn nested(&self, site: SiteId, tool: ToolId, what: &str) -> Vec<Arm> {
+        let slot = Slot::Nested(site, tool);
+        let class = self.program.tools[tool].effect;
+        let what = self.nested_what(tool, what);
+        let reopened = self.yield_result(slot, self.reopen(slot, class, &what));
+        let recorded = if self.run_mutation() == RunMutation::CellReplayIgnoresJournal {
+            self.fresh(slot, class, &what)
+        } else {
+            vec![Op::Replay(slot)]
+        };
+        vec![
+            arm(
+                format!("{what} runs"),
+                Entry::Live,
+                self.fresh(slot, class, &what),
+            ),
+            arm(
+                format!("{what} reopened after a crash left it running"),
+                Entry::Reopened(slot),
+                reopened,
+            ),
+            arm(
+                format!("{what} replayed from its journaled result"),
+                Entry::Recorded(slot),
+                recorded,
+            ),
+        ]
+    }
+
+    fn yield_result(&self, slot: Slot, ops: Vec<Op>) -> Vec<Op> {
+        ops.into_iter()
+            .flat_map(|op| match op {
+                Op::Yield { .. } => vec![op, Op::Append(Record::Result(slot))],
+                Op::Choice(arms) => vec![Op::Choice(
+                    arms.into_iter()
+                        .map(|choice| Arm {
+                            ops: self.yield_result(slot, choice.ops),
+                            ..choice
+                        })
+                        .collect(),
+                )],
+                other => vec![other],
+            })
+            .collect()
     }
 }

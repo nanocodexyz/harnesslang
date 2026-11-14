@@ -1,15 +1,17 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Const, Event, Expr, Function, Handler, Invariant, Item, Listing, Model,
-    Name, Param, Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Invariant, Item,
+    Listing, Model, Name, Param, Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr,
+    VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
 
 pub const NESTING_DEPTH_MAX: u32 = 64;
 
-pub const KEYWORDS: [&str; 26] = [
+pub const KEYWORDS: [&str; 27] = [
     "harness",
+    "code",
     "const",
     "type",
     "tool",
@@ -37,7 +39,9 @@ pub const KEYWORDS: [&str; 26] = [
     "requires",
 ];
 
-const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'model', 'state', 'invariant', 'fn' or 'on'";
+const ITEMS: &str =
+    "'const', 'type', 'tool', 'tools', 'code', 'model', 'state', 'invariant', 'fn' or 'on'";
+pub const CODE_TOOLS_FIELD: &str = "tools";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -172,6 +176,7 @@ impl<'a> Parser<'a> {
             "const" => self.constant().map(Item::Const),
             "type" => self.type_def().map(Item::Type),
             "tool" => self.tool().map(Item::Tool),
+            "code" => self.code().map(Item::Code),
             "tools" => self.listing().map(Item::Listing),
             "model" => self.model().map(Item::Model),
             "state" => self.state().map(Item::State),
@@ -307,6 +312,39 @@ impl<'a> Parser<'a> {
             bound,
             params,
             effect,
+        })
+    }
+
+    fn code(&mut self) -> Parsed<Code> {
+        self.word("code")?;
+        let name = self.name("a code tool name")?;
+        let open = self.symbol(Symbol::LeftBrace)?;
+        let mut tools = Vec::new();
+        let mut fields = Vec::new();
+        while !self.is_symbol(Symbol::RightBrace) {
+            if self.peek().token == Token::End {
+                return Err(Diagnostic::new(
+                    open,
+                    "code block is not closed before the end of the file",
+                ));
+            }
+            let key = self.name(&format!("a field of code '{}'", name.text))?;
+            if key.text == CODE_TOOLS_FIELD {
+                tools.push(self.name("a nested tool name")?);
+                while self.is_symbol(Symbol::Comma) {
+                    self.advance();
+                    tools.push(self.name("a nested tool name")?);
+                }
+                continue;
+            }
+            let value = self.bound(&format!("field '{}' of code '{}'", key.text, name.text))?;
+            fields.push(CodeField { key, value });
+        }
+        self.advance();
+        Ok(Code {
+            name,
+            tools,
+            fields,
         })
     }
 

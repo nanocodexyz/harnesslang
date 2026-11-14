@@ -182,6 +182,15 @@ invalid_fail() {
   expect_error examples/invalid/unbounded_list.hl any "unbounded_list.hl:8:22: error: a list needs a capacity"
   expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: error: the bound of loop 'step' must be a named constant, found number 64"
   expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
+  expect_error examples/invalid/code_no_model.hl any "code_no_model.hl:14:6: error: code 'exec' needs a model declaration"
+  expect_error examples/invalid/code_unknown_tool.hl any "code_unknown_tool.hl:17:15: error: code 'exec' lists 'bash', which is not a declared tool"
+  expect_error examples/invalid/code_nested_code.hl any "code_nested_code.hl:27:15: error: code 'outer' lists code tool 'exec'"
+  expect_error examples/invalid/code_literal_bound.hl any "code_literal_bound.hl:18:9: error: field 'calls' of code 'exec' must be a named constant, found number 8"
+  expect_error examples/invalid/code_parallel_over_calls.hl any "code_parallel_over_calls.hl:18:6: error: code 'exec': parallel (cell_wide = 16) exceeds calls (cell_calls_max = 8)"
+  expect_error examples/invalid/code_parallel_for.hl any "code_parallel_for.hl:39:7: error: a parallel for dispatches tool calls at once, but code 'exec' makes a dispatch able to run a cell"
+  expect_error examples/invalid/code_missing_field.hl any "code_missing_field.hl:16:6: error: code 'exec' lacks 'timers'"
+  expect_error examples/invalid/code_no_tools.hl any "code_no_tools.hl:16:6: error: code 'exec' lists no tools"
+  expect_error examples/invalid/code_unknown_field.hl any "code_unknown_field.hl:24:3: error: code 'exec' has no field 'memory'"
   expect_error examples/invalid/enum_missing_value.hl any 'enum_missing_value.hl:6:3: error: match on status is missing "interrupted"'
   expect_error examples/invalid/enum_unknown_value.hl any 'enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status'
   expect_error examples/invalid/reply_two_call_lists.hl any "reply_two_call_lists.hl:7:73: error: reply type 'split_reply' carries list<call, calls_max> in 'reads' and 'writes': exactly one variant carries the model's calls"
@@ -222,6 +231,7 @@ same_program() {
 fn_equal() {
   same_program examples/subagents.hl examples/inlined/subagents.hl
   same_program docs/snippets/fn.hl docs/snippets/fn_inline.hl
+  same_program examples/code_tasks.hl examples/inlined/code_tasks.hl
   sed '/push agents spawned/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' examples/inlined/subagents.hl > "$scratch/planted.hl"
   "$hl" check "$scratch/planted.hl" > /dev/null
   if same_program examples/subagents.hl "$scratch/planted.hl" 2> /dev/null; then
@@ -345,6 +355,7 @@ for plan in $(scripts/mutations.sh --diff-plans); do
   queue diff-plants scripts/mutations.sh --diff "$plan"
 done
 queue exhaustive scripts/exhaustive.sh
+queue js-mutations scripts/js-mutations.sh
 queue prove scripts/prove-mutations.sh
 run_queued
 stage census-examples census_examples

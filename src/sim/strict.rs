@@ -165,13 +165,20 @@ fn kept(program: &Program, state: &[Value], when: &str) -> Result<(), Violation>
     Ok(())
 }
 
-fn records_of(records: &[Record]) -> BTreeMap<u64, u64> {
+fn records_of(folded: &session::Session, records: &[Record]) -> BTreeMap<u64, u64> {
     let mut counts = BTreeMap::new();
     for record in records {
         let turn = match record {
             Record::Recovery { .. } => continue,
             Record::Checkpoint { revision, .. } if *revision == session::ENTRY_REVISION => continue,
             Record::Checkpoint { revision, .. } => *revision,
+            Record::Cell { cell, .. } => {
+                folded
+                    .cell_origins
+                    .get(cell)
+                    .expect("a folded cell record names a cell with an origin")
+                    .0
+            }
             other => other
                 .turn()
                 .expect("every record but a checkpoint names its turn"),
@@ -186,7 +193,7 @@ fn within_worst(
     folded: &session::Session,
     records: &[Record],
 ) -> Result<(), Violation> {
-    let counts = records_of(records);
+    let counts = records_of(folded, records);
     for (turn, log) in &folded.turns {
         let handler = program
             .handler(&log.handler)

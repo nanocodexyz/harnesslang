@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { CellChecks, DurableCells, TracedCells, engineDifferential } from "./js-sim-cell.mjs";
 
 const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
@@ -105,16 +106,29 @@ class Seed {
     this.opened = "";
     this.acks = [];
     this.dispatched = new Map();
-    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0 };
+    this.nestedDispatched = new Map();
+    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0 };
+    this.durableLines = () => [];
+    this.checks = new CellChecks(rt, (invariant, detail) => new Failure(invariant, detail));
+    this.cells = new TracedCells(this, {
+      rt,
+      cursor: this.cursor,
+      same,
+      failure: (invariant, detail) => new Failure(invariant, detail),
+      durable: () => new DurableCells(rt, this.durableLines()),
+      checks: this.checks,
+    });
+  }
+
+  durableCells() {
+    return new DurableCells(rt, this.durableLines());
   }
 
   hook(point) {
     const event = this.cursor.next("hook", rt.encodeJson(point));
-    same("hook point", event.point, point.point);
-    if (point.kind !== undefined) {
-      same("hook site", event.kind ?? null, point.kind);
-      same("hook effect", event.effect ?? null, point.effect);
-    }
+    same(`hook point at event ${this.cursor.index - 1}`, event.point, point.point);
+    if (point.kind !== undefined) same("hook site", event.kind ?? null, point.kind);
+    if (point.effect !== undefined) same("hook effect", event.effect ?? null, point.effect);
     if (event.answer === "crash") {
       this.stats.crashes += 1;
       throw new SimReset();
@@ -141,7 +155,37 @@ class Seed {
     same("run exit", event.result, kind);
   }
 
+  nestedTool(request) {
+    const callId = `${request.turn}/${request.seq}/code-${request.nested.id}`;
+    const external = request.effect === "external" ? 1 : 0;
+    const count = (this.nestedDispatched.get(callId) ?? 0) + external;
+    this.nestedDispatched.set(callId, count);
+    this.stats.dispatches += 1;
+    this.stats.nested += 1;
+    if (count > 1) throw new Failure("nested_external_once", `nested external call ${callId} (${request.tool}) was dispatched ${count} times`);
+    if (external === 1) {
+      const durable = this.durableCells();
+      if (!durable.header(request.nested.cell) || !durable.nested.has(callId)) {
+        throw new Failure("nested_external_once", `nested external call ${callId} was dispatched before C1 made durable its cell header (${durable.header(request.nested.cell)}) and call record (${durable.nested.has(callId)})`);
+      }
+    }
+  }
+
   tool(request, durable) {
+    if (request.nested === null) return this.topTool(request, durable);
+    if (durable !== null && durable.alarmed !== undefined) durable.alarmed(`${request.turn}/${request.seq}/code-${request.nested.id}`, request.effect);
+    const event = this.cursor.next("tool", short(rt.encodeJson({ ...request, nested: BigInt(request.nested.id) })));
+    same("tool call turn", event.turn, request.turn);
+    same("tool call seq", event.seq, request.seq);
+    same("tool call nested", event.nested, BigInt(request.nested.id));
+    same("tool call name", event.tool, request.tool);
+    same("tool call class", event.effect, request.effect);
+    same("tool call input", event.input, request.input);
+    this.checks.dispatched(this.stats.runs, request.nested, request, event.output);
+    return event.output;
+  }
+
+  topTool(request, durable) {
     const callId = `${request.turn}/${request.seq}`;
     const external = request.effect === "external" ? 1 : 0;
     const count = (this.dispatched.get(callId) ?? 0) + external;
@@ -150,10 +194,11 @@ class Seed {
     if (request.effect === "external" && count > 1) {
       throw new Failure("external_once", `external call ${callId} (${request.tool}) was dispatched ${count} times`);
     }
-    if (request.effect === "external" && durable !== null) durable(callId);
+    if (request.effect === "external" && durable !== null) durable.durable(callId);
     const event = this.cursor.next("tool", short(rt.encodeJson(request)));
     same("tool call turn", event.turn, request.turn);
     same("tool call seq", event.seq, request.seq);
+    same("tool call nested", event.nested ?? null, null);
     same("tool call name", event.tool, request.tool);
     same("tool call class", event.effect, request.effect);
     same("tool call input", event.input, request.input);
@@ -167,6 +212,16 @@ class Seed {
     same("listing seq", event.seq, request.seq);
     same("listing name", event.listing, request.listing);
     return event.output;
+  }
+
+  wait(wait) {
+    this.checks.waited(wait, wait.code);
+    if (!this.durableCells().header(wait.cell)) throw new Failure("header_before_wait", `cell ${wait.cell} waits on timer ${wait.timer} before its header is durable`);
+    const event = this.cursor.next("wait", `cell ${wait.cell} timer ${wait.timer}`);
+    same("wait cell", event.cell, BigInt(wait.cell));
+    same("wait timer", event.timer, BigInt(wait.timer));
+    same("wait until", event.until, wait.untilMs);
+    this.stats.waits += 1;
   }
 
   async tools(world, requests, limit) {
@@ -237,6 +292,7 @@ class Seed {
   }
 
   ended(medium) {
+    this.checks.ended(this.durableLines());
     const event = this.cursor.next("end", "end of seed");
     same("journal bytes", event.journal_bytes, BigInt(Buffer.byteLength(medium)));
     same("journal crc", event.journal_crc, BigInt(rt.crc32(medium)));
@@ -249,9 +305,10 @@ class Seed {
     const fakeFetch = async (url, init) => {
       const body = rt.decodeJson(init.body);
       if (url === TOOLS_URL) {
-        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null };
+        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
+        if (request.nested !== null) seed.nestedTool(request);
         fetchCheck(request);
-        const output = seed.tool(request, fetchCheck.durable ?? null);
+        const output = seed.tool(request, fetchCheck.durable === undefined ? null : fetchCheck);
         return new Response(rt.encodeJson(output), { status: HTTP_OK });
       }
       if (url === LISTINGS_URL) {
@@ -266,7 +323,22 @@ class Seed {
       }
       throw new Error(`unexpected fetch of ${url}`);
     };
-    return rt.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
+    const host = rt.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
+    const tool = host.tool;
+    return {
+      ...host,
+      async tool(request) {
+        seed.nestedCell = request.nested?.cell ?? null;
+        seed.nestedCode = request.nested?.code ?? null;
+        return tool(request);
+      },
+      async wait(wait) {
+        seed.wait(wait);
+      },
+      async observe(event) {
+        seed.cells.observe(event);
+      },
+    };
   }
 }
 
@@ -374,9 +446,14 @@ async function cloudflareSeed(seed) {
       if (rt.encodeLines(records, false) !== bytes) throw differ("rows inserted before the gate", rt.encodeLines(records, false), bytes);
       seed.flushed(bytes);
       storage.commit();
+      seed.checks.flushed(storage.lines());
     },
   };
-  const env = { HL_SIMULATION: simulation, HL_HOST: seed.host(fetchCheck) };
+  fetchCheck.alarmed = (callId, effect) => {
+    if (effect === "external" && storage.alarm === null) throw new Failure("liveness", `nested external call ${callId} left with no alarm committed, so a reset object never resumes`);
+  };
+  seed.durableLines = () => storage.lines();
+  const env = { HL_SIMULATION: simulation, HL_HOST: seed.host(fetchCheck), HL_CELLS: seed.cells };
   let instance = null;
   const durableStatus = (turn) => statusIn(storage.lines(), turn);
   while (seed.cursor.peek()?.event === "turn") {
@@ -426,6 +503,7 @@ class SimWorkflow {
     this.turnsMax = seed.seed.turns;
     this.stepIndex = 0;
     this.statusLive = false;
+    this.slept = new Set();
     this.lastInbox = null;
   }
 
@@ -481,6 +559,22 @@ class SimWorkflow {
         same("step attempt", event.answer, BigInt(attempts));
         return attempts;
       },
+      async nestedAttempt(turn, seq, nested) {
+        const event = seed.cursor.next("attempt", `nested ${turn}/${seq}/code-${nested} step ${index} attempt ${attempts}`);
+        same("nested attempt turn", event.turn, BigInt(turn));
+        same("nested attempt seq", event.seq, BigInt(seq));
+        same("nested attempt call", event.nested ?? null, BigInt(nested));
+        same("step attempt", event.answer, BigInt(attempts));
+        return attempts;
+      },
+      cells: seed.cells,
+      observeWaited: async (wait, answer) => {
+        if (answer && this.slept.has(`${wait.cell}/${wait.timer}`)) return;
+        const event = seed.cursor.next("waited", `cell ${wait.cell} timer ${wait.timer}`);
+        same("waited cell", event.cell, BigInt(wait.cell));
+        same("waited timer", event.timer, BigInt(wait.timer));
+        same("waited answer", event.answer, answer);
+      },
       hook: (point) => seed.hook(point),
       tools: (world, requests, limit) => seed.tools(world, requests, limit),
       host: this.state.host,
@@ -489,8 +583,9 @@ class SimWorkflow {
       answer: async (turn, position, answers) => seed.answered(turn, position, answers),
     };
     const output = await harness.runStep(input, context);
-    if (input.kind === "run") {
+    if (input.kind === "run" && output.wait === undefined) {
       this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
+      this.seed.checks.flushed([...this.state.lines(), ...output.lines]);
       const request = rt.decodeJson(input.request);
       if (output.lines.some((line) => {
         const record = rt.decodeLine(line, false);
@@ -500,9 +595,23 @@ class SimWorkflow {
     log.push({ name, output });
     return { output, live: true };
   }
+
+  async sleep(name, wait) {
+    const index = this.stepIndex;
+    this.stepIndex += 1;
+    const log = this.state.log;
+    if (index < log.length) {
+      if (log[index].name !== name) throw differ(`workflow sleep ${index} on replay`, log[index].name, name);
+      return;
+    }
+    this.seed.wait(wait);
+    this.slept.add(`${wait.cell}/${wait.timer}`);
+    log.push({ name, output: { lines: [] } });
+  }
 }
 
 async function vercelSeed(seed) {
+  seed.durableLines = () => state.lines();
   const state = {
     requests: [],
     log: [],
@@ -536,7 +645,8 @@ async function vercelSeed(seed) {
 }
 
 const seeds = parseTrace(values.trace);
-const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0 };
+const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0 };
+const engineTotals = { cells: 0, steps: 0, unparsed: 0 };
 const started = performance.now();
 for (const traced of seeds) {
   const seed = new Seed(traced);
@@ -544,6 +654,11 @@ for (const traced of seeds) {
     seed.cursor.next("seed", "start of seed");
     if (values.target === "cloudflare") await cloudflareSeed(seed);
     else await vercelSeed(seed);
+    try {
+      await engineDifferential(rt, seed.cells, engineTotals);
+    } catch (error) {
+      throw new Failure("engine_equal", short(error.message));
+    }
   } catch (error) {
     const invariant = error instanceof Failure ? error.invariant : "panic";
     const detail = error instanceof Failure ? error.message : (error?.stack ?? String(error));
@@ -557,7 +672,7 @@ for (const traced of seeds) {
     process.exit(1);
   }
   totals.seeds += 1;
-  for (const key of ["turns", "runs", "crashes", "dispatches", "steps"]) totals[key] += seed.stats[key];
+  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits"]) totals[key] += seed.stats[key];
 }
 const elapsed = Math.round(performance.now() - started);
-console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps} ms=${elapsed}`);
+console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""} ms=${elapsed}`);

@@ -4,10 +4,11 @@ use std::path::Path;
 
 use crate::effect::EffectClass;
 use crate::ir::Program;
-use crate::run::journal::{self, Record, call_id};
+use crate::run::cell_journal::{CallState, Entry};
+use crate::run::journal::{self, Record, call_id, nested_id};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
-use crate::run::session::{self, Session, SiteLog, TurnLog};
+use crate::run::session::{self, Call, Session, SiteLog, TurnLog};
 use crate::sim::{self, SeedRun};
 use crate::target::medium::Medium;
 use crate::target::{self, Recovery, Target};
@@ -74,6 +75,13 @@ fn tools_json(program: &Program) -> Json {
         );
         tools.insert(tool.name.clone(), Json::text(tool.effect.name()));
     }
+    for code in &program.codes {
+        let previous = tools.insert(code.name.clone(), Json::text(EffectClass::None.name()));
+        assert!(
+            previous.is_none(),
+            "the checker refuses a code tool named like a tool"
+        );
+    }
     for listing in &program.listings {
         tools.insert(listing.name.clone(), Json::text(EffectClass::None.name()));
         for word in crate::sim::world::WORDS {
@@ -89,27 +97,30 @@ fn header(
     target: Target,
     checksum: bool,
     seed: u64,
-    run: &SeedRun,
+    result: &str,
     records: u64,
 ) -> Json {
     let recovery = match target::model(target).recovery {
         Recovery::AtLoad => "at_load",
         Recovery::InStep { .. } => "in_step",
     };
-    let result = match &run.result {
-        Ok(()) => "ok".to_owned(),
-        Err(violation) => format!("{}: {}", violation.invariant.name(), violation.detail),
-    };
     Json::object([
         ("checksum", Json::Bool(checksum)),
         ("harness", Json::text(&program.name)),
         ("recovery", Json::text(recovery)),
         ("records", Json::Number(records)),
-        ("result", Json::String(result)),
+        ("result", Json::text(result)),
         ("seed", Json::Number(seed)),
         ("target", Json::text(target.name())),
         ("tools", tools_json(program)),
     ])
+}
+
+pub fn run_result(run: &SeedRun) -> String {
+    match &run.result {
+        Ok(()) => "ok".to_owned(),
+        Err(violation) => format!("{}: {}", violation.invariant.name(), violation.detail),
+    }
 }
 
 pub fn summary(
@@ -119,12 +130,30 @@ pub fn summary(
     seed: u64,
     run: &SeedRun,
 ) -> (String, u64) {
-    let decoded = journal::decode_lines(&run.journal, checksum);
+    summarize(
+        program,
+        target,
+        checksum,
+        seed,
+        &run_result(run),
+        &run.journal,
+    )
+}
+
+pub fn summarize(
+    program: &Program,
+    target: Target,
+    checksum: bool,
+    seed: u64,
+    result: &str,
+    bytes: &[u8],
+) -> (String, u64) {
+    let decoded = journal::decode_lines(bytes, checksum);
     let records = decoded
         .as_ref()
         .map_or(Vec::new(), |decoded| decoded.records.clone());
     let count = records.len() as u64;
-    let mut lines = vec![header(program, target, checksum, seed, run, count)];
+    let mut lines = vec![header(program, target, checksum, seed, result, count)];
     if let Err(error) = &decoded {
         lines.push(Json::object([("decode_error", Json::text(error))]));
     }
@@ -149,6 +178,9 @@ pub fn summary(
 }
 
 fn record_line(program: &Program, session: &Session, record: &Record, position: Json) -> Json {
+    if let Record::Cell { cell, .. } = record {
+        return Json::object([("cell", cell_json(session, *cell)), ("record", position)]);
+    }
     let Some(turn) = record.turn() else {
         let (revision, _) = session
             .checkpoints
@@ -176,26 +208,83 @@ fn record_line(program: &Program, session: &Session, record: &Record, position: 
     ])
 }
 
+fn cell_json(session: &Session, cell: u64) -> Json {
+    let (turn, seq) = session.cell_origins[&cell];
+    let log = &session.turns[&turn].cells[&seq];
+    assert_eq!(
+        log.cell, cell,
+        "a cell origin names the site holding that cell"
+    );
+    let calls = log
+        .calls
+        .values()
+        .filter(|call| !log.delivered(call.id))
+        .map(|call| {
+            let state = match call.state {
+                CallState::Queued => "queued",
+                CallState::Running => "running",
+                CallState::Completed { .. } => "completed",
+            };
+            (call.id.to_string(), Json::text(state))
+        })
+        .collect();
+    Json::object([
+        ("calls", Json::Object(calls)),
+        ("cell", Json::Number(cell)),
+        (
+            "entries",
+            Json::Array(log.entries.iter().map(Entry::to_json).collect()),
+        ),
+        ("finished", Json::Bool(log.finished)),
+        ("origin", Json::String(call_id(turn, seq))),
+        ("seq", Json::Number(log.next_seq)),
+        (
+            "unknown",
+            Json::Array(log.unknown_calls().into_iter().map(Json::Number).collect()),
+        ),
+    ])
+}
+
+fn site_call(site: &SiteLog) -> Option<&Call> {
+    match site {
+        SiteLog::Open(call) | SiteLog::Done(call, _) | SiteLog::Unknown(call) => Some(call),
+        SiteLog::Reply(_) => None,
+    }
+}
+
 fn classes(turn: u64, log: &TurnLog, keep: impl Fn(&SiteLog) -> bool) -> Json {
     let mut calls = BTreeMap::new();
     for (seq, site) in &log.sites {
-        let call = match site {
-            SiteLog::Open(call) | SiteLog::Done(call, _) | SiteLog::Unknown(call) => call,
-            SiteLog::Reply(_) => continue,
-        };
-        if keep(site) {
+        if let Some(call) = site_call(site)
+            && keep(site)
+        {
             calls.insert(call_id(turn, *seq), Json::text(call.effect.name()));
+        }
+    }
+    for ((seq, nested), site) in &log.nested {
+        if let Some(call) = site_call(site)
+            && keep(site)
+        {
+            calls.insert(
+                nested_id(turn, *seq, *nested),
+                Json::text(call.effect.name()),
+            );
         }
     }
     Json::Object(calls)
 }
 
 fn turn_json(turn: u64, log: &TurnLog) -> Json {
-    let unknown = log
+    let mut unknown: Vec<Json> = log
         .open_seqs(EffectClass::may_be_unknown)
         .into_iter()
         .map(|seq| Json::String(call_id(turn, seq)))
         .collect();
+    unknown.extend(
+        log.open_nested(EffectClass::may_be_unknown)
+            .into_iter()
+            .map(|(seq, nested)| Json::String(nested_id(turn, seq, nested))),
+    );
     let replies = log
         .sites
         .values()

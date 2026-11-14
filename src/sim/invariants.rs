@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::effect::EffectClass;
 use crate::ir::{ListingId, Program};
+use crate::run::cell::{CellOutcome, encode_output};
+use crate::run::cell_journal::{Entry, unknown_outcome};
 use crate::run::engine::Finish;
-use crate::run::journal::{self, Output, Record, call_id};
+use crate::run::journal::{self, Output, Record, call_id, nested_id};
 use crate::run::json::Json;
 use crate::run::session;
+use crate::run::session::{Session, SiteLog};
 use crate::run::turn;
 use crate::run::value;
 use crate::sim::world::SimWorld;
@@ -19,7 +23,15 @@ pub enum Invariant {
     Liveness,
     ReplayEqual,
     Panic,
+    NestedExternalOnce,
+    UnknownNestedReported,
+    NestedKnown,
+    CellFinishesOnce,
+    CellReplayEqual,
+    HeaderBeforeWait,
+    CellBounded,
     EnumValid,
+    NestedEnumValid,
     EventOnce,
     EventKept,
     EventBeforeRead,
@@ -33,7 +45,7 @@ pub enum Invariant {
 }
 
 impl Invariant {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 27] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -42,7 +54,15 @@ impl Invariant {
         Self::Liveness,
         Self::ReplayEqual,
         Self::Panic,
+        Self::NestedExternalOnce,
+        Self::UnknownNestedReported,
+        Self::NestedKnown,
+        Self::CellFinishesOnce,
+        Self::CellReplayEqual,
+        Self::HeaderBeforeWait,
+        Self::CellBounded,
         Self::EnumValid,
+        Self::NestedEnumValid,
         Self::EventOnce,
         Self::EventKept,
         Self::EventBeforeRead,
@@ -65,7 +85,15 @@ impl Invariant {
             Self::Liveness => "liveness",
             Self::ReplayEqual => "replay_equal",
             Self::Panic => "panic",
+            Self::NestedExternalOnce => "nested_external_once",
+            Self::UnknownNestedReported => "unknown_nested_reported",
+            Self::NestedKnown => "nested_known",
+            Self::CellFinishesOnce => "cell_finishes_once",
+            Self::CellReplayEqual => "cell_replay_equal",
+            Self::HeaderBeforeWait => "header_before_wait",
+            Self::CellBounded => "cell_bounded",
             Self::EnumValid => "enum_valid",
+            Self::NestedEnumValid => "nested_enum_valid",
             Self::EventOnce => "event_once",
             Self::EventKept => "event_kept",
             Self::EventBeforeRead => "event_before_read",
@@ -97,6 +125,9 @@ pub struct Calls {
     results: BTreeMap<String, Vec<Output>>,
     unknown: BTreeSet<String>,
     statuses: BTreeMap<u64, Vec<Record>>,
+    nested_external: BTreeSet<String>,
+    nested_results: BTreeMap<String, Vec<Output>>,
+    nested_unknown: BTreeSet<String>,
 }
 
 fn seq_unique(records: &[Record]) -> Result<Calls, Violation> {
@@ -104,8 +135,45 @@ fn seq_unique(records: &[Record]) -> Result<Calls, Violation> {
     let mut last: BTreeMap<u64, u64> = BTreeMap::new();
     let mut last_result: BTreeMap<u64, u64> = BTreeMap::new();
     let mut open: BTreeSet<String> = BTreeSet::new();
+    let mut nested_last: BTreeMap<(u64, u64), u64> = BTreeMap::new();
     for record in records {
         match record {
+            Record::NestedCall {
+                turn, seq, nested, ..
+            } => {
+                let previous = nested_last.get(&(*turn, *seq)).copied().unwrap_or(0);
+                let id = nested_id(*turn, *seq, *nested);
+                if *nested <= previous {
+                    return violation(
+                        Invariant::SeqUnique,
+                        format!(
+                            "nested call {id} is recorded after nested call {previous} of its cell site"
+                        ),
+                    );
+                }
+                nested_last.insert((*turn, *seq), *nested);
+                open.insert(id.clone());
+                calls.nested_external.insert(id);
+            }
+            Record::NestedResult {
+                turn,
+                seq,
+                nested,
+                output,
+            } => {
+                let id = nested_id(*turn, *seq, *nested);
+                if !open.remove(&id) {
+                    return violation(
+                        Invariant::SeqUnique,
+                        format!("result for nested call {id}, which has no open call"),
+                    );
+                }
+                calls
+                    .nested_results
+                    .entry(id)
+                    .or_default()
+                    .push(output.clone());
+            }
             Record::Call {
                 turn, seq, effect, ..
             } => {
@@ -138,7 +206,22 @@ fn seq_unique(records: &[Record]) -> Result<Calls, Violation> {
                 }
                 calls.results.entry(id).or_default().push(output.clone());
             }
-            Record::Recovery { turn, unknown, .. } => {
+            Record::Recovery {
+                turn,
+                unknown,
+                nested,
+                ..
+            } => {
+                for (seq, inner) in nested {
+                    let id = nested_id(*turn, *seq, *inner);
+                    if !open.remove(&id) {
+                        return violation(
+                            Invariant::SeqUnique,
+                            format!("recovery reports nested call {id}, which has no open call"),
+                        );
+                    }
+                    calls.nested_unknown.insert(id);
+                }
                 for seq in unknown {
                     let id = call_id(*turn, *seq);
                     if !open.remove(&id) {
@@ -184,7 +267,154 @@ pub fn check(
     idempotent_known(&calls, records)?;
     checkpoint_compacted(program, world, records)?;
     liveness_and_replay(program, world, turns, records)?;
-    world.inbox.kept(records)
+    world.inbox.kept(records)?;
+    let session = session::fold(records).expect("liveness folded this journal");
+    cells(program, &calls, &session)
+}
+
+fn nested_dispatches(world: &SimWorld<'_>) -> Result<(), Violation> {
+    if let Some(fault) = world.cell_faults.first() {
+        return Err(fault.clone());
+    }
+    for (id, dispatched) in &world.nested_dispatched {
+        if dispatched.external > 1 {
+            return violation(
+                Invariant::NestedExternalOnce,
+                format!(
+                    "nested external call {id} ({}) was dispatched {} times",
+                    dispatched.tool, dispatched.external
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn nested_reported(world: &SimWorld<'_>, calls: &Calls) -> Result<(), Violation> {
+    for (id, dispatched) in &world.nested_dispatched {
+        if let Some(results) = calls.nested_results.get(id)
+            && dispatched.external > 0
+            && results.first() != dispatched.outputs.first()
+        {
+            return violation(
+                Invariant::UnknownNestedReported,
+                format!(
+                    "nested external call {id} records {results:?}, the tool returned {:?}",
+                    dispatched.outputs
+                ),
+            );
+        }
+    }
+    for id in &calls.nested_external {
+        let known = calls.nested_results.contains_key(id);
+        let unknown = calls.nested_unknown.contains(id);
+        let dispatches = world
+            .nested_dispatched
+            .get(id)
+            .map_or(0, |dispatched| dispatched.external);
+        if known && dispatches == 0 {
+            return violation(
+                Invariant::UnknownNestedReported,
+                format!(
+                    "nested external call {id} records a result although it was never dispatched"
+                ),
+            );
+        }
+        if known && unknown {
+            return violation(
+                Invariant::UnknownNestedReported,
+                format!("nested external call {id} is both recorded and reported unknown"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn tool_class(program: &Program, name: &str) -> EffectClass {
+    program.dispatch_class(name)
+}
+
+fn cells(program: &Program, calls: &Calls, session: &Session) -> Result<(), Violation> {
+    let unknown_encoded = unknown_outcome().encode();
+    for (turn, log) in &session.turns {
+        for (seq, cell) in &log.cells {
+            let site_unknown = match log.sites.get(seq) {
+                Some(SiteLog::Done(_, output)) => {
+                    matches!(
+                        CellOutcome::from_output(output),
+                        Ok(CellOutcome::Unknown(_))
+                    )
+                }
+                _ => {
+                    return violation(
+                        Invariant::CellFinishesOnce,
+                        format!(
+                            "cell {} of finished turn {turn} has no site result",
+                            cell.cell
+                        ),
+                    );
+                }
+            };
+            if !cell.finished {
+                return violation(
+                    Invariant::CellFinishesOnce,
+                    format!(
+                        "cell {} of finished turn {turn} has no finished update",
+                        cell.cell
+                    ),
+                );
+            }
+            let mut names = BTreeMap::new();
+            let mut results = BTreeMap::new();
+            for entry in &cell.entries {
+                match entry {
+                    Entry::Call { id, name, .. } => {
+                        names.insert(*id, name.clone());
+                    }
+                    Entry::Result {
+                        id,
+                        encoded,
+                        success,
+                    } => {
+                        results.insert(*id, (encoded.clone(), *success));
+                    }
+                    _ => {}
+                }
+            }
+            for (id, name) in &names {
+                let nested = nested_id(*turn, *seq, *id);
+                let class = tool_class(program, name);
+                let result = results.get(id);
+                let delivered_unknown = result
+                    .is_some_and(|(encoded, success)| !success && *encoded == unknown_encoded);
+                if class == EffectClass::External {
+                    let listed = calls.nested_unknown.contains(&nested);
+                    if delivered_unknown != listed && (result.is_some() || !listed) {
+                        return violation(
+                            Invariant::UnknownNestedReported,
+                            format!(
+                                "nested external call {nested} is listed unknown: {listed}, delivered the unknown outcome: {delivered_unknown}"
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                if site_unknown {
+                    continue;
+                }
+                if result.is_none() || delivered_unknown {
+                    return violation(
+                        Invariant::NestedKnown,
+                        format!(
+                            "{} nested call {nested} ends without a known result",
+                            class.name()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn checkpoint_compacted(
@@ -254,9 +484,12 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             );
         }
     }
+    nested_dispatches(world)?;
     world.inbox.safety(records)?;
     let calls = seq_unique(records)?;
+    nested_reported(world, &calls)?;
     enum_valid(world, records)?;
+    nested_enum_valid(world, records)?;
     let refused = tool_admitted(world, records)?;
     for (id, dispatched) in world
         .dispatched
@@ -555,6 +788,9 @@ fn canonical_key(record: &Record) -> (u64, u8, u64, u8) {
         Record::Event { turn, at, .. } => (*turn, 2, *at, 2),
         Record::Status { turn, .. } => (*turn, 3, 0, 0),
         Record::Checkpoint { revision, .. } => (*revision, 4, 0, 0),
+        Record::NestedCall { .. } | Record::NestedResult { .. } | Record::Cell { .. } => {
+            panic!("the checker refuses parallel for in a harness with a code tool")
+        }
     }
 }
 
@@ -691,6 +927,77 @@ fn liveness_and_replay(
                 resumed.encode()
             ),
         );
+    }
+    Ok(())
+}
+
+fn nested_enum_valid(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    if world
+        .nested_dispatched
+        .values()
+        .all(|dispatched| dispatched.values.is_empty())
+    {
+        return Ok(());
+    }
+    let Ok(folded) = session::fold(records) else {
+        return Ok(());
+    };
+    for (turn, log) in &folded.turns {
+        for (seq, cell) in &log.cells {
+            nested_results_valid(world, *turn, *seq, &cell.entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn nested_results_valid(
+    world: &SimWorld<'_>,
+    turn: u64,
+    seq: u64,
+    entries: &[Entry],
+) -> Result<(), Violation> {
+    let unknown = unknown_outcome().encode();
+    let mut calls: BTreeMap<u64, (&str, &Json)> = BTreeMap::new();
+    for entry in entries {
+        match entry {
+            Entry::Call { id, name, input } => {
+                calls.insert(*id, (name, input));
+            }
+            Entry::Result {
+                id,
+                encoded,
+                success,
+            } => {
+                let nested = nested_id(turn, seq, *id);
+                let (Some(dispatched), Some(&(tool, input))) =
+                    (world.nested_dispatched.get(&nested), calls.get(id))
+                else {
+                    continue;
+                };
+                let returned: Vec<_> = dispatched
+                    .values
+                    .iter()
+                    .filter(|returned| returned.tool == tool && &returned.input == input)
+                    .collect();
+                let recorded = (encoded.clone(), *success);
+                if *encoded == unknown
+                    || returned.is_empty()
+                    || returned
+                        .iter()
+                        .any(|returned| encode_output(&returned.expected) == recorded)
+                {
+                    continue;
+                }
+                let outputs: Vec<_> = returned.iter().map(|returned| &returned.output).collect();
+                return violation(
+                    Invariant::NestedEnumValid,
+                    format!(
+                        "nested call {nested} ({tool}) records {encoded}, but the tool returned {outputs:?}: a result outside its text enum must be recorded as failed"
+                    ),
+                );
+            }
+            _ => {}
+        }
     }
     Ok(())
 }

@@ -8,6 +8,16 @@ pub fn program(program: &Program) {
         program.sums.len() >= crate::ir::BUILTIN_SUMS,
         "every program carries the builtin sums"
     );
+    for code in &program.codes {
+        assert!(!code.tools.is_empty(), "a code tool has nested tools");
+        assert!(
+            code.parallel.value <= code.calls.value,
+            "a code tool runs at most its calls at once"
+        );
+        for tool in &code.tools {
+            assert!(*tool < program.tools.len(), "a nested tool is declared");
+        }
+    }
     for invariant in &program.invariants {
         assert!(
             !reads_local(&invariant.condition),
@@ -129,6 +139,19 @@ fn handler(program: &Program, handler: &Handler) {
                 site.class,
                 SiteClass::Fixed(program.tools[tool].effect),
                 "a tool site has its tool's class"
+            );
+        }
+        if let SiteKind::Cell(code) = site.kind {
+            assert!(code < program.codes.len(), "a cell site names a code tool");
+            assert_eq!(
+                site.class,
+                SiteClass::Cell,
+                "a cell site has the cell class"
+            );
+            assert_eq!(
+                site.result,
+                Type::Maybe(Box::new(Type::Text)),
+                "a cell yields maybe<text>"
             );
         }
         if let SiteKind::Listing(listing) = site.kind {
