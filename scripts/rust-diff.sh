@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 
 seeds="${RUST_DIFF_SEEDS:-0..2000}"
 targets="${RUST_DIFF_TARGETS:-native-jsonl native-sqlite server-postgres}"
-files="${RUST_DIFF_FILES:-examples/agent.hl examples/minimal.hl examples/reviewer.hl}"
+files="${RUST_DIFF_FILES:-examples/agent.hl examples/minimal.hl examples/reviewer.hl examples/code_agent.hl}"
 opt="${RUST_DIFF_OPT:-2}"
 plant="${RUST_DIFF_PLANT:-none}"
 hl=target/release/hl
@@ -21,6 +21,8 @@ plant_expression() {
     double_fsync) echo 's/^    disk.sync().map_err(|_| Stop::Crash)?;$/    disk.sync().map_err(|_| Stop::Crash)?;\n    disk.sync().map_err(|_| Stop::Crash)?;/' ;;
     batch_seq_from_zero) echo 's/("seq", Json::Number(head + 1 + index as u64))/("seq", Json::Number(head + index as u64))/' ;;
     recovery_skipped) echo 's/SiteLog::Open(call) if call.effect.may_be_unknown() => Some(\*seq),/SiteLog::Open(call) if false => Some(*seq),/' ;;
+    nested_flush_after_dispatch) echo 's/if tool.effect.may_be_unknown() {/if false \&\& tool.effect.may_be_unknown() {/' ;;
+    timeout_rides) echo 's/if self.header_unsaved {/if false \&\& self.header_unsaved {/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

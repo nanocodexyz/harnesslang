@@ -136,4 +136,19 @@ if [ "${HL_DRILL:-0}" = 1 ]; then
     echo "drill: $mutation is caught on the real files"
   done
 fi
+if [ "${HL_RUST_DIFF:-0}" = 1 ]; then
+  RUST_DIFF_SEEDS=0..300 RUST_DIFF_OPT=0 scripts/rust-diff.sh
+  for plant in nested_flush_after_dispatch timeout_rides; do
+    if RUST_DIFF_SEEDS=0..300 RUST_DIFF_OPT=0 RUST_DIFF_FILES=examples/code_agent.hl RUST_DIFF_PLANT=$plant scripts/rust-diff.sh > "$scratch/rust-diff-$plant.log" 2>&1; then
+      echo "rust-diff: plant $plant matched the interpreter" >&2
+      exit 1
+    fi
+    if ! grep -q 'FAIL invariant=backend_equal' "$scratch/rust-diff-$plant.log"; then
+      echo "rust-diff: plant $plant failed for another reason:" >&2
+      cat "$scratch/rust-diff-$plant.log" >&2
+      exit 1
+    fi
+    echo "rust-diff: plant $plant is caught by the differential"
+  done
+fi
 echo "check.sh: ok"
