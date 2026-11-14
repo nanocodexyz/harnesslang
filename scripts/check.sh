@@ -365,12 +365,12 @@ queue invalid invalid_fail
 queue fn fn_equal
 queue docs scripts/docs-check.sh
 queue strict scripts/strict.sh
-for file in $examples; do
+for file in $examples docs/snippets/keep.hl; do
   for target in $js_targets; do
     queue js-diff js_diff_one "$target" "$file"
   done
 done
-for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl; do
+for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/keep.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
   done
@@ -378,7 +378,7 @@ done
 for target in $targets; do
   queue sim-twice sim_twice "$target"
 done
-for file in $examples; do
+for file in $examples docs/snippets/keep.hl; do
   for target in $rust_targets; do
     queue rust-diff rust_diff_one "$target" "$file"
   done
