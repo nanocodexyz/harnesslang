@@ -115,7 +115,7 @@ docs/snippets/tutorial/2-requires.hl: harness agent: 0 tool(s), 1 state field(s)
     outbound requests: no loops
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
-  proved handler prompt: no_overflow: 1 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 2 push(es) proved below capacity (14 prover steps)
+  proved handler prompt: no_overflow: 1 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 2 push(es) proved below capacity (15 prover steps)
   proved handler prompt on native-jsonl: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
   proved handler prompt on native-jsonl: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
   proved handler prompt on native-sqlite: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
@@ -393,7 +393,7 @@ examples/agent.hl: harness agent: 3 tool(s), 2 state field(s), 1 handler(s)
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
   proved zero state: invariant_initial: 2 invariant(s) hold
-  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4098 prover steps)
+  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4192 prover steps)
   proved handler prompt on cloudflare: durability: 1 external effect site(s) run only after a flush of their call and every record before it; 10 acknowledgement point(s) follow their status flush
   proved handler prompt on cloudflare: worst_case: 2115 journal records per run on the plan's longest path, as hl check counts (step below turn_steps_max (64) x call below calls_per_step_max (16))
   proved handler prompt on cloudflare: worst_case: 1088 outbound requests <= 10000 outbound requests per invocation (step below turn_steps_max (64) x call below calls_per_step_max (16))
