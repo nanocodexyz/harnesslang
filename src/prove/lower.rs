@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use crate::effect::EffectClass;
 use crate::ir::{
-    BinaryOp, CodeId, Expr, Handler, Parallel, Program, SiteClass, SiteId, SiteKind, Stmt, ToolId,
-    Type,
+    BinaryOp, CodeId, Expr, Handler, Kept, Parallel, Program, SiteClass, SiteId, SiteKind, Stmt,
+    ToolId, Type,
 };
 use crate::prove::Mutation;
 use crate::prove::text::Names;
@@ -217,6 +217,7 @@ fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
             Stmt::Let { .. }
             | Stmt::Assign { .. }
             | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
             | Stmt::Effect { .. }
             | Stmt::Finish { .. } => {}
         }
@@ -324,6 +325,7 @@ impl Lowering<'_> {
                 Stmt::Let { .. }
                 | Stmt::Assign { .. }
                 | Stmt::Push { .. }
+                | Stmt::Shrink { .. }
                 | Stmt::Finish { .. } => {}
             }
         }
@@ -408,6 +410,11 @@ impl Lowering<'_> {
                 self.arithmetic_trap(value, ops);
                 let name = &self.program.state[*field].name;
                 ops.push(self.trap(format!("push onto {name}")));
+            }
+            Stmt::Shrink { kept, .. } => {
+                if let Kept::Last(count) = kept {
+                    self.arithmetic_trap(count, ops);
+                }
             }
             Stmt::If {
                 condition,

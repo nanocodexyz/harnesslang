@@ -59,6 +59,16 @@ pub fn replay(
     log: &TurnLog,
     state: Vec<Value>,
 ) -> Result<Vec<Value>, Exit> {
+    replay_retiring(program, target, turn, log, state).map(|(state, _)| state)
+}
+
+pub fn replay_retiring(
+    program: &Program,
+    target: &target::Model,
+    turn: u64,
+    log: &TurnLog,
+    state: Vec<Value>,
+) -> Result<(Vec<Value>, u64), Exit> {
     let handler = program.handler(&log.handler).ok_or_else(|| {
         corrupt(format!(
             "turn {turn} ran handler '{}', which the program lacks",
@@ -83,7 +93,7 @@ pub fn replay(
             finished.result.encode()
         )));
     }
-    Ok(ran.state)
+    Ok((ran.state, ran.retired))
 }
 
 pub fn state_before(

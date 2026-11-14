@@ -171,6 +171,15 @@ pub enum Stmt {
         list: Name,
         value: Expr,
     },
+    Clear {
+        at: Position,
+        list: Name,
+    },
+    Keep {
+        at: Position,
+        list: Name,
+        count: Expr,
+    },
     If {
         at: Position,
         condition: Expr,

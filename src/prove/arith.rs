@@ -46,6 +46,12 @@ enum LoopKind<'b> {
 
 type Alternatives = Vec<Vec<Linear>>;
 
+struct ShrinkBound {
+    capacity: i128,
+    left: Option<i128>,
+    dropped: Option<i128>,
+}
+
 struct Prover<'a> {
     program: &'a Program,
     handler: Option<&'a Handler>,
@@ -56,6 +62,7 @@ struct Prover<'a> {
     quiet: u32,
     findings: Vec<Finding>,
     proved: BTreeMap<&'static str, u64>,
+    shrinks: BTreeMap<String, ShrinkBound>,
 }
 
 pub fn prove(program: &Program, report: &mut Report) {
@@ -138,7 +145,7 @@ fn modified(statements: &[Stmt], program: &Program, out: &mut BTreeSet<Quantity>
                 }
                 _ => {}
             },
-            Stmt::Push { field, .. } => {
+            Stmt::Push { field, .. } | Stmt::Shrink { field, .. } => {
                 out.insert(Quantity::FieldLen(*field));
             }
             Stmt::If {
@@ -155,6 +162,23 @@ fn modified(statements: &[Stmt], program: &Program, out: &mut BTreeSet<Quantity>
             Stmt::Let { .. } | Stmt::Effect { .. } | Stmt::Finish { .. } => {}
         }
     }
+}
+
+fn shrink_lines(shrinks: &BTreeMap<String, ShrinkBound>) -> String {
+    let shown =
+        |bound: Option<i128>| bound.map_or_else(|| "?".to_owned(), |value| value.to_string());
+    shrinks
+        .iter()
+        .map(|(statement, bound)| {
+            format!(
+                "{statement} leaves at most {} of {} entries and drops at most {}",
+                shown(bound.left),
+                bound.capacity,
+                shown(bound.dropped)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn related(facts: &[Linear], goal: &Linear) -> BTreeSet<Var> {
@@ -204,6 +228,7 @@ impl<'a> Prover<'a> {
             quiet: 0,
             findings: Vec::new(),
             proved: BTreeMap::new(),
+            shrinks: BTreeMap::new(),
         }
     }
 
@@ -224,6 +249,12 @@ impl<'a> Prover<'a> {
                 count("push_bound"),
                 PROOF_STEPS_PER_HANDLER_MAX - self.budget.steps_left
             ));
+            if !self.shrinks.is_empty() {
+                report.proved.push(format!(
+                    "handler {name}: shrink: {}",
+                    shrink_lines(&self.shrinks)
+                ));
+            }
         }
         for finding in self.findings {
             report.add(finding);

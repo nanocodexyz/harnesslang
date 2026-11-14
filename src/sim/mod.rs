@@ -245,7 +245,9 @@ fn run_seed_unguarded(
         world.begin_turn(&request, faulty);
         if let Err(violation) = drive_turn(program, &mut world, &request) {
             let specific = match world.medium.durable() {
-                Ok(records) => invariants::safety(&world, &records).err(),
+                Ok(records) => invariants::safety(&world, &records)
+                    .err()
+                    .or_else(|| invariants::checkpoint_compacted(program, &world, &records).err()),
                 Err(_) => None,
             };
             result = Err(specific.unwrap_or(violation));

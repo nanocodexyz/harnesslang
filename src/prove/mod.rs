@@ -179,6 +179,7 @@ fn repeat_assignments(statements: &mut Vec<Stmt>) {
             Stmt::Parallel(_)
             | Stmt::Let { .. }
             | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
             | Stmt::Effect { .. }
             | Stmt::Finish { .. } => {}
         }

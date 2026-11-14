@@ -109,7 +109,11 @@ fn collect<'a>(statements: &'a [Stmt], effects: &mut BTreeMap<LocalId, (SiteId, 
                 effects.insert(parallel.result, (parallel.site, parallel.args.as_slice()));
                 collect(&parallel.body, effects);
             }
-            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Finish { .. } => {}
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
+            | Stmt::Finish { .. } => {}
         }
     }
 }

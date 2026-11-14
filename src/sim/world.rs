@@ -77,6 +77,12 @@ impl Dispatched {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinishFlush {
+    pub turn: u64,
+    pub checkpointed: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub turns: u64,
@@ -116,6 +122,7 @@ pub struct SimWorld<'a> {
     pub acks: Vec<Finish>,
     pub ack_faults: Vec<String>,
     pub owner_faults: Vec<String>,
+    pub finish_flushes: Vec<FinishFlush>,
     pub stats: Stats,
     pub trace: Option<Trace>,
     pub nested_dispatched: BTreeMap<String, Dispatched>,
@@ -175,6 +182,7 @@ impl<'a> SimWorld<'a> {
             acks: Vec::new(),
             ack_faults: Vec::new(),
             owner_faults: Vec::new(),
+            finish_flushes: Vec::new(),
             stats: Stats::default(),
             trace: None,
             nested_dispatched: BTreeMap::new(),
@@ -557,6 +565,17 @@ impl World for SimWorld<'_> {
     }
 
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
+        for record in records {
+            if let Record::Status { turn, .. } = record {
+                let checkpointed = records.iter().any(|other| {
+                    matches!(other, Record::Checkpoint { revision, .. } if revision == turn)
+                });
+                self.finish_flushes.push(FinishFlush {
+                    turn: *turn,
+                    checkpointed,
+                });
+            }
+        }
         let result = self.flush_medium(epoch, records);
         let checksum = match &self.medium {
             Medium::Jsonl(file) => file.checksum,

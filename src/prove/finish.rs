@@ -122,9 +122,11 @@ impl Walk<'_> {
                 true
             }
             Stmt::Parallel(parallel) => self.statement(&parallel.sequential()),
-            Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::Push { .. } | Stmt::Effect { .. } => {
-                true
-            }
+            Stmt::Let { .. }
+            | Stmt::Assign { .. }
+            | Stmt::Push { .. }
+            | Stmt::Shrink { .. }
+            | Stmt::Effect { .. } => true,
         }
     }
 }

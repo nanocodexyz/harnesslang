@@ -488,12 +488,12 @@ Symbols: `{` `}` `(` `)` `<` `<=` `>` `>=` `,` `:` `=` `==` `!=` `->` `=>` `+` `
 
 Keywords, which cannot be used as names:
 
-Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `push` `if` `else` `match` `loop` `for` `return` `true` `false` `and` `or` `not` `list` `effect` `invariant` `requires`
+Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `push` `clear` `keep` `if` `else` `match` `loop` `for` `return` `true` `false` `and` `or` `not` `list` `effect` `invariant` `requires`
 
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `fn` `from` `in` `known` `listing` `maybe` `parallel` `reply` `tools`
+Contextual words: `below` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `parallel` `reply` `tools`
 
 Builtin functions, whose names declarations may not take:
 
@@ -561,6 +561,8 @@ type_expr  = "list" "<" type_expr "," bound ">"
 block      = "{" { statement } "}" ;
 statement  = "let" name [ ":" type_expr ] "=" expr
            | "push" name expr
+           | "clear" name
+           | "keep" name "last" expr
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
@@ -1668,7 +1670,8 @@ likely as the next, and the calls' variant in the rest, with fields drawn as
 tool results are, values outside a text enum included.
 `examples/claude_agent.hl` ports Claude's stop reasons this way: `max_tokens`
 continues at most `continuations_max` times, `pause_turn` sends the context
-again, `model_context_window_exceeded` is handled once, `refusal` stops the
+again, `model_context_window_exceeded` compacts once
+([clear and keep](#clear-and-keep)), `refusal` stops the
 turn, and a failed call is asked again up to `throttled_attempts_max` times
 in a row. `examples/codex_agent.hl` ports the Codex turn's `end_turn`
 (`crates/backends/codex/src/model/run/turn.rs`): its reply is
@@ -1680,12 +1683,12 @@ any other round and the worst case counts it.
 
 The planted bug `model_failure_unrecorded` writes no record for a failed
 call, as a harness that treats provider errors as transient might. A rerun
-asks the model again, and replaying the journal from nothing finds a model
-reply where the program runs a tool:
+asks the model again, and the journal it leaves records a sequence number
+the turn has already passed:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
-FAIL invariant=liveness seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: turn 3: replay of turn 3 diverged at seq 2: the journal records a model reply, the program runs 'steer_waiting' (3/2)
+FAIL invariant=seq_unique seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: turn 3 records seq 1 after seq 9
 replay: hl sim --target native-jsonl --seeds 1..2 --mutation model_failure_unrecorded examples/claude_agent.hl
 ```
 
@@ -1751,6 +1754,8 @@ on show(said: reply) -> u64 { return 1 }
 | `let x: T = e` | bind a new local of type `T`; `e` is checked against `T`, so a variant constructor takes its type from it |
 | `field = e` | assign a state field |
 | `push field e` | append to a state list; a full list traps with `bound(field)` |
+| `clear field` | empty a state list |
+| `keep field last n` | drop all but the last `n` entries of a state list, `n` a `u64`; a list of `n` entries or fewer is unchanged ([clear and keep](#clear-and-keep)) |
 | `if c { } else if c { } else { }` | `c` is `bool` |
 | `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas; a text enum's arms are its values, `"value" => { }` |
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
@@ -1785,6 +1790,179 @@ on finish(done: bool, words: text) -> outcome {
   }
 }
 ```
+
+### clear and keep
+
+A list only grows through `push`; `clear` and `keep` shrink it. `clear
+field` empties a state list, and `keep field last n` drops all but its last
+`n` entries. With them a harness compacts its history instead of refusing
+turns once the history is full: it asks the model for a summary, keeps the
+most recent entries verbatim and pushes the summary after them, as nanocode's
+compaction keeps its most recent messages (`COMPACT_KEPT`):
+
+```hl docs/snippets/compaction.hl
+harness compaction
+
+const rounds_max: u64 = 4
+const calls_max: u64 = 2
+const history_max: u64 = 24
+const kept_max: u64 = 8
+
+type outcome = completed(text) | failed(text) | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+state {
+  history: list<entry, history_max>
+}
+
+on prompt(input: text) -> outcome {
+  if len(history) + 1 + rounds_max * (1 + calls_max) > history_max {
+    keep history last history_max - 1
+    push history user("Summarize the conversation so far.")
+    let summary = infer(history)
+    keep history last kept_max
+    match summary {
+      answer(_) => { push history assistant(summary) }
+      calls(_) => { return failed("the summary asked for tools") }
+    }
+  }
+  push history user(input)
+  loop round below rounds_max {
+    let reply = infer(history)
+    push history assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push history result(call, output) }
+            failed(error) => { push history error(call, error) }
+            unknown => { push history unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on forget() -> u64 {
+  clear history
+  return 0
+}
+```
+
+`prompt` compacts when the history lacks room for a whole turn: one prompt
+and `rounds_max` replies of up to `calls_max` calls. The first `keep` makes
+room for the request should the history be full; the model's answer to it
+is the summary, and a reply asking for tools instead fails the turn. The
+summary comes from the same model as every other reply: compaction is an
+ordinary branch, with an ordinary effect site and `model` record.
+
+The prover sets a list's length to 0 after `clear`, and after `keep` to
+`min(len, n)`, the join of the list already being that short (unchanged)
+and the list being longer (now `n`). So the pushes that follow a
+compaction are proved against `kept_max`, not against what the turn started
+with, and no `requires` reserves room for the turn. `hl check` reports the
+length each one leaves and the most it can drop:
+
+```console
+$ hl check docs/snippets/compaction.hl | grep -E 'worst case|shrink'
+  handler prompt: worst case 13 effects, 24 journal records, 13 outbound requests
+  handler forget: worst case 0 effects, 3 journal records, 0 outbound requests
+  proved handler prompt: shrink: keep history last history_max - 1 leaves at most 23 of 24 entries and drops at most 1; keep history last kept_max leaves at most 8 of 24 entries and drops at most 16
+  proved handler forget: shrink: clear history leaves at most 0 of 24 entries and drops at most 24
+```
+
+`clear` and `keep` are not effects: they write no record and add nothing to
+the worst case, which counts the summary as one more model call. What they
+leave is in the checkpoint written with the turn's status, so the load that
+follows starts from the compacted list and never replays the entries they
+dropped. `hl sim` checks both halves of that as `checkpoint_compacted`:
+every checkpoint holds the state that replaying the journal reaches at its
+turn, and a turn that dropped entries flushes its checkpoint together with
+its status. Its planted bugs are nanocode-sim's: `retire_skipped` writes the
+dropped entries back into the checkpoint, and `seal_skipped` flushes a
+compacting turn's status without its checkpoint:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/compaction.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1278 crashes=774 power_losses=74 torn_writes=99 takeovers=0 fenced=0 dispatches=508 unknown=140
+$ hl sim --target native-jsonl --seeds 0..200 --mutation retire_skipped docs/snippets/compaction.hl
+FAIL invariant=checkpoint_compacted seed=1 target=native-jsonl profile=errors mutation=retire_skipped: checkpoint 2 holds 2 entries of history where replaying the journal to turn 2 gives 0 entries of history: a checkpoint must hold the lists as clear and keep left them
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation retire_skipped docs/snippets/compaction.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation seal_skipped docs/snippets/compaction.hl
+FAIL invariant=checkpoint_compacted seed=1 target=native-jsonl profile=errors mutation=seal_skipped: turn 2 retired 2 list entries but flushed its status without its checkpoint, so the next load replays the retired prefix from an earlier checkpoint
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation seal_skipped docs/snippets/compaction.hl
+```
+
+Only a state list can be cleared or kept short, `n` is a `u64`, and a
+`keep` that leaves a full list leaves no room for the push after it:
+
+```console
+$ hl check docs/snippets/errors/clear-field.hl
+docs/snippets/errors/clear-field.hl:8:9: error: cannot clear 'turns': it is not a list
+$ hl check docs/snippets/errors/keep-count.hl
+docs/snippets/errors/keep-count.hl:10:19: error: expected u64, found text
+$ hl check docs/snippets/errors/keep-room.hl > /dev/null
+docs/snippets/errors/keep-room.hl: error: handler 'note': push_bound: push onto lines may find it full and trap with bound(lines); path: entry; counterexample: len(lines) = 8
+docs/snippets/errors/keep-room.hl: error: 1 proof obligation(s) failed for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+```
+
+```hl docs/snippets/errors/clear-field.hl
+harness notes
+
+state {
+  turns: u64
+}
+
+on reset() -> u64 {
+  clear turns
+  return turns
+}
+```
+
+```hl docs/snippets/errors/keep-count.hl
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on trim(count: text) -> u64 {
+  keep lines last count
+  return len(lines)
+}
+```
+
+```hl docs/snippets/errors/keep-room.hl
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on note(line: text) -> u64 {
+  keep lines last lines_max
+  push lines line
+  return len(lines)
+}
+```
+
+`examples/claude_agent.hl`, `codex_agent.hl`, `subagents.hl` and
+`subagent_child.hl` compact this way before every model request, keeping
+`compact_kept` entries. `claude_agent.hl` writes compaction once as a
+[fn](#fn) and also calls it when the model reports the context window
+exhausted, and `subagents.hl` also keeps the `agents_kept` most recent agents
+of its roster when a child completes.
 
 ## Effects
 

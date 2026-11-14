@@ -1,7 +1,8 @@
 use std::fmt::Write;
 
 use crate::ir::{
-    BinaryOp, Durability, Expr, Handler, Program, Site, SiteClass, SiteKind, Stmt, SumKind, Type,
+    BinaryOp, Durability, Expr, Handler, Kept, Program, Site, SiteClass, SiteKind, Stmt, SumKind,
+    Type,
 };
 use crate::target::{self, Target};
 
@@ -352,6 +353,13 @@ impl Writer<'_> {
             }
             Stmt::Push { field, value } => {
                 self.line(&format!("rt.push({field}, {});", expr(program, value)))
+            }
+            Stmt::Shrink { field, kept } => {
+                let count = match kept {
+                    Kept::Nothing => "0n".to_owned(),
+                    Kept::Last(count) => expr(program, count),
+                };
+                self.line(&format!("rt.keep({field}, {count});"));
             }
             Stmt::If {
                 condition,

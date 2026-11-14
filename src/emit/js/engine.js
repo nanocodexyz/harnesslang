@@ -90,6 +90,16 @@ class Engine {
     this.state[field] = [...items, value];
   }
 
+  keep(field, count) {
+    const items = this.state[field];
+    assert(Array.isArray(items), "a list field holds a list");
+    if (count >= BigInt(items.length)) {
+      return;
+    }
+    this.state[field] = items.slice(items.length - Number(count));
+    assert(BigInt(this.state[field].length) === count, "keep leaves exactly the last count entries");
+  }
+
   resolve(site, args) {
     switch (site.kind) {
       case "tool": {

@@ -30,7 +30,7 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
     }
 }
 
-fn finite(extent: Extent) -> Option<i128> {
+pub(super) fn finite(extent: Extent) -> Option<i128> {
     match extent {
         Extent::At(value) => Some(value),
         Extent::Infeasible | Extent::Unbounded => None,

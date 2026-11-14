@@ -111,7 +111,7 @@ echo "check: every fn program emits, checks and proves exactly as its written-ou
 pids=()
 for target in $targets; do
   (
-    for file in examples/*.hl; do
+    for file in examples/*.hl docs/snippets/compaction.hl; do
       if [ -e "$scratch/unsupported-$(basename "$file" .hl)-$target" ]; then
         echo "skip $file on $target: cells: unsupported"
         continue
