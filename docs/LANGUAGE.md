@@ -4517,6 +4517,23 @@ dispatched claims the call for the asking owner's epoch, and the host refuses
 the call from an owner of an older epoch, which would otherwise run it a
 second time after a takeover.
 
+#### Hosts
+
+In the generated Rust, `Host` gains `recover(request)` (answering `Recovered::Reply`,
+`NotDispatched` or `Unknown`), `jobs(turn, open)` (the keys of open jobs it no longer
+runs) and `hold(turn, seq, until_ms)`, each with a default for a host that uses
+none of them; `ToolRequest` carries `job` (the tool has room for a job) and,
+with `ModelRequest`, `interrupts`, the events that abandon it, which the host
+watches in its inbox. Job notices reach the runtime through `Host::inbox` as
+`Inbound::Job`. The Durable Object and the Vercel binding ask the host at
+`HL_RECOVER_URL` and `HL_JOBS_URL`, abort an interruptible request's `fetch`
+with an `AbortSignal` when a cancel or steer is posted, and take job notices
+posted without a turn. `hl-agent` uses all of it for `examples/claude_code.hl`:
+a Bash call past its timeout keeps running as a job and is held for at the end
+of the turn, `run_in_background` jobs end with the turn as nanocode's
+`ENDS_WITH_TURN` binding says, and recovery answers from the file a `Write`
+or `Edit` left, or from the receipts `Bash` writes before and after it runs.
+
 #### What the checker, prover and simulator do
 
 The checker refuses each declaration that cannot hold:

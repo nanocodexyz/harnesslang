@@ -61,3 +61,20 @@ Claude keeps effort, thinking, fast mode and the auto-compact limit as session s
 Why not: A model call carries at most one `mode`, a name fixed at the call site (LANGUAGE.md, model). It cannot be a state value, and modes from separate dimensions (effort by fast by text_only or refresh) do not combine, so each combination needs its own call site. Thresholds and pins can be state fields, but the request settings the host must send cannot follow them.
 
 Smallest addition: Typed model settings: `model m ... settings effort: effort_enum, fast: bool`, and `m(context) with {effort: e}`, where e is any expression of that text enum or bool and omitted settings take declared defaults. The model record journals the settings as it journals mode, and a replay whose settings differ diverges. The worst case is unchanged, since there is still one site. The simulator draws settings changes between turns through ordinary handlers and checks settings_sent, the analogue of mode_sent. Mutation: settings_dropped.
+
+## 9. What effects in flight leave out
+
+Gaps 1, 4 and 6 of the earlier list are closed (LANGUAGE.md, Effects in flight). What
+nanocode does there that the additions do not write:
+
+- A `wait`, a cell's nested calls and a running code cell are not interruptible:
+  only tools and the model are. nanocode's retry sleep, cell stop and turn hold
+  race the cancel; here only `hold` wakes on a cancel.
+- A steer cannot be withdrawn once recorded (Codex's skipped withdrawn steers).
+- A job notice that arrives while no turn runs is recorded by the next turn the
+  host admits; nothing admits a turn because a job finished (nanocode's
+  `Delivery::Prompted`). `examples/claude_code.hl` takes notices only when it
+  would answer, after its `hold`, not at every round (taking them every round cost
+  3.1M prover steps more).
+- hl-agent sends no stall notices: its jobs report only their end.
+
