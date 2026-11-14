@@ -125,7 +125,7 @@ class Seed {
 
   hook(point) {
     const event = this.cursor.next("hook", rt.encodeJson(point));
-    same("hook point", event.point, point.point);
+    same(`hook point at event ${this.cursor.index - 1}`, event.point, point.point);
     if (point.kind !== undefined) same("hook site", event.kind ?? null, point.kind);
     if (point.effect !== undefined) same("hook effect", event.effect ?? null, point.effect);
     if (event.answer === "crash") {

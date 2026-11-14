@@ -117,10 +117,7 @@ class CellRunner {
 
   async interrupted(error) {
     if (error.kind === "threw") return { kind: "threw", text: error.text };
-    if (error.kind === "diverged") {
-      await this.host.observe({ kind: "diverged", cell: this.cell, reason: error.text });
-      return { kind: "unknown", text: divergenceText(this.cell, error.text) };
-    }
+    if (error.kind === "diverged") return { kind: "unknown", text: divergenceText(this.cell, error.text) };
     assert(error.kind === "overflow", "a cell is interrupted by a throw, a divergence or its journal bound");
     const bound = this.code.journalBytes;
     return { kind: "unknown", text: divergenceText(this.cell, `its journal passed journal_bytes (${bound.name} = ${bound.value})`) };
@@ -378,7 +375,7 @@ class CellRunner {
       return;
     }
     assert(call.tool !== null, "a call that is not refused names a nested tool");
-    const logged = this.consult ? this.site.nested.get(nestedKey(this.site.seq, this.recordId(id))) : undefined;
+    const logged = this.consult ? this.site.nested.get(nestedKey(this.site.seq, id)) : undefined;
     if (logged === undefined) {
       if (call.tool.effect === "external") await this.dispatch(id, true);
       else if (!started && this.site.mutation === "nested_idempotent_reported_unknown") this.unknown(id);
