@@ -24,7 +24,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
 const JOINS_PER_TURN_MAX: u64 = program::ROUNDS_MAX * program::CALLS_PER_ROUND_MAX;
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N]";
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N] [--turn N]";
 const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 
 struct Options {
@@ -34,6 +34,7 @@ struct Options {
     journal: PathBuf,
     rounds: u64,
     keep_warm: u64,
+    turn: u64,
 }
 
 fn fail_usage(message: &str) -> ! {
@@ -49,6 +50,7 @@ fn options() -> Options {
     let (mut instruction, mut cwd, mut model, mut journal, mut rounds) =
         (None, None, None, None, None);
     let mut keep_warm = 0;
+    let mut turn = FIRST_TURN;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let value = rest
@@ -83,6 +85,13 @@ fn options() -> Options {
                     ));
                 }
             }
+            "--turn" => {
+                turn = value
+                    .parse()
+                    .ok()
+                    .filter(|turn| *turn >= FIRST_TURN)
+                    .unwrap_or_else(|| fail_usage(&format!("--turn {value} is not a turn number")));
+            }
             other => fail_usage(&format!("unknown flag {other}")),
         }
     }
@@ -93,6 +102,7 @@ fn options() -> Options {
         journal: journal.unwrap_or_else(|| fail_usage("--journal is required")),
         rounds: rounds.unwrap_or(program::ROUNDS_MAX),
         keep_warm,
+        turn,
     }
 }
 
@@ -425,12 +435,12 @@ macro_rules! host_for {
                 self.jobs
                     .notices()
                     .into_iter()
-                    .map(|(key, notice)| $module::Delivery {
-                        id: format!("{}{key}", jobs::DONE_PREFIX),
+                    .map(|notice| $module::Delivery {
+                        id: notice.id,
                         inbound: $module::Inbound::Job($module::JobNotice {
-                            key,
-                            notice,
-                            done: true,
+                            key: notice.key,
+                            notice: notice.notice,
+                            done: notice.done,
                         }),
                     })
                     .collect()
@@ -809,7 +819,7 @@ fn main() {
         std::process::exit(EXIT_HARNESS_ERROR)
     });
     let request = TurnRequest {
-        turn: FIRST_TURN,
+        turn: options.turn,
         arguments: Arguments::Prompt(instruction, options.rounds),
     };
     let ran = run_turn(&mut agent, &mut disk, &request);
