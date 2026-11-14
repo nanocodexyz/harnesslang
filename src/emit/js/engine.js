@@ -164,7 +164,7 @@ class Engine {
 
   async unknown(seq, call) {
     const attempt = this.nextAttempt();
-    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: [seq] });
+    this.append({ kind: "recovery", turn: this.turn, attempt, unknown: [seq], nested: [] });
     this.sites.set(seq, { kind: "unknown", call });
     await this.flush();
     return variant(VARIANT_UNKNOWN, []);
@@ -306,11 +306,21 @@ function recoverAtLoad(log) {
   for (const seq of unknown) {
     log.sites.set(seq, { kind: "unknown", call: log.sites.get(seq).call });
   }
-  return unknown;
+  const nested = [];
+  for (const [key, site] of log.nested) {
+    if (site.kind === "open" && mayBeUnknown(site.call.effect)) nested.push(key.split("/").map(Number));
+  }
+  nested.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  for (const [seq, id] of nested) {
+    const key = nestedKey(seq, id);
+    log.nested.set(key, { kind: "unknown", call: log.nested.get(key).call });
+  }
+  return { unknown, nested };
 }
 
 function cloneLog(log) {
-  return { ...log, sites: new Map(log.sites) };
+  const cells = new Map([...log.cells].map(([seq, cell]) => [seq, cellLogClone(cell)]));
+  return { ...log, sites: new Map(log.sites), nested: new Map(log.nested), lastNested: new Map(log.lastNested), cells };
 }
 
 async function runTurn(setup, world, epoch, records, request) {
@@ -324,7 +334,7 @@ async function runTurn(setup, world, epoch, records, request) {
   }
   const state = await stateBefore(setup, session, request.turn);
   const pending = [];
-  let unknown = [];
+  let unknown = { unknown: [], nested: [] };
   let log;
   if (existing !== undefined) {
     if (existing.handler !== request.handler || !jsonEqual(existing.arguments, args)) {
@@ -340,8 +350,8 @@ async function runTurn(setup, world, epoch, records, request) {
   }
   const engine = new Engine(setup, handler, { live: true, world, epoch }, request.turn, state, log);
   for (const record of pending) engine.append(record);
-  if (unknown.length > 0) {
-    engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown });
+  if (unknown.unknown.length > 0 || unknown.nested.length > 0) {
+    engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown: unknown.unknown, nested: unknown.nested });
   }
   const ran = await engine.run(request.arguments);
   return { ran: "finished", finish: ran.finish };
