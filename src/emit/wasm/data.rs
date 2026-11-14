@@ -10,6 +10,12 @@ pub const KIND_DISPATCH: u32 = 1;
 pub const KIND_MODEL: u32 = 2;
 pub const KIND_NOW: u32 = 3;
 pub const KIND_RANDOM: u32 = 4;
+pub const KIND_WAIT: u32 = 5;
+pub const KIND_HOLD: u32 = 6;
+pub const KIND_SUSPEND: u32 = 7;
+pub const KIND_DENY: u32 = 8;
+const INTERRUPT_CANCEL: u32 = 1;
+const INTERRUPT_STEER: u32 = 2;
 const TYPE_U64: u32 = 0;
 const TYPE_BOOL: u32 = 1;
 const TYPE_TEXT: u32 = 2;
@@ -38,6 +44,10 @@ pub fn effect_code(effect: EffectClass) -> u32 {
         EffectClass::Idempotent => 1,
         EffectClass::External => 2,
     }
+}
+
+fn interrupt_bits(interrupts: ir::Interrupts) -> u32 {
+    u32::from(interrupts.cancel) * INTERRUPT_CANCEL + u32::from(interrupts.steer) * INTERRUPT_STEER
 }
 
 pub fn wat_string(bytes: &[u8]) -> String {
@@ -187,9 +197,10 @@ impl<'p> Tables<'p> {
             .expect("writing to a string succeeds");
         writeln!(
             self.out,
-            "(words {label} {name} {} {} {label}_params {returns})",
+            "(words {label} {name} {} {} {label}_params {returns} {})",
             effect_code(tool.effect),
-            tool.params.len()
+            tool.params.len(),
+            interrupt_bits(tool.interrupts)
         )
         .expect("writing to a string succeeds");
         Ok(label)
@@ -202,6 +213,10 @@ impl<'p> Tables<'p> {
             SiteKind::Model => (KIND_MODEL, "0".to_owned()),
             SiteKind::Now => (KIND_NOW, "0".to_owned()),
             SiteKind::Random => (KIND_RANDOM, "0".to_owned()),
+            SiteKind::Wait(_) => (KIND_WAIT, "0".to_owned()),
+            SiteKind::Hold(_) => (KIND_HOLD, "0".to_owned()),
+            SiteKind::Suspend => (KIND_SUSPEND, "0".to_owned()),
+            SiteKind::Deny => (KIND_DENY, "0".to_owned()),
             other => return Err(format!("emit: not yet in wasm: {} sites", other.name())),
         };
         if site.mode.is_some() {
@@ -296,6 +311,31 @@ impl<'p> Tables<'p> {
             self.out,
             "(words $target {checksum} {} {in_step})",
             u32::from(model.gate_before_outbound)
+        )
+        .expect("writing to a string succeeds");
+        self.events(target)
+    }
+
+    fn events(&mut self, target: Target) -> Result<(), String> {
+        let events = &self.program.events;
+        let bound = |bound: Option<&ir::Bound>, what: &str| {
+            bound.map_or(Ok((0, 0)), |bound| Ok((1, word(bound.value, what)?)))
+        };
+        let (steers, steers_max) = bound(events.steers.as_ref(), "a steer bound")?;
+        let (jobs, jobs_max) = bound(events.jobs.as_ref(), "a job bound")?;
+        let records_max = word(events.records_max(), "a turn's event records")?;
+        let after_flush =
+            u32::from(target::inbound::of(target).drain == target::inbound::Drain::AfterFlush);
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .map_or(0, |model| interrupt_bits(model.interrupts));
+        writeln!(
+            self.out,
+            "(words $events {} {steers} {steers_max} {jobs} {jobs_max} {records_max} {after_flush} {} {model})",
+            u32::from(events.cancel),
+            u32::from(events.resume)
         )
         .expect("writing to a string succeeds");
         Ok(())
