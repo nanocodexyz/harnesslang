@@ -302,6 +302,7 @@ fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
             root: setup.cwd.clone(),
             state,
             image_bytes_max: child_harness::program::blob_bound("Read").map(|(_, bytes)| bytes),
+            left: std::sync::Mutex::new(Vec::new()),
         },
         ledger: Ledger { file },
         children: None,

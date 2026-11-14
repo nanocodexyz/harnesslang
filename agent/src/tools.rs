@@ -98,6 +98,7 @@ pub struct Workspace {
     pub root: PathBuf,
     pub state: PathBuf,
     pub image_bytes_max: Option<u64>,
+    pub left: std::sync::Mutex<Vec<u32>>,
 }
 
 pub enum Ran {
@@ -515,7 +516,26 @@ impl Workspace {
             }
             std::thread::sleep(TIMEOUT_POLL);
         };
+        if group_alive(started.child.id()) {
+            self.left
+                .lock()
+                .expect("the left process groups")
+                .push(started.child.id());
+        }
         Ok(Waited::Done(settled(started, status, false)?))
+    }
+
+    pub fn stop_left(&self) {
+        let groups = std::mem::take(&mut *self.left.lock().expect("the left process groups"));
+        for group in groups {
+            kill_group_id(group);
+        }
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        self.stop_left();
     }
 }
 
@@ -536,11 +556,25 @@ pub enum Bashed {
 }
 
 pub fn kill_group(child: &std::process::Child) {
+    kill_group_id(child.id());
+}
+
+fn kill_group_id(group: u32) {
     let _ = Command::new("kill")
         .arg("-KILL")
         .arg("--")
-        .arg(format!("-{}", child.id()))
+        .arg(format!("-{group}"))
         .status();
+}
+
+fn group_alive(group: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg("--")
+        .arg(format!("-{group}"))
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub fn settled(

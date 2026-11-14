@@ -735,6 +735,7 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
         root: cwd,
         state,
         image_bytes_max: program::blob_bound("Read").map(|(_, bytes)| bytes),
+        left: std::sync::Mutex::new(Vec::new()),
     };
     Ok((
         Agent {
@@ -813,6 +814,7 @@ fn main() {
     };
     let ran = run_turn(&mut agent, &mut disk, &request);
     agent.jobs.stop_all();
+    agent.workspace.stop_left();
     if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
         keep_warm(&mut agent, &mut disk, options.keep_warm);
     }
