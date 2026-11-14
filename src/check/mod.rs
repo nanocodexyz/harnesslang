@@ -1431,7 +1431,6 @@ fn state(
         (ir::HOOK_REASON_FIELD, Type::Text, decides),
         (ir::HOOK_INPUT_FIELD, Type::Text, decides),
         (ir::IDLE_RUNS_FIELD, Type::U64, idles),
-        (ir::IDLE_RAN_FIELD, Type::U64, idles),
     ] {
         if !wanted {
             continue;
@@ -1555,15 +1554,13 @@ fn idle(
                         ),
                     },
                     ast::Stmt::Assign {
-                        name: named(ir::IDLE_RAN_FIELD),
-                        value: ast::Expr::Name(
-                            handler
-                                .idle
-                                .as_ref()
-                                .expect("the idle handler has its clause")
-                                .due
-                                .clone(),
-                        ),
+                        name: handler
+                            .idle
+                            .as_ref()
+                            .expect("the idle handler has its clause")
+                            .due
+                            .clone(),
+                        value: ast::Expr::Number(0, at),
                     },
                 ];
                 handler.body.statements.splice(0..0, prologue);
@@ -1596,7 +1593,6 @@ fn idle(
         due,
         bound: limit,
         runs: globals.fields[ir::IDLE_RUNS_FIELD],
-        ran: globals.fields[ir::IDLE_RAN_FIELD],
     });
     Ok(Some(ast::Program {
         name: source.name.clone(),

@@ -220,6 +220,19 @@ effect. The sender is answered once the record is durable.
 LANGUAGE.md has the details and `src/target/inbound.rs` each target's delivery
 path with its platform facts.
 
+### Idle turns
+
+`on idle name() at field bound N` declares the handler the host admits while
+the session idles, once the clock reaches the time the `u64` state field names:
+nanocode's prompt cache refresh (`agent/keep.rs`) written as a turn. The
+runtime, not the host's timer, decides admission (the last turn finished, the
+field armed, fewer than `N` idle turns since another, the clock at or past the
+due) and records `{"at","due"}` in the `admitted` record; a refused request
+writes nothing. The count is a hidden state field the checker maintains, so the
+prover bounds it and replay restores it. The Durable Object arms its alarm at
+the due, the Vercel session races its next prompt against a workflow
+`sleep()`, and `hl-agent --keep-warm` stays alive for the refreshes.
+
 ### Code mode
 
 `code exec { tools read, edit, bash  calls cell_calls_max  parallel ...  timers ...  timer_ms ...  journal_bytes ...  yield_ms ... }`
@@ -591,6 +604,7 @@ Invariants, named as nanocode-sim names them:
 | `search_listed` | every name a journaled search found was listed by its turn's latest read of the listing before it (`search_unchecked` records searches unchecked) |
 | `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, a deferred one only after a search of its turn found it (`discovery_unchecked`), and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
 | `suspend_durable`, `resume_matched`, `wait_until`, `wall_limit` | waits and suspends, defined in [LANGUAGE.md](LANGUAGE.md#suspend-and-resume) |
+| `idle_due` | every idle turn was admitted at or after the due its state armed, at most its bound after each other turn, defined in [LANGUAGE.md](LANGUAGE.md#idle-turns) (`idle_early` admits a request before its due) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded`, `nested_enum_valid` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a

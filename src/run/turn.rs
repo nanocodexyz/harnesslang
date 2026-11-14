@@ -46,9 +46,8 @@ impl NotDue {
 pub fn armed(program: &Program, state: &[Value]) -> Option<u64> {
     let idle = program.idle.as_ref()?;
     let due = state[idle.due].as_u64();
-    let ran = state[idle.ran].as_u64();
     let runs = state[idle.runs].as_u64();
-    (due != 0 && due != ran && runs < idle.bound.value).then_some(due)
+    (due != 0 && runs < idle.bound.value).then_some(due)
 }
 
 pub fn idle_due(

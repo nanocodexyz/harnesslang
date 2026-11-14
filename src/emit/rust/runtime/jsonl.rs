@@ -462,6 +462,10 @@ impl<'d> JsonlJournal<'d> {
         idle_due(self.start, &self.records)
     }
 
+    pub fn next_turn(&self) -> Result<u64, Exit> {
+        next_turn(self.start, &self.records)
+    }
+
     fn advance(&mut self, turn: u64, mut flushed: Vec<Record>) {
         if program::HOLDS_BLOBS {
             assert_eq!(self.start, Start::Beginning, "a journal of blobs is read whole, so every turn finds the blobs before it");

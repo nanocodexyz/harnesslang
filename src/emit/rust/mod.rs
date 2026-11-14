@@ -298,10 +298,9 @@ fn idle(out: &mut String, program: &Program) {
     let field = |id: ir::FieldId| ident(&program.state[id].name);
     writeln!(
         out,
-        "pub const IDLE_HANDLER: Option<&str> = Some({:?});\n\npub fn idle_armed(state: &State) -> Option<u64> {{\n    let due = state.{};\n    (due != 0 && due != state.{} && state.{} < {}).then_some(due)\n}}\n",
+        "pub const IDLE_HANDLER: Option<&str> = Some({:?});\n\npub fn idle_armed(state: &State) -> Option<u64> {{\n    let due = state.{};\n    (due != 0 && state.{} < {}).then_some(due)\n}}\n",
         idle.handler,
         field(idle.due),
-        field(idle.ran),
         field(idle.runs),
         constant(&idle.bound.name)
     )

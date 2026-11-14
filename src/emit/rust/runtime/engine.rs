@@ -174,6 +174,11 @@ pub fn idle_arguments(clock: u64, due: u64) -> Json {
     Json::object(vec![(IDLE_AT, Json::Number(clock)), (IDLE_DUE, Json::Number(due))])
 }
 
+pub fn next_turn(start: Start, records: &[Record]) -> Result<u64, Exit> {
+    let session = fold_from(start, records).map_err(corrupt)?;
+    Ok(session.turns.last_key_value().map_or(session.start.first_turn(), |(last, _)| last + 1))
+}
+
 pub fn idle_due(start: Start, records: &[Record]) -> Result<Option<u64>, Exit> {
     if program::IDLE_HANDLER.is_none() {
         return Ok(None);

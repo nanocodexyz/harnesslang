@@ -304,10 +304,9 @@ fn program_literal(program: &Program) -> String {
     match &program.idle {
         Some(idle) => writeln!(
             out,
-            "  idle: {{ handler: {}, due: {}, ran: {}, runs: {}, bound: {}n }},",
+            "  idle: {{ handler: {}, due: {}, runs: {}, bound: {}n }},",
             js_string(&idle.handler),
             idle.due,
-            idle.ran,
             idle.runs,
             idle.bound.value
         )

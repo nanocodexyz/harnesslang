@@ -908,7 +908,7 @@ function idleArmed(state) {
   const idle = PROGRAM.idle;
   if (idle === null) return null;
   const due = state[idle.due];
-  return due !== 0n && due !== state[idle.ran] && state[idle.runs] < idle.bound ? due : null;
+  return due !== 0n && state[idle.runs] < idle.bound ? due : null;
 }
 
 async function idleDue(setup, records) {

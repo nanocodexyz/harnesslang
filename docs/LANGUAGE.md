@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -558,7 +558,8 @@ spawn      = "spawn" name "runs" name "from" text ;
 hook       = ( "before" | "after" ) "tool" params block ;
 lifecycle  = "on" ( "session" "start" | "prompt" "submit" | "pre" "compact" | "post" "compact"
                   | "stop" | "subagent" "start" | "subagent" "stop" ) [ params ] block
-           | "on" "session" "end" params "->" type_expr [ "requires" expr ] block ;
+           | "on" "session" "end" params "->" type_expr [ "requires" expr ] block
+           | "on" "idle" name params "at" name "bound" bound "->" type_expr [ "requires" expr ] block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
 event      = "on" name [ params "bound" bound ] ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
@@ -3811,6 +3812,191 @@ of `examples/subagents.hl` on every target replay the same answers.
 `examples/subagents.hl` ports nanocode's subagent runtime: `spawn_agent` starts
 `examples/subagent_child.hl`, `wait_agent` joins the child the model names, and
 `on subagent start` and `on subagent stop` keep its roster.
+
+### Idle turns
+
+`on idle name() at field bound N -> type { ... }` declares the one handler the
+host runs while the session idles: once every turn has finished and the clock
+reaches the time, in the milliseconds `now()` reads, that the `u64` state field
+`field` names, the host admits it as a turn of its own, with no arguments. A
+field of 0 arms nothing. nanocode keeps its prompt cache warm this way: after
+a reply the backend keeps its request and, while the session idles, sends it
+again before the cache's lifetime runs out, at most a bounded number of times
+per kept request, and stops when a refresh fails or finds the cache lapsed
+(`agent/keep.rs`). `docs/snippets/keep.hl` writes that logic in the harness:
+the due is the request's start plus the cache's lifetime less twice its reach
+(the time from the request to its reply), and the idle turn refreshes, stops
+when the cache read nothing or wrote something, and keeps the cache again from
+its own readings.
+
+```hl docs/snippets/keep.hl
+harness keeper
+
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+const window_tokens: u64 = 200000
+const lifetime_ms: u64 = 300000
+const refreshes_max: u64 = 12
+const clock_ms_max: u64 = 8640000000000000
+
+type outcome = answered(text) | failed(text)
+type kept = refreshed(u64) | lapsed(text)
+
+model infer calls calls_max window window_tokens modes refresh
+
+state {
+  context: list<entry, entries_max>
+  requested_ms: u64
+  refresh_due: u64
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+fn kept_at(started: u64, opened: u64) {
+  refresh_due = 0
+  if started <= opened and opened <= clock_ms_max {
+    if (opened - started) * 2 < lifetime_ms {
+      requested_ms = started
+      refresh_due = started + lifetime_ms - (opened - started) * 2
+    }
+  }
+}
+
+on prompt(input: text) -> outcome
+  requires len(context) + 2 <= entries_max
+{
+  push context user(input)
+  let started = now()
+  match infer(context) {
+    ok(reply, _, _, _, _, _) => {
+      let opened = now()
+      kept_at(started, opened)
+      push context assistant(reply)
+      match reply {
+        answer(words) => { return answered(words) }
+        calls(_) => { return answered("") }
+      }
+    }
+    throttled(error, _) => { return failed(error) }
+    transient(error, _) => { return failed(error) }
+    rejected(error) => { return failed(error) }
+  }
+}
+
+on idle refresh() at refresh_due bound refreshes_max -> kept {
+  let started = now()
+  if started > clock_ms_max or requested_ms > clock_ms_max {
+    return lapsed("the clock reads past its range")
+  }
+  if started >= requested_ms + lifetime_ms {
+    return lapsed("the cache outlived its lifetime")
+  }
+  match infer(context) mode refresh {
+    ok(_, _, _, _, cache_read, cache_write) => {
+      let opened = now()
+      if cache_read == 0 or cache_write > 0 {
+        return lapsed("the refresh found the cache lapsed")
+      }
+      kept_at(started, opened)
+      return refreshed(cache_read)
+    }
+    throttled(error, _) => { return lapsed(error) }
+    transient(error, _) => { return lapsed(error) }
+    rejected(error) => { return lapsed(error) }
+  }
+}
+```
+
+How it runs:
+
+- Arming. The idle turn is armed for `field`'s time when the field is not 0
+  and fewer than `N` idle turns ran since the last other turn. The checker keeps
+  that count in a hidden state field, `_idle_runs`, which every other handler
+  sets to 0 where it starts and the idle handler counts up: its `requires`
+  gains `_idle_runs < N`, and the invariant `_idle_bounded`, `_idle_runs <= N`,
+  is proved with the program's own. The idle handler's body starts with the
+  field set to 0, so an idle turn disarms its due unless it assigns a new one.
+- Admission. A host's timer is advice. The runtime admits an idle request only
+  when the session's last turn has finished (otherwise `busy`), the state arms
+  it (`unarmed`) and the clock, read as a `wait` reads it, has reached the due
+  (`early`). A refused request writes nothing and takes no turn number. An
+  admitted idle turn's `admitted` record holds the clock and the due,
+  `{"at":A,"due":D}`.
+- Journal. An idle turn is a turn like any other: its effects are journaled
+  under it, a crash reruns it as its classes say, and a replay returns its
+  recorded results, so a refresh whose reply is in the journal is never sent
+  again. A prompt that arrives before the due runs first, resets the count and
+  computes its own due.
+- Worst case. `hl check` prints the idle handler's worst case and that many
+  times `N`, the most the idle turns after one other turn can cost.
+- Hosts. Rust: `idle_due(start, records)` and `JsonlJournal::idle_due` give the
+  armed due, `run_turn` returns `Ran::NotDue` for a refused request, and
+  `hl-agent run --keep-warm N` stays alive after its prompt and runs up to `N`
+  idle turns. Cloudflare: after every finished turn the Durable Object sets its
+  alarm to the due, and `alarm()` runs the idle turn when no turn is
+  unfinished. Vercel: before each request the session reads the due in a step
+  and races the next prompt's hook against a workflow `sleep()` until it.
+- The model's `refresh` mode is a name the host interprets, as every mode is:
+  `hl-agent` sends it as nanocode's refresh, the request that produced the
+  context's last reply (the entries before its last `assistant` entry) with
+  `max_tokens` 0. The Messages API accepts `max_tokens` 0 only unstreamed, so
+  the refresh is not streamed.
+
+```console
+$ hl check docs/snippets/keep.hl | grep -E '^  handler refresh|runs when'
+  handler refresh: worst case 3 effects, 8 journal records, 1 outbound requests
+    runs when the session idles until refresh_due, at most refreshes_max (12) time(s) after each other turn: 36 effects, 96 journal records, 12 outbound requests in all
+$ hl check docs/snippets/errors/idle-due.hl
+docs/snippets/errors/idle-due.hl:9:22: error: an idle handler's due time is a u64 state field: 'kept' is not one
+```
+
+```hl docs/snippets/errors/idle-due.hl
+harness keeper
+
+const refreshes_max: u64 = 12
+
+state {
+  kept: text
+}
+
+on idle refresh() at kept bound refreshes_max -> u64 { return 1 }
+```
+
+The simulator is the host. After every turn of a harness with an idle handler
+it reads the armed due. A prompt arrives before it in `IDLE_PREEMPT_PPM` =
+300000 per million of the times it is armed (never after the session's last
+prompt, so every session idles out), the host's timer fires early in
+`IDLE_EARLY_PPM` = 150000, at most once per due, and late by up to
+`IDLE_LATE_MS_MAX` (ten minutes, twice nanocode's five-minute cache lifetime)
+in `IDLE_LATE_PPM` = 100000, and an idle turn's model call reads the cache it
+refreshes and writes none in `CACHE_WARM_PPM` = 800000. It asks at most
+`REQUESTS_PER_DUE_MAX` (2) times for each of `N` + 1 idle turns after a prompt
+and fails a session still armed after that. Crashes, power losses and second
+owners land in idle turns as in any other. These draws happen only for a
+harness with an idle handler, so other programs' seeds are unchanged.
+`idle_due` requires every idle turn to have been admitted at a clock at or
+after its recorded due, for the due its state armed, at most `N` after each
+other turn, and every early refusal to name a clock before its due;
+`idle_early`, a runtime that admits an idle request before its due, is caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/keep.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=862 runs=2218 crashes=1300 power_losses=71 torn_writes=118 takeovers=0 fenced=0 dispatches=0 unknown=0 idle_turns=358 idle_refused=56
+$ hl sim --target native-jsonl --seeds 0..200 --mutation idle_early docs/snippets/keep.hl
+FAIL invariant=idle_due seed=4 target=native-jsonl profile=async mutation=idle_early: idle turn 4 was admitted at clock 302253, before its due 602071
+replay: hl sim --target native-jsonl --seeds 4..5 --mutation idle_early docs/snippets/keep.hl
+```
+
+`idle_turns` counts the idle turns admitted and `idle_refused` the requests
+the runtime refused. The generated Rust and JavaScript make the same
+admission, so the differential runs refuse and admit the same requests as the
+interpreter; their plants `rust idle_early` and `js idle_early` remove the
+clock check and are caught as `backend_equal` on every target.
+`examples/claude_code.hl` keeps nanocode's five-minute `CACHE_LIFETIME`
+(`cache_lifetime_ms`) and the twelve refreshes `ClaudeModel::cache_refreshes`
+allows for it (`cache_refreshes`: a five-minute cache write costs 1.25 times
+an input token and a read 0.1 times, so twelve reads cost what one more write
+would).
 
 ### Traps
 
