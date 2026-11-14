@@ -74,7 +74,7 @@ pub enum Mutation {
     DropCellFinish,
 }
 
-const LOWERING_MUTATIONS: [run::mutation::Mutation; 26] = [
+const LOWERING_MUTATIONS: [run::mutation::Mutation; 28] = [
     run::mutation::Mutation::FlushAfterDispatch,
     run::mutation::Mutation::RecoveryRedispatchesExternal,
     run::mutation::Mutation::VercelRetryRedispatches,
@@ -101,6 +101,8 @@ const LOWERING_MUTATIONS: [run::mutation::Mutation; 26] = [
     run::mutation::Mutation::CellGateReleasesEarly,
     run::mutation::Mutation::PostgresCellUnfenced,
     run::mutation::Mutation::NestedIdempotentReportedUnknown,
+    run::mutation::Mutation::SuspendBeforeFlush,
+    run::mutation::Mutation::ResumeReplaysSuspend,
 ];
 
 const PROGRAM_MUTATIONS: [Mutation; 5] = [
@@ -221,6 +223,7 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
         durability::prove(&program, &plan, &mut report);
         records(&program, &plan, mutation, &mut report);
         bounds(&program, &plan, &mut report);
+        waits(&program, &plan, &mut report);
     }
     report
 }
@@ -324,7 +327,7 @@ fn planned(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Planned> {
                 body,
                 ..
             } => repeated(planned(body, cost)?, *bound, *every_iteration)?,
-            Op::End => Planned {
+            Op::End | Op::Park { .. } => Planned {
                 through: None,
                 ended: Some(Count::default()),
             },
@@ -335,6 +338,7 @@ fn planned(ops: &[Op], cost: &dyn Fn(&Op) -> Count) -> Option<Planned> {
             | Op::Yield { .. }
             | Op::Replay(_)
             | Op::Wait { .. }
+            | Op::Sleep { .. }
             | Op::CloseCell(..)
             | Op::Acknowledge => Planned {
                 through: Some(cost(op)),
@@ -358,6 +362,75 @@ fn outbound(op: &Op) -> Count {
             nested: u64::from(*outbound && slot.nested()),
         },
         _ => Count::default(),
+    }
+}
+
+fn slept(op: &Op) -> Count {
+    match op {
+        Op::Sleep { ms, .. } => Count {
+            total: *ms,
+            nested: 0,
+        },
+        _ => Count::default(),
+    }
+}
+
+fn waits(program: &Program, plan: &Plan, report: &mut Report) {
+    let model = &plan.model;
+    let Some(crate::target::WaitLimit { limit, scope }) = model.limits.wait_ms else {
+        return;
+    };
+    for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
+        let counted = &handler.worst.wait_ms;
+        if counted.total == 0 {
+            continue;
+        }
+        let Some(planned) = planned_max(&lowered.ops, &slept) else {
+            report.add(Finding {
+                handler: handler.name.clone(),
+                target: Some(model.target),
+                property: "worst_case",
+                message: "the worst case of milliseconds of waits overflows u64".to_owned(),
+                path: counted.describe_loops(),
+                counterexample: None,
+            });
+            continue;
+        };
+        assert!(
+            planned.total <= counted.total,
+            "the IR's wait worst case covers every path of the plan"
+        );
+        let (measured, what) = match scope {
+            crate::target::WaitScope::Run => (planned.total, "milliseconds of waits per run"),
+            crate::target::WaitScope::Step => (
+                crate::target::longest_wait(program, handler).map_or(0, |(_, value)| value),
+                "milliseconds in its longest wait",
+            ),
+        };
+        if measured > limit.value {
+            report.add(Finding {
+                handler: handler.name.clone(),
+                target: Some(model.target),
+                property: "worst_case",
+                message: format!(
+                    "worst case {measured} {what} exceeds {}'s limit of {} {}",
+                    model.target.name(),
+                    limit.value,
+                    limit.unit
+                ),
+                path: counted.describe_loops(),
+                counterexample: None,
+            });
+            continue;
+        }
+        report.proved.push(format!(
+            "handler {} on {}: worst_case: {measured} {what} <= {} {} ({})",
+            handler.name,
+            model.target.name(),
+            limit.value,
+            limit.unit,
+            counted.describe_loops()
+        ));
     }
 }
 

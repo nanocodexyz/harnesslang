@@ -131,9 +131,38 @@ fn handler(program: &Program, handler: &Handler) {
     for site in &handler.sites {
         assert_eq!(
             site.durability,
-            Durability::of(site.class),
-            "a site's durability follows from its class"
+            Durability::of_site(site.kind, site.class),
+            "a site's durability follows from its kind and class"
         );
+        if site.kind.parks() {
+            assert_eq!(
+                site.class,
+                SiteClass::Fixed(EffectClass::None),
+                "a wait or suspend is a none effect"
+            );
+            assert!(
+                program.events.resume || site.kind != SiteKind::Suspend,
+                "a suspend needs the resume event"
+            );
+        }
+        if let SiteKind::Wait(constant) = site.kind {
+            assert!(
+                constant < program.constants.len(),
+                "a wait names a constant"
+            );
+            assert_eq!(
+                site.result,
+                Type::U64,
+                "a wait yields the clock at its wake"
+            );
+        }
+        if site.kind == SiteKind::Suspend {
+            assert_eq!(
+                site.result,
+                Type::Text,
+                "a suspend yields the resume's answer"
+            );
+        }
         if let SiteKind::Tool(tool) = site.kind {
             assert_eq!(
                 site.class,

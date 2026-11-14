@@ -46,10 +46,16 @@ pub enum Mutation {
     ResultsInCompletionOrder,
     BatchPushesReversed,
     LoopPastBound,
+    ResumeReplaysSuspend,
+    SuspendBeforeFlush,
+    ResumeUnmatched,
+    WaitUnjournaled,
+    WaitRerunSkips,
+    WaitOversleeps,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 50] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -94,6 +100,12 @@ impl Mutation {
         Self::ResultsInCompletionOrder,
         Self::BatchPushesReversed,
         Self::LoopPastBound,
+        Self::ResumeReplaysSuspend,
+        Self::SuspendBeforeFlush,
+        Self::ResumeUnmatched,
+        Self::WaitUnjournaled,
+        Self::WaitRerunSkips,
+        Self::WaitOversleeps,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -142,6 +154,12 @@ impl Mutation {
             Self::ResultsInCompletionOrder => "results_in_completion_order",
             Self::BatchPushesReversed => "batch_pushes_reversed",
             Self::LoopPastBound => "loop_past_bound",
+            Self::ResumeReplaysSuspend => "resume_replays_suspend",
+            Self::SuspendBeforeFlush => "suspend_before_flush",
+            Self::ResumeUnmatched => "resume_unmatched",
+            Self::WaitUnjournaled => "wait_unjournaled",
+            Self::WaitRerunSkips => "wait_rerun_skips",
+            Self::WaitOversleeps => "wait_oversleeps",
         }
     }
 
@@ -200,7 +218,13 @@ impl Mutation {
             | Self::ListingUnchecked
             | Self::ListedClassDropped
             | Self::InputUnchecked
-            | Self::LoopPastBound => all,
+            | Self::LoopPastBound
+            | Self::ResumeReplaysSuspend
+            | Self::SuspendBeforeFlush
+            | Self::ResumeUnmatched
+            | Self::WaitUnjournaled
+            | Self::WaitRerunSkips
+            | Self::WaitOversleeps => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

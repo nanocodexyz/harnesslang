@@ -5,8 +5,8 @@ use crate::ir::{self, Program, Type};
 use crate::run::cell::{CellEngine, CellEvent, Input, Step, Wait};
 use crate::run::cell_journal::Entry;
 use crate::run::engine::{
-    Answer, Finish, ListingRequest, ModelRequest, Point, Read, Stop, ToolRequest, World,
-    batch_width, run_batch,
+    Answer, Finish, ListingRequest, ModelRequest, Point, Read, Resume, Stop, Suspension,
+    ToolRequest, World, batch_width, run_batch,
 };
 use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
@@ -100,6 +100,8 @@ pub struct Stats {
     pub nested: u64,
     pub divergences: u64,
     pub waits: u64,
+    pub sleeps: u64,
+    pub suspensions: u64,
     pub events: Option<u64>,
     pub entry_states: u64,
 }
@@ -138,6 +140,7 @@ pub struct SimWorld<'a> {
     cell_timers: BTreeMap<u64, BTreeSet<u64>>,
     cell_codes: BTreeMap<u64, usize>,
     pub inbox: Inbox,
+    pub parking: crate::sim::park::Parking,
     pub edges: Option<Edges>,
     pub greedy: bool,
     pub worst_faults: Vec<String>,
@@ -148,10 +151,10 @@ pub struct SimWorld<'a> {
     rng: Rng,
     faults_left: u64,
     armed: bool,
-    nested: bool,
+    pub(crate) nested: bool,
     lease_spent: bool,
     current: Option<TurnRequest>,
-    clock: u64,
+    pub(crate) clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
     run_epoch: u64,
     batch_calls: BTreeMap<(u64, u64), u64>,
@@ -199,6 +202,7 @@ impl<'a> SimWorld<'a> {
             cell_timers: BTreeMap::new(),
             cell_codes: BTreeMap::new(),
             inbox: Inbox::default(),
+            parking: crate::sim::park::Parking::default(),
             edges: None,
             greedy: false,
             worst_faults: Vec::new(),
@@ -272,7 +276,7 @@ impl<'a> SimWorld<'a> {
             Medium::Jsonl(_) => None,
         };
         format!(
-            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?}",
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?} {}",
             self.nested_dispatched,
             self.cell_faults,
             self.injected,
@@ -282,7 +286,8 @@ impl<'a> SimWorld<'a> {
             self.cell_timers,
             self.cell_codes,
             self.clock,
-            waited
+            waited,
+            self.parking.key()
         )
     }
 
@@ -318,6 +323,8 @@ impl<'a> SimWorld<'a> {
             ]
         });
         self.current = Some(request.clone());
+        self.parking.pending = None;
+        self.parking.suspensions = 0;
         self.inbox.schedule(program, self.seed, request.turn);
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
@@ -341,6 +348,7 @@ impl<'a> SimWorld<'a> {
         self.stats.runs += 1;
         self.run_effects = 0;
         self.run_outbound = 0;
+        self.parking.run_waited_ms = 0;
         if self.faults_left == 0 {
             self.armed = false;
         }
@@ -444,17 +452,19 @@ impl<'a> SimWorld<'a> {
         };
         let counted = (self.run_effects, self.run_outbound);
         (self.run_effects, self.run_outbound) = (0, 0);
+        let waited = std::mem::take(&mut self.parking.run_waited_ms);
         self.inbox.load(&records, true);
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
         self.inbox.unload();
         (self.run_effects, self.run_outbound) = counted;
+        self.parking.run_waited_ms = waited;
         if let Some(trace) = &mut self.trace {
             trace.exit(&ran);
         }
         match ran {
-            Ok(Ran::Finished(_)) => {}
+            Ok(Ran::Finished(_) | Ran::Suspended(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => self.acknowledge(&finish),
             Err(exit) => self
                 .owner_faults
@@ -537,6 +547,50 @@ impl<'a> SimWorld<'a> {
                 request.turn, request.handler
             ));
         }
+    }
+
+    pub(crate) fn rng_step(&mut self) -> u64 {
+        self.rng.range(1, CLOCK_STEP_MAX)
+    }
+
+    pub(crate) fn count_wait(&mut self) {
+        self.stats.sleeps += 1;
+        self.count_effect(false);
+    }
+
+    pub(crate) fn crash_mid_wait(&mut self, until: u64) -> Option<Stop> {
+        if !self.fault(self.profile.crash_ppm) {
+            return None;
+        }
+        if until > self.clock {
+            self.clock += self.rng.below(until - self.clock);
+        }
+        Some(self.crash())
+    }
+
+    pub(crate) fn handler_worst(&self) -> &ir::worst::WorstCase {
+        let request = self
+            .current
+            .as_ref()
+            .expect("a wait or suspend runs within a turn");
+        &self
+            .program
+            .handler(&request.handler)
+            .expect("a turn request names a handler of the program")
+            .worst
+    }
+
+    pub(crate) fn handler_wait_ms(&self) -> u64 {
+        self.handler_worst().wait_ms.total
+    }
+
+    pub fn enter_turn(&mut self, request: &TurnRequest) {
+        if self.current.as_ref().map(|current| current.turn) == Some(request.turn) {
+            return;
+        }
+        self.current = Some(request.clone());
+        self.parking.pending = None;
+        self.parking.suspensions = 0;
     }
 
     fn durable_status(&self, turn: u64) -> Option<Record> {
@@ -854,6 +908,22 @@ impl World for SimWorld<'_> {
             ]
         });
         self.check_acknowledge(finish);
+    }
+
+    fn clock(&mut self) -> u64 {
+        self.wait_clock()
+    }
+
+    fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        self.sleep_until(turn, seq, until_ms)
+    }
+
+    fn resume(&mut self, suspension: &Suspension) -> Option<Resume> {
+        self.deliver_resume(suspension)
+    }
+
+    fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {
+        self.answer_resume(suspension, resume, matched);
     }
 
     fn inbox(&mut self, turn: u64) -> Vec<Delivery> {

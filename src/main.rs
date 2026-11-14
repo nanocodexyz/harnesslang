@@ -155,6 +155,13 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
     for (name, cost) in measures {
         lines.push(format!("    {name}: {}", cost.describe_loops()));
     }
+    if worst.wait_ms.total > 0 {
+        lines.push(format!(
+            "    milliseconds of waits: {}, {}",
+            worst.wait_ms.total,
+            worst.wait_ms.describe_loops()
+        ));
+    }
     lines.push("    plus one recovery record per restart".to_owned());
     let events = &program.events;
     if events.any() {
@@ -226,7 +233,7 @@ fn check_command(args: &[String]) -> ExitCode {
     }
     if let Some(limit) = model.limits.duration_per_invocation {
         println!(
-            "  not checked: duration ({} {}), since effect durations are not modelled",
+            "  not checked: duration ({} {}) beyond waits, since other effects' durations are not modelled",
             limit.value, limit.unit
         );
     }

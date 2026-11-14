@@ -58,7 +58,10 @@ pub fn jsonl_open_tail(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
                             disk,
                             offset + start as u64,
                             decoded,
-                            Start::Checkpoint { revision, next_cell },
+                            Start::Checkpoint {
+                                revision,
+                                next_cell,
+                            },
                         )
                     }
                     _ => jsonl_open(disk),
@@ -153,19 +156,25 @@ fn last_cell(bytes: &[u8], from_start: bool) -> Result<CellScan, OpenError> {
         .windows(CELL_OPENING.len())
         .rposition(|window| window == CELL_OPENING);
     let Some(at) = found else {
-        return Ok(if from_start { CellScan::Absent } else { CellScan::Wider });
+        return Ok(if from_start {
+            CellScan::Absent
+        } else {
+            CellScan::Wider
+        });
     };
     let line_start = match bytes[..at].iter().rposition(|byte| *byte == LINE_END) {
         Some(newline) => newline + 1,
         None if from_start => 0,
         None => return Ok(CellScan::Wider),
     };
-    let corrupt = |what: String| OpenError::Corrupt(format!("the cell line before the checkpoint {what}"));
+    let corrupt =
+        |what: String| OpenError::Corrupt(format!("the cell line before the checkpoint {what}"));
     let length = bytes[at..]
         .iter()
         .position(|byte| *byte == LINE_END)
         .ok_or_else(|| corrupt("has no end".to_owned()))?;
-    let line = std::str::from_utf8(&bytes[line_start..at + length]).map_err(|_| corrupt("is not utf-8".to_owned()))?;
+    let line = std::str::from_utf8(&bytes[line_start..at + length])
+        .map_err(|_| corrupt("is not utf-8".to_owned()))?;
     match decode_line(line, true) {
         Ok(Record::Cell { cell, .. }) => Ok(CellScan::Found(cell)),
         Ok(other) => Err(corrupt(format!("decodes as a {} record", other.tag()))),
@@ -343,7 +352,11 @@ impl<H: Host> World for JsonlWorld<'_, H> {
         self.host.listing(request)
     }
 
-    fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+    fn tools(
+        &mut self,
+        requests: &[ToolRequest<'_>],
+        limit: Option<u64>,
+    ) -> Result<Vec<(usize, Output)>, Stop> {
         host_tools(self.host, requests, limit)
     }
 
@@ -449,7 +462,10 @@ impl<'d> JsonlJournal<'d> {
             *revision, turn,
             "a finished turn checkpoints its own revision"
         );
-        let next_cell = next_cell_after(next_cell_after(self.start.first_cell(), &self.records), &flushed);
+        let next_cell = next_cell_after(
+            next_cell_after(self.start.first_cell(), &self.records),
+            &flushed,
+        );
         self.start = Start::Checkpoint {
             revision: turn,
             next_cell,

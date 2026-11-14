@@ -74,6 +74,8 @@ struct Prover<'a> {
     external_sites: BTreeSet<Slot>,
     waits: BTreeSet<SiteId>,
     cells: BTreeSet<SiteId>,
+    sleeps: BTreeSet<Slot>,
+    parks: BTreeSet<Slot>,
 }
 
 pub fn prove(program: &Program, plan: &Plan, report: &mut Report) {
@@ -91,6 +93,8 @@ pub fn prove(program: &Program, plan: &Plan, report: &mut Report) {
             external_sites: BTreeSet::new(),
             waits: BTreeSet::new(),
             cells: BTreeSet::new(),
+            sleeps: BTreeSet::new(),
+            parks: BTreeSet::new(),
         };
         prover.conformance();
         let fell = prover.ops(&handler.ops, BTreeSet::from([State::start()]));
@@ -147,6 +151,13 @@ impl Prover<'_> {
             self.external_sites.len() - nested,
             acknowledgements(&self.handler.ops)
         ));
+        if !self.sleeps.is_empty() || !self.parks.is_empty() {
+            report.proved.push(format!(
+                "handler {name} on {target}: parks: {} wait site(s) sleep only after their call and every record before it are durable; {} suspend site(s) end the run only with nothing buffered and are never appended twice",
+                self.sleeps.len(),
+                self.parks.len()
+            ));
+        }
         if self.cells.is_empty() {
             return;
         }
@@ -312,6 +323,12 @@ impl Prover<'_> {
                 self.path.pop();
                 all
             }
+            Op::Park { slot, what } => {
+                for state in states {
+                    self.park(*slot, what, &state);
+                }
+                BTreeSet::new()
+            }
             Op::End => {
                 for state in states {
                     if state.phase != Phase::Acknowledged {
@@ -358,9 +375,10 @@ impl Prover<'_> {
                 );
             }
             Op::Wait { site, what } => self.wait(*site, what, &state),
+            Op::Sleep { slot, what, .. } => self.sleep(*slot, what, &state),
             Op::CloseCell(site, _) => self.close_cell(*site, &mut state),
             Op::Acknowledge => self.acknowledge(&mut state),
-            Op::Choice(_) | Op::Repeat { .. } | Op::End => {
+            Op::Choice(_) | Op::Repeat { .. } | Op::End | Op::Park { .. } => {
                 unreachable!("structured ops are walked by op")
             }
         }
@@ -473,6 +491,45 @@ impl Prover<'_> {
                 None,
             ),
         }
+    }
+
+    fn sleep(&mut self, slot: Slot, what: &str, state: &State) {
+        self.sleeps.insert(slot);
+        if state.pending.is_empty() && state.durable_calls.contains(&slot) {
+            return;
+        }
+        let pending = self.describe(&state.pending);
+        self.finding(
+            "durable_before_wait",
+            format!("{what} waits while records are not durable: {pending}"),
+            Some(
+                "the host is evicted during the wait and the rerun repeats the model calls and tools before it"
+                    .to_owned(),
+            ),
+        );
+    }
+
+    fn park(&mut self, slot: Slot, what: &str, state: &State) {
+        self.parks.insert(slot);
+        if state.phase != Phase::Running {
+            self.finding(
+                "finish_once",
+                format!("{what} suspends a turn that already appended its status"),
+                None,
+            );
+        }
+        if state.pending.is_empty() && state.durable_calls.contains(&slot) {
+            return;
+        }
+        let pending = self.describe(&state.pending);
+        self.finding(
+            "suspend_durable",
+            format!("{what} ends the run waiting while records are not durable: {pending}"),
+            Some(
+                "the waiting status is lost with the process, so no resume can find the turn"
+                    .to_owned(),
+            ),
+        );
     }
 
     fn wait(&mut self, site: SiteId, what: &str, state: &State) {

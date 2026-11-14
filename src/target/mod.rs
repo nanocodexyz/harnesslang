@@ -45,6 +45,8 @@ pub const CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX: u64 = 10_000;
 pub const CLOUDFLARE_CONNECTIONS_WAITING_MAX: u64 = 6;
 pub const VERCEL_FUNCTION_DURATION_SECONDS_MAX: u64 = 800;
 pub const VERCEL_STEP_ATTEMPTS_MAX: u64 = 4;
+pub const MILLISECONDS_PER_SECOND: u64 = 1000;
+pub const CLOUDFLARE_ALARM_WALL_SECONDS_MAX: u64 = 15 * 60;
 pub const BLOCK_DEVICE_SECTOR_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,8 +127,32 @@ pub struct Fact {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitScope {
+    Run,
+    Step,
+}
+
+impl WaitScope {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Run => "the waits of one run, added up",
+            Self::Step => {
+                "each wait, since a wait's flush ends a step and a step holds at most one wait"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitLimit {
+    pub limit: Limit,
+    pub scope: WaitScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub memory: Option<Limit>,
+    pub wait_ms: Option<WaitLimit>,
     pub outbound_requests_per_invocation: Option<Limit>,
     pub duration_per_invocation: Option<Limit>,
     pub concurrent_requests: Option<Limit>,
@@ -159,6 +185,7 @@ impl Model {
 
 const NO_LIMITS: Limits = Limits {
     memory: None,
+    wait_ms: None,
     outbound_requests_per_invocation: None,
     duration_per_invocation: None,
     concurrent_requests: None,
@@ -169,6 +196,14 @@ const CLOUDFLARE_LIMITS: Limits = Limits {
         value: CLOUDFLARE_ISOLATE_MEMORY_BYTES_MAX,
         unit: "bytes per isolate",
         source: "developers.cloudflare.com/durable-objects/platform/limits",
+    }),
+    wait_ms: Some(WaitLimit {
+        limit: Limit {
+            value: CLOUDFLARE_ALARM_WALL_SECONDS_MAX * MILLISECONDS_PER_SECOND,
+            unit: "milliseconds of waits per run",
+            source: "developers.cloudflare.com/durable-objects/platform/limits (an alarm handler's wall time is 15 minutes; a request's is unlimited while its client stays connected); a turn a reset leaves unfinished resumes in the alarm, so its waits must fit one alarm invocation",
+        },
+        scope: WaitScope::Run,
     }),
     outbound_requests_per_invocation: Some(Limit {
         value: CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX,
@@ -266,6 +301,14 @@ const VERCEL_FACTS: &[Fact] = &[
 
 const VERCEL_LIMITS: Limits = Limits {
     memory: None,
+    wait_ms: Some(WaitLimit {
+        limit: Limit {
+            value: VERCEL_FUNCTION_DURATION_SECONDS_MAX * MILLISECONDS_PER_SECOND,
+            unit: "milliseconds per wait",
+            source: "vercel.com/docs/functions/limitations (a Function's duration, Pro and Enterprise, fluid compute; a Workflow step runs in one invocation, while a workflow sleep() has no limit, vercel.com/docs/workflows/pricing); a wait runs inside the step after its flush",
+        },
+        scope: WaitScope::Step,
+    }),
     outbound_requests_per_invocation: None,
     duration_per_invocation: Some(Limit {
         value: VERCEL_FUNCTION_DURATION_SECONDS_MAX,
@@ -347,8 +390,51 @@ pub const fn model(target: Target) -> Model {
     }
 }
 
-pub fn check_limits(program: &Program, model: &Model) -> Vec<String> {
+pub fn longest_wait(program: &Program, handler: &crate::ir::Handler) -> Option<(String, u64)> {
+    handler
+        .sites
+        .iter()
+        .filter_map(|site| match site.kind {
+            crate::ir::SiteKind::Wait(constant) => Some(&program.constants[constant]),
+            _ => None,
+        })
+        .max_by_key(|constant| constant.value)
+        .map(|constant| (constant.name.clone(), constant.value))
+}
+
+pub fn check_waits(program: &Program, model: &Model) -> Vec<String> {
+    let Some(WaitLimit { limit, scope }) = model.limits.wait_ms else {
+        return Vec::new();
+    };
     let mut errors = Vec::new();
+    for handler in &program.handlers {
+        let waited = &handler.worst.wait_ms;
+        let over = match scope {
+            WaitScope::Run if waited.total > limit.value => Some(format!(
+                "worst case {} milliseconds of waits; loops: {}",
+                waited.total,
+                waited.describe_loops()
+            )),
+            WaitScope::Run => None,
+            WaitScope::Step => longest_wait(program, handler)
+                .filter(|(_, value)| *value > limit.value)
+                .map(|(name, value)| format!("wait({name}) waits {value} milliseconds")),
+        };
+        if let Some(over) = over {
+            errors.push(format!(
+                "handler '{}': {over}, which exceeds {}'s limit of {} {}",
+                handler.name,
+                model.target.name(),
+                limit.value,
+                limit.unit
+            ));
+        }
+    }
+    errors
+}
+
+pub fn check_limits(program: &Program, model: &Model) -> Vec<String> {
+    let mut errors = check_waits(program, model);
     let Some(limit) = model.limits.outbound_requests_per_invocation else {
         return errors;
     };
@@ -412,6 +498,15 @@ pub fn describe(model: &Model) -> String {
                 limit.value, limit.unit, limit.source
             ));
         }
+    }
+    if let Some(WaitLimit { limit, scope }) = model.limits.wait_ms {
+        lines.push(format!(
+            "  limit waits: {} {}, checked on {} ({})",
+            limit.value,
+            limit.unit,
+            scope.describe(),
+            limit.source
+        ));
     }
     for fact in model
         .facts

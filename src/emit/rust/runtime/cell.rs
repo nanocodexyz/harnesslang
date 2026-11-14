@@ -1,4 +1,3 @@
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limit {
     pub name: &'static str,
@@ -41,13 +40,29 @@ pub enum Step {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Issued,
-    Refused { error: String },
-    Result { id: u64, encoded: String, success: bool },
-    Timer { id: u64 },
-    Clock { value: u64 },
-    Monotonic { value: u64 },
-    Random { value: u32 },
-    Bytes { data: Vec<u8> },
+    Refused {
+        error: String,
+    },
+    Result {
+        id: u64,
+        encoded: String,
+        success: bool,
+    },
+    Timer {
+        id: u64,
+    },
+    Clock {
+        value: u64,
+    },
+    Monotonic {
+        value: u64,
+    },
+    Random {
+        value: u32,
+    },
+    Bytes {
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +138,10 @@ impl CellOutcome {
             Output::Failed(error) => Ok(Self::Threw(error.clone())),
             Output::Ok(json) => match json.get(UNKNOWN_KEY).and_then(Json::as_str) {
                 Some(text) => Ok(Self::Unknown(text.to_owned())),
-                None => Err(format!("cell output {} is neither text nor unknown", json.encode())),
+                None => Err(format!(
+                    "cell output {} is neither text nor unknown",
+                    json.encode()
+                )),
             },
         }
     }
@@ -174,7 +192,10 @@ pub fn header_tools(code: &CodeSpec) -> Vec<Json> {
                 .iter()
                 .map(|(name, ty)| ((*name).to_owned(), Json::text(ty)))
                 .collect();
-            Json::object([("input", Json::Object(input)), ("name", Json::text(tool.name))])
+            Json::object([
+                ("input", Json::Object(input)),
+                ("name", Json::text(tool.name)),
+            ])
         })
         .collect()
 }
@@ -209,7 +230,9 @@ pub fn run_cell(site: CellSite<'_>, host: &mut dyn CellHost) -> Result<CellOutco
         Ok(outcome) => outcome,
         Err(Interrupt::Stop(stop)) => return Err(stop),
         Err(Interrupt::Threw(error)) => CellOutcome::Threw(error),
-        Err(Interrupt::Diverged(reason)) => CellOutcome::Unknown(divergence_text(runner.cell, &reason)),
+        Err(Interrupt::Diverged(reason)) => {
+            CellOutcome::Unknown(divergence_text(runner.cell, &reason))
+        }
         Err(Interrupt::Overflow) => {
             let reason = format!(
                 "its journal passed journal_bytes ({} = {})",
@@ -291,7 +314,15 @@ impl<'a, 'h> Runner<'a, 'h> {
                     tools: header_tools(code),
                     yield_time_ms: code.yield_ms.value,
                 };
-                (cell, Vec::new(), 0, 0, Some(header), 0, site.script.to_owned())
+                (
+                    cell,
+                    Vec::new(),
+                    0,
+                    0,
+                    Some(header),
+                    0,
+                    site.script.to_owned(),
+                )
             }
             CellStart::Existing(log) => (
                 log.cell,
@@ -317,7 +348,11 @@ impl<'a, 'h> Runner<'a, 'h> {
             fresh_entries: Vec::new(),
             changed: BTreeMap::new(),
             journaled: match site.cell {
-                CellStart::Existing(log) => log.calls.iter().map(|(id, call)| (*id, call.state.clone())).collect(),
+                CellStart::Existing(log) => log
+                    .calls
+                    .iter()
+                    .map(|(id, call)| (*id, call.state.clone()))
+                    .collect(),
                 CellStart::Fresh(_) => BTreeMap::new(),
             },
             next_seq,
@@ -384,7 +419,10 @@ impl<'a, 'h> Runner<'a, 'h> {
 
     fn ended(&mut self, outcome: CellOutcome) -> Driven<CellOutcome> {
         if let Some(entry) = self.replay.get(self.cursor) {
-            let reason = format!("the script ended where its journal holds {}", entry.describe());
+            let reason = format!(
+                "the script ended where its journal holds {}",
+                entry.describe()
+            );
             return Err(self.diverged(reason));
         }
         Ok(outcome)
@@ -467,7 +505,8 @@ impl<'a, 'h> Runner<'a, 'h> {
 
     fn emit(&mut self, finished: bool) {
         let header = self.header.take();
-        if self.fresh_entries.is_empty() && self.changed.is_empty() && header.is_none() && !finished {
+        if self.fresh_entries.is_empty() && self.changed.is_empty() && header.is_none() && !finished
+        {
             return;
         }
         let entries = std::mem::take(&mut self.fresh_entries);
@@ -477,7 +516,11 @@ impl<'a, 'h> Runner<'a, 'h> {
         }
         let entries_from = self.entries - entries.len() as u64;
         let fresh = header.is_some();
-        assert_eq!(fresh, self.next_seq == 0, "the header rides the first update only");
+        assert_eq!(
+            fresh,
+            self.next_seq == 0,
+            "the header rides the first update only"
+        );
         let update = CellUpdate {
             session_id: self.site.session.to_owned(),
             cell_id: self.cell,
@@ -503,7 +546,10 @@ impl<'a, 'h> Runner<'a, 'h> {
             Phase::Queued => CallState::Queued,
             Phase::Running => CallState::Running,
             Phase::Completed => {
-                let (encoded, success) = call.output.clone().expect("a completed call has its output");
+                let (encoded, success) = call
+                    .output
+                    .clone()
+                    .expect("a completed call has its output");
                 CallState::Completed { encoded, success }
             }
         };
@@ -528,7 +574,10 @@ impl<'a, 'h> Runner<'a, 'h> {
     }
 
     fn running(&self) -> u64 {
-        self.calls.values().filter(|call| call.phase == Phase::Running).count() as u64
+        self.calls
+            .values()
+            .filter(|call| call.phase == Phase::Running)
+            .count() as u64
     }
 
     fn call(&mut self, id: u64, name: String, input: Json) -> Driven<()> {
@@ -536,9 +585,17 @@ impl<'a, 'h> Runner<'a, 'h> {
             return Err(self.diverged(format!("the engine issued nested call {id} twice")));
         }
         self.issued += 1;
-        let tool = self.code.tools.iter().find(|tool| tool.name == name).copied();
+        let tool = self
+            .code
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .copied();
         let refused = if tool.is_none() {
-            Some(format!("'{name}' is not a tool of code '{}'", self.code.name))
+            Some(format!(
+                "'{name}' is not a tool of code '{}'",
+                self.code.name
+            ))
         } else if self.issued > self.code.calls.value {
             Some(format!(
                 "the cell made its calls bound ({} = {}) of nested calls",
@@ -573,7 +630,10 @@ impl<'a, 'h> Runner<'a, 'h> {
     }
 
     fn start_call(&mut self, id: u64) -> Driven<()> {
-        self.calls.get_mut(&id).expect("a started call was issued").phase = Phase::Running;
+        self.calls
+            .get_mut(&id)
+            .expect("a started call was issued")
+            .phase = Phase::Running;
         self.changed(id);
         if self.live {
             self.settle(id)?;
@@ -585,7 +645,11 @@ impl<'a, 'h> Runner<'a, 'h> {
         if self.live {
             return Ok(());
         }
-        assert_eq!(self.cursor, self.replay.len(), "a cell goes live at its journal's end");
+        assert_eq!(
+            self.cursor,
+            self.replay.len(),
+            "a cell goes live at its journal's end"
+        );
         self.live = true;
         let open: Vec<u64> = self
             .calls
@@ -611,7 +675,9 @@ impl<'a, 'h> Runner<'a, 'h> {
             self.set_output(id, refusal(error));
             return Ok(());
         }
-        let tool = call.tool.expect("a call that is not refused names a nested tool");
+        let tool = call
+            .tool
+            .expect("a call that is not refused names a nested tool");
         let logged = if self.consult {
             self.site.nested.get(&(self.site.seq, id)).cloned()
         } else {
@@ -620,7 +686,9 @@ impl<'a, 'h> Runner<'a, 'h> {
         match logged {
             Some(SiteLog::Done(_, output)) => self.set_output(id, encode_output(&output)),
             Some(SiteLog::Unknown(_)) => self.set_output(id, (unknown_outcome().encode(), false)),
-            Some(SiteLog::Open(_)) => panic!("recovery turns every open nested external call unknown before the cell runs again"),
+            Some(SiteLog::Open(_)) => panic!(
+                "recovery turns every open nested external call unknown before the cell runs again"
+            ),
             Some(SiteLog::Reply(_)) => panic!("a nested call never holds a model reply"),
             None if tool.effect == EffectClass::External => self.dispatch(id, true)?,
             None => {}
@@ -702,7 +770,11 @@ impl<'a, 'h> Runner<'a, 'h> {
         if self.timers.contains_key(&id) {
             return Err(self.diverged(format!("the engine armed timer {id} twice")));
         }
-        let entry = self.record(Entry::Timeout { id, delay_ms, at_ms: 0 })?;
+        let entry = self.record(Entry::Timeout {
+            id,
+            delay_ms,
+            at_ms: 0,
+        })?;
         let Entry::Timeout { at_ms, .. } = entry else {
             panic!("a timeout step records a timeout entry, found {entry:?}");
         };
@@ -740,10 +812,19 @@ impl<'a, 'h> Runner<'a, 'h> {
 
     fn replayed_input(&mut self, entry: Entry) -> Driven<Input> {
         match entry {
-            Entry::Result { id, encoded, success } => {
-                let running = self.calls.get(&id).is_some_and(|call| call.phase == Phase::Running);
+            Entry::Result {
+                id,
+                encoded,
+                success,
+            } => {
+                let running = self
+                    .calls
+                    .get(&id)
+                    .is_some_and(|call| call.phase == Phase::Running);
                 if !running {
-                    let reason = format!("its journal delivers nested call {id}, which the script has not started");
+                    let reason = format!(
+                        "its journal delivers nested call {id}, which the script has not started"
+                    );
                     return Err(self.diverged(reason));
                 }
                 self.cursor += 1;
@@ -753,11 +834,16 @@ impl<'a, 'h> Runner<'a, 'h> {
                 let call = self.calls.get_mut(&id).expect("running");
                 call.output = Some((encoded.clone(), success));
                 self.complete(id)?;
-                Ok(Input::Result { id, encoded, success })
+                Ok(Input::Result {
+                    id,
+                    encoded,
+                    success,
+                })
             }
             Entry::Timer { id } => {
                 if self.timers.remove(&id).is_none() {
-                    let reason = format!("its journal fires timer {id}, which the script has not armed");
+                    let reason =
+                        format!("its journal fires timer {id}, which the script has not armed");
                     return Err(self.diverged(reason));
                 }
                 self.cursor += 1;
@@ -767,16 +853,25 @@ impl<'a, 'h> Runner<'a, 'h> {
                 Ok(Input::Timer { id })
             }
             other => {
-                let reason = format!("the script waits where its journal holds {}", other.describe());
+                let reason = format!(
+                    "the script waits where its journal holds {}",
+                    other.describe()
+                );
                 Err(self.diverged(reason))
             }
         }
     }
 
     fn complete(&mut self, id: u64) -> Driven<()> {
-        self.calls.get_mut(&id).expect("a delivered call exists").phase = Phase::Completed;
+        self.calls
+            .get_mut(&id)
+            .expect("a delivered call exists")
+            .phase = Phase::Completed;
         self.changed(id);
-        self.host.observe(&CellEvent::Delivered { cell: self.cell, id });
+        self.host.observe(&CellEvent::Delivered {
+            cell: self.cell,
+            id,
+        });
         while self.running() < self.code.parallel.value
             && let Some(next) = self.queue.pop_front()
         {
@@ -789,7 +884,10 @@ impl<'a, 'h> Runner<'a, 'h> {
         if self.calls[&id].output.is_none() {
             self.dispatch(id, false)?;
         }
-        let (encoded, success) = self.calls[&id].output.clone().expect("a delivered call has its output");
+        let (encoded, success) = self.calls[&id]
+            .output
+            .clone()
+            .expect("a delivered call has its output");
         self.append_entry(Entry::Result {
             id,
             encoded: encoded.clone(),
@@ -797,7 +895,11 @@ impl<'a, 'h> Runner<'a, 'h> {
         })?;
         self.complete(id)?;
         self.emit(false);
-        Ok(Input::Result { id, encoded, success })
+        Ok(Input::Result {
+            id,
+            encoded,
+            success,
+        })
     }
 
     fn fire(&mut self, id: u64, until_ms: u64) -> Driven<Input> {

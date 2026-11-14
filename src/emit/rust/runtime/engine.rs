@@ -139,7 +139,9 @@ pub fn listed(tool: &str) -> Option<(usize, &str)> {
     if name.is_empty() {
         return None;
     }
-    let id = program::LISTINGS.iter().position(|listing| listing.0 == prefix)?;
+    let id = program::LISTINGS
+        .iter()
+        .position(|listing| listing.0 == prefix)?;
     Some((id, name))
 }
 
@@ -161,9 +163,17 @@ pub fn input_fields(input: &Json) -> Result<&BTreeMap<String, Json>, String> {
     }
 }
 
-pub fn input_param<T>(fields: &BTreeMap<String, Json>, name: &str, parse: fn(&Json) -> Result<T, String>) -> Result<(), String> {
-    let field = fields.get(name).ok_or_else(|| format!("missing '{name}'"))?;
-    parse(field).map(drop).map_err(|error| format!("'{name}': {error}"))
+pub fn input_param<T>(
+    fields: &BTreeMap<String, Json>,
+    name: &str,
+    parse: fn(&Json) -> Result<T, String>,
+) -> Result<(), String> {
+    let field = fields
+        .get(name)
+        .ok_or_else(|| format!("missing '{name}'"))?;
+    parse(field)
+        .map(drop)
+        .map_err(|error| format!("'{name}': {error}"))
 }
 
 pub fn input_extra(fields: &BTreeMap<String, Json>, params: &[&str]) -> Result<(), String> {
@@ -183,9 +193,12 @@ pub fn admitted_tools(json: &Json) -> Result<BTreeMap<String, String>, String> {
     };
     let mut tools = BTreeMap::new();
     for (name, fingerprint) in map {
-        let fingerprint = fingerprint
-            .as_str()
-            .ok_or_else(|| format!("listed tool '{name}' has fingerprint {}, not text", fingerprint.encode()))?;
+        let fingerprint = fingerprint.as_str().ok_or_else(|| {
+            format!(
+                "listed tool '{name}' has fingerprint {}, not text",
+                fingerprint.encode()
+            )
+        })?;
         tools.insert(name.clone(), fingerprint.to_owned());
     }
     Ok(tools)
@@ -201,7 +214,13 @@ pub fn checked_listing(listing: usize, output: Output) -> Output {
         return output;
     };
     let fingerprints = match json {
-        Json::Object(map) if map.iter().all(|(tool, fingerprint)| !tool.is_empty() && fingerprint.as_str().is_some()) => map.len() as u64,
+        Json::Object(map)
+            if map
+                .iter()
+                .all(|(tool, fingerprint)| !tool.is_empty() && fingerprint.as_str().is_some()) =>
+        {
+            map.len() as u64
+        }
         other => {
             return Output::Failed(format!(
                 "listing {name} returned {}, which is not an object of fingerprints",
@@ -269,7 +288,11 @@ pub trait World {
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop>;
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
     fn listing(&mut self, request: &ListingRequest<'_>) -> Output;
-    fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop>;
+    fn tools(
+        &mut self,
+        requests: &[ToolRequest<'_>],
+        limit: Option<u64>,
+    ) -> Result<Vec<(usize, Output)>, Stop>;
     fn model(&mut self, request: &ModelRequest<'_>) -> Json;
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
@@ -333,7 +356,10 @@ impl Inbox {
                 let _ = sent.reply.send(EventAnswer::NotRunning);
             }
         }
-        self.waiting.iter().map(|sent| sent.delivery.clone()).collect()
+        self.waiting
+            .iter()
+            .map(|sent| sent.delivery.clone())
+            .collect()
     }
 
     pub fn answer(&mut self, turn: u64, answers: &[(String, EventAnswer)]) {
@@ -356,7 +382,9 @@ pub const fn events_taken() -> bool {
 
 pub fn event_seq(turn: u64, index: u64) -> Option<u64> {
     assert!(index >= 1, "an event's index in its turn counts from 1");
-    turn.checked_sub(1)?.checked_mul(program::EVENT_RECORDS_MAX)?.checked_add(index)
+    turn.checked_sub(1)?
+        .checked_mul(program::EVENT_RECORDS_MAX)?
+        .checked_add(index)
 }
 
 pub fn steer_count(events: &[Recorded]) -> u64 {
@@ -375,7 +403,11 @@ pub fn close_inbox(world: &mut dyn World, turn: u64, position: u64, events: &[Re
         .into_iter()
         .map(|delivery| {
             let recorded = events.iter().any(|event| event.delivery.id == delivery.id);
-            let answer = if recorded { EventAnswer::Duplicate } else { EventAnswer::Finished };
+            let answer = if recorded {
+                EventAnswer::Duplicate
+            } else {
+                EventAnswer::Finished
+            };
             (delivery.id, answer)
         })
         .collect();
@@ -445,7 +477,11 @@ pub fn batch_width(count: usize, limit: Option<u64>) -> usize {
     }
 }
 
-pub fn dispatch_concurrently(tools: &dyn ConcurrentTools, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Vec<(usize, Output)> {
+pub fn dispatch_concurrently(
+    tools: &dyn ConcurrentTools,
+    requests: &[ToolRequest<'_>],
+    limit: Option<u64>,
+) -> Vec<(usize, Output)> {
     let width = batch_width(requests.len(), limit);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -469,11 +505,19 @@ pub fn dispatch_concurrently(tools: &dyn ConcurrentTools, requests: &[ToolReques
     });
     drop(sender);
     let completed: Vec<(usize, Output)> = receiver.into_iter().collect();
-    assert_eq!(completed.len(), requests.len(), "every request of a batch completes once");
+    assert_eq!(
+        completed.len(),
+        requests.len(),
+        "every request of a batch completes once"
+    );
     completed
 }
 
-pub fn host_tools<H: Host>(host: &mut H, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+pub fn host_tools<H: Host>(
+    host: &mut H,
+    requests: &[ToolRequest<'_>],
+    limit: Option<u64>,
+) -> Result<Vec<(usize, Output)>, Stop> {
     for request in requests {
         host.hook(Point::BeforeRun(Kind::Dispatch, request.effect))?;
     }
@@ -588,7 +632,10 @@ impl<'a> Engine<'a> {
                 Inbound::Cancel => None,
             })
             .collect();
-        assert!(self.taken <= visible.len(), "the steers a turn sees only grow");
+        assert!(
+            self.taken <= visible.len(),
+            "the steers a turn sees only grow"
+        );
         let fresh = visible[self.taken..].to_vec();
         self.taken = visible.len();
         fresh
@@ -611,7 +658,10 @@ impl<'a> Engine<'a> {
             let answer = self.admit_event(position, &delivery);
             answers.push((delivery.id, answer));
         }
-        if answers.iter().any(|(_, answer)| *answer == EventAnswer::Recorded) {
+        if answers
+            .iter()
+            .any(|(_, answer)| *answer == EventAnswer::Recorded)
+        {
             self.flush()?;
         }
         if let Mode::Live { world, .. } = &mut self.mode {
@@ -621,13 +671,21 @@ impl<'a> Engine<'a> {
     }
 
     fn admit_event(&mut self, position: u64, delivery: &Delivery) -> EventAnswer {
-        if self.events.iter().any(|event| event.delivery.id == delivery.id) {
+        if self
+            .events
+            .iter()
+            .any(|event| event.delivery.id == delivery.id)
+        {
             return EventAnswer::Duplicate;
         }
         match &delivery.inbound {
             Inbound::Cancel if !program::TAKES_CANCEL => return EventAnswer::Undeclared,
             Inbound::Cancel => {
-                if self.events.iter().any(|event| event.delivery.inbound == Inbound::Cancel) {
+                if self
+                    .events
+                    .iter()
+                    .any(|event| event.delivery.inbound == Inbound::Cancel)
+                {
                     return EventAnswer::Duplicate;
                 }
             }
@@ -667,7 +725,11 @@ impl<'a> Engine<'a> {
         self.attempts
     }
 
-    pub fn run(mut self, mut state: program::State, arguments: &program::Arguments) -> Result<(Finish, program::State), Exit> {
+    pub fn run(
+        mut self,
+        mut state: program::State,
+        arguments: &program::Arguments,
+    ) -> Result<(Finish, program::State), Exit> {
         let finish = match program::run_body(&mut self, &mut state, arguments) {
             Ok(result) => self.finish(&state, Outcome::Completed, result),
             Err(Halt::Trap(trap)) => self.finish(
@@ -680,7 +742,12 @@ impl<'a> Engine<'a> {
         Ok((finish, state))
     }
 
-    fn finish(&mut self, state: &program::State, outcome: Outcome, result: Json) -> Result<Finish, Exit> {
+    fn finish(
+        &mut self,
+        state: &program::State,
+        outcome: Outcome,
+        result: Json,
+    ) -> Result<Finish, Exit> {
         let finish = Finish {
             turn: self.turn,
             outcome,
@@ -790,7 +857,11 @@ impl<'a> Engine<'a> {
     }
 
     fn run_code(&mut self, code: usize, seq: u64, call: &Call) -> Result<CellOutcome, Halt> {
-        let script = call.input.as_str().expect("a cell's input is its script").to_owned();
+        let script = call
+            .input
+            .as_str()
+            .expect("a cell's input is its script")
+            .to_owned();
         let existing = self.cells.get(&seq).cloned();
         if let Some(log) = &existing
             && log.finished
@@ -919,7 +990,11 @@ impl<'a> Engine<'a> {
         }
         self.hook(Point::BeforeRun(site.kind, call.effect))?;
         let turn = self.turn;
-        let gate = if site.kind == Kind::Dispatch { self.gate(&call) } else { Ok(None) };
+        let gate = if site.kind == Kind::Dispatch {
+            self.gate(&call)
+        } else {
+            Ok(None)
+        };
         let listing = match run {
             Run::Listing(listing) => Some(listing),
             _ => None,
@@ -995,7 +1070,11 @@ impl<'a> Engine<'a> {
         let Some((listing, name)) = listed(&call.tool) else {
             return Ok(None);
         };
-        match self.admitted.get(&listing).and_then(|tools| tools.get(name)) {
+        match self
+            .admitted
+            .get(&listing)
+            .and_then(|tools| tools.get(name))
+        {
             Some(fingerprint) => Ok(Some(fingerprint.clone())),
             None => Err(not_admitted(&call.tool, program::LISTINGS[listing].0, name)),
         }
@@ -1014,7 +1093,12 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    pub fn parallel(&mut self, calls: Vec<Call>, returns: Returns, limit: Option<u64>) -> Result<Vec<Answer>, Halt> {
+    pub fn parallel(
+        &mut self,
+        calls: Vec<Call>,
+        returns: Returns,
+        limit: Option<u64>,
+    ) -> Result<Vec<Answer>, Halt> {
         let mut answers: Vec<Option<Answer>> = (0..calls.len()).map(|_| None).collect();
         let mut pending: Vec<(usize, u64)> = Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().enumerate() {
@@ -1025,7 +1109,9 @@ impl<'a> Engine<'a> {
                     self.same(seq, &recorded, call)?;
                     answers[index] = Some(Answer::Output(output));
                 }
-                Some(SiteLog::Reply(_)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+                Some(SiteLog::Reply(_)) => {
+                    return Err(self.diverged(seq, "a model reply", &call.tool));
+                }
                 Some(SiteLog::Unknown(recorded)) => {
                     self.same(seq, &recorded, call)?;
                     answers[index] = Some(Answer::Unknown);
@@ -1065,13 +1151,25 @@ impl<'a> Engine<'a> {
         }
         Ok(answers
             .into_iter()
-            .map(|answer| answer.expect("every call of a parallel for has an answer before its pushes"))
+            .map(|answer| {
+                answer.expect("every call of a parallel for has an answer before its pushes")
+            })
             .collect())
     }
 
-    fn batch_group(&mut self, calls: &[Call], group: &[(usize, u64)], returns: Returns, limit: Option<u64>, answers: &mut [Option<Answer>]) -> Result<(), Halt> {
+    fn batch_group(
+        &mut self,
+        calls: &[Call],
+        group: &[(usize, u64)],
+        returns: Returns,
+        limit: Option<u64>,
+        answers: &mut [Option<Answer>],
+    ) -> Result<(), Halt> {
         let external = calls[group[0].0].effect.may_be_unknown();
-        assert!(!external || group.len() == 1, "an external call of a parallel for runs alone");
+        assert!(
+            !external || group.len() == 1,
+            "an external call of a parallel for runs alone"
+        );
         if external {
             self.flush()?;
             assert!(
@@ -1080,8 +1178,13 @@ impl<'a> Engine<'a> {
             );
         }
         let turn = self.turn;
-        let gates: Vec<Result<Option<String>, String>> = group.iter().map(|(index, _)| self.gate(&calls[*index])).collect();
-        let sent: Vec<usize> = (0..group.len()).filter(|position| gates[*position].is_ok()).collect();
+        let gates: Vec<Result<Option<String>, String>> = group
+            .iter()
+            .map(|(index, _)| self.gate(&calls[*index]))
+            .collect();
+        let sent: Vec<usize> = (0..group.len())
+            .filter(|position| gates[*position].is_ok())
+            .collect();
         let requests: Vec<ToolRequest<'_>> = sent
             .iter()
             .map(|position| {
@@ -1101,8 +1204,16 @@ impl<'a> Engine<'a> {
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
-        let mut completed = if requests.is_empty() { Vec::new() } else { world.tools(&requests, limit)? };
-        assert_eq!(completed.len(), sent.len(), "a batch returns one output per request");
+        let mut completed = if requests.is_empty() {
+            Vec::new()
+        } else {
+            world.tools(&requests, limit)?
+        };
+        assert_eq!(
+            completed.len(),
+            sent.len(),
+            "a batch returns one output per request"
+        );
         if matches!(self.sites.get(&self.seq), Some(SiteLog::Open(_))) {
             self.drain()?;
         }
@@ -1123,7 +1234,8 @@ impl<'a> Engine<'a> {
                 seq,
                 output: output.clone(),
             });
-            self.sites.insert(seq, SiteLog::Done(calls[index].clone(), output.clone()));
+            self.sites
+                .insert(seq, SiteLog::Done(calls[index].clone(), output.clone()));
             answers[index] = Some(Answer::Output(output));
         }
         Ok(())
@@ -1196,7 +1308,9 @@ impl CellHost for Engine<'_> {
 fn halt_stop(halt: Halt) -> Stop {
     match halt {
         Halt::Exit(Exit::Stop(stop)) => stop,
-        Halt::Exit(Exit::Corrupt(error)) => panic!("a flush cannot find the journal corrupt, found {error}"),
+        Halt::Exit(Exit::Corrupt(error)) => {
+            panic!("a flush cannot find the journal corrupt, found {error}")
+        }
         Halt::Trap(trap) => panic!("a flush cannot trap, found {trap}"),
     }
 }
@@ -1208,17 +1322,29 @@ fn halt_exit(halt: Halt) -> Exit {
     }
 }
 
-pub fn known<T>(engine: &Engine<'_>, answer: Answer, parse: fn(&Json) -> Result<T, String>) -> Result<Known<T>, Halt> {
+pub fn known<T>(
+    engine: &Engine<'_>,
+    answer: Answer,
+    parse: fn(&Json) -> Result<T, String>,
+) -> Result<Known<T>, Halt> {
     match answer {
-        Answer::Output(Output::Ok(json)) => Ok(Known::Ok(parse(&json).map_err(|error| engine.corrupt(error))?)),
+        Answer::Output(Output::Ok(json)) => Ok(Known::Ok(
+            parse(&json).map_err(|error| engine.corrupt(error))?,
+        )),
         Answer::Output(Output::Failed(error)) => Ok(Known::Failed(error)),
         Answer::Reply(_) | Answer::Unknown => panic!("a known site gets an output"),
     }
 }
 
-pub fn maybe<T>(engine: &Engine<'_>, answer: Answer, parse: fn(&Json) -> Result<T, String>) -> Result<Maybe<T>, Halt> {
+pub fn maybe<T>(
+    engine: &Engine<'_>,
+    answer: Answer,
+    parse: fn(&Json) -> Result<T, String>,
+) -> Result<Maybe<T>, Halt> {
     match answer {
-        Answer::Output(Output::Ok(json)) => Ok(Maybe::Ok(parse(&json).map_err(|error| engine.corrupt(error))?)),
+        Answer::Output(Output::Ok(json)) => Ok(Maybe::Ok(
+            parse(&json).map_err(|error| engine.corrupt(error))?,
+        )),
         Answer::Output(Output::Failed(error)) => Ok(Maybe::Failed(error)),
         Answer::Unknown => Ok(Maybe::Unknown),
         Answer::Reply(_) => panic!("a tool site gets no model reply"),
@@ -1230,7 +1356,9 @@ pub fn scalar(engine: &Engine<'_>, answer: Answer) -> Result<u64, Halt> {
         Answer::Output(Output::Ok(json)) => json
             .as_u64()
             .ok_or_else(|| engine.corrupt(format!("{} is not u64", json.encode()))),
-        Answer::Output(Output::Failed(error)) => Err(engine.corrupt(format!("Failed({error:?}) does not fit U64"))),
+        Answer::Output(Output::Failed(error)) => {
+            Err(engine.corrupt(format!("Failed({error:?}) does not fit U64")))
+        }
         Answer::Reply(_) | Answer::Unknown => panic!("a clock or random site gets an output"),
     }
 }
@@ -1259,7 +1387,9 @@ pub fn known_reply<T>(answer: Answer, parse: fn(&Json) -> Result<T, String>) -> 
 
 pub fn reply<T>(answer: Answer, parse: fn(&Json) -> Result<T, String>) -> Result<T, Halt> {
     match answer {
-        Answer::Reply(response) => parse(&response).map_err(|error| Halt::Trap(format!("model reply: {error}"))),
+        Answer::Reply(response) => {
+            parse(&response).map_err(|error| Halt::Trap(format!("model reply: {error}")))
+        }
         Answer::Output(_) | Answer::Unknown => panic!("a model site gets a reply"),
     }
 }
@@ -1325,7 +1455,12 @@ pub fn parse_text(json: &Json) -> Result<String, String> {
         .ok_or_else(|| format!("expected text, found {}", json.encode()))
 }
 
-pub fn parse_list<T>(json: &Json, capacity: u64, name: &str, element: fn(&Json) -> Result<T, String>) -> Result<Vec<T>, String> {
+pub fn parse_list<T>(
+    json: &Json,
+    capacity: u64,
+    name: &str,
+    element: fn(&Json) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
     let Json::Array(items) = json else {
         return Err(format!("expected a list, found {}", json.encode()));
     };
@@ -1339,7 +1474,11 @@ pub fn parse_list<T>(json: &Json, capacity: u64, name: &str, element: fn(&Json) 
     Ok(values)
 }
 
-pub fn variant_of<'j>(json: &'j Json, type_name: &str, variants: &[&str]) -> Result<(usize, Option<&'j Json>), String> {
+pub fn variant_of<'j>(
+    json: &'j Json,
+    type_name: &str,
+    variants: &[&str],
+) -> Result<(usize, Option<&'j Json>), String> {
     let (name, payload) = match json {
         Json::String(name) => (name.as_str(), None),
         other => match other.tagged() {
@@ -1358,11 +1497,17 @@ pub fn variant_of<'j>(json: &'j Json, type_name: &str, variants: &[&str]) -> Res
     Ok((index, payload))
 }
 
-pub fn variant_fields<'j>(payload: Option<&'j Json>, name: &str, count: usize) -> Result<Vec<&'j Json>, String> {
+pub fn variant_fields<'j>(
+    payload: Option<&'j Json>,
+    name: &str,
+    count: usize,
+) -> Result<Vec<&'j Json>, String> {
     match (count, payload) {
         (0, None) => Ok(Vec::new()),
         (1, Some(payload)) => Ok(vec![payload]),
-        (count, Some(Json::Array(items))) if count > 1 && items.len() == count => Ok(items.iter().collect()),
+        (count, Some(Json::Array(items))) if count > 1 && items.len() == count => {
+            Ok(items.iter().collect())
+        }
         _ => Err(format!("variant '{name}' has {count} field(s)")),
     }
 }
@@ -1386,13 +1531,14 @@ fn corrupt(error: String) -> Exit {
 }
 
 pub fn replay(turn: u64, log: &TurnLog, state: program::State) -> Result<program::State, Exit> {
-    let arguments = program::decode_arguments(&log.handler, &log.arguments).map_err(|error| match error {
-        program::ArgumentsError::NoHandler => corrupt(format!(
-            "turn {turn} ran handler '{}', which the program lacks",
-            log.handler
-        )),
-        program::ArgumentsError::Invalid(error) => corrupt(error),
-    })?;
+    let arguments =
+        program::decode_arguments(&log.handler, &log.arguments).map_err(|error| match error {
+            program::ArgumentsError::NoHandler => corrupt(format!(
+                "turn {turn} ran handler '{}', which the program lacks",
+                log.handler
+            )),
+            program::ArgumentsError::Invalid(error) => corrupt(error),
+        })?;
     check_events(turn, log)?;
     let finished = log
         .finished
@@ -1414,7 +1560,10 @@ pub fn state_before(session: &Session, turn: u64) -> Result<program::State, Exit
         Some((revision, payload)) => {
             let payload = Json::decode(payload)
                 .map_err(|error| corrupt(format!("checkpoint {revision}: {error}")))?;
-            (revision + 1, program::state_from_json(&payload).map_err(corrupt)?)
+            (
+                revision + 1,
+                program::state_from_json(&payload).map_err(corrupt)?,
+            )
         }
         None => (1, program::State::default()),
     };
@@ -1450,7 +1599,10 @@ fn recover(log: &mut TurnLog) -> Vec<u64> {
 fn reopen_nested(log: &mut TurnLog) -> Vec<(u64, u64)> {
     let unknown = log.open_nested(|class| class.may_be_unknown());
     for id in &unknown {
-        let site = log.nested.get_mut(id).expect("an open nested call has a site");
+        let site = log
+            .nested
+            .get_mut(id)
+            .expect("an open nested call has a site");
         let SiteLog::Open(call) = site else {
             panic!("open_nested returns open calls");
         };
@@ -1459,11 +1611,22 @@ fn reopen_nested(log: &mut TurnLog) -> Vec<(u64, u64)> {
     unknown
 }
 
-pub fn run_turn(world: &mut dyn World, epoch: u64, records: &[Record], request: &TurnRequest) -> Result<Ran, Exit> {
+pub fn run_turn(
+    world: &mut dyn World,
+    epoch: u64,
+    records: &[Record],
+    request: &TurnRequest,
+) -> Result<Ran, Exit> {
     run_turn_from(world, epoch, Start::Beginning, records, request)
 }
 
-pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &[Record], request: &TurnRequest) -> Result<Ran, Exit> {
+pub fn run_turn_from(
+    world: &mut dyn World,
+    epoch: u64,
+    start: Start,
+    records: &[Record],
+    request: &TurnRequest,
+) -> Result<Ran, Exit> {
     if let Start::Checkpoint { revision, .. } = start {
         assert!(
             request.turn > revision,
@@ -1522,7 +1685,8 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             TurnLog::new(handler.to_owned(), Json::Null)
         }
     };
-    let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log).with_next_cell(session.next_cell());
+    let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log)
+        .with_next_cell(session.next_cell());
     if let Some(record) = pending {
         engine.append(record);
     }
@@ -1541,5 +1705,9 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
 }
 
 pub fn self_check() {
-    assert_eq!(crc32(CRC32_CHECK_INPUT), CRC32_CHECK, "CRC-32 matches its catalogued check value");
+    assert_eq!(
+        crc32(CRC32_CHECK_INPUT),
+        CRC32_CHECK,
+        "CRC-32 matches its catalogued check value"
+    );
 }

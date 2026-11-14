@@ -136,7 +136,11 @@ impl Json {
 fn write_fraction(out: &mut String, numerator: u32) {
     let scaled = u128::from(numerator) * FRACTION_SCALE;
     let digits = format!("{scaled:0FRACTION_DIGITS$}");
-    assert_eq!(digits.len(), FRACTION_DIGITS, "a fraction below one has fraction_digits decimals");
+    assert_eq!(
+        digits.len(),
+        FRACTION_DIGITS,
+        "a fraction below one has fraction_digits decimals"
+    );
     let trimmed = digits.trim_end_matches('0');
     let shown = if trimmed.is_empty() { "0" } else { trimmed };
     write!(out, "0.{shown}").expect("writing to a string succeeds");
@@ -250,7 +254,11 @@ impl Parser<'_> {
     fn fraction(&mut self) -> Result<Json, String> {
         self.offset += 1;
         let start = self.offset;
-        while self.bytes.get(self.offset).is_some_and(|byte| byte.is_ascii_digit()) {
+        while self
+            .bytes
+            .get(self.offset)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
             self.offset += 1;
         }
         if matches!(self.bytes.get(self.offset), Some(b'e' | b'E')) {
@@ -258,7 +266,9 @@ impl Parser<'_> {
         }
         match fraction_from(&self.bytes[start..self.offset]) {
             Some(numerator) => Ok(Json::Fraction(numerator)),
-            None => self.fail(&format!("a fraction here is a multiple of 2^-{FRACTION_BITS} below one")),
+            None => self.fail(&format!(
+                "a fraction here is a multiple of 2^-{FRACTION_BITS} below one"
+            )),
         }
     }
 
@@ -692,7 +702,10 @@ fn record_body(record: &Record) -> Json {
             ("digest", Json::text(handler)),
             ("first", Json::Number(FIRST_SEQ)),
             ("hand", Json::Null),
-            ("metadata", Json::object(vec![("handler", Json::text(handler))])),
+            (
+                "metadata",
+                Json::object(vec![("handler", Json::text(handler))]),
+            ),
             ("prompt", arguments.clone()),
             ("turn", turn_text(*turn)),
         ]),
@@ -811,12 +824,22 @@ fn record_body(record: &Record) -> Json {
 }
 
 fn recovery_ids(turn: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Json {
-    assert!(unknown.windows(2).all(|pair| pair[0] < pair[1]), "a recovery lists its top-level calls in seq order");
-    assert!(nested.windows(2).all(|pair| pair[0] < pair[1]), "a recovery lists its nested calls in order");
+    assert!(
+        unknown.windows(2).all(|pair| pair[0] < pair[1]),
+        "a recovery lists its top-level calls in seq order"
+    );
+    assert!(
+        nested.windows(2).all(|pair| pair[0] < pair[1]),
+        "a recovery lists its nested calls in order"
+    );
     let mut keyed: Vec<((u64, u64), String)> = unknown
         .iter()
         .map(|seq| ((*seq, 0), call_id(turn, *seq)))
-        .chain(nested.iter().map(|(seq, id)| ((*seq, *id), nested_id(turn, *seq, *id))))
+        .chain(
+            nested
+                .iter()
+                .map(|(seq, id)| ((*seq, *id), nested_id(turn, *seq, *id))),
+        )
         .collect();
     keyed.sort();
     Json::Array(keyed.into_iter().map(|(_, id)| Json::String(id)).collect())
@@ -1029,7 +1052,9 @@ fn recovery_from(fields: &Fields<'_>) -> Result<Record, String> {
     }
     unknown.sort_unstable();
     nested.sort_unstable();
-    if unknown.windows(2).any(|pair| pair[0] == pair[1]) || nested.windows(2).any(|pair| pair[0] == pair[1]) {
+    if unknown.windows(2).any(|pair| pair[0] == pair[1])
+        || nested.windows(2).any(|pair| pair[0] == pair[1])
+    {
         return Err("recovery lists a call twice".to_owned());
     }
     let ids = recovery_ids(turn, &unknown, &nested);
@@ -1219,7 +1244,10 @@ impl TurnLog {
 pub enum Start {
     #[default]
     Beginning,
-    Checkpoint { revision: u64, next_cell: u64 },
+    Checkpoint {
+        revision: u64,
+        next_cell: u64,
+    },
 }
 
 impl Start {
@@ -1295,11 +1323,23 @@ pub fn fold_from(start: Start, records: &[Record]) -> Result<Session, String> {
     let rest = match start {
         Start::Beginning => records,
         Start::Checkpoint { revision, .. } => {
-            let Some((Record::Checkpoint { revision: first, payload, .. }, rest)) = records.split_first() else {
-                return Err(format!("a journal read from checkpoint {revision} does not start with it"));
+            let Some((
+                Record::Checkpoint {
+                    revision: first,
+                    payload,
+                    ..
+                },
+                rest,
+            )) = records.split_first()
+            else {
+                return Err(format!(
+                    "a journal read from checkpoint {revision} does not start with it"
+                ));
             };
             if *first != revision {
-                return Err(format!("a journal read from checkpoint {revision} starts with checkpoint {first}"));
+                return Err(format!(
+                    "a journal read from checkpoint {revision} starts with checkpoint {first}"
+                ));
             }
             session.checkpoints.insert(revision, payload.clone());
             rest
@@ -1316,7 +1356,9 @@ fn admit(session: &mut Session, turn: u64, handler: &str, arguments: &Json) -> R
         && session.turns.is_empty()
         && turn != revision + 1
     {
-        return Err(format!("turn {turn} is admitted after checkpoint {revision}"));
+        return Err(format!(
+            "turn {turn} is admitted after checkpoint {revision}"
+        ));
     }
     if let Some((last, log)) = session.turns.last_key_value() {
         if turn != last + 1 {
@@ -1352,7 +1394,12 @@ fn nested_call(log: &mut TurnLog, turn: u64, id: (u64, u64), call: Call) -> Resu
     Ok(())
 }
 
-fn close_nested(session: &mut Session, turn: u64, id: (u64, u64), output: &Output) -> Result<(), String> {
+fn close_nested(
+    session: &mut Session,
+    turn: u64,
+    id: (u64, u64),
+    output: &Output,
+) -> Result<(), String> {
     let (seq, nested) = id;
     let log = running(session, turn, "a nested result")?;
     let site = log.nested.get_mut(&id).ok_or_else(|| {
@@ -1387,7 +1434,12 @@ fn recover_nested(log: &mut TurnLog, turn: u64, id: (u64, u64)) -> Result<(), St
     Ok(())
 }
 
-fn apply_cell(session: &mut Session, cell: u64, fresh: bool, update: &CellUpdate) -> Result<(), String> {
+fn apply_cell(
+    session: &mut Session,
+    cell: u64,
+    fresh: bool,
+    update: &CellUpdate,
+) -> Result<(), String> {
     if !fresh {
         let (turn, seq) = *session
             .cell_origins
@@ -1401,7 +1453,10 @@ fn apply_cell(session: &mut Session, cell: u64, fresh: bool, update: &CellUpdate
         return folded.apply(update);
     }
     if cell < session.next_cell() {
-        return Err(format!("cell {cell} starts before cell {}", session.next_cell()));
+        return Err(format!(
+            "cell {cell} starts before cell {}",
+            session.next_cell()
+        ));
     }
     let header = update
         .header
@@ -1427,7 +1482,13 @@ fn apply_cell(session: &mut Session, cell: u64, fresh: bool, update: &CellUpdate
     Ok(())
 }
 
-fn event(session: &mut Session, turn: u64, seq: u64, at: u64, delivery: &Delivery) -> Result<(), String> {
+fn event(
+    session: &mut Session,
+    turn: u64,
+    seq: u64,
+    at: u64,
+    delivery: &Delivery,
+) -> Result<(), String> {
     if seq <= session.last_event {
         return Err(format!(
             "event {seq} of turn {turn} follows event {}",
@@ -1479,7 +1540,13 @@ fn close(session: &mut Session, turn: u64, seq: u64, output: &Output) -> Result<
     Ok(())
 }
 
-fn recover_record(session: &mut Session, turn: u64, attempt: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Result<(), String> {
+fn recover_record(
+    session: &mut Session,
+    turn: u64,
+    attempt: u64,
+    unknown: &[u64],
+    nested: &[(u64, u64)],
+) -> Result<(), String> {
     let log = running(session, turn, "a recovery")?;
     for id in nested {
         recover_nested(log, turn, *id)?;
@@ -1492,9 +1559,10 @@ fn recover_record(session: &mut Session, turn: u64, attempt: u64, unknown: &[u64
     }
     log.attempts = attempt;
     for seq in unknown {
-        let site = log.sites.get_mut(seq).ok_or_else(|| {
-            format!("recovery of seq {seq} of turn {turn}, which has no call")
-        })?;
+        let site = log
+            .sites
+            .get_mut(seq)
+            .ok_or_else(|| format!("recovery of seq {seq} of turn {turn}, which has no call"))?;
         let SiteLog::Open(call) = site else {
             return Err(format!(
                 "recovery of seq {seq} of turn {turn}, which is not open"

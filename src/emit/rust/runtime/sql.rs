@@ -33,7 +33,11 @@ pub enum SqlError {
 }
 
 pub trait Sql {
-    fn query(&mut self, statement: &Statement, values: &[SqlValue]) -> Result<Vec<Vec<Option<String>>>, SqlError>;
+    fn query(
+        &mut self,
+        statement: &Statement,
+        values: &[SqlValue],
+    ) -> Result<Vec<Vec<Option<String>>>, SqlError>;
     fn rollback(&mut self);
 }
 
@@ -108,13 +112,19 @@ fn column(row: &[Option<String>], statement: &Statement, name: &str) -> Result<u
     row.get(index)
         .and_then(|value| value.as_deref())
         .and_then(|text| text.parse().ok())
-        .ok_or_else(|| OpenError::Corrupt(format!("{} returned no number for {name}", statement.name)))
+        .ok_or_else(|| {
+            OpenError::Corrupt(format!("{} returned no number for {name}", statement.name))
+        })
 }
 
 pub fn sql_prepare(sql: &mut dyn Sql) -> Result<(), OpenError> {
     for statement in CONNECT.iter().chain(SCHEMA) {
-        assert!(statement.params.is_empty(), "setup statements take no parameters");
-        sql.query(statement, &[]).map_err(|error| OpenError::Sql(format!("{}: {error:?}", statement.name)))?;
+        assert!(
+            statement.params.is_empty(),
+            "setup statements take no parameters"
+        );
+        sql.query(statement, &[])
+            .map_err(|error| OpenError::Sql(format!("{}: {error:?}", statement.name)))?;
     }
     Ok(())
 }
@@ -128,7 +138,10 @@ pub fn sql_open(sql: &mut dyn Sql, journal: &mut SqlJournal) -> Result<Opened, O
         return Err(OpenError::Held);
     };
     if rows.len() != 1 {
-        return Err(OpenError::Corrupt(format!("acquire returned {} rows", rows.len())));
+        return Err(OpenError::Corrupt(format!(
+            "acquire returned {} rows",
+            rows.len()
+        )));
     }
     let epoch = column(row, &ACQUIRE, "epoch")?;
     let head = column(row, &ACQUIRE, "head")?;
@@ -140,13 +153,24 @@ pub fn sql_open(sql: &mut dyn Sql, journal: &mut SqlJournal) -> Result<Opened, O
     for (index, row) in rows.iter().enumerate() {
         let seq = column(row, &LOAD, "seq")?;
         if seq != index as u64 + 1 {
-            return Err(OpenError::Corrupt(format!("row {} has seq {seq}", index + 1)));
+            return Err(OpenError::Corrupt(format!(
+                "row {} has seq {seq}",
+                index + 1
+            )));
         }
         let text = row
-            .get(LOAD.returns.iter().position(|name| *name == "record").expect("load returns record"))
+            .get(
+                LOAD.returns
+                    .iter()
+                    .position(|name| *name == "record")
+                    .expect("load returns record"),
+            )
             .and_then(|value| value.as_deref())
             .ok_or_else(|| OpenError::Corrupt(format!("row {} has no record", index + 1)))?;
-        records.push(decode_line(text, false).map_err(|error| OpenError::Corrupt(format!("row {}: {error}", index + 1)))?);
+        records.push(
+            decode_line(text, false)
+                .map_err(|error| OpenError::Corrupt(format!("row {}: {error}", index + 1)))?,
+        );
     }
     if records.len() as u64 != head {
         return Err(OpenError::Corrupt(format!(
@@ -160,18 +184,27 @@ pub fn sql_open(sql: &mut dyn Sql, journal: &mut SqlJournal) -> Result<Opened, O
 }
 
 pub fn rows_turn(records: &[Record], before: u64) -> u64 {
-    records.iter().fold(before, |turn, record| record.turn().unwrap_or(turn))
+    records
+        .iter()
+        .fold(before, |turn, record| record.turn().unwrap_or(turn))
 }
 
 pub fn batch_json(records: &[Record], head: u64, last_turn: u64) -> String {
-    assert!(!records.is_empty(), "a durability point commits at least one record");
+    assert!(
+        !records.is_empty(),
+        "a durability point commits at least one record"
+    );
     let mut rows = Vec::with_capacity(records.len());
     let mut turn = last_turn;
     for (index, record) in records.iter().enumerate() {
         turn = record.turn().unwrap_or(turn);
         assert!(turn > 0, "a cell row follows its site's call row");
         let text = record_json(record).encode();
-        assert_eq!(decode_line(&text, false).as_ref(), Ok(record), "a row's record decodes back");
+        assert_eq!(
+            decode_line(&text, false).as_ref(),
+            Ok(record),
+            "a row's record decodes back"
+        );
         rows.push(Json::object(vec![
             ("kind", Json::text(record.tag())),
             ("record", Json::String(text)),
@@ -182,7 +215,12 @@ pub fn batch_json(records: &[Record], head: u64, last_turn: u64) -> String {
     Json::Array(rows).encode()
 }
 
-pub fn sql_flush(sql: &mut dyn Sql, journal: &mut SqlJournal, epoch: u64, records: &[Record]) -> Result<(), Stop> {
+pub fn sql_flush(
+    sql: &mut dyn Sql,
+    journal: &mut SqlJournal,
+    epoch: u64,
+    records: &[Record],
+) -> Result<(), Stop> {
     let batch = batch_json(records, journal.head, journal.last_turn);
     for statement in COMMIT {
         let values = journal.values(statement, epoch, &batch);
@@ -226,7 +264,11 @@ impl<H: Host> World for SqlWorld<'_, H> {
         self.host.listing(request)
     }
 
-    fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+    fn tools(
+        &mut self,
+        requests: &[ToolRequest<'_>],
+        limit: Option<u64>,
+    ) -> Result<Vec<(usize, Output)>, Stop> {
         host_tools(self.host, requests, limit)
     }
 
@@ -275,10 +317,16 @@ pub enum RunError {
     Exit(Exit),
 }
 
-pub fn run_sql<H: Host>(host: &mut H, sql: &mut dyn Sql, journal: &mut SqlJournal, request: &TurnRequest) -> Result<Ran, RunError> {
+pub fn run_sql<H: Host>(
+    host: &mut H,
+    sql: &mut dyn Sql,
+    journal: &mut SqlJournal,
+    request: &TurnRequest,
+) -> Result<Ran, RunError> {
     let opened = sql_open(sql, journal).map_err(RunError::Open)?;
     let mut world = SqlWorld { host, sql, journal };
-    let ran = run_turn(&mut world, opened.epoch, &opened.records, request).map_err(RunError::Exit)?;
+    let ran =
+        run_turn(&mut world, opened.epoch, &opened.records, request).map_err(RunError::Exit)?;
     if let Ran::AlreadyFinished(finish) = &ran {
         world.host.acknowledge(finish);
     }
