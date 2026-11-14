@@ -1,4 +1,7 @@
 mod handler;
+mod inline;
+
+pub use inline::STATEMENTS_PER_HANDLER_MAX;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -49,8 +52,9 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
     sums(source, &mut program, &mut globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
-    invariants(source, &mut program, &globals)?;
-    handlers(source, &mut program, &globals)?;
+    let expanded = inline::expand(source, &program, &globals, &mut values)?;
+    invariants(&expanded, &mut program, &globals)?;
+    handlers(&expanded, &mut program, &globals)?;
     ir::validate::program(&program);
     Ok(program)
 }

@@ -146,9 +146,11 @@ yields `unknown`.
 
 `let`, assignment to a state field, `push list value`, `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
-`return value`. There is no recursion, no unbounded loop and no user function:
-a handler is straight-line code over bounded loops, so its worst case is a
-number the checker computes.
+`return value`, and a call of a `fn`, whose body the checker inlines at each
+call before lowering, in a scope that sees only its parameters and the
+harness's declarations. There is no recursion (a fn may not call itself,
+directly or through others) and no unbounded loop: a handler is straight-line
+code over bounded loops, so its worst case is a number the checker computes.
 
 ### Code mode
 

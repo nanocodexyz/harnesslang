@@ -238,8 +238,16 @@ impl Checker<'_> {
 
     fn statement(&mut self, statement: &ast::Stmt, out: &mut Vec<Stmt>) -> Checked<bool> {
         match statement {
-            ast::Stmt::Let { name, value } => {
-                let (value, ty) = self.expr(value, None, out)?;
+            ast::Stmt::Let { name, ty, value } => {
+                let wanted = match ty {
+                    Some(ty) => Some(resolve(self.program, self.globals, ty)?),
+                    None => None,
+                };
+                let at = value.at();
+                let (value, ty) = self.expr(value, wanted.as_ref(), out)?;
+                if let Some(wanted) = &wanted {
+                    self.expect(at, wanted, &ty)?;
+                }
                 let local = self.declare(name, ty)?;
                 out.push(Stmt::Let { local, value });
                 Ok(false)
@@ -291,7 +299,47 @@ impl Checker<'_> {
                 out.push(Stmt::Finish { value });
                 Ok(true)
             }
+            ast::Stmt::Inlined {
+                arguments, body, ..
+            } => self.inlined(arguments, body, out),
+            ast::Stmt::Call { callee, .. } => {
+                panic!(
+                    "fn calls are inlined before checking, yet '{}' is still a call",
+                    callee.text
+                )
+            }
         }
+    }
+
+    fn inlined(
+        &mut self,
+        arguments: &[(ast::Param, ast::Expr)],
+        body: &ast::Block,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let mut parameters = Vec::with_capacity(arguments.len());
+        for (param, argument) in arguments {
+            let wanted = resolve(self.program, self.globals, &param.ty)?;
+            let at = argument.at();
+            let (value, ty) = self.expr(argument, Some(&wanted), out)?;
+            self.expect(at, &wanted, &ty)?;
+            let caller = std::mem::replace(&mut self.scopes, vec![parameters]);
+            let declared = self.declare(&param.name, ty);
+            let mut own = std::mem::replace(&mut self.scopes, caller);
+            parameters = own.pop().expect("the fn's parameters are its one scope");
+            assert!(own.is_empty(), "declaring a parameter adds no scope");
+            out.push(Stmt::Let {
+                local: declared?,
+                value,
+            });
+        }
+        let caller = std::mem::replace(&mut self.scopes, vec![parameters]);
+        let checked = self.block(body);
+        let own = std::mem::replace(&mut self.scopes, caller);
+        assert_eq!(own.len(), 1, "a fn body leaves only its parameters' scope");
+        let (statements, returned) = checked?;
+        out.extend(statements);
+        Ok(returned)
     }
 
     fn if_statement(
@@ -914,9 +962,11 @@ impl Checker<'_> {
     }
 }
 
-fn statement_at(statement: &ast::Stmt) -> Position {
+pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
     match statement {
         ast::Stmt::Let { name, .. } | ast::Stmt::Assign { name, .. } => name.at,
+        ast::Stmt::Call { callee, .. } => callee.at,
+        ast::Stmt::Inlined { at, .. } => *at,
         ast::Stmt::Push { at, .. }
         | ast::Stmt::If { at, .. }
         | ast::Stmt::Match { at, .. }

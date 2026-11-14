@@ -1,0 +1,18 @@
+harness fn_hidden_name
+
+const notes_max: u64 = 64
+
+state {
+  notes: list<text, notes_max>
+}
+
+fn remember() {
+  push notes input
+}
+
+on add(input: text) -> u64
+  requires len(notes) < notes_max
+{
+  remember()
+  return len(notes)
+}

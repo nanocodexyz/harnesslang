@@ -1,0 +1,10 @@
+harness notes
+
+fn greet(name: text) {
+  return "hello " ++ name
+}
+
+on ping(name: text) -> text {
+  let words = greet(name)
+  return words
+}

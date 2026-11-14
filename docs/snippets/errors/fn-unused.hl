@@ -1,0 +1,11 @@
+harness notes
+
+state {
+  count: u64
+}
+
+fn reset() {
+  count = 0
+}
+
+on ping() -> u64 { return count }

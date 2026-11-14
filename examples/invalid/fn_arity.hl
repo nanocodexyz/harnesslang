@@ -1,0 +1,18 @@
+harness fn_arity
+
+const notes_max: u64 = 64
+
+state {
+  notes: list<text, notes_max>
+}
+
+fn note(label: text, body: text) {
+  push notes label ++ ": " ++ body
+}
+
+on add(body: text) -> u64
+  requires len(notes) < notes_max
+{
+  note(body)
+  return len(notes)
+}
