@@ -101,6 +101,46 @@ fn raw(text: &str) -> Value {
     serde_json::from_str(text).expect("a RawValue nanocode decoded is JSON")
 }
 
+fn phase(found: &Phase, ours: &TurnSummary) -> Vec<String> {
+    let mut wrong = Vec::new();
+    match found {
+        Phase::Finished {
+            last,
+            outcome,
+            result,
+        } => {
+            if ours.phase != summary::Phase::Finished {
+                wrong.push(format!(
+                    "phase: nanocode finished, interpreter {:?}",
+                    ours.phase
+                ));
+            }
+            if ours.outcome != Some(*outcome) || ours.last != Some(*last) {
+                wrong.push(format!(
+                    "outcome: nanocode {outcome:?} at {last}, interpreter {:?} at {:?}",
+                    ours.outcome, ours.last
+                ));
+            }
+            if raw(result.get()) != ours.result {
+                wrong.push(format!(
+                    "result: nanocode {}, interpreter {}",
+                    result.get(),
+                    ours.result
+                ));
+            }
+        }
+        Phase::Queued { .. } | Phase::Running { .. } => {
+            if ours.phase != summary::Phase::Running || ours.outcome.is_some() {
+                wrong.push(format!(
+                    "phase: nanocode running, interpreter {:?} {:?}",
+                    ours.phase, ours.outcome
+                ));
+            }
+        }
+    }
+    wrong
+}
+
 struct Check<'a> {
     journal: &'a str,
     header: &'a Header,
@@ -389,42 +429,7 @@ impl<'a> Check<'a> {
             self.disagree(Some(index), format!("nanocode's fold has no turn {turn}"));
             return;
         };
-        let mut wrong = Vec::new();
-        match &found.phase {
-            Phase::Finished {
-                last,
-                outcome,
-                result,
-            } => {
-                if ours.phase != summary::Phase::Finished {
-                    wrong.push(format!(
-                        "phase: nanocode finished, interpreter {:?}",
-                        ours.phase
-                    ));
-                }
-                if ours.outcome != Some(*outcome) || ours.last != Some(*last) {
-                    wrong.push(format!(
-                        "outcome: nanocode {outcome:?} at {last}, interpreter {:?} at {:?}",
-                        ours.outcome, ours.last
-                    ));
-                }
-                if raw(result.get()) != ours.result {
-                    wrong.push(format!(
-                        "result: nanocode {}, interpreter {}",
-                        result.get(),
-                        ours.result
-                    ));
-                }
-            }
-            Phase::Queued { .. } | Phase::Running { .. } => {
-                if ours.phase != summary::Phase::Running || ours.outcome.is_some() {
-                    wrong.push(format!(
-                        "phase: nanocode running, interpreter {:?} {:?}",
-                        ours.phase, ours.outcome
-                    ));
-                }
-            }
-        }
+        let mut wrong = phase(&found.phase, ours);
         if found.digest != ours.handler || raw(found.prompt.get()) != ours.arguments {
             wrong.push(format!(
                 "admission: nanocode {} {}, interpreter {} {}",
