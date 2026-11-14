@@ -212,7 +212,6 @@ Measurements (5-core Linux Hand shared with two other agents, `nice`):
 
 Commands: `hl check docs/snippets/recovery.hl`, `hl sim --target T --seeds 0..2000 docs/snippets/recovery.hl`, `hl sim --target T --seeds 0..300 --strict docs/snippets/recovery.hl`, `MUTATIONS=M scripts/mutations.sh`, `RUST_DIFF_FILES=docs/snippets/recovery.hl RUST_DIFF_SEEDS=0..200 RUST_DIFF_OPT=0 scripts/rust-diff.sh`, `JS_DIFF_FILES=docs/snippets/recovery.hl JS_DIFF_SEEDS=0..200 scripts/js-diff.sh`, `hl-agent run --instruction tasks/T/instruction.md --cwd SCRATCH --model claude-haiku-4-5 --journal J` then `tests/test.sh`, `scripts/agent-drill.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
 
-<<<<<<< HEAD
 ## 2026-11-14: listing notices, tool search and blobs; claude_code.hl reads images, evicts them as nanocode does, rereads its MCP listing each round and finds deferred tools
 
 What this establishes (branch gaps-6-8, from master 8549e8a), closing GAPS.md gap 6 and the images and structured results of gap 8:
@@ -246,7 +245,7 @@ Measurements (5-core Linux Hand shared with two other agents, `nice`, 2 check jo
 - `scripts/agent-drill.sh` (mock, seed 1): 11 kills (8 in a model call, 3 in a tool), 7 external dispatches, none repeated, 1 blob journaled with its data; `batch_flush_after_dispatch` still caught.
 
 Commands: `hl sim --target T --seeds 0..2000 F`, `MUTATIONS=M scripts/mutations.sh`, `scripts/mutations.sh --diff BACKEND:blob_unjournaled:TARGET`, `RUST_DIFF_FILES=F RUST_DIFF_SEEDS=0..200 scripts/rust-diff.sh`, `JS_DIFF_FILES=F JS_DIFF_SEEDS=0..200 scripts/js-diff.sh`, `hl-agent run --instruction tasks/T/instruction.md --cwd SCRATCH --model claude-haiku-4-5 --journal J` then `tests/test.sh`, `AGENT_DRILL_SEED=1 scripts/agent-drill.sh`, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
-=======
+
 ## 2026-11-14: hl-agent against nanocode's own Claude agent on 20 tasks, same model, same containers
 
 `evals/` runs a suite of nanoeval-format tasks (`instruction.md`, `environment/`, `tests/test.sh`, unchanged) with two agents and compares them. It is outside the compiler build (Python standard library and shell, like `oracle/` is outside it).
@@ -307,4 +306,3 @@ Losses and limits, kept:
 - Spend: $25.94 for the two measured arms, $0.66 for the Bash-fix arm, a few cents of claude-haiku-4-5 while developing.
 
 Commands: `NANOCODE_DIR=<nanocode checkout> HL_AGENT=<hl-agent binary> sh evals/setup.sh`, then `python3 evals/run.py --suite evals/suite.txt --tasks output/eval/tasks --agent-root output/eval/agent-root --out output/eval/main --agents nanocode,hl-agent --attempts 3 --model claude-sonnet-4-6 --parallel 3 --limits none` and `python3 evals/report.py output/eval/main`. A second runner at once needs its own `--meter-port` and `--relay-port`.
->>>>>>> master
