@@ -62,7 +62,8 @@ The model reaches it like any tool, through `dispatch(call)`, whose type
 stays `maybe<text>`, or a handler calls it directly: `let out = exec(script)`
 has type `maybe<text>`:
 
-- `ok(output)`: the cell finished; `output` is what it returned and printed.
+- `ok(output)`: the cell finished; `output` is what it printed, one line per
+  `console.log`, as djs gives it (a script's return value is not part of it).
 - `failed(error)`: the script threw, or a limit stopped it.
 - `unknown`: the cell could not be resumed (a divergence, or its journal
   passed `journal_bytes`); nested calls it made may have run. The text the
@@ -74,8 +75,7 @@ the script receives it as a failed call carrying nanocode's
 
 Inside the cell the script sees `tools.<name>(input)` for each listed tool
 (a promise of its text, or a rejection with the tool's error), `setTimeout`,
-`Date.now()`, `performance.now()`, `Math.random()` and
-`crypto.getRandomValues`, each journaled, and no network, file or process
+`Date.now()`, `performance.now()` and `Math.random()`, each journaled, and no network, file or process
 access of its own: every effect is a nested call. A program may declare more
 than one `code` tool, each with its own tool set.
 
@@ -157,7 +157,7 @@ in the session from 1. `session` is the session's name.
 | header | the cell starts | `cell` with `fresh` and `header`, `seq` 0 | rides the next flush, which C1 and C2 force |
 | nested call | a nested call starts | a `Call` entry and its `running` `JournaledCall`; for an `external` tool also harnesslang's `call` record, id `<origin>/code-<id>`, effect `external` | external: flushed before dispatch (C1); none and idempotent: ride |
 | nested result | a nested call returns | a `Result` entry and the call `completed`; for an `external` tool also a `result` record for its id | rides the next flush |
-| queued | a call over `parallel` | the call `queued`, no entry yet; its `Call` entry is written when it starts | rides |
+| queued | a call over `parallel` | its `Call` entry, written when the script issues the call as nanocode's engine does, and the call `queued`; it turns `running` when a slot frees, and an external one gets its `call` record and C1 then | rides |
 | timeout | the script arms a timer | a `Timeout { id, delay_ms, at_ms }` entry, `at_ms` from the world clock | flushed before the cell waits when the header is not yet durable (C2), else rides |
 | timer | a timer fires | a `Timer { id }` entry | rides |
 | clock, random | the script reads one | `Clock`, `Monotonic`, `Random`, `Bytes` entries | ride |

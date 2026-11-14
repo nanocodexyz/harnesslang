@@ -239,6 +239,7 @@ pub trait CellHost {
     fn clock(&mut self) -> u64;
     fn random(&mut self) -> u64;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
+    fn waited(&mut self, wait: &Wait) -> bool;
     fn observe(&mut self, event: &CellEvent);
 }
 
@@ -376,6 +377,7 @@ struct Runner<'a, 'h> {
     entries: u64,
     fresh_entries: Vec<Entry>,
     changed: BTreeMap<u64, JournaledCall>,
+    journaled: BTreeMap<u64, CallState>,
     next_seq: u64,
     header: Option<Header>,
     header_unsaved: bool,
@@ -431,6 +433,14 @@ impl<'a, 'h> Runner<'a, 'h> {
             }
         };
         let consult = matches!(site.cell, Cell::Existing(_)) && !ignores;
+        let journaled = match site.cell {
+            Cell::Existing(log) if !ignores => log
+                .calls
+                .iter()
+                .map(|(id, call)| (*id, call.state.clone()))
+                .collect(),
+            Cell::Existing(_) | Cell::Fresh(_) => BTreeMap::new(),
+        };
         Self {
             code,
             host,
@@ -444,6 +454,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             entries,
             fresh_entries: Vec::new(),
             changed: BTreeMap::new(),
+            journaled,
             next_seq,
             header_unsaved: false,
             header,
@@ -603,6 +614,9 @@ impl<'a, 'h> Runner<'a, 'h> {
         }
         let entries = std::mem::take(&mut self.fresh_entries);
         let calls: Vec<JournaledCall> = std::mem::take(&mut self.changed).into_values().collect();
+        for call in &calls {
+            self.journaled.insert(call.id, call.state.clone());
+        }
         let entries_from = self.entries - entries.len() as u64;
         let fresh = header.is_some();
         assert_eq!(
@@ -654,6 +668,10 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn changed(&mut self, id: u64) {
         if self.live {
             let journaled = self.journaled(id);
+            if self.journaled.get(&id) == Some(&journaled.state) {
+                self.changed.remove(&id);
+                return;
+            }
             self.changed.insert(id, journaled);
         }
     }
@@ -689,6 +707,17 @@ impl<'a, 'h> Runner<'a, 'h> {
         } else {
             None
         };
+        let step = Entry::Call {
+            id,
+            name: name.clone(),
+            input: input.clone(),
+        };
+        let recorded = self.record(step);
+        let record = if self.live {
+            id - self.id_shift.min(id - 1)
+        } else {
+            id
+        };
         self.calls.insert(
             id,
             Nested {
@@ -698,13 +727,19 @@ impl<'a, 'h> Runner<'a, 'h> {
                 phase: Phase::Queued,
                 output: None,
                 refused,
-                record: if self.live {
-                    id - self.id_shift.min(id - 1)
-                } else {
-                    id
-                },
+                record,
             },
         );
+        if let Err(diverged) = recorded {
+            if matches!(diverged, Interrupt::Diverged(_))
+                && self.site.mutation == Mutation::DivergenceDispatches
+                && self.calls[&id].refused.is_none()
+            {
+                self.calls.get_mut(&id).expect("inserted").phase = Phase::Running;
+                self.run_tool(id)?;
+            }
+            return Err(diverged);
+        }
         if self.running() < self.code.parallel.value || self.unchecked() {
             return self.start_call(id);
         }
@@ -714,23 +749,10 @@ impl<'a, 'h> Runner<'a, 'h> {
     }
 
     fn start_call(&mut self, id: u64) -> Ran<()> {
-        let call = self.calls[&id].clone();
-        let step = Entry::Call {
-            id,
-            name: call.name.clone(),
-            input: call.input.clone(),
-        };
-        if let Err(diverged) = self.record(step) {
-            if matches!(diverged, Interrupt::Diverged(_))
-                && self.site.mutation == Mutation::DivergenceDispatches
-                && call.refused.is_none()
-            {
-                self.calls.get_mut(&id).expect("inserted").phase = Phase::Running;
-                self.run_tool(id)?;
-            }
-            return Err(diverged);
-        }
-        self.calls.get_mut(&id).expect("inserted").phase = Phase::Running;
+        self.calls
+            .get_mut(&id)
+            .expect("a started call was issued")
+            .phase = Phase::Running;
         self.changed(id);
         if self.live {
             self.settle(id, true)?;
@@ -813,7 +835,7 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn reopen(&mut self, id: u64) -> Ran<()> {
         let rid = self.record_id(id);
         if self.in_step() {
-            let attempt = self.host.attempt(self.site.seq, rid)?;
+            let attempt = self.host.attempt(self.site.seq, id)?;
             if attempt > 1 && self.site.mutation != Mutation::VercelNestedRetryRedispatches {
                 self.host.recovered(self.site.seq, rid)?;
                 self.header_unsaved = false;
@@ -835,6 +857,7 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn dispatch(&mut self, id: u64, fresh: bool) -> Ran<()> {
         let call = self.calls[&id].clone();
         let (_, class) = call.tool.expect("a dispatched call names a nested tool");
+        self.emit(false);
         if fresh && class == EffectClass::External {
             self.host.append(Record::NestedCall {
                 turn: self.site.turn,
@@ -867,7 +890,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             }
         }
         if first {
-            let attempt = self.host.attempt(self.site.seq, self.record_id(id))?;
+            let attempt = self.host.attempt(self.site.seq, id)?;
             assert!(
                 attempt == 1 || self.site.mutation == Mutation::CellReplayIgnoresJournal,
                 "a fresh nested external step starts at its first attempt"
@@ -1071,14 +1094,17 @@ impl<'a, 'h> Runner<'a, 'h> {
             self.host.flush()?;
             self.header_unsaved = false;
         }
-        self.host.hook(CellPoint::Waiting)?;
-        self.host.wait(&Wait {
+        let wait = Wait {
             cell: self.cell,
             code: self.site.code,
             timer: id,
             delay_ms,
             until_ms,
-        })?;
+        };
+        if !(self.site.target.wait_is_durable() && self.host.waited(&wait)) {
+            self.host.hook(CellPoint::Waiting)?;
+            self.host.wait(&wait)?;
+        }
         self.timers.remove(&id);
         self.append_entry(Entry::Timer { id })?;
         self.emit(false);

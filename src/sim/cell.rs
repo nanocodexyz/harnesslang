@@ -11,11 +11,10 @@ pub const OVER_LIMIT_PPM: u64 = 5_000;
 pub const OP_CALL_PPM: u64 = 400_000;
 pub const OP_PARALLEL_PPM: u64 = 150_000;
 pub const OP_SLEEP_PPM: u64 = 100_000;
-pub const OP_READ_PPM: u64 = 50_000;
 pub const OP_PRINT_PPM: u64 = 100_000;
 pub const END_RETURN_PPM: u64 = 700_000;
 pub const END_THROW_PPM: u64 = 100_000;
-pub const BYTES_LENGTH_MAX: u64 = 16;
+pub const READ_KINDS: u64 = 3;
 pub const SLEEP_MS_MAX: u64 = 1_000;
 pub const DIVERGENCE_PPM: u64 = 10_000;
 
@@ -210,11 +209,10 @@ impl Plan<'_> {
             } else if roll < OP_CALL_PPM + OP_PARALLEL_PPM + OP_SLEEP_PPM + OP_PRINT_PPM {
                 Op::Print(crate::sim::world::SimWorld::generated_text(rng))
             } else {
-                match rng.below(4) {
+                match rng.below(READ_KINDS) {
                     0 => Op::Clock,
                     1 => Op::Monotonic,
-                    2 => Op::Random,
-                    _ => Op::Bytes(rng.range(1, BYTES_LENGTH_MAX)),
+                    _ => Op::Random,
                 }
             };
             if calls > calls_max || timers > timers_max {
@@ -340,15 +338,12 @@ impl Machine {
                     continue;
                 }
                 Op::Throw(error) => (Await::Ended, Step::Threw { error }),
-                Op::Return(text) => {
-                    self.printed.push(text);
-                    (
-                        Await::Ended,
-                        Step::Done {
-                            output: self.printed.join("\n"),
-                        },
-                    )
-                }
+                Op::Return(_) => (
+                    Await::Ended,
+                    Step::Done {
+                        output: self.printed.join("\n"),
+                    },
+                ),
             };
             self.state = state;
             return step;

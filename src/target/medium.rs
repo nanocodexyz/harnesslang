@@ -82,6 +82,7 @@ pub struct Rows {
     pub epoch: u64,
     pub attempts: BTreeMap<(u64, u64), u64>,
     pub nested_attempts: BTreeMap<(u64, u64, u64), u64>,
+    pub waited: std::collections::BTreeSet<(u64, u64)>,
 }
 
 impl Rows {

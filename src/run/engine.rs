@@ -89,6 +89,7 @@ pub trait World {
     fn cell_resume(&mut self, cell: u64, input: Input) -> Step;
     fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64) -> Result<u64, Stop>;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
+    fn waited(&mut self, wait: &Wait) -> bool;
     fn observe(&mut self, event: &CellEvent);
 }
 
@@ -948,6 +949,10 @@ impl CellHost for Engine<'_> {
 
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
         self.world().wait(wait)
+    }
+
+    fn waited(&mut self, wait: &Wait) -> bool {
+        self.world().waited(wait)
     }
 
     fn observe(&mut self, event: &CellEvent) {

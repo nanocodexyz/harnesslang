@@ -16,7 +16,7 @@ use crate::sim::invariants::{Invariant, Violation};
 use crate::sim::rng::Rng;
 use crate::sim::trace::{self, Trace};
 use crate::target::medium::Medium;
-use crate::target::{self, Target};
+use crate::target::{self, Recovery, Target};
 
 pub const RESTARTS_PER_TURN_MAX: u64 = 12;
 pub const ANSWER_PPM: u64 = 350_000;
@@ -480,6 +480,11 @@ impl World for SimWorld<'_> {
         self.check_wait(wait);
         self.stats.waits += 1;
         self.clock = self.clock.max(wait.until_ms);
+        if let (Medium::Rows(rows), Recovery::InStep { .. }) =
+            (&mut self.medium, self.target.recovery)
+        {
+            rows.waited.insert((wait.cell, wait.timer));
+        }
         let clock = self.clock;
         self.record("wait", || {
             vec![
@@ -490,6 +495,18 @@ impl World for SimWorld<'_> {
             ]
         });
         Ok(())
+    }
+
+    fn waited(&mut self, wait: &Wait) -> bool {
+        let waited = matches!(&self.medium, Medium::Rows(rows) if rows.waited.contains(&(wait.cell, wait.timer)));
+        self.record("waited", || {
+            vec![
+                ("cell", Json::Number(wait.cell)),
+                ("timer", Json::Number(wait.timer)),
+                ("answer", Json::Bool(waited)),
+            ]
+        });
+        waited
     }
 
     fn observe(&mut self, event: &CellEvent) {
@@ -785,10 +802,10 @@ impl SimWorld<'_> {
             let fenced = !self.nested
                 && matches!(&self.medium, Medium::Rows(rows) if rows.fenced(self.run_epoch))
                 && self.target.target == Target::ServerPostgres;
-            if durable.reported.contains(&recorded) && !fenced {
+            if durable.reported.contains(id) && !fenced {
                 self.cell_fault(
                     Invariant::NestedExternalOnce,
-                    format!("nested external call {recorded} was dispatched after a recovery reported it unknown"),
+                    format!("nested external call {id} was dispatched after a recovery reported it unknown"),
                 );
             }
             let id = &recorded;
