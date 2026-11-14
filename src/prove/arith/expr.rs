@@ -248,11 +248,20 @@ impl Prover<'_> {
     }
 
     pub(super) fn assume(&mut self, mut state: State, condition: &Expr, truth: bool) -> State {
-        match self.goals(&state, condition, truth) {
-            Some(alternatives) if alternatives.is_empty() => state.facts.push(Linear::constant(1)),
-            Some(mut alternatives) if alternatives.len() == 1 => {
-                state.facts.extend(alternatives.remove(0));
+        let Some(alternatives) = self.goals(&state, condition, truth) else {
+            return state;
+        };
+        let mut possible = Vec::new();
+        for alternative in alternatives {
+            let mut system = state.facts.clone();
+            system.extend(alternative.iter().cloned());
+            if linear::feasible(&system, &mut self.budget).unwrap_or(true) {
+                possible.push(alternative);
             }
+        }
+        match possible.len() {
+            0 => state.facts.push(Linear::constant(1)),
+            1 => state.facts.extend(possible.remove(0)),
             _ => {}
         }
         state
