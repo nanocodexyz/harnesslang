@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+seeds="${MUTATION_SEEDS:-0..200}"
+hl=target/release/hl
+file=examples/agent.hl
+targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
+mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early"
+
+[ -x "$hl" ] || cargo build --release --locked
+
+for mutation in $mutations; do
+  applied=0
+  for target in $targets; do
+    set +e
+    output=$("$hl" sim --target "$target" --seeds "$seeds" --mutation "$mutation" "$file" 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -eq 2 ]; then
+      continue
+    fi
+    applied=$((applied + 1))
+    if [ "$status" -ne 1 ] || ! grep -q '^FAIL invariant=' <<< "$output"; then
+      echo "mutation $mutation on $target was not caught in seeds $seeds:" >&2
+      echo "$output" >&2
+      exit 1
+    fi
+    echo "caught $mutation on $target: $(head -1 <<< "$output" | cut -d: -f1)"
+  done
+  if [ "$applied" -eq 0 ]; then
+    echo "mutation $mutation applies to no target" >&2
+    exit 1
+  fi
+done
+echo "mutations: every mutation is caught"
