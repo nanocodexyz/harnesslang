@@ -87,7 +87,13 @@ pub trait World {
     fn acknowledge(&mut self, finish: &Finish);
     fn cell_start(&mut self, cell: u64, script: &str) -> Step;
     fn cell_resume(&mut self, cell: u64, input: Input) -> Step;
-    fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64) -> Result<u64, Stop>;
+    fn nested_attempt(
+        &mut self,
+        turn: u64,
+        seq: u64,
+        nested: u64,
+        first: bool,
+    ) -> Result<u64, Stop>;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn waited(&mut self, wait: &Wait) -> bool;
     fn observe(&mut self, event: &CellEvent);
@@ -920,9 +926,9 @@ impl CellHost for Engine<'_> {
         self.world().tool(request)
     }
 
-    fn attempt(&mut self, seq: u64, nested: u64) -> Result<u64, Stop> {
+    fn attempt(&mut self, seq: u64, nested: u64, first: bool) -> Result<u64, Stop> {
         let turn = self.turn;
-        self.world().nested_attempt(turn, seq, nested)
+        self.world().nested_attempt(turn, seq, nested, first)
     }
 
     fn recovered(&mut self, seq: u64, nested: u64) -> Result<(), Stop> {

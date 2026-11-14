@@ -234,7 +234,7 @@ pub trait CellHost {
     fn start(&mut self, cell: u64, script: &str) -> Step;
     fn resume(&mut self, cell: u64, input: Input) -> Step;
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
-    fn attempt(&mut self, seq: u64, nested: u64) -> Result<u64, Stop>;
+    fn attempt(&mut self, seq: u64, nested: u64, first: bool) -> Result<u64, Stop>;
     fn recovered(&mut self, seq: u64, nested: u64) -> Result<(), Stop>;
     fn clock(&mut self) -> u64;
     fn random(&mut self) -> u64;
@@ -835,7 +835,7 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn reopen(&mut self, id: u64) -> Ran<()> {
         let rid = self.record_id(id);
         if self.in_step() {
-            let attempt = self.host.attempt(self.site.seq, id)?;
+            let attempt = self.host.attempt(self.site.seq, id, false)?;
             if attempt > 1 && self.site.mutation != Mutation::VercelNestedRetryRedispatches {
                 self.host.recovered(self.site.seq, rid)?;
                 self.header_unsaved = false;
@@ -890,7 +890,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             }
         }
         if first {
-            let attempt = self.host.attempt(self.site.seq, id)?;
+            let attempt = self.host.attempt(self.site.seq, id, true)?;
             assert!(
                 attempt == 1 || self.site.mutation == Mutation::CellReplayIgnoresJournal,
                 "a fresh nested external step starts at its first attempt"

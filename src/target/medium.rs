@@ -107,10 +107,39 @@ impl Rows {
         *attempts
     }
 
-    pub fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64) -> u64 {
+    pub fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64, first: bool) -> u64 {
         let attempts = self.nested_attempts.entry((turn, seq, nested)).or_insert(0);
-        *attempts += 1;
+        if first {
+            *attempts += 1;
+        }
         *attempts
+    }
+
+    pub fn step_reexecuted(&mut self, records: &[Record]) {
+        let mut open = std::collections::BTreeSet::new();
+        for record in records {
+            match record {
+                Record::NestedCall {
+                    turn, seq, nested, ..
+                } => {
+                    open.insert((*turn, *seq, *nested));
+                }
+                Record::NestedResult {
+                    turn, seq, nested, ..
+                } => {
+                    open.remove(&(*turn, *seq, *nested));
+                }
+                Record::Recovery { turn, nested, .. } => {
+                    for (seq, inner) in nested {
+                        open.remove(&(*turn, *seq, *inner));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for key in open {
+            *self.nested_attempts.entry(key).or_insert(0) += 1;
+        }
     }
 
     pub fn open(&self) -> Result<Vec<Record>, String> {

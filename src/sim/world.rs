@@ -202,6 +202,11 @@ impl<'a> SimWorld<'a> {
         };
         self.opened("run", epoch, bytes);
         self.run_epoch = epoch;
+        if let (Medium::Rows(rows), Recovery::InStep { .. }) =
+            (&mut self.medium, self.target.recovery)
+        {
+            rows.step_reexecuted(&records);
+        }
         Ok((records, epoch))
     }
 
@@ -460,9 +465,15 @@ impl World for SimWorld<'_> {
         step
     }
 
-    fn nested_attempt(&mut self, turn: u64, seq: u64, nested: u64) -> Result<u64, Stop> {
+    fn nested_attempt(
+        &mut self,
+        turn: u64,
+        seq: u64,
+        nested: u64,
+        first: bool,
+    ) -> Result<u64, Stop> {
         let attempt = match &mut self.medium {
-            Medium::Rows(rows) => rows.nested_attempt(turn, seq, nested),
+            Medium::Rows(rows) => rows.nested_attempt(turn, seq, nested, first),
             Medium::Jsonl(_) => panic!("only step targets count attempts"),
         };
         self.record("attempt", || {
