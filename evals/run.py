@@ -312,7 +312,7 @@ def main():
                 row["id"] = task["source"] + "." + task["task"] + "." + agent + "." + str(attempt)
                 rows.append(row)
                 os.makedirs(os.path.join(runs, row["id"]), exist_ok=True)
-    with open(os.path.join(args.out, "run.json"), "w") as handle:
+    with open(os.path.join(args.out, "run-" + "-".join(agents) + ".json"), "w") as handle:
         json.dump({"argv": sys.argv[1:], "rows": len(rows), "started": time.time()}, handle, indent=1)
     gateway, upstream = network()
     env = container_env(gateway, upstream, args.relay_port)
