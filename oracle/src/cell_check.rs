@@ -15,6 +15,7 @@ const NESTED_ID_INFIX: &str = "/code-";
 const TOOL_NAME_KEY: &str = "name";
 const DIFFERENTIAL_SEED: u64 = 0;
 const DIFFERENTIAL_WALL_MS: u64 = 0;
+const REFUSED_TIMER_PREFIX: &str = "setTimeout: ";
 
 pub struct CellView {
     pub journal: CellJournal,
@@ -230,7 +231,7 @@ pub fn open_running(journal: &CellJournal) -> BTreeSet<u64> {
 
 pub enum SiteOutput {
     Ok(String),
-    Failed,
+    Failed(String),
     Unknown,
 }
 
@@ -263,8 +264,13 @@ pub fn differential(journal: &CellJournal, output: &SiteOutput) -> Result<(), St
     let entries = &journal.entries;
     let mut follow = Follow { expected: entries };
     let run = djs::run(&script, Some(entries.clone()), &mut follow)?;
+    let refused_timer = matches!(output, SiteOutput::Failed(error) if error.starts_with(REFUSED_TIMER_PREFIX))
+        && run.entries.len() == entries.len() + 1
+        && matches!(run.entries.last(), Some(JournalEntry::Timeout { .. }))
+        && matches!(run.terminal, Terminal::Waiting(_));
     let compared = match output {
         SiteOutput::Unknown if run.entries.len() >= entries.len() => &run.entries[..entries.len()],
+        SiteOutput::Failed(_) if refused_timer => &run.entries[..entries.len()],
         _ => &run.entries[..],
     };
     if let Some(difference) = cells::first_difference(compared, entries) {
@@ -279,15 +285,16 @@ pub fn differential(journal: &CellJournal, output: &SiteOutput) -> Result<(), St
             journal.cell_id
         )),
         (_, SiteOutput::Unknown) => Ok(()),
+        (_, SiteOutput::Failed(_)) if refused_timer => Ok(()),
         (Terminal::Done, SiteOutput::Ok(text)) if *text == run.text => {
             golden::resumes(&script, entries, &run)
         }
-        (Terminal::Threw(_), SiteOutput::Failed) => golden::resumes(&script, entries, &run),
+        (Terminal::Threw(_), SiteOutput::Failed(_)) => golden::resumes(&script, entries, &run),
         (terminal, SiteOutput::Ok(text)) => Err(format!(
             "djs replaying cell {} ends {terminal:?} with text {:?}; the site's result is ok({text:?})",
             journal.cell_id, run.text
         )),
-        (terminal, SiteOutput::Failed) => Err(format!(
+        (terminal, SiteOutput::Failed(_)) => Err(format!(
             "djs replaying cell {} ends {terminal:?} with text {:?}; the site's result is failed",
             journal.cell_id, run.text
         )),

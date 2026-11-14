@@ -601,7 +601,7 @@ impl<'a> Check<'a> {
                 {
                     SiteOutput::Unknown
                 }
-                (None, Some(_)) => SiteOutput::Failed,
+                (None, Some(Value::String(error))) => SiteOutput::Failed(error.clone()),
                 _ => {
                     return self.disagree(
                         Some(index),
