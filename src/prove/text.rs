@@ -30,6 +30,7 @@ impl<'a> Names<'a> {
                 .model
                 .as_ref()
                 .map_or_else(|| "model".to_owned(), |model| model.name.clone()),
+            SiteKind::Cell(code) => self.program.codes[code].name.clone(),
             kind => kind.name().to_owned(),
         };
         let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
