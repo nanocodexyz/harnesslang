@@ -1,0 +1,13 @@
+harness listing_unknown
+
+const docs_max: u64 = 16
+
+tools from listing(docs, docs_max) (query: text) effect external
+
+on admit() -> u64 {
+  match docs() {
+    ok(listed) => { return listed }
+    failed(error) => { return 0 }
+    unknown => { return 0 }
+  }
+}

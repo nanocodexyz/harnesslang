@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::Program;
+use crate::ir::{ListingId, Program};
 use crate::run::engine::Finish;
 use crate::run::journal::{self, Output, Record, call_id};
 use crate::run::json::Json;
@@ -20,6 +20,7 @@ pub enum Invariant {
     ReplayEqual,
     Panic,
     EnumValid,
+    ToolAdmitted,
     NoTrap,
     InvariantKept,
     WorstCase,
@@ -27,7 +28,7 @@ pub enum Invariant {
 }
 
 impl Invariant {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -37,6 +38,7 @@ impl Invariant {
         Self::ReplayEqual,
         Self::Panic,
         Self::EnumValid,
+        Self::ToolAdmitted,
         Self::NoTrap,
         Self::InvariantKept,
         Self::WorstCase,
@@ -54,6 +56,7 @@ impl Invariant {
             Self::ReplayEqual => "replay_equal",
             Self::Panic => "panic",
             Self::EnumValid => "enum_valid",
+            Self::ToolAdmitted => "tool_admitted",
             Self::NoTrap => "no_trap",
             Self::InvariantKept => "invariant_kept",
             Self::WorstCase => "worst_case",
@@ -181,6 +184,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     }
     let calls = seq_unique(records)?;
     enum_valid(world, records)?;
+    let refused = tool_admitted(world, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()
@@ -214,7 +218,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
             .dispatched
             .get(id)
             .map_or(0, |dispatched| dispatched.external);
-        if known && dispatches == 0 {
+        if known && dispatches == 0 && !refused.contains(id) {
             return violation(
                 Invariant::UnknownReported,
                 format!("external call {id} records a result although it was never dispatched"),
@@ -291,6 +295,160 @@ fn enum_valid(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation>
         }
     }
     Ok(())
+}
+
+type Admissions = BTreeMap<(u64, ListingId), BTreeMap<u64, Option<BTreeMap<String, String>>>>;
+
+struct Recorded<'r> {
+    turn: u64,
+    seq: u64,
+    tool: &'r str,
+    input: &'r Json,
+}
+
+fn admissions<'r>(
+    program: &Program,
+    records: &'r [Record],
+) -> (
+    BTreeMap<String, Recorded<'r>>,
+    Admissions,
+    Vec<(String, &'r Output)>,
+) {
+    let mut calls = BTreeMap::new();
+    let mut admissions: Admissions = BTreeMap::new();
+    let mut results = Vec::new();
+    for record in records {
+        match record {
+            Record::Call {
+                turn,
+                seq,
+                tool,
+                input,
+                ..
+            } => {
+                let recorded = Recorded {
+                    turn: *turn,
+                    seq: *seq,
+                    tool,
+                    input,
+                };
+                calls.insert(call_id(*turn, *seq), recorded);
+            }
+            Record::Result { turn, seq, output } => {
+                let id = call_id(*turn, *seq);
+                results.push((id.clone(), output));
+                let Some(call) = calls.get(&id) else { continue };
+                let listing = program
+                    .listings
+                    .iter()
+                    .position(|listing| listing.name == call.tool);
+                let Some(listing) = listing.filter(|_| *call.input == Json::Null) else {
+                    continue;
+                };
+                let tools = match output {
+                    Output::Ok(json) => value::admitted(json).ok(),
+                    Output::Failed(_) => None,
+                };
+                admissions
+                    .entry((*turn, listing))
+                    .or_default()
+                    .insert(*seq, tools);
+            }
+            _ => {}
+        }
+    }
+    (calls, admissions, results)
+}
+
+fn admitted_fingerprint<'a>(
+    admissions: &'a Admissions,
+    call: &Recorded<'_>,
+    listing: ListingId,
+    name: &str,
+) -> Option<&'a String> {
+    admissions
+        .get(&(call.turn, listing))?
+        .range(..call.seq)
+        .next_back()?
+        .1
+        .as_ref()?
+        .get(name)
+}
+
+fn tool_admitted(world: &SimWorld<'_>, records: &[Record]) -> Result<BTreeSet<String>, Violation> {
+    let program = world.program;
+    let (calls, admissions, results) = admissions(program, records);
+    for (id, executions) in &world.executed {
+        for executed in executions {
+            if let Some(params) = program.input_params(&executed.tool)
+                && let Err(error) = value::input_fits(program, params, &executed.input)
+            {
+                return violation(
+                    Invariant::ToolAdmitted,
+                    format!(
+                        "call {id} ({}) ran with input {}, which does not fit its declared input: {error}",
+                        executed.tool,
+                        executed.input.encode()
+                    ),
+                );
+            }
+        }
+        let last = executions
+            .last()
+            .expect("an executed call ran at least once");
+        let Some((listing, name)) = program.listed(&last.tool) else {
+            continue;
+        };
+        let Some(call) = calls.get(id).filter(|call| call.tool == last.tool) else {
+            continue;
+        };
+        let admitted = admitted_fingerprint(&admissions, call, listing, name);
+        if admitted != last.fingerprint.as_ref() {
+            return violation(
+                Invariant::ToolAdmitted,
+                format!(
+                    "listed call {id} ({}) ran as {:?} while listing {} admitted {:?} in turn {}: a tool that changed since admission must be refused",
+                    last.tool,
+                    last.fingerprint,
+                    program.listings[listing].name,
+                    admitted,
+                    call.turn
+                ),
+            );
+        }
+    }
+    Ok(refused(program, &calls, &admissions, results))
+}
+
+fn refused(
+    program: &Program,
+    calls: &BTreeMap<String, Recorded<'_>>,
+    admissions: &Admissions,
+    results: Vec<(String, &Output)>,
+) -> BTreeSet<String> {
+    let mut refused = BTreeSet::new();
+    for (id, output) in results {
+        let (Output::Failed(error), Some(call)) = (output, calls.get(&id)) else {
+            continue;
+        };
+        let invalid = match call.input {
+            Json::String(raw) => match value::tool_input(program, call.tool, raw) {
+                value::Input::Invalid(invalid) => Some(invalid),
+                value::Input::Untyped | value::Input::Typed(_) => None,
+            },
+            _ => None,
+        };
+        let expected = invalid.or_else(|| {
+            let (listing, name) = program.listed(call.tool)?;
+            admitted_fingerprint(admissions, call, listing, name)
+                .is_none()
+                .then(|| value::not_admitted(call.tool, &program.listings[listing].name, name))
+        });
+        if expected.as_ref() == Some(error) {
+            refused.insert(id);
+        }
+    }
+    refused
 }
 
 fn canonical_key(record: &Record) -> (u64, u8, u64, u8) {

@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 
 const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
+const LISTINGS_URL = "https://listings.simulation.invalid/list";
 const TURN_URL = "https://harness.simulation.invalid/turn";
 const DETAIL_CHARACTERS_MAX = 400;
 const HTTP_OK = 200;
@@ -156,6 +157,15 @@ class Seed {
     same("tool call name", event.tool, request.tool);
     same("tool call class", event.effect, request.effect);
     same("tool call input", event.input, request.input);
+    same("tool call admission", event.admitted, request.admitted ?? null);
+    return event.output;
+  }
+
+  listing(request) {
+    const event = this.cursor.next("listing", `${request.turn}/${request.seq}`);
+    same("listing turn", event.turn, request.turn);
+    same("listing seq", event.seq, request.seq);
+    same("listing name", event.listing, request.listing);
     return event.output;
   }
 
@@ -226,9 +236,14 @@ class Seed {
     const fakeFetch = async (url, init) => {
       const body = rt.decodeJson(init.body);
       if (url === TOOLS_URL) {
-        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input };
+        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null };
         fetchCheck(request);
         const output = seed.tool(request, fetchCheck.durable ?? null);
+        return new Response(rt.encodeJson(output), { status: HTTP_OK });
+      }
+      if (url === LISTINGS_URL) {
+        fetchCheck(null);
+        const output = seed.listing({ turn: body.turn, seq: body.seq, listing: body.listing });
         return new Response(rt.encodeJson(output), { status: HTTP_OK });
       }
       if (url === MODEL_URL) {
@@ -238,7 +253,7 @@ class Seed {
       }
       throw new Error(`unexpected fetch of ${url}`);
     };
-    return rt.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
+    return rt.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
   }
 }
 

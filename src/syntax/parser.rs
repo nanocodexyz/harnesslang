@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Const, Expr, Function, Handler, Invariant, Item, Model, Name, Param,
-    Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Const, Expr, Function, Handler, Invariant, Item, Listing, Model, Name,
+    Param, Pattern, Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -35,7 +35,7 @@ pub const KEYWORDS: [&str; 24] = [
     "requires",
 ];
 
-const ITEMS: &str = "'const', 'type', 'tool', 'model', 'state', 'invariant', 'fn' or 'on'";
+const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'model', 'state', 'invariant', 'fn' or 'on'";
 
 pub struct Parser<'a> {
     lexemes: &'a [Lexeme],
@@ -170,6 +170,7 @@ impl<'a> Parser<'a> {
             "const" => self.constant().map(Item::Const),
             "type" => self.type_def().map(Item::Type),
             "tool" => self.tool().map(Item::Tool),
+            "tools" => self.listing().map(Item::Listing),
             "model" => self.model().map(Item::Model),
             "state" => self.state().map(Item::State),
             "invariant" => self.invariant().map(Item::Invariant),
@@ -259,6 +260,16 @@ impl<'a> Parser<'a> {
         let params = self.params()?;
         self.symbol(Symbol::Arrow)?;
         let returns = self.type_expr()?;
+        let effect = self.effect_class()?;
+        Ok(Tool {
+            name,
+            params,
+            returns,
+            effect,
+        })
+    }
+
+    fn effect_class(&mut self) -> Parsed<EffectClass> {
         self.word("effect")?;
         let at = self.at();
         let effect = match &self.peek().token {
@@ -275,10 +286,24 @@ impl<'a> Parser<'a> {
             )
         })?;
         self.advance();
-        Ok(Tool {
+        Ok(effect)
+    }
+
+    fn listing(&mut self) -> Parsed<Listing> {
+        self.word("tools")?;
+        self.word("from")?;
+        self.word("listing")?;
+        self.symbol(Symbol::LeftParen)?;
+        let name = self.name("a listing name")?;
+        self.symbol(Symbol::Comma)?;
+        let bound = self.bound("the tools one listing may hold")?;
+        self.symbol(Symbol::RightParen)?;
+        let params = self.params()?;
+        let effect = self.effect_class()?;
+        Ok(Listing {
             name,
+            bound,
             params,
-            returns,
             effect,
         })
     }

@@ -120,6 +120,13 @@ impl Host for Drill {
         Ok(())
     }
 
+    fn listing(&mut self, request: &harness::ListingRequest<'_>) -> Output {
+        let id = call_id(request.turn, request.seq);
+        let line = checks::dispatch_line(&id, request.listing, EffectClass::None, &self.tag);
+        checks::append_synced(&mut self.ledger, &line);
+        Output::Ok(Json::Object(std::collections::BTreeMap::new()))
+    }
+
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
         let id = call_id(request.turn, request.seq);
         let line = checks::dispatch_line(&id, request.tool, request.effect, &self.tag);
@@ -162,7 +169,7 @@ impl Host for Drill {
                     Json::String(format!("c{}-{}-{index}", request.turn, request.seq)),
                 ),
                 ("tool", Json::text(tool)),
-                ("input", Json::String(format!("input-{index}"))),
+                ("input", Json::String(typed_input(tool, index))),
             ]));
         }
         Json::object(vec![("calls", Json::Array(calls))])
@@ -520,4 +527,14 @@ fn main() {
         other => usage(&format!("unknown command {other}")),
     };
     std::process::exit(status);
+}
+
+fn typed_input(tool: &str, index: u64) -> String {
+    let fields = match tool {
+        "read" => vec![("path", Json::String(format!("input-{index}")))],
+        "edit" => vec![("path", Json::String(format!("input-{index}"))), ("body", Json::String(format!("body-{index}")))],
+        "bash" => vec![("command", Json::String(format!("input-{index}")))],
+        _ => return format!("input-{index}"),
+    };
+    Json::object(fields).encode()
 }
