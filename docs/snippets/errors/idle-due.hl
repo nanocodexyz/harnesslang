@@ -1,0 +1,9 @@
+harness keeper
+
+const refreshes_max: u64 = 12
+
+state {
+  kept: text
+}
+
+on idle refresh() at kept bound refreshes_max -> u64 { return 1 }

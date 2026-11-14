@@ -64,10 +64,15 @@ pub enum Mutation {
     BlobsUnevicted,
     DenyDispatches,
     SpawnKeyUnscoped,
+    GrandchildUnscoped,
+    FamilyOneLevel,
+    SideLiveState,
+    SideJournaled,
+    IdleEarly,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 67] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -130,6 +135,11 @@ impl Mutation {
         Self::BlobsUnevicted,
         Self::DenyDispatches,
         Self::SpawnKeyUnscoped,
+        Self::GrandchildUnscoped,
+        Self::FamilyOneLevel,
+        Self::SideLiveState,
+        Self::SideJournaled,
+        Self::IdleEarly,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -196,6 +206,11 @@ impl Mutation {
             Self::BlobsUnevicted => "blobs_unevicted",
             Self::DenyDispatches => "deny_dispatches",
             Self::SpawnKeyUnscoped => "spawn_key_unscoped",
+            Self::GrandchildUnscoped => "grandchild_unscoped",
+            Self::FamilyOneLevel => "family_one_level",
+            Self::SideLiveState => "side_live_state",
+            Self::SideJournaled => "side_journaled",
+            Self::IdleEarly => "idle_early",
         }
     }
 
@@ -272,7 +287,12 @@ impl Mutation {
             | Self::BlobUnjournaled
             | Self::BlobsUnevicted
             | Self::DenyDispatches
-            | Self::SpawnKeyUnscoped => all,
+            | Self::SpawnKeyUnscoped
+            | Self::GrandchildUnscoped
+            | Self::FamilyOneLevel
+            | Self::SideLiveState
+            | Self::SideJournaled
+            | Self::IdleEarly => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

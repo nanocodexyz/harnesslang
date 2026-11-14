@@ -5,11 +5,16 @@ const SUSPEND_TOOL = "suspend";
 const SUSPEND_KEY = "key";
 const DENY_TOOL = "deny";
 const SPAWN_KEY_SEPARATOR = ".";
+const SPAWN_SCOPE_SEPARATOR = "/";
+const ROOT_SCOPE = "";
+const SIDE_TURN = 0;
+const SIDE_REFUSED = "the checker refuses this effect in a side handler";
 
-function spawnOutput(tool, turn, seq, output) {
+function spawnOutput(tool, scope, turn, seq, output) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (output.tag !== "ok" || declared === undefined || !declared.spawn) return output;
-  return { tag: "ok", value: String(turn) + SPAWN_KEY_SEPARATOR + String(seq) };
+  const key = String(turn) + SPAWN_KEY_SEPARATOR + String(seq);
+  return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };
 }
 
 class Suspended {
@@ -47,6 +52,24 @@ class Engine {
     this.notices = new Map();
     this.discovered = new Map();
     this.blobs = new Blobs();
+    this.snapshot = null;
+  }
+
+  async sideQuestion(seq) {
+    if (PROGRAM.sides.length === 0) return;
+    const world = this.mode.world;
+    if (world.side === undefined) return;
+    const request = await world.side(this.turn, seq);
+    if (request === null) return;
+    assert(this.snapshot !== null, "a live run of a program with side handlers keeps its snapshot");
+    let answer;
+    try {
+      answer = await runSide({ target: this.target, mutation: "none" }, world, this.snapshot, this.blobs, request);
+    } catch (error) {
+      if (!(error instanceof Corrupt)) throw error;
+      answer = { error: error.message };
+    }
+    await world.sided(request, answer);
   }
 
   notice(listing) {
@@ -239,6 +262,7 @@ class Engine {
     const logged = this.sites.get(seq);
     if (logged !== undefined) return this.recorded(siteId, seq, call, args, logged);
     this.requireLive(seq);
+    await this.sideQuestion(seq);
     if (site.kind !== "model") {
       this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
       this.sites.set(seq, { kind: "open", call });
@@ -549,7 +573,7 @@ class Engine {
     const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
     for (const [position, raw] of ordered) {
       const waiting = group[position];
-      const output = spawnOutput(waiting.call.tool, this.turn, waiting.seq, this.checked(waiting.call.tool, returned[position], raw));
+      const output = spawnOutput(waiting.call.tool, this.mode.scope, this.turn, waiting.seq, this.checked(waiting.call.tool, returned[position], raw));
       this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output });
       this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output });
       values[waiting.index] = this.settle(site, waiting.call, output);
@@ -592,7 +616,7 @@ class Engine {
         output = { tag: "failed", error: gate.refused };
       } else {
         const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted };
-        output = spawnOutput(call.tool, this.turn, seq, this.checked(call.tool, returns, await world.tool(request)));
+        output = spawnOutput(call.tool, this.mode.scope, this.turn, seq, this.checked(call.tool, returns, await world.tool(request)));
       }
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));
@@ -901,6 +925,25 @@ function cloneLog(log) {
   return { ...log, sites: new Map(log.sites), nested: new Map(log.nested), lastNested: new Map(log.lastNested), cells, events: log.events.slice() };
 }
 
+const IDLE_AT = "at";
+const IDLE_DUE = "due";
+
+function idleArmed(state) {
+  const idle = PROGRAM.idle;
+  if (idle === null) return null;
+  const due = state[idle.due];
+  return due !== 0n && state[idle.runs] < idle.bound ? due : null;
+}
+
+async function idleDue(setup, records) {
+  if (PROGRAM.idle === null) return null;
+  const session = fold(records);
+  const last = session.turns.get(session.lastTurn);
+  if (last !== undefined && last.finished === null) return null;
+  const state = await stateBefore(setup, session, session.lastTurn + 1);
+  return idleArmed(state);
+}
+
 async function runTurn(setup, world, epoch, records, request) {
   const session = fold(records);
   const handler = handlerNamed(request.handler);
@@ -911,6 +954,9 @@ async function runTurn(setup, world, epoch, records, request) {
     if (eventsTaken()) await closeInbox(world, request.turn, existing.finished.last, existing.events);
     return { ran: "already_finished", finish: { turn: request.turn, outcome: existing.finished.outcome, result: existing.finished.result } };
   }
+  const idles = PROGRAM.idle !== null && PROGRAM.idle.handler === request.handler;
+  const lastLog = session.turns.get(session.lastTurn);
+  if (idles && existing === undefined && lastLog !== undefined && lastLog.finished === null) return { ran: "not_due", notDue: { kind: "busy" } };
   const state = await stateBefore(setup, session, request.turn);
   const blobs = sessionBlobs(session);
   blobs.checkState(state);
@@ -918,7 +964,7 @@ async function runTurn(setup, world, epoch, records, request) {
   let unknown = { unknown: [], nested: [] };
   let log;
   if (existing !== undefined) {
-    if (existing.handler !== request.handler || !jsonEqual(existing.arguments, args)) {
+    if (existing.handler !== request.handler || (!idles && !jsonEqual(existing.arguments, args))) {
       throw new Corrupt(`turn ${request.turn} was admitted with other arguments`);
     }
     checkEvents(request.turn, existing);
@@ -927,11 +973,22 @@ async function runTurn(setup, world, epoch, records, request) {
   } else {
     const next = session.turns.size === 0 ? 1 : session.lastTurn + 1;
     if (request.turn !== next) throw new Corrupt(`turn ${request.turn} is requested when turn ${next} is next`);
-    pending.push({ kind: "admitted", turn: request.turn, handler: request.handler, arguments: args });
+    let admitted = args;
+    if (idles) {
+      const due = idleArmed(state);
+      if (due === null) return { ran: "not_due", notDue: { kind: "unarmed" } };
+      const clock = await world.clock();
+      if (clock < due) return { ran: "not_due", notDue: { kind: "early", due, clock } };
+      admitted = object([[IDLE_AT, clock], [IDLE_DUE, due]]);
+    }
+    pending.push({ kind: "admitted", turn: request.turn, handler: request.handler, arguments: admitted });
     log = newTurnLog(request.handler, null);
   }
   const assumed = setup.mutation === "cell_recovery_reports_failed" ? assumeNestedFailed(log, unknown.nested.splice(0)) : [];
-  const engine = new Engine(setup, handler, { live: true, world, epoch }, request.turn, state, log);
+  const scope = request.scope === undefined ? ROOT_SCOPE : request.scope;
+  assert(typeof scope === "string", "a turn request's scope is text");
+  const engine = new Engine(setup, handler, { live: true, world, epoch, scope }, request.turn, state, log);
+  if (PROGRAM.sides.length > 0) engine.snapshot = stateFromJson(stateJson(state));
   engine.nextCell = nextCell(session);
   engine.blobs = blobs;
   for (const record of pending) engine.append(record);
@@ -946,13 +1003,159 @@ async function runTurn(setup, world, epoch, records, request) {
   return { ran: "finished", finish: ran.finish };
 }
 
+class SideWorld {
+  constructor(world) {
+    this.world = world;
+    this.answered = null;
+  }
+
+  append() {}
+
+  async hook() {}
+
+  async beforeExternal() {
+    throw new Panic(SIDE_REFUSED + ": a side question runs no external call");
+  }
+
+  async flush() {}
+
+  async attempt() {
+    throw new Panic(SIDE_REFUSED + ": a side question runs no external call");
+  }
+
+  async nestedAttempt() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  cellStart() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  cellResume() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  async waited() {
+    throw new Panic(SIDE_REFUSED + ": a code cell's timer");
+  }
+
+  async wait() {
+    throw new Panic(SIDE_REFUSED + ": a code cell's timer");
+  }
+
+  async observe() {
+    throw new Panic(SIDE_REFUSED + ": a code cell");
+  }
+
+  tool(request) {
+    assert(request.turn === SIDE_TURN, "a side question's tool calls carry the side turn");
+    return this.world.tool(request);
+  }
+
+  listing() {
+    throw new Panic(SIDE_REFUSED + ": a listing read");
+  }
+
+  async tools() {
+    throw new Panic(SIDE_REFUSED + ": a parallel for");
+  }
+
+  model(request) {
+    assert(request.turn === SIDE_TURN, "a side question's model calls carry the side turn");
+    return this.world.model(request);
+  }
+
+  now() {
+    throw new Panic(SIDE_REFUSED + ": now");
+  }
+
+  random() {
+    throw new Panic(SIDE_REFUSED + ": random");
+  }
+
+  async acknowledge(finish) {
+    assert(this.answered === null, "a side question is answered once");
+    this.answered = finish;
+  }
+
+  async inbox(turn) {
+    assert(turn === SIDE_TURN, "a side question reads no turn's inbox");
+    return [];
+  }
+
+  async answer() {
+    throw new Panic("a side question takes no events, so it answers none");
+  }
+
+  clock() {
+    throw new Panic(SIDE_REFUSED + ": wait");
+  }
+
+  sleep() {
+    throw new Panic(SIDE_REFUSED + ": wait");
+  }
+
+  async resume() {
+    throw new Panic(SIDE_REFUSED + ": suspend");
+  }
+
+  async resumed() {
+    throw new Panic(SIDE_REFUSED + ": suspend");
+  }
+}
+
+function sideNamed(name) {
+  return PROGRAM.sides.find((side) => side.name === name) ?? null;
+}
+
+async function runSide(setup, world, state, blobs, request) {
+  const side = sideNamed(request.handler);
+  assert(side !== null, "a side request names a side handler of the program");
+  const scratch = new SideWorld(world);
+  const engine = new Engine(setup, side, { live: true, world: scratch, epoch: 0 }, SIDE_TURN, stateFromJson(stateJson(state)), newTurnLog(side.name, null));
+  engine.blobs = blobs;
+  const ran = await engine.run(request.arguments);
+  assert(ran.suspended === undefined, SIDE_REFUSED + ": a side handler never suspends");
+  assert(scratch.answered === ran.finish, "a side question's finish is its answer");
+  return { outcome: ran.finish.outcome, result: ran.finish.result };
+}
+
+function lastFinished(session) {
+  let last = 0;
+  for (const [turn, log] of session.turns) {
+    if (log.finished !== null && turn > last) last = turn;
+  }
+  return last;
+}
+
+async function answerSide(setup, world, records, request) {
+  const session = fold(records);
+  const state = await stateBefore(setup, session, lastFinished(session) + 1);
+  const blobs = sessionBlobs(session);
+  blobs.checkState(state);
+  return runSide(setup, world, state, blobs, request);
+}
+
+function sideRequestFromJson(json) {
+  if (!isObject(json) || typeof json.handler !== "string") throw new DecodeError("a side question names its side handler");
+  const side = sideNamed(json.handler);
+  if (side === null) throw new DecodeError(`no side handler '${json.handler}'`);
+  return { handler: json.handler, arguments: argumentsFromJson(side, json.arguments) };
+}
+
+function sideAnswerJson(answer) {
+  return object([["outcome", answer.outcome], ["result", answer.result]]);
+}
+
 function turnRequestFromJson(json) {
   if (!isObject(json)) throw new DecodeError("a turn request is an object");
   const turn = smallNumber(json.turn, "a turn request's turn");
   if (typeof json.handler !== "string") throw new DecodeError("a turn request names its handler");
   const handler = handlerNamed(json.handler);
   if (handler === null) throw new DecodeError(`no handler '${json.handler}'`);
-  return { turn, handler: json.handler, arguments: argumentsFromJson(handler, json.arguments) };
+  if (json.scope !== undefined && typeof json.scope !== "string") throw new DecodeError("a turn request's scope is text, the key its session was spawned under");
+  const scope = json.scope === undefined ? ROOT_SCOPE : json.scope;
+  return { turn, handler: json.handler, arguments: argumentsFromJson(handler, json.arguments), scope };
 }
 
 function finishJson(finish) {
@@ -1078,4 +1281,6 @@ const runtime = {
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
   Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
   deliveryJson, deliveryFrom, suspensionJson, suspensionFrom, resumeJson, resumeFrom,
+  SIDE_TURN, answerSide, sideRequestFromJson, sideAnswerJson,
+  idleDue,
 };

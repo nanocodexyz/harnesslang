@@ -1,37 +1,85 @@
-# What nanocode's Claude agent loop does that harnesslang cannot write
+# What nanocode's Claude and Codex loops do that harnesslang cannot write
 
-`examples/claude_agent.hl`, `claude_code.hl`, `codex_agent.hl`, `hooks.hl`,
-`subagents.hl` and `subagent_child.hl` port the shapes of nanocode's harnesses. Gaps 1 to 8 of the
-earlier list are closed (the last two by `suspend` and `wait`, LANGUAGE.md), so
-numbers 1 to 8 now list what a fresh read of nanocode's Claude backend loop,
-`crates/backends/claude/src/agent.rs` and `agent/` at nanocode c7679e3, still
-does that harnesslang cannot express. They are ranked by how much of a real
-harness each blocks, each with the smallest language addition that would let
-it be written and how the compiler would keep checking it. A gap the language
-closes is removed and the others keep their numbers. Gaps 1 to 4 (token
-accounting and truncation, summarizing compaction, recovery by stop reason,
-retry and backoff) are closed by a model's `window`, the `attempt` and `stop`
-builtins, `len` and `truncate_middle` on text, `keep ... after`, `with` and
-`wait(e) at most c` (LANGUAGE.md); `examples/claude_code.hl` keeps their
-behaviour, short of the backoff's jitter, which needs a remainder operator.
-Gap 6 (tool catalogs that change within a turn) is closed by `name(context)`
-listing notices and `finds` tool search, and the images and structured
-results of gap 8 by `blob<N>`, `text or blob<N>` tools and `keep L blobs
-last N` ([Listing notices and tool search](LANGUAGE.md#listing-notices-and-tool-search),
-[Blobs](LANGUAGE.md#blobs)); what is left of gap 8 is the prompt cache's
-lifetime. Gaps 5 (hooks around every tool and lifecycle event) and 7
-(subagents) are closed by `before tool`, `after tool`, the lifecycle hooks,
-`spawn` and `join` (LANGUAGE.md). Numbers 9 to 11 are what
-porting nanocode's Claude Code prompt and tools as `examples/claude_code.hl`
-left out.
+`examples/claude_code.hl`, `claude_code_child.hl`, `claude_agent.hl`, `codex_agent.hl`,
+`hooks.hl`, `subagents.hl` and `subagent_child.hl` port the shapes of nanocode's harnesses.
+Every gap of the earlier lists is closed: token accounting, truncation and
+summarizing compaction, recovery by stop reason, retry and backoff (a model's
+`window`, `attempt`, `stop`, `len`, `truncate_middle`, `keep ... after`,
+`with`, `wait(e) at most c`); hooks around tools and lifecycle events
+(`before tool`, `after tool`, the lifecycle hooks); subagents (`spawn`, `join`,
+spawn trees with `sessions at most`); tool catalogs that change within a turn
+(listing notices, `finds`); images and structured results (`blob<N>`); side
+questions (`on side`); and the prompt cache's lifetime (`on idle`), all in
+LANGUAGE.md. `hl-agent` runs real child sessions of `claude_code_child.hl`.
 
-## 8. Prompt cache lifetime
+The list below comes from a fresh read of nanocode c7679e3's Claude backend
+(`crates/backends/claude/src`) and Codex backend (`crates/backends/codex/src`),
+checked against LANGUAGE.md. Gaps are ranked by how much of a real harness each
+blocks, each with what nanocode does, why harnesslang cannot write it, and the
+smallest language addition that would let it be written and how the compiler
+would keep checking it. A gap the language closes is removed and the others
+keep their numbers.
 
-The prompt cache's lifetime is tracked and kept warm: after a reply the
-backend keeps its request and, while the session idles, sends it again
-before the cache's lifetime (five minutes, or an hour) runs out, a bounded
-number of times (`agent/keep.rs:24-177`). A harness has no notion of time
-passing between turns and no effect that runs while no turn does. Smallest
-addition: a `keep` timer on the model whose refreshes are model calls the
-journal records under the session rather than a turn, bounded by a named
-count, so the worst case counts them and replay skips them.
+## 1. Cancel and steer preempt an effect in flight
+
+Claude: a running tool races the cancel and is abandoned as outcome unknown (agent/durable.rs:955-959; a call reached after cancel gets the same, 910-911). A cancelled model stream ends the turn after pushing "[Request interrupted by user]" and committing the history (agent.rs:7700-7708). Calls of an interrupted batch that never started get StartedToolCall::REASON results (agent.rs:8051, 8105-8116). Lifecycle hooks and the turn hold also race the cancel (agent.rs:7187-7190, 8408-8422). Accepting a steer preempts running code cells (agent.rs:6798-6800). Codex: with instant_tool_steering, a pending steer preempts the running tool batch (model/run/turn.rs:1050-1070). Compaction races the cancel and keeps a resumable checkpoint (turn.rs:97-113). A cancelled turn terminates its cells and commits a cancelled checkpoint (turn.rs:302-313). Withdrawn steers are skipped (turn.rs:992).
+
+Why not: In harnesslang every effect runs to completion. `cancelled` and `take steers` are reads between effects, and an event that arrives during an effect is only stamped `at` that effect (LANGUAGE.md, on (events)). Nothing lets an event abort a tool, a model call, a wait or a cell, so a ten-minute Bash or a 600 s wait cannot be stopped. There is also no arm for an effect that was interrupted, and no steer withdrawal.
+
+Smallest addition: An `interruptible by cancel[, steer]` modifier on an effect site, plus an `interrupted` arm in its match. When an event the site lists is recorded at its sequence number, the runtime tells the host to abort the effect and records {"interrupted":event} as its result. For an external effect that result is `unknown`, since its call record is already durable. The `interrupted` arm then runs the epilogue, such as pushing the interrupted notice. Replay takes the same arm because the event's `at` names that seq. The prover adds the arm to the effect's choices and keeps external_once and unknown_reported. The worst case is unchanged, and waits interrupted by an event count at most their constant. The simulator draws events during effects and checks interrupt_recorded (an interrupted result has an event at its seq) and interrupt_external_unknown. Mutations: interrupt_ignored, where the effect runs on and the arm never fires, and interrupt_reruns, which redispatches the aborted external.
+
+## 2. A parallel batch whose calls each run their own effects
+
+Claude groups a reply's calls into batches by name: every call when parallel_tools is on, otherwise consecutive parallel_safe_tools (agent.rs:1148-1162, tool_batches 2932-2946). It runs each batch's durable_tool calls concurrently (agent.rs:8015-8094), and each one runs hooked_handler inside it: a PreToolUse hook, the handler, then a PostToolUse hook (agent.rs:562-624). Codex runs every call of a reply concurrently, external ones included, as a FuturesOrdered (model/run/tool_calls.rs:659-820). Each call has its own durable step tool-{index}-{id} and its own before_tool_call hook (tool_calls.rs:680-757, 1064-1073). Results land in reply order.
+
+Why not: `for call in requested parallel` must be one `match dispatch(call)` whose arms only push, bind and assign. Its batch groups by effect class: an external call always runs alone after a flush. The checker refuses a parallel for in a harness with `before tool`, `after tool`, `on subagent start` or a `code` tool, and the arms cannot `join`, `suspend` or cut (LANGUAGE.md, Parallel tool calls and Hooks; claude_code.hl run_joining falls back to a sequential for). So a hooked or approval-gated harness, or Codex's concurrent shell calls, is serial.
+
+Smallest addition: Allow a parallel for's body to be a lane: straight-line code per call that may include the inlined hooks, `suspend`, `join` and further effects. Each lane's effects take a sub-sequence T.S/k, where S is the batch's seq and k the call's index, so concurrent completion order never changes numbering. Add a grouping predicate, `parallel when pure_cond(call)`, chosen by the program instead of by effect class. Durability point 1 then applies per external within its lane. The prover lowers each lane as a sequential plan; since flushes are per record, a lane-local flush-before-external proves durable_before_external and external_once. The worst case for records and requests is the sum of the lanes, and for waits their maximum. The simulator completes lanes in random order with crashes between their effects. It extends sequential_equal per lane (each lane's journal equals the sequential run of that call). Mutation: lane_seq_shared, which numbers lane effects from one counter.
+
+## 3. Code cells that outlive their tool call (yield, wait, detach)
+
+Claude's exec and wait race a running cell's progress against cancel. On a stop it runs stop_code_cells and returns STOPPED or STOPPED_UNKNOWN, with the output gathered before the stop (agent.rs:6965-7044, stop_code_cells and settle_code_turn 6154-6190). Each cell's nested-call summaries are kept across rounds (agent.rs:8157-8165). Codex terminates every turn cell when a turn completes or is cancelled (model/run/turn.rs:288, 303, 383-396). A failed turn with no active call detaches its cells instead, so they outlive the turn (turn.rs:335-357, 366-381). After a crash it reattaches a cell still running on the host with recover_code, and runs it fresh when the call was never sent (tool_calls.rs:1277-1287).
+
+Why not: CODE_MODE.md, Not in this spec, says it: a harnesslang turn blocks on its cell, and yield_ms only goes into the header. A cell cannot return "Script running" and be collected by a later `wait` call in another round. There is also no lifecycle for a cell that is still running when its site, round or turn ends: terminated or detached, with nested calls left open. LANGUAGE.md's Code mode section has no second site for the same cell.
+
+Smallest addition: A `waits name` clause on `code`. A site may finish with running(cell) after yield_ms, and a site of the wait tool continues that cell's journal. Every running cell is stopped at its turn's `return`, with open nested calls recorded unknown, unless the program says `detach`. Cell records are already keyed by cell, so C1 and C2 hold unchanged. cell_finish_once is extended to: exactly one `finished` per cell across all its sites. A new property, cell_settled_at_turn_end, requires each cell to be finished or detached when its turn's status is flushed, with open nested ids carried as unknown. The calls and timers bounds become per cell, summed over its sites in the worst case. The simulator yields cells and drives waits across rounds and crashes. Mutation: cell_leaks, a cell left running past its turn.
+
+## 4. Background jobs whose completion arrives later
+
+A foreground Bash that reaches its timeout, or one run with run_in_background, keeps running as a job and returns at once with its task id (claude_bash.rs:969-1034). A watcher delivers the job's completion, or a stall notice when it waits on interactive input. Depending on the binding it arrives as a steer into the running turn, a notice merged into the next round, or a new prompt (claude_bash.rs:337-377, 600-640, 651-678; round notices pushed at agent.rs:8124-8131). Before a turn ends, the turn hold waits for busy jobs, racing cancel (claude_bash.rs:570-597, agent.rs:8408-8422). Job state rides each tool receipt and is restored on replay (agent/durable.rs:399-452, 871). At load, jobs that were running when the process ended get a "killed, outcome unknown" notice (agent.rs:1756-1761, 2619-2670).
+
+Why not: harnesslang has no effect that returns before it finishes. Its only outside events are cancel, steer and resume, and its only waits are a fixed-time `wait` and a `join` that ends the run. Idle turns are admitted on the clock alone. So there is no construct for a job's completion as an event, for holding a turn open until pending jobs settle, for starting a turn when a job completes, or for reporting jobs lost in a restart. spawn and join cover child harness sessions, not host processes.
+
+Smallest addition: A `job name(params) effect external` tool that returns a handle keyed T.S, like spawn, bounded by `jobs at most N` per session. Add an event `on job done(key: text, output: text)`, read with `take jobs` and recorded with `at` like a steer. `hold jobs at most c` is a wait-like effect, flushed first, that wakes on a completion, a cancel or c. An idle admission `on idle name() when jobs` starts a turn on a completion. At load, every job open across a crash yields a lost(key) event in the recovery record. The worst case counts event records and hold milliseconds. The simulator completes, stalls and loses jobs across crashes. Invariants: job_once (each handle completes or is reported lost exactly once) and hold_bounded. Mutation: job_lost_dropped.
+
+## 5. Rewriting entries already in the history
+
+On provider errors the Claude loop retries once after transforming the whole pending history. It drops thinking blocks whose signatures belong to another organization (agent.rs:7563-7586). It turns refused compaction blocks into plain-text summaries (7587-7608), and strips appended tool-change blocks while resending the current tool list (7609-7643). It cuts the unfinished server turn out as evidence (2862-2884, 7688, 7975), and omits images when a continuation produced at most one token (8256). Codex repairs a rejected request by replacing images or a tool definition in history (model/run/turn.rs:120, 337, 939-945) and reconciles reasoning items after a repair (turn.rs:969). Local compaction drops the first history item on context_exceeded and retries (lifecycle.rs:530-536).
+
+Why not: A list changes only through push, clear, `keep L last n [after e]` and `keep L blobs last N` (LANGUAGE.md, Statements, clear and keep, Blobs). No statement maps or filters the entries a list already holds, such as replacing a field of every assistant(...) entry or removing entries of one variant. A provider-error recovery that edits the history is not writable. Only dropping the first entry can be approximated with keep.
+
+Smallest addition: A statement `rewrite L { pattern => entry | drop, ... }`: a pure, total map over a state list, with patterns on entry and reply variants and no effects in the arms. The prover sets the new length to at most the old one, or equal when no arm drops, and checks text bounds such as cut lengths through the arm expressions. It writes no record: state is derived and the checkpoint written with the status holds the result, so checkpoint_compacted already covers it. The simulator replays it, with the mutation rewrite_live_only (the live run rewrites but replay does not), caught by checkpoint_compacted and replay_equal.
+
+## 6. Asking the tool host to resolve an unknown outcome
+
+After a crash, a tool call admitted as Interrupted is not reported unknown directly. Claude asks the host's recovery hook, which returns the real reply, NOT_DISPATCHED (the call then runs now), or unknown, the last also on cancel (agent.rs:6895-6927, agent/durable.rs:876-909). Codex runs an interrupted call with recover: true. tools.recover_tool returns the recovered output or the interrupted result (model/run/tool_calls.rs:707-713, 1132-1140), and an unsent code cell runs fresh (1277-1287).
+
+Why not: In harnesslang, recovery always writes `unknown` for an open external call, and the program meets it as final (ARCHITECTURE.md, Durability points; external_once). A program-level probe tool in the `unknown` arm cannot express this. It lacks the journal's turn/seq key the host knows the call by, and a re-dispatch takes a new sequence number and a new call record, so the host sees a second call rather than the same one.
+
+Smallest addition: An effect class modifier `external recoverable`. Before reporting an open call unknown, recovery asks the host recover(tool, turn/seq) and records the answer in the recovery record. A reply becomes the call's result (ok or failed), not_dispatched runs the call under the same seq (its call record is already durable), and anything else is unknown. The prover's external_once becomes: dispatched at most once, unless the host attested it was not dispatched. unknown_reported then holds only for an unknown answer. The simulator's host knows the truth and answers truthfully or unknown. Invariant: recovered_truthful. Mutation: recover_trusts_lost, a rerun after an unknown answer, caught by external_once.
+
+## 7. Forking or rewinding a session at a boundary
+
+Claude forks a session, or a side conversation, from the latest boundary, a completed turn or a checkpoint (agent.rs:3190-3257, fork_point 4292-4311). Boundaries are published per round (agent.rs:4245-4265). The child's state is scrubbed: no tasks, pending continuation, previous message id or container, lifecycle_started false so SessionStart hooks run again, and auto-compaction off for side conversations. Its first record is a checkpoint under a branched policy. A rewind picks an earlier checkpoint, keeps admitted tool ids and recovery notices, and adds a notice that effects from discarded turns may still exist (agent/durable.rs:1640-1675). Codex publishes a fork snapshot before every model call (model/run/turn.rs:834-841, 922) and branches sessions (agent/driver/branch.rs:97-160).
+
+Why not: spawn starts a fresh session of another handler, with only typed arguments (LANGUAGE.md, Spawn and join). A side question reads a snapshot but writes nothing. Nothing creates a session of the same harness that starts from another session's state at a chosen finished turn, and no hook decides what a fork keeps and resets.
+
+Smallest addition: A `fork name at latest|turn` tool, external like spawn and keyed T.S. The child's journal starts with a `forked` record and a checkpoint holding the parent's state at that turn, taken from the parent's durable journal as a side question's snapshot is. An `on forked(origin: text)` hook may assign, clear, keep and push but run no effects, and resets fields such as job handles or flags. The checker counts forks as sessions in the spawn tree's worst case. The simulator checks fork_state_equal (the child's initial state is the replay of the parent's durable journal at that turn, after the hook). Mutation: fork_live_state, which forks from the running turn's state.
+
+## 8. Request settings held as session state
+
+Claude keeps effort, thinking, fast mode and the auto-compact limit as session settings that hosts change between turns (agent.rs:8939-8997). A turn pins the effort in effect, and when the setting differs from the history it appends an effort-change message (agent.rs:7420-7442). Context-recovery compaction overrides thinking and effort for that one request (agent.rs:6383-6405). Codex appends a reasoning sampling update when the effort changes (model/run/turn.rs:906-916). It takes set_thinking, set_auto_compact_token_limit, set_fast_mode and service tier (agent/backend.rs:330-370), and picks a separate compaction effort (lifecycle.rs:118-135). The model itself is fixed per thread in both (agent.rs:8629-8647, codex agent/driver/control.rs:536-561).
+
+Why not: A model call carries at most one `mode`, a name fixed at the call site (LANGUAGE.md, model). It cannot be a state value, and modes from separate dimensions (effort by fast by text_only or refresh) do not combine, so each combination needs its own call site. Thresholds and pins can be state fields, but the request settings the host must send cannot follow them.
+
+Smallest addition: Typed model settings: `model m ... settings effort: effort_enum, fast: bool`, and `m(context) with {effort: e}`, where e is any expression of that text enum or bool and omitted settings take declared defaults. The model record journals the settings as it journals mode, and a replay whose settings differ diverges. The worst case is unchanged, since there is still one site. The simulator draws settings changes between turns through ordinary handlers and checks settings_sent, the analogue of mode_sent. Mutation: settings_dropped.

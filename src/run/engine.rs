@@ -11,6 +11,7 @@ use crate::run::journal::{Delivery, Inbound, Outcome, Output, Record, call_id};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::session::{Call, Recorded, SiteLog, TurnLog};
+use crate::run::side::{self, SideAnswer, SideRequest};
 use crate::run::value::{self, Value};
 use crate::target::inbound::{self, Drain};
 use crate::target::{self, Recovery};
@@ -188,6 +189,19 @@ pub trait World {
     fn inbox(&mut self, turn: u64) -> Vec<Delivery>;
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]);
     fn read(&mut self, read: &Read);
+    fn scope(&self) -> String {
+        String::new()
+    }
+    fn side(&mut self, _turn: u64, _seq: u64, _buffered: &[Record]) -> Option<SideRequest> {
+        None
+    }
+    fn sided(
+        &mut self,
+        _request: &SideRequest,
+        _answer: &Result<SideAnswer, Exit>,
+        _buffered: &[Record],
+    ) {
+    }
 }
 
 pub fn close_inbox(world: &mut dyn World, turn: u64, position: u64, events: &[Recorded]) {
@@ -328,6 +342,7 @@ pub struct Engine<'a> {
     notices: BTreeMap<ir::ListingId, String>,
     discovered: BTreeMap<ir::ListingId, BTreeSet<String>>,
     blobs: Blobs,
+    snapshot: Option<Vec<Value>>,
 }
 
 enum Flow {
@@ -387,7 +402,17 @@ impl<'a> Engine<'a> {
             notices: BTreeMap::new(),
             discovered: BTreeMap::new(),
             blobs: Blobs::default(),
+            snapshot: None,
         }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: Vec<Value>) -> Self {
+        assert!(
+            !self.program.sides.is_empty(),
+            "only a program with side handlers keeps the snapshot a side question reads"
+        );
+        self.snapshot = Some(snapshot);
+        self
     }
 
     pub fn with_blobs(mut self, blobs: Blobs) -> Self {
@@ -1066,6 +1091,7 @@ impl<'a> Engine<'a> {
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
+        let scope = world.scope();
         let mut completed = if requests.is_empty() {
             Vec::new()
         } else {
@@ -1095,7 +1121,15 @@ impl<'a> Engine<'a> {
                 let output = self.checked(tool, &returned[position], output);
                 (
                     position,
-                    spawn_output(self.program, self.mutation, self.turn, seq, tool, output),
+                    spawn_output(
+                        self.program,
+                        self.mutation,
+                        &scope,
+                        self.turn,
+                        seq,
+                        tool,
+                        output,
+                    ),
                 )
             })
             .collect();
@@ -1366,11 +1400,11 @@ impl<'a> Engine<'a> {
                 self.reopen(site_id, seq, call, &args)
             }
             None => {
+                self.require_live(seq)?;
+                self.side_question(seq)?;
                 if site.kind == SiteKind::Model {
-                    self.require_live(seq)?;
                     return self.execute(site_id, seq, &call, &args);
                 }
-                self.require_live(seq)?;
                 self.append(Record::Call {
                     turn: self.turn,
                     seq,
@@ -1382,6 +1416,42 @@ impl<'a> Engine<'a> {
                 self.execute(site_id, seq, &call, &args)
             }
         }
+    }
+
+    fn side_question(&mut self, seq: u64) -> Result<(), Halt> {
+        if self.program.sides.is_empty() {
+            return Ok(());
+        }
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("a side question arrives only while a turn runs live")
+        };
+        let Some(request) = world.side(self.turn, seq, &self.buffer) else {
+            return Ok(());
+        };
+        let state = if self.mutation == Mutation::SideLiveState {
+            self.state.clone()
+        } else {
+            self.snapshot
+                .clone()
+                .expect("a live run of a program with side handlers keeps its snapshot")
+        };
+        let setup = Setup {
+            program: self.program,
+            target: self.target,
+            mutation: self.mutation,
+        };
+        let ran = side::run(setup, &mut **world, state, self.blobs.clone(), &request);
+        let answer = match ran {
+            Ok((answer, records)) => {
+                if self.mutation == Mutation::SideJournaled {
+                    self.buffer.extend(records);
+                }
+                Ok(answer)
+            }
+            Err(exit) => Err(exit),
+        };
+        world.sided(&request, &answer, &self.buffer);
+        Ok(())
     }
 
     fn suspend_site(&mut self, site_id: usize, seq: u64, call: Call) -> Result<Value, Halt> {
@@ -1876,6 +1946,7 @@ impl<'a> Engine<'a> {
                 match gate {
                     Err(refused) => Output::Failed(refused),
                     Ok(admitted) => {
+                        let scope = world.scope();
                         let output = world.tool(&ToolRequest {
                             turn: self.turn,
                             seq,
@@ -1890,6 +1961,7 @@ impl<'a> Engine<'a> {
                         spawn_output(
                             self.program,
                             self.mutation,
+                            &scope,
                             self.turn,
                             seq,
                             &call.tool,
@@ -2249,6 +2321,7 @@ pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
 pub fn spawn_output(
     program: &Program,
     mutation: Mutation,
+    scope: &str,
     turn: u64,
     seq: u64,
     tool: &str,
@@ -2257,10 +2330,10 @@ pub fn spawn_output(
     if !matches!(output, Output::Ok(_)) || program.spawn_of(tool).is_none() {
         return output;
     }
-    let key = if mutation == Mutation::SpawnKeyUnscoped {
-        seq.to_string()
-    } else {
-        ir::spawn_key(turn, seq)
+    let key = match mutation {
+        Mutation::SpawnKeyUnscoped => seq.to_string(),
+        Mutation::GrandchildUnscoped => ir::spawn_key(turn, seq),
+        _ => ir::scoped_spawn_key(scope, turn, seq),
     };
     Output::Ok(Json::String(key))
 }

@@ -14,7 +14,7 @@ use crate::prove::lower::{Op, Plan, Record, Slot};
 use crate::run;
 use crate::target::{self, Target};
 
-pub const PROOF_STEPS_PER_HANDLER_MAX: u64 = 4_000_000;
+pub const PROOF_STEPS_PER_HANDLER_MAX: u64 = 8_000_000;
 pub const PROOF_CONSTRAINTS_MAX: usize = 4_096;
 pub const PROOF_MEMO_ENTRIES_PER_HANDLER_MAX: usize = 16_384;
 
@@ -225,7 +225,7 @@ pub fn prove(program: &Program, targets: &[Target], mutation: Mutation) -> Repor
         records(&program, &plan, mutation, &mut report);
         bounds(&program, &plan, &mut report);
         waits(&program, &plan, &mut report);
-        children(&program, &plan, &mut report);
+        children(&program, &plan, mutation, &mut report);
     }
     report
 }
@@ -238,39 +238,93 @@ fn spawning(program: &Program, kind: crate::ir::SiteKind) -> bool {
     }
 }
 
-fn children(program: &Program, plan: &Plan, report: &mut Report) {
-    let model = &plan.model;
-    for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
-        let Some(family) = &handler.worst.family else {
-            continue;
-        };
-        let spawns = |op: &Op| match op {
-            Op::Run {
-                slot: lower::Slot::Site(site),
-                ..
-            } => Count {
-                total: u64::from(spawning(program, handler.sites[*site].kind)),
-                nested: 0,
-            },
-            _ => Count::default(),
-        };
-        let planned = planned_max(&lowered.ops, &spawns)
-            .expect("the IR's child session count fits u64, and the plan starts no more")
-            .total;
-        assert!(
-            planned <= handler.worst.spawns.total,
-            "the IR's child session worst case covers every path of the plan"
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlannedTree {
+    records: u64,
+    requests: u64,
+    sessions: u64,
+}
+
+fn spawns_on(
+    program: &Program,
+    handler: &crate::ir::Handler,
+    ops: &[Op],
+    real: &[crate::ir::SiteId],
+) -> u64 {
+    let spawns = |op: &Op| match op {
+        Op::Run {
+            slot: lower::Slot::Site(site),
+            ..
+        } => Count {
+            total: u64::from(spawning(program, handler.sites[real[*site]].kind)),
+            nested: 0,
+        },
+        _ => Count::default(),
+    };
+    planned_max(ops, &spawns)
+        .expect("the IR's child session count fits u64, and the plan starts no more")
+        .total
+}
+
+struct Descent<'a> {
+    model: &'a target::Model,
+    mutation: Mutation,
+    root: &'a str,
+}
+
+fn planned_tree(
+    descent: &Descent<'_>,
+    program: &Program,
+    handler: &crate::ir::Handler,
+    ops: &[Op],
+    real: &[crate::ir::SiteId],
+    chain: &str,
+    report: &mut Report,
+) -> Option<PlannedTree> {
+    let model = descent.model;
+    let records = planned_max(ops, &|op| appended(program, op))
+        .expect("the IR's record count fits u64, and the plan appends no more")
+        .total;
+    let requests = planned_max(ops, &outbound)?.total;
+    let mut tree = PlannedTree {
+        records,
+        requests,
+        sessions: 1,
+    };
+    let spawns = spawns_on(program, handler, ops, real);
+    if spawns == 0 {
+        return Some(tree);
+    }
+    let mut widest = PlannedTree::default();
+    for (tool, spawn) in program.spawns() {
+        let child_program = &spawn.program;
+        let child_plan = lower::lower(child_program, model, descent.mutation);
+        let index = child_program
+            .handlers
+            .iter()
+            .position(|declared| declared.name == spawn.handler)
+            .expect("the checker spawns only a handler the child harness declares");
+        let child = &child_program.handlers[index];
+        let child_chain = format!(
+            "{chain} > {} runs {}.{}",
+            tool.name,
+            spawn.harness(),
+            spawn.handler
         );
-        let mut fits = true;
-        for (tool, spawn) in program.spawns() {
-            let child = &spawn.child().worst.requests;
-            let Some(limit) = model.limits.outbound_requests_per_invocation else {
-                continue;
-            };
-            if child.total > limit.value {
-                fits = false;
+        let child_tree = planned_tree(
+            descent,
+            child_program,
+            child,
+            &child_plan.handlers[index].ops,
+            &child_plan.handlers[index].real,
+            &child_chain,
+            report,
+        )?;
+        if let Some(limit) = model.limits.outbound_requests_per_invocation {
+            let own = planned_max(&child_plan.handlers[index].ops, &outbound)?.total;
+            if own > limit.value {
                 report.add(Finding {
-                    handler: handler.name.clone(),
+                    handler: descent.root.to_owned(),
                     target: Some(model.target),
                     property: "worst_case",
                     message: format!(
@@ -278,19 +332,97 @@ fn children(program: &Program, plan: &Plan, report: &mut Report) {
                         spawn.harness(),
                         spawn.handler,
                         tool.name,
-                        child.total,
+                        own,
                         model.target.name(),
                         limit.value,
                         limit.unit
                     ),
-                    path: child.describe_loops(),
+                    path: format!(
+                        "{child_chain} ({})",
+                        child.worst.requests.describe_loops()
+                    ),
                     counterexample: None,
                 });
+                return None;
             }
         }
-        if !fits {
-            continue;
+        if let Some(limit) = &spawn.sessions
+            && child_tree.sessions > limit.value
+        {
+            report.add(Finding {
+                handler: descent.root.to_owned(),
+                target: Some(model.target),
+                property: "worst_case",
+                message: format!(
+                    "one call of {} starts {} sessions on the plans' longest paths, over sessions at most {} ({})",
+                    tool.name, child_tree.sessions, limit.name, limit.value
+                ),
+                path: child_chain,
+                counterexample: Some(format!(
+                    "{}.{} and {} descendant session(s), each running its handler's longest path",
+                    spawn.harness(),
+                    spawn.handler,
+                    child_tree.sessions - 1
+                )),
+            });
+            return None;
         }
+        widest.records = widest.records.max(child_tree.records);
+        widest.requests = widest.requests.max(child_tree.requests);
+        widest.sessions = widest.sessions.max(child_tree.sessions);
+    }
+    tree.records = tree
+        .records
+        .checked_add(spawns.checked_mul(widest.records)?)?;
+    tree.requests = tree
+        .requests
+        .checked_add(spawns.checked_mul(widest.requests)?)?;
+    tree.sessions = tree
+        .sessions
+        .checked_add(spawns.checked_mul(widest.sessions)?)?;
+    Some(tree)
+}
+
+fn children(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Report) {
+    let model = &plan.model;
+    for (handler, lowered) in program.handlers.iter().zip(&plan.handlers) {
+        let Some(family) = &handler.worst.family else {
+            continue;
+        };
+        let planned = spawns_on(program, handler, &lowered.ops, &lowered.real);
+        assert!(
+            planned <= handler.worst.spawns.total,
+            "the IR's child session worst case covers every path of the plan"
+        );
+        let descent = Descent {
+            model,
+            mutation,
+            root: &handler.name,
+        };
+        let chain = format!("{}.{}", program.name, handler.name);
+        let Some(tree) = planned_tree(
+            &descent,
+            program,
+            handler,
+            &lowered.ops,
+            &lowered.real,
+            &chain,
+            report,
+        ) else {
+            continue;
+        };
+        assert!(
+            tree.records <= family.total[1],
+            "the IR's family record worst case covers every path of the plans"
+        );
+        assert!(
+            tree.requests <= family.total[2],
+            "the IR's family request worst case covers every path of the plans"
+        );
+        assert!(
+            tree.sessions - 1 <= family.sessions,
+            "the IR's family session worst case covers every path of the plans"
+        );
         report.proved.push(format!(
             "handler {} on {}: worst_case: {planned} child session(s) on the plan's longest path, as hl check counts ({}), each in its own run; with them {} effects, {} journal records, {} outbound requests",
             handler.name,
@@ -300,6 +432,16 @@ fn children(program: &Program, plan: &Plan, report: &mut Report) {
             family.total[1],
             family.total[2]
         ));
+        if family.depth > 1 {
+            report.proved.push(format!(
+                "handler {} on {}: worst_case: {} sessions in its tree on the plans' longest paths, {} journal records and {} outbound requests with them, as hl check counts; every spawn within its sessions at most",
+                handler.name,
+                model.target.name(),
+                tree.sessions - 1,
+                tree.records,
+                tree.requests
+            ));
+        }
     }
 }
 

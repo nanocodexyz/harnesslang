@@ -10,8 +10,9 @@ const HARNESS_BINDING = "HARNESS";
 const TURN_PATH = "/turn";
 const EVENT_PATH = "/event";
 const RESUME_PATH = "/resume";
-const SESSION_PATH = /^\/sessions\/([^/]+)\/(turn|event|resume)$/;
-const SESSION_PATHS = { turn: TURN_PATH, event: EVENT_PATH, resume: RESUME_PATH };
+const SIDE_PATH = "/side";
+const SESSION_PATH = /^\/sessions\/([^/]+)\/(turn|event|resume|side)$/;
+const SESSION_PATHS = { turn: TURN_PATH, event: EVENT_PATH, resume: RESUME_PATH, side: SIDE_PATH };
 const RAN_HEADER = "hl-ran";
 const HTTP_BAD_REQUEST = 400;
 const HTTP_NOT_FOUND = 404;
@@ -147,6 +148,15 @@ class CloudflareWorld {
     }
     this.object.answered(turn, answers);
   }
+
+  async side(turn, seq) {
+    if (this.object.simulation.side === undefined) return null;
+    return this.object.simulation.side(turn, seq);
+  }
+
+  async sided(request, answer) {
+    if (this.object.simulation.sided !== undefined) await this.object.simulation.sided(request, answer);
+  }
 }
 
 class HarnessObject {
@@ -260,14 +270,35 @@ class HarnessObject {
     }
   }
 
-  load() {
+  rows() {
     const rows = this.storage.sql.exec(JOURNAL_LOAD).toArray();
-    const records = rows.map((row, index) => {
+    return rows.map((row, index) => {
       if (Number(row.position) !== index + 1) throw new Corrupt(`journal row ${index + 1} has position ${row.position}`);
       return decodeOrCorrupt(() => decodeLine(row.record, false));
     });
-    this.position = rows.length;
+  }
+
+  load() {
+    const records = this.rows();
+    this.position = records.length;
     return records;
+  }
+
+  async side(request) {
+    let question;
+    try {
+      question = sideRequestFromJson(decodeJson(await request.text()));
+    } catch (error) {
+      if (error instanceof DecodeError) return new Response(error.message, { status: HTTP_BAD_REQUEST });
+      throw error;
+    }
+    try {
+      const answer = await answerSide({ target: CLOUDFLARE_TARGET, mutation: "none" }, new CloudflareWorld(this), this.rows(), question);
+      return new Response(encodeJson(sideAnswerJson(answer)), { headers: { "content-type": "application/json" } });
+    } catch (error) {
+      if (error instanceof Corrupt) return new Response(error.message, { status: HTTP_INTERNAL_ERROR });
+      throw error;
+    }
   }
 
   insert(record) {
@@ -304,9 +335,14 @@ class HarnessObject {
         await this.settle();
         return { ran: ran.ran, suspension: ran.suspension };
       }
+      if (ran.ran === "not_due") {
+        await this.settle();
+        return { ran: ran.ran };
+      }
       if (ran.ran === "already_finished") await world.acknowledge(ran.finish);
       await this.settle();
       assert(world.finish !== null, "a driven turn is acknowledged");
+      await this.armIdle();
       return { ran: ran.ran, finish: world.finish };
     } catch (error) {
       this.armed = false;
@@ -323,6 +359,7 @@ class HarnessObject {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === EVENT_PATH) return this.deliver(request);
     if (request.method === "POST" && url.pathname === RESUME_PATH) return this.deliverResume(request);
+    if (request.method === "POST" && url.pathname === SIDE_PATH) return this.side(request);
     if (request.method !== "POST" || url.pathname !== TURN_PATH) return new Response("not found", { status: HTTP_NOT_FOUND });
     let turn;
     try {
@@ -342,8 +379,27 @@ class HarnessObject {
     }
   }
 
+  async armIdle() {
+    const due = await idleDue({ target: CLOUDFLARE_TARGET, mutation: this.mutation }, this.load());
+    if (due === null) return;
+    this.storageWrites.push(this.storage.setAlarm(Number(due)));
+    await this.settle();
+  }
+
+  async woken() {
+    const resumed = await this.resume();
+    if (resumed.ran !== "idle" || PROGRAM.idle === null) return resumed;
+    try {
+      const session = fold(this.load());
+      return await this.drive({ turn: session.lastTurn + 1, handler: PROGRAM.idle.handler, arguments: [] });
+    } catch (error) {
+      if (error instanceof Corrupt) return { ran: "corrupt", message: error.message };
+      throw error;
+    }
+  }
+
   async alarm() {
-    const resumed = await this.serialized(() => this.resume());
+    const resumed = await this.serialized(() => this.woken());
     if (resumed !== null) return resumed;
     await this.storage.setAlarm(Date.now() + ALARM_RESUME_DELAY_MS);
     return { ran: "busy" };
@@ -466,6 +522,7 @@ const harness = {
   turnPath: TURN_PATH,
   eventPath: EVENT_PATH,
   resumePath: RESUME_PATH,
+  sidePath: SIDE_PATH,
 };
 
 export { HarnessObject, harness };

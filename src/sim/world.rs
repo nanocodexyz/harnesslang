@@ -4,6 +4,7 @@ use crate::effect::EffectClass;
 use crate::ir::{self, Program, Type};
 use crate::run::cell::{CellEngine, CellEvent, Input, Step, Wait};
 use crate::run::cell_journal::Entry;
+use crate::run::engine::Exit;
 use crate::run::engine::{
     Answer, Finish, ListingRequest, ModelRequest, Point, Read, Resume, Stop, Suspension,
     ToolRequest, World, batch_width, run_batch,
@@ -11,6 +12,7 @@ use crate::run::engine::{
 use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
+use crate::run::side::{SIDE_TURN, SideAnswer, SideRequest};
 use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value;
 use crate::sim::cell::{CELL_CALL_PPM, DIVERGENCE_PPM, Plan, SimEngine};
@@ -137,11 +139,17 @@ pub struct Stats {
     pub children: u64,
     pub joined: u64,
     pub child_crashes: u64,
+    pub side_questions: u64,
+    pub idle_turns: u64,
+    pub idle_refused: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct Child {
     pub result: Result<String, Violation>,
+    pub turn: u64,
+    pub tool: String,
+    pub sessions: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,6 +188,8 @@ pub struct SimWorld<'a> {
     pub inbox: Inbox,
     pub parking: crate::sim::park::Parking,
     pub children: BTreeMap<String, Child>,
+    pub scope: String,
+    pub family_left: usize,
     pub denied_ran: Vec<String>,
     denying: bool,
     pub edges: Option<Edges>,
@@ -194,14 +204,16 @@ pub struct SimWorld<'a> {
     armed: bool,
     pub(crate) nested: bool,
     lease_spent: bool,
-    current: Option<TurnRequest>,
+    pub(crate) current: Option<TurnRequest>,
     pub(crate) clock: u64,
+    pub idle_log: Vec<(u64, crate::run::turn::NotDue)>,
     model_calls: BTreeMap<(u64, u64), u64>,
     pub model_modes: BTreeMap<(u64, u64), Vec<(Option<String>, Json)>>,
-    run_epoch: u64,
+    pub(crate) run_epoch: u64,
     batch_calls: BTreeMap<(u64, u64), u64>,
     listing_reads: BTreeMap<(u64, u64), u64>,
     listing_changes: u64,
+    pub(crate) sides: crate::sim::side::Sides,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +258,8 @@ impl<'a> SimWorld<'a> {
             inbox: Inbox::default(),
             parking: crate::sim::park::Parking::default(),
             children: BTreeMap::new(),
+            scope: String::new(),
+            family_left: CHILD_SESSIONS_PER_SEED_MAX,
             denied_ran: Vec::new(),
             denying: false,
             edges: None,
@@ -260,6 +274,7 @@ impl<'a> SimWorld<'a> {
             lease_spent: false,
             current: None,
             clock: 0,
+            idle_log: Vec::new(),
             model_calls: BTreeMap::new(),
             model_modes: BTreeMap::new(),
             run_epoch: 0,
@@ -268,6 +283,7 @@ impl<'a> SimWorld<'a> {
             executed: BTreeMap::new(),
             listing_reads: BTreeMap::new(),
             listing_changes: 0,
+            sides: crate::sim::side::Sides::default(),
         };
         world.change_listings(LISTED_PRESENT_PPM);
         world
@@ -343,7 +359,7 @@ impl<'a> SimWorld<'a> {
         }
     }
 
-    fn opened(&mut self, name: &str, epoch: u64, bytes: Option<Vec<u8>>) {
+    pub(crate) fn opened(&mut self, name: &str, epoch: u64, bytes: Option<Vec<u8>>) {
         if let (Some(trace), Some(bytes)) = (&mut self.trace, bytes) {
             trace.opened(name, epoch, &bytes);
         }
@@ -372,7 +388,9 @@ impl<'a> SimWorld<'a> {
         self.parking.pending = None;
         self.parking.suspensions = 0;
         self.parking.unmatched = 0;
-        self.inbox.schedule(program, self.seed, request.turn);
+        if !program.idles(&request.handler) {
+            self.inbox.schedule(program, self.seed, request.turn);
+        }
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
         self.armed = faults;
@@ -512,7 +530,7 @@ impl<'a> SimWorld<'a> {
             trace.exit(&ran);
         }
         match ran {
-            Ok(Ran::Finished(_) | Ran::Suspended(_)) => {}
+            Ok(Ran::Finished(_) | Ran::Suspended(_) | Ran::NotDue(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => self.acknowledge(&finish),
             Err(exit) => self
                 .owner_faults
@@ -717,6 +735,10 @@ impl<'a> SimWorld<'a> {
 }
 
 impl World for SimWorld<'_> {
+    fn scope(&self) -> String {
+        self.scope.clone()
+    }
+
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
         self.inbox.hook();
         match point {
@@ -796,6 +818,9 @@ impl World for SimWorld<'_> {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        if request.turn == SIDE_TURN {
+            return self.side_tool_output(request);
+        }
         self.count_effect(true);
         if self.denying {
             self.denied_ran.push(format!(
@@ -866,6 +891,9 @@ impl World for SimWorld<'_> {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        if request.turn == SIDE_TURN {
+            return self.side_model_reply(request);
+        }
         self.count_effect(true);
         self.change_listings(LISTING_CHANGE_PPM);
         let response = self.reply(request);
@@ -1087,6 +1115,19 @@ impl World for SimWorld<'_> {
         self.inbox.answer(turn, position, answers);
     }
 
+    fn side(&mut self, turn: u64, seq: u64, buffered: &[Record]) -> Option<SideRequest> {
+        self.side_at_effect(turn, seq, buffered)
+    }
+
+    fn sided(
+        &mut self,
+        request: &SideRequest,
+        answer: &Result<SideAnswer, Exit>,
+        buffered: &[Record],
+    ) {
+        self.side_answered(request, answer, buffered);
+    }
+
     fn read(&mut self, read: &Read) {
         self.inbox.read(read);
     }
@@ -1231,8 +1272,8 @@ impl SimWorld<'_> {
         if !matches!(output, Output::Ok(_)) {
             return output;
         }
-        let key = crate::ir::spawn_key(request.turn, request.seq);
-        if !self.children.contains_key(&key) && self.children.len() >= CHILD_SESSIONS_PER_SEED_MAX {
+        let key = crate::ir::scoped_spawn_key(&self.scope, request.turn, request.seq);
+        if !self.children.contains_key(&key) && self.family_left == 0 {
             return Output::Failed(format!(
                 "{} refused: the host holds child_sessions_per_seed_max ({CHILD_SESSIONS_PER_SEED_MAX}) child sessions",
                 request.tool
@@ -1240,18 +1281,39 @@ impl SimWorld<'_> {
         }
         if !self.children.contains_key(&key) {
             let seed = Rng::derive_keyed(self.seed, "child", &[request.turn, request.seq]).draw();
+            self.family_left -= 1;
             let (result, stats) = crate::sim::run_child(
                 &spawn.program,
-                self.target.target,
-                self.mutation,
-                seed,
+                &crate::sim::Placement {
+                    target: self.target.target,
+                    mutation: self.mutation,
+                    seed,
+                    scope: &key,
+                    family_left: self.family_left,
+                },
                 &spawn.handler,
                 request.input,
             );
+            let descendants = usize::try_from(stats.children)
+                .expect("a family's sessions fit usize, bounded by child_sessions_per_seed_max");
+            assert!(
+                descendants <= self.family_left,
+                "a child starts no more sessions than the family has left"
+            );
+            self.family_left -= descendants;
+            let child_crashes = self.stats.child_crashes + stats.crashes;
             crate::sim::add(&mut self.stats, &stats);
-            self.stats.child_crashes += stats.crashes;
+            self.stats.child_crashes = child_crashes;
             self.stats.children += 1;
-            self.children.insert(key.clone(), Child { result });
+            self.children.insert(
+                key.clone(),
+                Child {
+                    result,
+                    turn: request.turn,
+                    tool: request.tool.to_owned(),
+                    sessions: stats.children + 1,
+                },
+            );
         }
         Output::Ok(Json::String(key))
     }
@@ -1284,19 +1346,23 @@ impl SimWorld<'_> {
             .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
+        self.reply_from(&mut rng, request)
+    }
+
+    pub(crate) fn reply_from(&self, rng: &mut Rng, request: &ModelRequest<'_>) -> Json {
         let model = self
             .program
             .model
             .as_ref()
             .expect("the checker admits model calls only with a model");
         if let Some(window) = &model.window {
-            return self.attempt_reply(&mut rng, request, window.tokens.value);
+            return self.attempt_reply(rng, request, window.tokens.value);
         }
         if model.declared() && !self.greedy && rng.chance(MODEL_FAILURE_PPM) {
-            let error = format!("{} failed: {}", model.name, Self::generated_text(&mut rng));
+            let error = format!("{} failed: {}", model.name, Self::generated_text(rng));
             return Json::object([(ir::MODEL_FAILED, Json::String(error))]);
         }
-        self.reply_value(&mut rng, request)
+        self.reply_value(rng, request)
     }
 
     fn attempt_reply(&self, rng: &mut Rng, request: &ModelRequest<'_>, window: u64) -> Json {
@@ -1349,6 +1415,8 @@ impl SimWorld<'_> {
             };
             fields.push(Json::Number(used));
         }
+        let cache = fields.len() - 2;
+        self.warm_usage(rng, &mut fields[cache..]);
         Self::variant_json(name(ir::ATTEMPT_OK), fields)
     }
 

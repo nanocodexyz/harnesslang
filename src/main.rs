@@ -16,7 +16,7 @@ const SUMMARIZED_RESULT: &str = "summarized";
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
@@ -40,18 +40,48 @@ fn print_report(report: &str) -> std::io::Result<()> {
 }
 
 fn load(file: &str) -> Result<Program, String> {
+    load_within(file, &mut Vec::new())
+}
+
+fn load_within(
+    file: &str,
+    spawning: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<Program, String> {
     let source = std::fs::read_to_string(file)
         .map_err(|error| format!("{file}: error: cannot read: {error}"))?;
+    let identity = std::fs::canonicalize(file)
+        .map_err(|error| format!("{file}: error: cannot resolve: {error}"))?;
+    if let Some(start) = spawning.iter().position(|(path, _)| *path == identity) {
+        let chain: Vec<&str> = spawning[start..]
+            .iter()
+            .map(|(_, shown)| shown.as_str())
+            .chain([file])
+            .collect();
+        return Err(format!(
+            "{file}: error: the spawn tree returns to a harness it is inside, so its sessions have no bound: {}",
+            chain.join(" spawns ")
+        ));
+    }
+    let depth = u64::try_from(spawning.len()).expect("a spawn chain's length fits u64");
+    if depth > ir::SPAWN_DEPTH_MAX {
+        return Err(format!(
+            "{file}: error: the spawn tree is deeper than spawn_depth_max ({}) levels",
+            ir::SPAWN_DEPTH_MAX
+        ));
+    }
     let parsed = syntax::parse(&source).map_err(|diagnostic| diagnostic.render(file))?;
     let directory = std::path::Path::new(file)
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
-    check::check_with(&parsed, &mut |child: &str| {
+    spawning.push((identity, file.to_owned()));
+    let checked = check::check_with(&parsed, &mut |child: &str| {
         let path = directory.join(child);
-        load(&path.to_string_lossy())
+        load_within(&path.to_string_lossy(), spawning)
     })
-    .map_err(|diagnostic| diagnostic.render(file))
+    .map_err(|diagnostic| diagnostic.render(file));
+    spawning.pop();
+    checked
 }
 
 fn parse_seeds(value: &str) -> Option<std::ops::Range<u64>> {
@@ -101,6 +131,7 @@ struct Flags {
     arguments: Vec<String>,
     seed: u64,
     trace: Option<String>,
+    scope: String,
     dump: Option<String>,
     summarize: Option<String>,
     exhaustive: bool,
@@ -121,6 +152,7 @@ fn flags(args: &[String]) -> Option<Flags> {
         arguments: Vec::new(),
         seed: 0,
         trace: None,
+        scope: String::new(),
         dump: None,
         summarize: None,
         exhaustive: false,
@@ -140,6 +172,7 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--arg" => flags.arguments.push(rest.next()?.clone()),
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
             "--trace" => flags.trace = Some(rest.next()?.clone()),
+            "--scope" => flags.scope = rest.next()?.clone(),
             "--dump-journal" => flags.dump = Some(rest.next()?.clone()),
             "--summarize" => flags.summarize = Some(rest.next()?.clone()),
             "--exhaustive" => flags.exhaustive = true,
@@ -189,23 +222,56 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
             worst.spawns.describe_loops()
         ));
         for (tool, spawn) in program.spawns() {
-            let child = &spawn.child().worst;
+            let tree = spawn.tree();
+            let descendants = match &spawn.sessions {
+                Some(limit) if tree.sessions > 1 => format!(
+                    ", {} sessions with its descendants (sessions at most {} ({}))",
+                    tree.sessions, limit.name, limit.value
+                ),
+                _ => String::new(),
+            };
             lines.push(format!(
-                "      {} runs {}.{}: worst case {} effects, {} journal records, {} outbound requests each",
+                "      {} runs {}.{}: worst case {} effects, {} journal records, {} outbound requests each{descendants}",
                 tool.name,
                 spawn.harness(),
                 spawn.handler,
-                child.effects.total,
-                child.records.total,
-                child.requests.total
+                tree.measures[0],
+                tree.measures[1],
+                tree.measures[2]
             ));
         }
         lines.push(format!(
             "    with its child sessions: {} effects, {} journal records, {} outbound requests",
             family.total[0], family.total[1], family.total[2]
         ));
+        if family.depth > 1 {
+            lines.push(format!(
+                "    sessions in its tree: {}, {} levels below it",
+                family.sessions, family.depth
+            ));
+        }
     }
     lines.push("    plus one recovery record per restart".to_owned());
+    if let Some(idle) = program
+        .idle
+        .as_ref()
+        .filter(|idle| idle.handler == handler.name)
+    {
+        let times = |measure: u64| {
+            measure
+                .checked_mul(idle.bound.value)
+                .map_or_else(|| "more than u64".to_owned(), |total| total.to_string())
+        };
+        lines.push(format!(
+            "    runs when the session idles until {}, at most {} ({}) time(s) after each other turn: {} effects, {} journal records, {} outbound requests in all",
+            program.state[idle.due].name,
+            idle.bound.name,
+            idle.bound.value,
+            times(worst.effects.total),
+            times(worst.records.total),
+            times(worst.requests.total)
+        ));
+    }
     let events = &program.events;
     if events.any() {
         let steers = events.steers.as_ref().map_or_else(String::new, |bound| {
@@ -218,6 +284,23 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
         ));
     }
     lines.join("\n")
+}
+
+fn side_lines(side: &ir::Handler) -> String {
+    let worst = &side.worst;
+    [
+        format!(
+            "  side handler {}: worst case {} effects, 0 journal records, {} outbound requests",
+            side.name, worst.effects.total, worst.requests.total
+        ),
+        format!("    effects: {}", worst.effects.describe_loops()),
+        format!("    outbound requests: {}", worst.requests.describe_loops()),
+        "    journaled nowhere: it runs over the state at the last finished turn".to_owned(),
+    ]
+    .join(
+        "
+",
+    )
 }
 
 fn check_command(args: &[String]) -> ExitCode {
@@ -234,8 +317,13 @@ fn check_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
+    let sides = if program.sides.is_empty() {
+        String::new()
+    } else {
+        format!(", {} side handler(s)", program.sides.len())
+    };
     println!(
-        "{file}: harness {}: {} tool(s), {} state field(s), {} handler(s)",
+        "{file}: harness {}: {} tool(s), {} state field(s), {} handler(s){sides}",
         program.name,
         program.tools.len(),
         program.state.len(),
@@ -243,6 +331,9 @@ fn check_command(args: &[String]) -> ExitCode {
     );
     for handler in &program.handlers {
         println!("{}", worst_lines(&program, handler));
+    }
+    for side in &program.sides {
+        println!("{}", side_lines(side));
     }
     let proved_targets = flags
         .target
@@ -487,6 +578,7 @@ fn sim_command(args: &[String]) -> ExitCode {
             (true, true) => sim::strict::Mode::FromAny,
             (false, true) => return usage(),
         },
+        scope: flags.scope.clone(),
     };
     let summary = match &flags.trace {
         None => sim::sweep(&program, &options),

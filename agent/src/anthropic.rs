@@ -12,6 +12,8 @@ pub const STREAM_IDLE_SECONDS_MAX: u64 = 600;
 pub const STREAM_IDLE_BYTES_PER_SECOND: u64 = 1;
 pub const CURL_TIMED_OUT: i32 = 28;
 pub const MODE_TEXT_ONLY: &str = "text_only";
+pub const MODE_REFRESH: &str = "refresh";
+pub const REFRESH_MAX_TOKENS: u64 = 0;
 pub const HTTP_OK: u16 = 200;
 pub const HTTP_REQUEST_TIMEOUT: u16 = 408;
 pub const HTTP_CONFLICT: u16 = 409;
@@ -270,6 +272,15 @@ pub fn messages(context: &Value, attached: &Attached<'_>) -> Result<Vec<Value>, 
     Ok(messages)
 }
 
+fn kept_request(context: &Value) -> Result<Value, String> {
+    let entries = context.as_array().ok_or("the context is not a list")?;
+    let last = entries
+        .iter()
+        .rposition(|entry| entry.get("assistant").is_some())
+        .ok_or("a refresh needs a context that holds a reply")?;
+    Ok(Value::Array(entries[..last].to_vec()))
+}
+
 impl Client {
     pub fn body(
         &self,
@@ -283,16 +294,29 @@ impl Client {
         {
             last.insert("cache_control", ephemeral());
         }
+        let refresh = mode == Some(MODE_REFRESH);
+        let kept = if refresh {
+            kept_request(context)?
+        } else {
+            context.clone()
+        };
         let mut body = Value::object([
             ("model", Value::text(&self.model)),
-            ("max_tokens", Value::number(self.max_tokens)),
+            (
+                "max_tokens",
+                Value::number(if refresh {
+                    REFRESH_MAX_TOKENS
+                } else {
+                    self.max_tokens
+                }),
+            ),
             ("system", self.system.clone()),
             ("tools", tools),
-            ("messages", Value::Array(messages(context, attached)?)),
-            ("stream", Value::Bool(true)),
+            ("messages", Value::Array(messages(&kept, attached)?)),
+            ("stream", Value::Bool(!refresh)),
         ]);
         match mode {
-            None => {}
+            None | Some(MODE_REFRESH) => {}
             Some(MODE_TEXT_ONLY) => {
                 body.insert(
                     "tool_choice",

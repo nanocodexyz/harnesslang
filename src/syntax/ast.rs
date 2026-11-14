@@ -98,6 +98,7 @@ pub struct Spawn {
     pub name: Name,
     pub handler: Name,
     pub file: Name,
+    pub sessions: Option<Name>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +208,14 @@ pub struct Handler {
     pub requires: Option<Expr>,
     pub body: Block,
     pub ends_session: bool,
+    pub side: bool,
+    pub idle: Option<Idle>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Idle {
+    pub due: Name,
+    pub bound: Name,
 }
 
 #[derive(Clone, Debug)]

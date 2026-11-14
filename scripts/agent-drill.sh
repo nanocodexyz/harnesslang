@@ -6,6 +6,8 @@ mode="${AGENT_DRILL_MODE:-mock}"
 kills_max="${AGENT_DRILL_KILLS:-12}"
 kill_ms_max="${AGENT_DRILL_KILL_MS_MAX:-1500}"
 steps="${AGENT_DRILL_STEPS:-6}"
+spawn_after="${AGENT_DRILL_SPAWN_AFTER:-2}"
+child_steps="${AGENT_DRILL_CHILD_STEPS:-2}"
 mock_delay_ms="${AGENT_DRILL_MOCK_DELAY_MS:-300}"
 tool_sleep="${AGENT_DRILL_TOOL_SLEEP:-0.3}"
 model="${AGENT_DRILL_MODEL:-claude-haiku-4-5}"
@@ -53,14 +55,28 @@ case "$mode" in
       printf '['
       for step in $(seq 1 "$steps"); do
         printf '{"text":"Step %d.","throttle":%d,"calls":[{"name":"Bash","input":{"command":"echo step%d >> effects.log && sleep %s","description":"Record step %d"}},{"name":"Read","input":{"file_path":"effects.log"}}]},' "$step" "$(( step == 1 ))" "$step" "$tool_sleep" "$step"
+        if [ "$step" -eq "$spawn_after" ]; then
+          printf '{"text":"Delegating the child steps.","calls":[{"name":"spawn_agent","input":{"role":"recorder","task":"Record the child steps in effects.log, then submit what you recorded."}}]},'
+        fi
+        if [ "$step" -eq $(( spawn_after + 1 )) ]; then
+          printf '{"calls":[{"name":"wait_agent","input":{"agent_id":"$spawned"}}]},'
+        fi
       done
       printf '{"calls":[{"name":"Read","input":{"file_path":"pixel.png"}}]},'
       printf '{"text":"Writing done.txt n","stop":"max_tokens"},'
       printf '{"calls":[{"name":"Write","input":{"file_path":"done.txt","content":"done\\n"}}]},'
       printf '{"answer":"All steps ran."}]\n'
     } > "$out/script.json"
+    {
+      printf '['
+      for step in $(seq 1 "$child_steps"); do
+        printf '{"text":"Child step %d.","calls":[{"name":"Bash","input":{"command":"echo child%d >> effects.log && sleep %s","description":"Record child step %d"}}]},' "$step" "$step" "$tool_sleep" "$step"
+      done
+      printf '{"calls":[{"name":"Read","input":{"file_path":"effects.log"}}]},'
+      printf '{"calls":[{"name":"submit_result","input":{"output":"the child recorded %d steps"}}]}]\n' "$child_steps"
+    } > "$out/child.json"
     printf '\211PNG\r\n\032\nhl-agent drill image' > "$workspace/pixel.png"
-    "$mock" "$out/port" "$out/script.json" "$mock_delay_ms" 2> "$out/mock.log" &
+    "$mock" "$out/port" "$out/script.json" "$mock_delay_ms" "$out/child.json" 2> "$out/mock.log" &
     mock_pid=$!
     for _ in $(seq 1 100); do
       [ -s "$out/port" ] && break
@@ -93,6 +109,7 @@ RANDOM=$seed
 kills=0
 kills_model=0
 kills_tool=0
+kills_child=0
 status=
 for attempt in $(seq 1 "$kills_max"); do
   run_agent &
@@ -109,6 +126,9 @@ for attempt in $(seq 1 "$kills_max"); do
     set -e
     if [ "$status" -eq "$killed_status" ]; then
       kills=$((kills + 1))
+      case "$last" in
+        "hl-agent["*) kills_child=$((kills_child + 1)) ;;
+      esac
       case "$last" in
         *" model "*) kills_model=$((kills_model + 1)) ;;
         *) kills_tool=$((kills_tool + 1)) ;;
@@ -145,15 +165,19 @@ if [ "$rerun" -ne 0 ]; then
   exit 1
 fi
 
-python3 - "$out" "$mode" "$steps" <<'EOF'
+python3 - "$out" "$mode" "$steps" "$child_steps" <<'EOF'
 import collections, json, os, sys
-out, mode, steps = sys.argv[1], sys.argv[2], int(sys.argv[3])
-external = {"Bash", "Edit", "Write"}
+out, mode, steps, child_steps = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+external = {"Bash", "Edit", "Write", "spawn_agent"}
+children_dir = f"{out}/journal/children"
+children = sorted(os.listdir(children_dir)) if os.path.isdir(children_dir) else []
+journals = [f"{out}/journal"] + [f"{children_dir}/{key}" for key in children]
 dispatches = collections.Counter()
-for line in open(f"{out}/journal/usage.jsonl"):
-    record = json.loads(line)
-    if record.get("kind") == "tool" and record["tool"] in external:
-        dispatches[record["call"]] += 1
+for journal in journals:
+    for line in open(f"{journal}/usage.jsonl"):
+        record = json.loads(line)
+        if record.get("kind") == "tool" and record["tool"] in external:
+            dispatches[(journal, record["call"])] += 1
 repeated = {call: count for call, count in dispatches.items() if count > 1}
 if repeated:
     sys.exit(f"agent-drill: external calls dispatched more than once: {repeated}")
@@ -165,23 +189,47 @@ effects = collections.Counter(open(log).read().split()) if os.path.exists(log) e
 twice = {step: count for step, count in effects.items() if count > 1}
 if mode == "mock" and twice:
     sys.exit(f"agent-drill: effects ran more than once: {twice}")
-if set(effects) - {f"step{index}" for index in range(1, steps + 1)}:
+expected = {f"step{index}" for index in range(1, steps + 1)} | {f"child{index}" for index in range(1, child_steps + 1)}
+if set(effects) - expected:
     sys.exit(f"agent-drill: unexpected effects {sorted(effects)}")
 if open(f"{out}/ws/done.txt").read().strip() != "done":
     sys.exit("agent-drill: done.txt is wrong")
 unknown = 0
-replies = set()
+child_unknown = 0
+discarded = []
+for journal in journals:
+    replies = set()
+    for line in open(f"{journal}/journal.jsonl"):
+        record = json.loads(line)["record"]
+        if "recovery" in record:
+            unknown += len(record["recovery"].get("unknown", []))
+            if journal != journals[0]:
+                child_unknown += len(record["recovery"].get("unknown", []))
+        if "model" in record:
+            replies.add(record["model"]["call_id"])
+    cut = [json.loads(line) for line in open(f"{journal}/usage.jsonl")]
+    cut = [record["call"] for record in cut if record.get("kind") == "stream_discarded"]
+    discarded += cut
+    unanswered = sorted(set(cut) - replies)
+    if unanswered:
+        sys.exit(f"agent-drill: streams cut by a kill in {journal} were not requested again to a journaled reply: {unanswered}")
+    leftover = [name for name in os.listdir(f"{journal}/state") if name.endswith(".sse")]
+    if leftover:
+        sys.exit(f"agent-drill: partial streams left in {journal} after the turn finished: {leftover}")
+joined = []
 for line in open(f"{out}/journal/journal.jsonl"):
     record = json.loads(line)["record"]
-    if "recovery" in record:
-        unknown += len(record["recovery"].get("unknown", []))
-    if "model" in record:
-        replies.add(record["model"]["call_id"])
-discarded = [json.loads(line) for line in open(f"{out}/journal/usage.jsonl")]
-discarded = [record["call"] for record in discarded if record.get("kind") == "stream_discarded"]
-unanswered = sorted(set(discarded) - replies)
-if unanswered:
-    sys.exit(f"agent-drill: streams cut by a kill were not requested again to a journaled reply: {unanswered}")
+    output = record.get("result", {}).get("output", {})
+    if isinstance(output.get("ok"), str) and "the child recorded" in output["ok"]:
+        joined.append(output["ok"])
+if mode == "mock":
+    if len(children) != 1:
+        sys.exit(f"agent-drill: expected one child journal under {children_dir}, found {children}")
+    child_records = [json.loads(line)["record"] for line in open(f"{children_dir}/{children[0]}/journal.jsonl")]
+    if not any("status" in record for record in child_records):
+        sys.exit(f"agent-drill: the child's journal holds no status record: {sorted({next(iter(record)) for record in child_records})}")
+    if len(joined) != 1 or json.loads(joined[0]) != {"submitted": f"the child recorded {child_steps} steps"}:
+        sys.exit(f"agent-drill: the parent's journal holds {joined} for the join, expected the child's submitted result once")
 blobs = []
 for line in open(f"{out}/journal/journal.jsonl"):
     record = json.loads(line)["record"]
@@ -190,10 +238,8 @@ for line in open(f"{out}/journal/journal.jsonl"):
         blobs.append(output["ok"])
 if mode == "mock" and (len(blobs) != 1 or "data" not in blobs[0]):
     sys.exit(f"agent-drill: the image read journaled {len(blobs)} blob results, expected one holding its data")
-leftover = [name for name in os.listdir(f"{out}/journal/state") if name.endswith(".sse")]
-if leftover:
-    sys.exit(f"agent-drill: partial streams left after the turn finished: {leftover}")
-print(f"agent-drill: blobs_journaled={len(blobs)} external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
+child_dispatches = sum(count for (journal, _), count in dispatches.items() if journal != journals[0])
+print(f"agent-drill: children={len(children)} joined={len(joined)} child_dispatches={child_dispatches} child_unknown_recovered={child_unknown} children_reported={usage['children']} blobs_journaled={len(blobs)} external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
 EOF
 finished=1
-echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool)"
+echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool; in the child $kills_child)"

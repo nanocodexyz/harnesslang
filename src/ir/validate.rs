@@ -33,6 +33,45 @@ pub fn program(program: &Program) {
     for handler in &program.handlers {
         self::handler(program, handler);
     }
+    for side in &program.sides {
+        self::handler(program, side);
+        side_reads_only(side);
+    }
+}
+
+fn side_reads_only(side: &ir::Handler) {
+    for site in &side.sites {
+        let reads = match (site.kind, site.class) {
+            (ir::SiteKind::Model, _) => true,
+            (ir::SiteKind::Tool(_), ir::SiteClass::Fixed(class)) => class == EffectClass::None,
+            _ => false,
+        };
+        assert!(
+            reads,
+            "a side handler calls only the model and tools of effect none"
+        );
+    }
+    assert!(
+        !writes_state(&side.body),
+        "a side handler changes no state field"
+    );
+}
+
+fn writes_state(statements: &[ir::Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        ir::Stmt::Assign { .. }
+        | ir::Stmt::Push { .. }
+        | ir::Stmt::Shrink { .. }
+        | ir::Stmt::KeepBlobs { .. }
+        | ir::Stmt::Take { .. }
+        | ir::Stmt::Parallel(_) => true,
+        ir::Stmt::If {
+            then, otherwise, ..
+        } => writes_state(then) || writes_state(otherwise),
+        ir::Stmt::Match { arms, .. } => arms.iter().any(|arm| writes_state(&arm.body)),
+        ir::Stmt::Loop { body, .. } | ir::Stmt::For { body, .. } => writes_state(body),
+        ir::Stmt::Let { .. } | ir::Stmt::Effect { .. } | ir::Stmt::Finish { .. } => false,
+    })
 }
 
 fn listings(program: &Program) {

@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `sessions` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -540,7 +540,7 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | code | spawn | model | state | invariant | function | hook | lifecycle | handler | event ;
+item       = const | type | tool | listing | code | spawn | model | state | invariant | function | hook | lifecycle | handler | side | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
@@ -554,12 +554,14 @@ model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "m
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
-spawn      = "spawn" name "runs" name "from" text ;
+spawn      = "spawn" name "runs" name "from" text [ "sessions" "at" "most" name ] ;
 hook       = ( "before" | "after" ) "tool" params block ;
 lifecycle  = "on" ( "session" "start" | "prompt" "submit" | "pre" "compact" | "post" "compact"
                   | "stop" | "subagent" "start" | "subagent" "stop" ) [ params ] block
-           | "on" "session" "end" params "->" type_expr [ "requires" expr ] block ;
+           | "on" "session" "end" params "->" type_expr [ "requires" expr ] block
+           | "on" "idle" name params "at" name "bound" bound "->" type_expr [ "requires" expr ] block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
+side       = "on" "side" name params "->" type_expr [ "requires" expr ] block ;
 event      = "on" name [ params "bound" bound ] ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
 bound      = name ;
@@ -1213,6 +1215,8 @@ kind of turn. Its parameters are the turn's arguments, recorded in the
 false, the turn finishes `failed` with `requires(name)` before the body runs.
 Every path through the body must end in `return`, and nothing may follow a
 `return` in its block.
+`on side name(...)` declares a side handler, which answers a question
+without a turn ([Side questions](#side-questions)).
 
 ```console
 $ hl check docs/snippets/errors/no-return.hl
@@ -3698,7 +3702,7 @@ name. It is external in class, so its call record is durable before the host
 starts the child, and a crash then leaves it `unknown`, never started twice.
 
 - The key is the spawn's place in the parent's journal, `T.S` for turn `T` and
-  sequence number `S`: the host keeps the child's session and journal under the
+  sequence number `S` (under the parent's own key in a [tree](#spawn-trees)): the host keeps the child's session and journal under the
   parent's session and that key, and the runtime records the key as the
   spawn's `ok` result whatever the host answers, so a replay names the same
   child.
@@ -3710,8 +3714,8 @@ starts the child, and a crash then leaves it `unknown`, never started twice.
   each child's worst case to the parent's. The prover counts the same spawns on
   the plan and checks the child's outbound requests against the target's limit
   per invocation, since each child runs in its own.
-- A spawned harness declares no spawn tool of its own, so a parent's worst case
-  holds every session it can start.
+- A spawned harness may spawn children of its own, so a family is a tree
+  ([below](#spawn-trees)).
 
 ```hl docs/snippets/spawn.hl
 harness coordinator
@@ -3812,6 +3816,536 @@ of `examples/subagents.hl` on every target replay the same answers.
 `examples/subagent_child.hl`, `wait_agent` joins the child the model names, and
 `on subagent start` and `on subagent stop` keep its roster.
 
+`examples/claude_code.hl` offers the same tools to Claude: `spawn_agent`
+starts `examples/claude_code_child.hl`'s `delegated(role, task)`, the Claude
+harness without its MCP listing, which ends when the model calls
+`submit_result`; `list_agents` asks the host; and a round that holds a
+`wait_agent` call runs its calls one after another, joining at each
+`wait_agent`, since the arms of a `parallel` for run no effects. `hl-agent`
+(`agent/`) is its host: a spawn writes the child's arguments to
+`children/T.S/spawn.json` under the parent's journal directory and runs the
+child on a thread, with its own journal there; a join is answered once the
+child's status is durable. After a kill, the parent's replay reaches its open
+join and the host runs an unfinished child from its journal, whose open
+external calls are reported `unknown`, or answers with a finished child's
+result.
+
+#### Spawn trees
+
+A child may spawn children of its own. `docs/snippets/tree.hl` starts a
+planner, which starts two reviewers of `spawn_child.hl` one after the other and
+joins each, so one review is a tree of three sessions under the lead:
+
+```hl docs/snippets/tree.hl
+harness lead
+
+const tree_sessions_max: u64 = 3
+
+type outcome = planned(text) | lost(text)
+
+spawn planner runs plan_change from "tree_planner.hl" sessions at most tree_sessions_max
+
+on resume
+
+on review(change: text) -> outcome {
+  match planner(change) {
+    ok(agent) => {
+      let verdict = join(agent)
+      return planned(verdict)
+    }
+    failed(error) => { return lost(error) }
+    unknown => { return lost("the spawn's outcome is unknown") }
+  }
+}
+```
+
+```hl docs/snippets/tree_planner.hl
+harness planner
+
+const parts_max: u64 = 2
+
+type verdict = planned(text) | lost(text)
+
+spawn reviewer runs review_change from "spawn_child.hl"
+
+on resume
+
+state {
+  notes: text
+}
+
+on plan_change(change: text) -> verdict {
+  notes = ""
+  loop part below parts_max {
+    match reviewer(change) {
+      ok(agent) => {
+        let notes_of_part = join(agent)
+        notes = notes ++ notes_of_part
+      }
+      failed(error) => { return lost(error) }
+      unknown => { return lost("the spawn's outcome is unknown") }
+    }
+  }
+  return planned(notes)
+}
+```
+
+- Keys are scoped. A session spawned under key `K` records its own children
+  as `K/T.S`, so every key of a family names one session and a host can keep
+  each session under its key alone. The host tells a session its key:
+  `Host::scope` in the generated Rust, and the turn request's `scope` field on
+  Cloudflare and Vercel. A root session's scope is empty, so its keys stay
+  `T.S`.
+- A spawn whose child spawns says how many sessions one call may start, the
+  child's and every descendant's: `sessions at most c`. `hl check` computes
+  the family from the bottom up, each child's family times the spawns that
+  reach it, refuses a spawn tool whose tree passes its `c`, and prints the
+  whole tree's totals and its sessions.
+- The prover lowers every descendant's handler for the same target and
+  recomputes the family from the plans, independently of the IR: records,
+  outbound requests and sessions on each plan's longest path, times the spawns
+  on its parent's. It checks the result against what `hl check` counts, each
+  descendant's outbound requests against the target's limit per invocation,
+  and each spawn's tree against its `sessions at most`, with the path of
+  spawns that passes it.
+- The files of a tree form no cycle, and a tree is at most `spawn_depth_max`
+  (16) levels deep, which bounds the checker's walk down the files. nanocode
+  bounds no depth (`DEFAULT_MAX_SUBAGENTS` is `usize::MAX`) but keeps at most
+  `DEFAULT_MAX_RESIDENT_SUBAGENTS` (16) subagents resident in a root
+  session's tree.
+
+```console
+$ hl check --target cloudflare docs/snippets/tree.hl | grep sessions
+    child sessions: 1, no loops
+      planner runs planner.plan_change: worst case 6 effects, 21 journal records, 4 outbound requests each, 3 sessions with its descendants (sessions at most tree_sessions_max (3))
+    with its child sessions: 8 effects, 28 journal records, 5 outbound requests
+    sessions in its tree: 3, 2 levels below it
+  proved handler review on cloudflare: worst_case: 3 sessions in its tree on the plans' longest paths, 28 journal records and 5 outbound requests with them, as hl check counts; every spawn within its sessions at most
+$ hl check examples/invalid/family_sessions.hl
+examples/invalid/family_sessions.hl:7:37: error: spawn tool 'planner' starts up to 3 sessions per call (planner.plan_change and 2 descendant sessions, part below parts_max (2)), over sessions at most two_sessions (2)
+$ hl check docs/snippets/errors/spawn-sessions.hl
+docs/snippets/errors/spawn-sessions.hl:3:37: error: handler 'plan_change' of harness 'planner' starts child sessions of its own: declare how many sessions one call of 'planner' starts, the child's and its descendants', as spawn planner runs plan_change from "../tree_planner.hl" sessions at most constant
+$ hl check docs/snippets/errors/spawn-cycle.hl
+docs/snippets/errors/spawn-cycle.hl:5:28: error: spawn tool 'again' cannot check "spawn-cycle.hl": docs/snippets/errors/spawn-cycle.hl: error: the spawn tree returns to a harness it is inside, so its sessions have no bound: docs/snippets/errors/spawn-cycle.hl spawns docs/snippets/errors/spawn-cycle.hl
+```
+
+```hl docs/snippets/errors/spawn-sessions.hl
+harness lead
+
+spawn planner runs plan_change from "../tree_planner.hl"
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/spawn-cycle.hl
+harness echo
+
+const echoes_max: u64 = 4
+
+spawn again runs ping from "spawn-cycle.hl" sessions at most echoes_max
+
+on ping() -> u64 { return 1 }
+```
+
+The simulator runs a grandchild as it runs a child, as a session of its own
+with a seed derived from its parent's, its own faults and every invariant,
+under its key's scope. `CHILD_SESSIONS_PER_SEED_MAX` bounds the sessions of
+the whole tree per seed, as nanocode's resident limit holds for a root
+session's whole tree. `child_scoped` holds at every level, and
+`family_bounded` requires the sessions a turn's tree starts to stay within its
+handler's family worst case, and each spawn's within its `sessions at most`.
+`grandchild_unscoped`, a runtime that keys a grandchild by `T.S` without its
+parent's scope, and `family_one_level`, a worst case that counts only the
+direct children, are caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/tree.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=1168 runs=3645 crashes=1793 power_losses=309 torn_writes=422 takeovers=0 fenced=0 dispatches=1276 unknown=186 sleeps=0 suspensions=684 children=664 joined=546 child_crashes=992
+$ hl sim --target native-jsonl --seeds 0..200 --mutation grandchild_unscoped docs/snippets/tree.hl
+FAIL invariant=child_scoped seed=1 target=native-jsonl profile=errors mutation=grandchild_unscoped: child session 3.1: spawn reviewer at turn 1 seq 1 records child key "1.1", but its call starts the child session "3.1/1.1"
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation grandchild_unscoped docs/snippets/tree.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation family_one_level docs/snippets/tree.hl
+FAIL invariant=family_bounded seed=1 target=native-jsonl profile=errors mutation=family_one_level: turn 3 (review) started 3 sessions in its tree, over its worst case of 1 (1 child sessions, no loops)
+replay: hl sim --target native-jsonl --seeds 1..2 --mutation family_one_level docs/snippets/tree.hl
+```
+
+`hl sim --scope K` runs a harness as if it were spawned under `K`, and the
+differential runs use it, so generated Rust and JavaScript record scoped keys
+as the interpreter does (`scripts/check.sh` runs `docs/snippets/tree_planner.hl`
+under `1.1` on every target).
+
+### Side questions
+
+`on side name(param: type, ...) -> type [requires condition] { ... }`
+declares a side handler: it answers a question about the session without
+touching it, as nanocode's `side_question` answers `/btw`. A side handler is
+not a turn. The host asks it between turns, while a turn is parked and while
+one runs; it appends no record anywhere, writes no checkpoint, takes no lease
+and leaves the session's state and sequence numbers as they were. Its model and
+tool requests go to the host with turn `0`, which no turn has, so a host tells
+them from a turn's; a crash loses the question and the host asks again.
+`docs/snippets/side.hl` asks the model with nanocode's
+`SIDE_QUESTION_REMINDER` in front of the question, the entry reaching the model
+through `with`, never pushed:
+
+```hl docs/snippets/side.hl
+harness sidecar
+
+const steps_max: u64 = 2
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+
+type outcome = completed(text) | exhausted
+
+tool Bash(command: text) -> text effect external
+
+model infer calls calls_max
+
+on resume
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          let verdict = suspend(call.id)
+          if verdict == "allow" {
+            match dispatch(call) {
+              ok(output) => { push context result(call, output) }
+              failed(error) => { push context error(call, error) }
+              unknown => { push context unknown(call) }
+            }
+          } else {
+            push context error(call, "Denied: " ++ verdict)
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on side ask(question: text) -> text {
+  let reminder = "<system-reminder>This is a side question from the user. You must answer this question directly in a single response.\nIMPORTANT CONTEXT:\n- You are a separate, lightweight agent spawned to answer this one question\n- The main agent is NOT interrupted - it continues working independently in the background\n- You share the conversation context but are a completely separate instance\n- Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\nCRITICAL CONSTRAINTS:\n- You have NO tools available - you cannot read files, run commands, search, or take any actions\n- Do NOT write tool calls or tool output as text (for example invoke or function_calls XML blocks) - nothing you write here is executed; if answering would need reading files, running commands, or searching, say that can't be checked from a side question and suggest asking in the main conversation\n- This is a one-off response - there will be no follow-up turns\n- You can ONLY provide information based on what you already know from the conversation context\n- NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n- If you don't know the answer, say so - do not offer to look it up or investigate\nSimply answer the question with the information you have.</system-reminder>\n\n"
+  let reply = infer(context with user(reminder ++ question))
+  match reply {
+    answer(words) => { return words }
+    calls(_) => { return "A side question cannot run tools: ask it in the main conversation." }
+  }
+}
+```
+
+It reads the state at the last finished turn: after the latest turn whose
+`status` is durable, which is the state a running or parked turn started from.
+A turn's changes are a function of records that may not be durable yet, so a
+crash can roll them back and an answer from them would have seen a state that
+never existed; a Durable Object request or a Vercel step cannot read another
+run's memory; and this snapshot is the same on every target. Every target makes
+a turn's `status` durable before it acknowledges the turn (durability point 2),
+so the next turn is admitted only after it. This departs from nanocode, which
+shows a side question the running turn's live transcript.
+
+The checker refuses anything that would change the session or need a journal,
+in the side handler and in every fn it calls: assigning, `push`, `clear`, `keep`, a
+parallel for, `take` and `cancelled`, tools of effect `idempotent` or `external`
+(spawn tools among them), `dispatch`, `join`, `suspend`, `wait`, `now()`,
+`random()`, listing reads and code cells. The model and tools of effect `none`
+remain. No hook runs in a side handler. `requires` is checked over the snapshot;
+when it is false the answer is `failed` with `requires(name)`. Its worst case
+counts no journal records, and Cloudflare's limit on outbound requests applies
+to it, since a side question runs in its own invocation:
+
+```console
+$ hl check docs/snippets/side.hl | grep 'side handler'
+docs/snippets/side.hl: harness sidecar: 1 tool(s), 1 state field(s), 1 handler(s), 1 side handler(s)
+  side handler ask: worst case 1 effects, 0 journal records, 1 outbound requests
+  proved side handler ask: finish_once: every path ends in exactly one of 2 return(s)
+  proved side handler ask: no_overflow: 0 arithmetic operation(s) proved in range; invariant_preserved: 3 invariant check(s) at returns and trap points; push_bound: 0 push(es) proved below capacity (6 prover steps)
+$ hl check docs/snippets/errors/side-push.hl
+docs/snippets/errors/side-push.hl:12:3: error: side handler 'ask' cannot push onto 'context': a side question reads the session's state at its last finished turn and changes none of it
+$ hl check docs/snippets/errors/side-dispatch.hl
+docs/snippets/errors/side-dispatch.hl:10:9: error: side handler 'run' cannot call tool 'Bash' of effect external: a side question is journaled nowhere, so it calls only the model and tools of effect none
+```
+
+```hl docs/snippets/errors/side-push.hl
+harness notes
+
+const entries_max: u64 = 8
+
+model infer calls entries_max
+
+state {
+  context: list<entry, entries_max>
+}
+
+fn remember(question: text) {
+  push context user(question)
+}
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on side ask(question: text) -> text {
+  remember(question)
+  return question
+}
+```
+
+```hl docs/snippets/errors/side-dispatch.hl
+harness notes
+
+tool Bash(command: text) -> text effect external
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on side run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "unknown" }
+  }
+}
+```
+
+Each backend runs a side question as a scratch run: a fresh engine over a copy
+of the snapshot whose flushes are discarded. The interpreter answers through
+`run::side::answer` between runs and through `World::side`, which a running
+turn polls before each effect it runs fresh. Generated Rust has
+`JsonlJournal::side`, `sql_side` (which loads the rows without acquiring the
+session) and `Host::side`; the Durable Object answers `POST /side` with
+`{"handler", "arguments"}` from its rows, without queueing behind a running turn
+or writing storage, its output gate holding the answer until rows a finishing
+turn inserted commit; Vercel exports `harnessSide(lines, request)`, which folds
+the run's journal lines outside any step.
+
+The simulator asks side questions only of programs that declare a side handler:
+before an effect a turn runs fresh (`SIDE_AT_EFFECT_PPM` = 100000 per million),
+after each turn (`SIDE_BETWEEN_TURNS_PPM` = 500000) and while a turn is parked
+(`SIDE_PARKED_PPM` = 500000), with replies drawn from generators keyed apart
+from the session's, so no other draw moves. `side_isolated` requires the
+journal, durable and buffered, to be the same after a question as before, and
+the answer to equal an oracle run over the state that replaying the durable
+journal's finished turns gives, with the same replies and the same requests.
+`side_live_state`, a runtime that answers from the running turn's state, and
+`side_journaled`, one that appends the side run's records to the session, are
+caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/side.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=3131 crashes=1610 power_losses=184 torn_writes=286 takeovers=0 fenced=0 dispatches=314 unknown=160 sleeps=0 suspensions=1017 side_questions=947
+$ hl sim --target native-jsonl --seeds 0..200 --mutation side_live_state docs/snippets/side.hl
+FAIL invariant=side_isolated seed=0 target=native-jsonl profile=errors mutation=side_live_state: side question 5 (ask turn 2 before seq 3): the snapshot at the last durable status gives another run: request 1 of the oracle's run is a model call at seq 1 over 4 context entries (crc 1293496392), where the runtime's was a model call at seq 1 over 6 context entries (crc 256348170)
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation side_live_state docs/snippets/side.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation side_journaled docs/snippets/side.hl
+FAIL invariant=side_isolated seed=0 target=native-jsonl profile=errors mutation=side_journaled: side question 1 (ask while turn 1 is parked) changed the session's journal: 443 bytes before it, 878 after
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation side_journaled docs/snippets/side.hl
+```
+
+`side_questions` counts the questions asked, printed only when there are some.
+The differential runs carry them too: generated Rust and JavaScript answer
+every question the interpreter asks, mid-turn and between runs, with the same
+requests and answers.
+
+### Idle turns
+
+`on idle name() at field bound N -> type { ... }` declares the one handler the
+host runs while the session idles: once every turn has finished and the clock
+reaches the time, in the milliseconds `now()` reads, that the `u64` state field
+`field` names, the host admits it as a turn of its own, with no arguments. A
+field of 0 arms nothing. nanocode keeps its prompt cache warm this way: after
+a reply the backend keeps its request and, while the session idles, sends it
+again before the cache's lifetime runs out, at most a bounded number of times
+per kept request, and stops when a refresh fails or finds the cache lapsed
+(`agent/keep.rs`). `docs/snippets/keep.hl` writes that logic in the harness:
+the due is the request's start plus the cache's lifetime less twice its reach
+(the time from the request to its reply), and the idle turn refreshes, stops
+when the cache read nothing or wrote something, and keeps the cache again from
+its own readings.
+
+```hl docs/snippets/keep.hl
+harness keeper
+
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+const window_tokens: u64 = 200000
+const lifetime_ms: u64 = 300000
+const refreshes_max: u64 = 12
+const clock_ms_max: u64 = 8640000000000000
+
+type outcome = answered(text) | failed(text)
+type kept = refreshed(u64) | lapsed(text)
+
+model infer calls calls_max window window_tokens modes refresh
+
+state {
+  context: list<entry, entries_max>
+  requested_ms: u64
+  refresh_due: u64
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+fn kept_at(started: u64, opened: u64) {
+  refresh_due = 0
+  if started <= opened and opened <= clock_ms_max {
+    if (opened - started) * 2 < lifetime_ms {
+      requested_ms = started
+      refresh_due = started + lifetime_ms - (opened - started) * 2
+    }
+  }
+}
+
+on prompt(input: text) -> outcome
+  requires len(context) + 2 <= entries_max
+{
+  push context user(input)
+  let started = now()
+  match infer(context) {
+    ok(reply, _, _, _, _, _) => {
+      let opened = now()
+      kept_at(started, opened)
+      push context assistant(reply)
+      match reply {
+        answer(words) => { return answered(words) }
+        calls(_) => { return answered("") }
+      }
+    }
+    throttled(error, _) => { return failed(error) }
+    transient(error, _) => { return failed(error) }
+    rejected(error) => { return failed(error) }
+  }
+}
+
+on idle refresh() at refresh_due bound refreshes_max -> kept {
+  let started = now()
+  if started > clock_ms_max or requested_ms > clock_ms_max {
+    return lapsed("the clock reads past its range")
+  }
+  if started >= requested_ms + lifetime_ms {
+    return lapsed("the cache outlived its lifetime")
+  }
+  match infer(context) mode refresh {
+    ok(_, _, _, _, cache_read, cache_write) => {
+      let opened = now()
+      if cache_read == 0 or cache_write > 0 {
+        return lapsed("the refresh found the cache lapsed")
+      }
+      kept_at(started, opened)
+      return refreshed(cache_read)
+    }
+    throttled(error, _) => { return lapsed(error) }
+    transient(error, _) => { return lapsed(error) }
+    rejected(error) => { return lapsed(error) }
+  }
+}
+```
+
+How it runs:
+
+- Arming. The idle turn is armed for `field`'s time when the field is not 0
+  and fewer than `N` idle turns ran since the last other turn. The checker keeps
+  that count in a hidden state field, `_idle_runs`, which every other handler
+  sets to 0 where it starts and the idle handler counts up: its `requires`
+  gains `_idle_runs < N`, and the invariant `_idle_bounded`, `_idle_runs <= N`,
+  is proved with the program's own. The idle handler's body starts with the
+  field set to 0, so an idle turn disarms its due unless it assigns a new one.
+- Admission. A host's timer is advice. The runtime admits an idle request only
+  when the session's last turn has finished (otherwise `busy`), the state arms
+  it (`unarmed`) and the clock, read as a `wait` reads it, has reached the due
+  (`early`). A refused request writes nothing and takes no turn number. An
+  admitted idle turn's `admitted` record holds the clock and the due,
+  `{"at":A,"due":D}`.
+- Journal. An idle turn is a turn like any other: its effects are journaled
+  under it, a crash reruns it as its classes say, and a replay returns its
+  recorded results, so a refresh whose reply is in the journal is never sent
+  again. A prompt that arrives before the due runs first, resets the count and
+  computes its own due.
+- Worst case. `hl check` prints the idle handler's worst case and that many
+  times `N`, the most the idle turns after one other turn can cost.
+- Hosts. Rust: `idle_due(start, records)` and `JsonlJournal::idle_due` give the
+  armed due, `run_turn` returns `Ran::NotDue` for a refused request, and
+  `hl-agent run --keep-warm N` stays alive after its prompt and runs up to `N`
+  idle turns. Cloudflare: after every finished turn the Durable Object sets its
+  alarm to the due, and `alarm()` runs the idle turn when no turn is
+  unfinished. Vercel: before each request the session reads the due in a step
+  and races the next prompt's hook against a workflow `sleep()` until it.
+- The model's `refresh` mode is a name the host interprets, as every mode is:
+  `hl-agent` sends it as nanocode's refresh, the request that produced the
+  context's last reply (the entries before its last `assistant` entry) with
+  `max_tokens` 0. The Messages API accepts `max_tokens` 0 only unstreamed, so
+  the refresh is not streamed.
+
+```console
+$ hl check docs/snippets/keep.hl | grep -E '^  handler refresh|runs when'
+  handler refresh: worst case 3 effects, 8 journal records, 1 outbound requests
+    runs when the session idles until refresh_due, at most refreshes_max (12) time(s) after each other turn: 36 effects, 96 journal records, 12 outbound requests in all
+$ hl check docs/snippets/errors/idle-due.hl
+docs/snippets/errors/idle-due.hl:9:22: error: an idle handler's due time is a u64 state field: 'kept' is not one
+```
+
+```hl docs/snippets/errors/idle-due.hl
+harness keeper
+
+const refreshes_max: u64 = 12
+
+state {
+  kept: text
+}
+
+on idle refresh() at kept bound refreshes_max -> u64 { return 1 }
+```
+
+The simulator is the host. After every turn of a harness with an idle handler
+it reads the armed due. A prompt arrives before it in `IDLE_PREEMPT_PPM` =
+300000 per million of the times it is armed (never after the session's last
+prompt, so every session idles out), the host's timer fires early in
+`IDLE_EARLY_PPM` = 150000, at most once per due, and late by up to
+`IDLE_LATE_MS_MAX` (ten minutes, twice nanocode's five-minute cache lifetime)
+in `IDLE_LATE_PPM` = 100000, and an idle turn's model call reads the cache it
+refreshes and writes none in `CACHE_WARM_PPM` = 800000. It asks at most
+`REQUESTS_PER_DUE_MAX` (2) times for each of `N` + 1 idle turns after a prompt
+and fails a session still armed after that. Crashes, power losses and second
+owners land in idle turns as in any other. These draws happen only for a
+harness with an idle handler, so other programs' seeds are unchanged.
+`idle_due` requires every idle turn to have been admitted at a clock at or
+after its recorded due, for the due its state armed, at most `N` after each
+other turn, and every early refusal to name a clock before its due;
+`idle_early`, a runtime that admits an idle request before its due, is caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/keep.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=862 runs=2218 crashes=1300 power_losses=71 torn_writes=118 takeovers=0 fenced=0 dispatches=0 unknown=0 idle_turns=358 idle_refused=56
+$ hl sim --target native-jsonl --seeds 0..200 --mutation idle_early docs/snippets/keep.hl
+FAIL invariant=idle_due seed=4 target=native-jsonl profile=async mutation=idle_early: idle turn 4 was admitted at clock 302253, before its due 602071
+replay: hl sim --target native-jsonl --seeds 4..5 --mutation idle_early docs/snippets/keep.hl
+```
+
+`idle_turns` counts the idle turns admitted and `idle_refused` the requests
+the runtime refused. The generated Rust and JavaScript make the same
+admission, so the differential runs refuse and admit the same requests as the
+interpreter; their plants `rust idle_early` and `js idle_early` remove the
+clock check and are caught as `backend_equal` on every target.
+`examples/claude_code.hl` keeps nanocode's five-minute `CACHE_LIFETIME`
+(`cache_lifetime_ms`) and the twelve refreshes `ClaudeModel::cache_refreshes`
+allows for it (`cache_refreshes`: a five-minute cache write costs 1.25 times
+an input token and a read 0.1 times, so twelve reads cost what one more write
+would).
+
 ### Traps
 
 A turn ends `failed` without running further when `requires` is false
@@ -3874,7 +4408,7 @@ The compiler's own bounds:
 | --- | --- | --- |
 | nesting of blocks, types, expressions | `NESTING_DEPTH_MAX` = 64 | policy; also bounds the blocks of a handler once its fns are inlined |
 | statements per handler once its fns are inlined | `STATEMENTS_PER_HANDLER_MAX` = 65,536 | policy: over a thousand times the largest example handler; a program whose fns double at each level reaches it in milliseconds |
-| prover steps per handler | `PROOF_STEPS_PER_HANDLER_MAX` = 4,000,000 | policy; reaching it fails the obligation and says so |
+| prover steps per handler | `PROOF_STEPS_PER_HANDLER_MAX` = 8,000,000 | policy; reaching it fails the obligation and says so |
 | constraints per prover step | `PROOF_CONSTRAINTS_MAX` = 4,096 | policy; same |
 | nesting of a journal's JSON | `JSON_DEPTH_MAX` = 128 | policy |
 | Cloudflare outbound requests per invocation | `CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX` = 10,000 | Workers Paid default, developers.cloudflare.com/workers/platform/limits |

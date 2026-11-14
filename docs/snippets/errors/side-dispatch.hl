@@ -1,0 +1,15 @@
+harness notes
+
+tool Bash(command: text) -> text effect external
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on side run(command: text) -> text {
+  match Bash(command) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "unknown" }
+  }
+}
