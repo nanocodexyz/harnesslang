@@ -1,6 +1,6 @@
 # What nanocode's harnesses do that harnesslang cannot write
 
-`examples/claude_agent.hl`, `codex_agent.hl`, `subagents.hl` and
+`examples/claude_agent.hl`, `claude_code.hl`, `codex_agent.hl`, `subagents.hl` and
 `subagent_child.hl` port the shapes of nanocode's Claude backend
 (`crates/backends/claude/src/agent.rs`), Codex backend
 (`crates/backends/codex/src/model/run/`) and subagent runtime
@@ -34,3 +34,15 @@ Vercel and Cloudflare models cannot check. Smallest addition: `wait(ms)` as
 an effect whose result is journaled and whose duration enters the target's
 wall-time limit, with the C2 durability point code mode specifies for timer
 waits.
+
+## 9. Optional tool parameters
+
+Claude's tools have optional parameters (Bash's `timeout`, Read's `offset` and `limit`, Edit's `replace_all`), and typed input requires exactly the declared parameters. `examples/claude_code.hl` declares every parameter and `agent/`'s host fills a missing one with the schema's default before the engine sees the call, so the journal holds the defaulted input rather than what the model sent. Smallest addition: `param: type = default` in a tool's parameters, filled by `dispatch` and journaled as filled, with the simulator drawing inputs that leave it out.
+
+## 10. Options on a model call
+
+nanocode's compaction call offers no tools (`disable_tools`) and retries once forcing text; a harnesslang model call has no options, so `claude_code.hl`'s compaction keeps the tools offered and fails the turn if the summary calls one. Smallest addition: a declared, finite set of call modes (`messages(context) mode text_only`) passed to the host and journaled with the call.
+
+## 11. Text processing
+
+nanocode strips the summary's `<analysis>` block and rewrites its `<summary>` tag (`compact_summary`); harnesslang text has only `++`, so the summary enters the context as written. Smallest addition: pure, bounded text builtins (find, slice) that the interpreter and every backend implement identically.
