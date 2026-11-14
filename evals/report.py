@@ -165,9 +165,39 @@ def differences(rows, agents):
     return lines
 
 
+def sign_test(wins, losses):
+    count = wins + losses
+    if count == 0:
+        return 1.0
+    tail = sum(math.comb(count, k) for k in range(min(wins, losses) + 1)) / 2 ** count
+    return min(1.0, 2 * tail)
+
+
+def paired_outcomes(rows, agents):
+    if len(agents) != 2:
+        return []
+    first, second = agents
+    by_key = {(row["source"], row["task"], row["attempt"], row["agent"]): row for row in rows}
+    scored = ("passed", "failed")
+    pairs = [
+        (by_key[key[:3] + (first,)], row)
+        for key, row in sorted(by_key.items())
+        if key[3] == second and key[:3] + (first,) in by_key and row["outcome"] in scored and by_key[key[:3] + (first,)]["outcome"] in scored
+    ]
+    both = sum(base["outcome"] == "passed" and other["outcome"] == "passed" for base, other in pairs)
+    neither = sum(base["outcome"] == "failed" and other["outcome"] == "failed" for base, other in pairs)
+    only_second = sum(base["outcome"] == "failed" and other["outcome"] == "passed" for base, other in pairs)
+    only_first = sum(base["outcome"] == "passed" and other["outcome"] == "failed" for base, other in pairs)
+    return [
+        "Paired outcomes (%d pairs both scored): both passed %d, both failed %d, only %s passed %d, only %s passed %d; exact two-sided sign test on the discordant pairs p = %.3f"
+        % (len(pairs), both, neither, second, only_second, first, only_first, sign_test(only_second, only_first))
+    ]
+
+
 def main():
-    out = sys.argv[1]
-    rows = load(out)
+    rows = []
+    for out in sys.argv[1:]:
+        rows += load(out)
     agents = sorted({row["agent"] for row in rows}, key=lambda agent: (agent != "nanocode", agent))
     models = sorted({row["model"] for row in rows})
     print("Model: " + ", ".join(models) + ". Prices: " + PRICES_SOURCE + ".")

@@ -29,6 +29,7 @@ pub const SIMILAR_EXTENSION_CHARS_MAX: usize = 32;
 
 const SHELL: &str = "bash";
 const SHELL_FALLBACK: &str = "/bin/sh";
+const GROUP_KILL: &str = "kill -KILL -\"$1\"";
 const BASH_WRAPPER: &str = "__hl_state=\"$1\"; shift; trap 'pwd -P > \"$__hl_state-cwd.new\" && mv \"$__hl_state-cwd.new\" \"$__hl_state-cwd\"' EXIT; . \"$__hl_state-command\"";
 const TRUNCATED: &str = "[Truncated: PARTIAL view \u{2014} ";
 const ALLOW_LARGE_UNAVAILABLE: &str =
@@ -98,7 +99,6 @@ pub struct Workspace {
     pub root: PathBuf,
     pub state: PathBuf,
     pub image_bytes_max: Option<u64>,
-    pub left: std::sync::Mutex<Vec<u32>>,
 }
 
 pub enum Ran {
@@ -506,7 +506,7 @@ impl Workspace {
                 if movable {
                     return Ok(Waited::Moved(started));
                 }
-                kill_group(&started.child);
+                kill_group(&mut started.child)?;
                 let status = started.child.wait().map_err(|error| error.to_string())?;
                 let mut shell = settled(started, status, true)?;
                 shell.message = Some(format!(
@@ -517,26 +517,7 @@ impl Workspace {
             }
             std::thread::sleep(TIMEOUT_POLL);
         };
-        if group_alive(started.child.id()) {
-            self.left
-                .lock()
-                .expect("the left process groups")
-                .push(started.child.id());
-        }
         Ok(Waited::Done(settled(started, status, false)?))
-    }
-
-    pub fn stop_left(&self) {
-        let groups = std::mem::take(&mut *self.left.lock().expect("the left process groups"));
-        for group in groups {
-            kill_group_id(group);
-        }
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        self.stop_left();
     }
 }
 
@@ -577,26 +558,22 @@ pub enum Bashed {
     Job(Started, String),
 }
 
-pub fn kill_group(child: &std::process::Child) {
-    kill_group_id(child.id());
-}
-
-fn kill_group_id(group: u32) {
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg("--")
-        .arg(format!("-{group}"))
-        .status();
-}
-
-fn group_alive(group: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg("--")
-        .arg(format!("-{group}"))
+pub fn kill_group(child: &mut std::process::Child) -> Result<(), String> {
+    let group = Command::new(SHELL_FALLBACK)
+        .arg("-c")
+        .arg(GROUP_KILL)
+        .arg(SHELL_FALLBACK)
+        .arg(child.id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .map(|_| ())
+        .map_err(|error| format!("signal process group {}: {error}", child.id()));
+    child
+        .kill()
+        .map_err(|error| format!("signal process {}: {error}", child.id()))?;
+    group
 }
 
 pub fn settled(

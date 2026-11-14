@@ -205,20 +205,30 @@ def outcome(agent_result, verifier, totals):
     return ("passed" if verifier["reward"] == 1 else "failed"), ("agent timed out" if agent_result["timed_out"] else None)
 
 
+def remove_tree(path, image):
+    try:
+        shutil.rmtree(path)
+        return
+    except PermissionError:
+        pass
+    sh(["docker", "run", "--rm", "-u", "0", "-v", os.path.abspath(path) + ":/stale", "--entrypoint", "", image, "find", "/stale", "-mindepth", "1", "-delete"])
+    shutil.rmtree(path)
+
+
 def run_row(row, args, gateway, env, lock, agent_root, runs):
     out = os.path.join(runs, row["id"])
     if os.path.isfile(os.path.join(out, "result.json")):
         return json.load(open(os.path.join(out, "result.json")))
-    if os.path.isdir(out):
-        shutil.rmtree(out)
-    journal = os.path.join(out, "journal")
-    os.makedirs(journal)
-    os.chmod(journal, 0o777)
     config = task_config(row["dir"])
+    journal = os.path.join(out, "journal")
     name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
     result = {"id": row["id"], "source": row["source"], "task": row["task"], "agent": row["agent"], "attempt": row["attempt"], "model": args.model}
     try:
         image = image_for(row, config, env, lock)
+        if os.path.isdir(out):
+            remove_tree(out, image)
+        os.makedirs(journal)
+        os.chmod(journal, 0o777)
         workdir = sh(["docker", "image", "inspect", "-f", "{{.Config.WorkingDir}}", image]).stdout.strip() or "/"
         row["workdir"] = workdir
         sh(["docker", "rm", "-f", name], check=False)
@@ -252,6 +262,7 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
     finally:
         sh(["docker", "exec", "-u", "0", name, "chown", "-R", str(os.getuid()) + ":" + str(os.getgid()), JOURNAL_MOUNT], check=False)
         sh(["docker", "rm", "-f", name], check=False)
+    os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "result.json"), "w") as handle:
         json.dump(result, handle, indent=1)
     return result
