@@ -35,6 +35,21 @@ class Engine {
     this.events = log.events.slice();
     this.taken = 0;
     this.admitted = new Map();
+    this.listed = new Map();
+    this.notices = new Map();
+    this.discovered = new Map();
+    this.blobs = new Blobs();
+  }
+
+  notice(listing) {
+    return this.notices.get(listing) ?? "";
+  }
+
+  keepBlobs(field, count) {
+    assert(PROGRAM.blobs !== undefined, "the checker keeps blobs only in a program with blobs");
+    const items = this.state[field];
+    assert(Array.isArray(items), "keep blobs targets a list field");
+    this.state[field] = keptBlobs(items, PROGRAM.blobs.attached, count);
   }
 
   cancelled() {
@@ -223,8 +238,7 @@ class Engine {
     switch (logged.kind) {
       case "done":
         this.same(seq, logged.call, call);
-        this.admitListing(site, logged.output);
-        return this.decode(site, logged.output);
+        return this.settle(site, call, logged.output);
       case "reply":
         if (site.kind !== "model") throw this.diverged(seq, "a model reply", call.tool);
         if (logged.mode !== site.mode) {
@@ -233,7 +247,7 @@ class Engine {
         return this.reply(logged.response);
       case "unknown":
         this.same(seq, logged.call, call);
-        if (site.result.maybe === undefined) return this.reopen(siteId, seq, call, args);
+        if (!reportsUnknown(site.result)) return this.reopen(siteId, seq, call, args);
         return variant(VARIANT_UNKNOWN, []);
       case "open":
         this.same(seq, logged.call, call);
@@ -255,7 +269,7 @@ class Engine {
     switch (logged.kind) {
       case "done":
         this.same(seq, logged.call, call);
-        return this.decode(site, logged.output);
+        return this.decode(site, call, logged.output);
       case "reply":
         throw this.diverged(seq, "a model reply", call.tool);
       case "open":
@@ -272,7 +286,7 @@ class Engine {
             this.sites.set(seq, { kind: "done", call: logged.call, output });
             await this.flush();
             await world.resumed(suspension, resume, true);
-            return this.decode(site, output);
+            return this.decode(site, call, output);
           }
           await world.resumed(suspension, resume, false);
         }
@@ -310,7 +324,7 @@ class Engine {
     switch (logged.kind) {
       case "done":
         this.same(seq, withoutUntil(logged.call), call);
-        return this.decode(site, logged.output);
+        return this.decode(site, call, logged.output);
       case "reply":
         throw this.diverged(seq, "a model reply", call.tool);
       case "open":
@@ -449,7 +463,7 @@ class Engine {
       switch (logged.kind) {
         case "done":
           this.same(seq, logged.call, call);
-          values[index] = this.decode(site, logged.output);
+          values[index] = this.settle(site, call, logged.output);
           break;
         case "reply":
           throw this.diverged(seq, "a model reply", call.tool);
@@ -501,8 +515,8 @@ class Engine {
       }
       assert(first.reopened || attempt === 1, "a fresh external step starts at its first attempt");
     }
-    const returns = site.result.maybe;
-    assert(returns !== undefined, "a dispatch yields maybe");
+    assert(reportsUnknown(site.result), "a dispatch yields an outcome that reports unknown");
+    const returned = group.map((waiting) => dispatchedReturns(waiting.call.tool));
     const gates = group.map((waiting) => this.gate(waiting.call));
     const sent = [];
     for (let position = 0; position < group.length; position++) {
@@ -510,7 +524,7 @@ class Engine {
     }
     const requests = sent.map((position) => {
       const waiting = group[position];
-      return { turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns, admitted: gates[position].admitted };
+      return { turn: this.turn, seq: waiting.seq, tool: waiting.call.tool, effect: waiting.call.effect, input: waiting.call.input, returns: returned[position], admitted: gates[position].admitted };
     });
     const batch = requests.length === 0 ? [] : await this.mode.world.tools(requests, CONCURRENT_REQUESTS_MAX);
     assert(batch.length === sent.length, "a batch returns one output per request");
@@ -522,10 +536,10 @@ class Engine {
     const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
     for (const [position, raw] of ordered) {
       const waiting = group[position];
-      const output = checkedOutput(waiting.call.tool, returns, raw);
+      const output = this.checked(waiting.call.tool, returned[position], raw);
       this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output });
       this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output });
-      values[waiting.index] = this.decode(site, output);
+      values[waiting.index] = this.settle(site, waiting.call, output);
     }
     if (late || inStep) await this.flush();
   }
@@ -536,7 +550,7 @@ class Engine {
     await this.hook(runPoint("before_run", site.kind, call.effect));
     if (site.kind === "model") {
       const callsMax = PROGRAM.model === null ? 0n : PROGRAM.model.calls;
-      const response = await world.model({ turn: this.turn, seq, callsMax, mode: site.mode, context: args[0] });
+      const response = await world.model({ turn: this.turn, seq, callsMax, mode: site.mode, context: args[0], blobs: this.blobs });
       await this.hook(runPoint("after_run", site.kind, call.effect));
       await this.drain();
       this.append({ kind: "model", turn: this.turn, seq, response, mode: site.mode });
@@ -556,14 +570,14 @@ class Engine {
       const listing = PROGRAM.listings[site.tool];
       output = checkedListing(listing, await world.listing({ turn: this.turn, seq, listing: listing.name }));
     } else {
-      const returns = site.result.known ?? site.result.maybe;
+      const returns = site.result.known ?? site.result.maybe ?? (reportsUnknown(site.result) ? dispatchedReturns(call.tool) : undefined);
       assert(returns !== undefined, "a tool site yields known or maybe");
       const gate = site.kind === "dispatch" ? this.gate(call) : { admitted: null };
       if (gate.refused !== undefined) {
         output = { tag: "failed", error: gate.refused };
       } else {
         const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted };
-        output = checkedOutput(call.tool, returns, await world.tool(request));
+        output = this.checked(call.tool, returns, await world.tool(request));
       }
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));
@@ -571,8 +585,31 @@ class Engine {
     this.append({ kind: "result", turn: this.turn, seq, output });
     this.sites.set(seq, { kind: "done", call, output });
     if (step) await this.flush();
+    return this.settle(site, call, output);
+  }
+
+  checked(tool, returns, raw) {
+    let output = checkedOutput(tool, returns, raw);
+    const listing = searchOf(tool);
+    if (listing !== null) output = checkedSearch(tool, listing, this.admitted.get(listing), output);
+    if (output.tag !== "ok" || blobReturned(tool) === null) return output;
+    const data = hostData(output.value);
+    if (data === null) return output;
+    return { tag: "ok", value: this.blobs.journaled(data, true) };
+  }
+
+  settle(site, call, output) {
     this.admitListing(site, output);
-    return this.decode(site, output);
+    const listing = searchOf(call.tool);
+    if (listing !== null && output.tag === "ok" && typeof output.value === "string") {
+      if (!this.discovered.has(listing)) this.discovered.set(listing, new Set());
+      const found = this.discovered.get(listing);
+      for (const name of foundNames(output.value)) {
+        const named = listed(name);
+        if (named !== null) found.add(named.name);
+      }
+    }
+    return this.decode(site, call, output);
   }
 
   gate(call) {
@@ -585,21 +622,29 @@ class Engine {
     const tools = this.admitted.get(found.listing);
     const fingerprint = tools === undefined ? undefined : tools.get(found.name);
     if (fingerprint === undefined) return { refused: notAdmitted(call.tool, PROGRAM.listings[found.listing].name, found.name) };
+    const discovered = this.discovered.get(found.listing)?.has(found.name) ?? false;
+    if (deferredListing(found.listing) && !discovered) return { refused: notDiscovered(call.tool, PROGRAM.listings[found.listing].name) };
     return { admitted: fingerprint };
   }
 
   admitListing(site, output) {
     if (site.kind !== "listing") return;
     if (output.tag !== "ok") {
+      this.notices.set(site.tool, "");
       this.admitted.delete(site.tool);
       return;
     }
+    let tools;
     try {
-      this.admitted.set(site.tool, admittedTools(output.value));
+      tools = admittedTools(output.value);
     } catch (error) {
       if (!(error instanceof DecodeError)) throw error;
       throw new Corrupt(`turn ${this.turn} result: ${error.message}`);
     }
+    const before = this.listed.get(site.tool);
+    this.notices.set(site.tool, before === undefined ? "" : listingNotice(PROGRAM.listings[site.tool].name, before, tools));
+    this.listed.set(site.tool, tools);
+    this.admitted.set(site.tool, tools);
   }
 
   reply(response) {
@@ -613,8 +658,9 @@ class Engine {
     }
   }
 
-  decode(site, output) {
+  decode(site, call, output) {
     const corrupt = (message) => new Corrupt(`turn ${this.turn} result: ${message}`);
+    if (reportsUnknown(site.result) && site.result.maybe === undefined) return this.dispatched(call, output, corrupt);
     if (site.result === "text" && output.tag === "ok") {
       if (typeof output.value !== "string") throw corrupt(`${encodeJson(output.value)} is not text`);
       return output.value;
@@ -642,6 +688,20 @@ class Engine {
     }
     if (inner !== undefined && output.tag === "failed") return variant(VARIANT_FAILED, [output.error]);
     throw corrupt(`${encodeJson(outputJson(output))} does not fit ${typeName(site.result)}`);
+  }
+
+  dispatched(call, output, corrupt) {
+    if (output.tag === "failed") return variant(VARIANT_FAILED, [output.error]);
+    if (isObject(output.value) && blobReturned(call.tool) !== null) {
+      try {
+        return variant(DISPATCHED_BLOB, [digestOf(output.value)]);
+      } catch (error) {
+        if (!(error instanceof DecodeError)) throw error;
+        throw corrupt(error.message);
+      }
+    }
+    if (typeof output.value === "string") return variant(VARIANT_OK, [output.value]);
+    throw corrupt(`${encodeJson(output.value)} is not text`);
   }
 
   same(seq, recorded, call) {
@@ -837,6 +897,8 @@ async function runTurn(setup, world, epoch, records, request) {
     return { ran: "already_finished", finish: { turn: request.turn, outcome: existing.finished.outcome, result: existing.finished.result } };
   }
   const state = await stateBefore(setup, session, request.turn);
+  const blobs = sessionBlobs(session);
+  blobs.checkState(state);
   const pending = [];
   let unknown = { unknown: [], nested: [] };
   let log;
@@ -856,6 +918,7 @@ async function runTurn(setup, world, epoch, records, request) {
   const assumed = setup.mutation === "cell_recovery_reports_failed" ? assumeNestedFailed(log, unknown.nested.splice(0)) : [];
   const engine = new Engine(setup, handler, { live: true, world, epoch }, request.turn, state, log);
   engine.nextCell = nextCell(session);
+  engine.blobs = blobs;
   for (const record of pending) engine.append(record);
   if (unknown.unknown.length > 0 || unknown.nested.length > 0) {
     engine.append({ kind: "recovery", turn: request.turn, attempt: engine.nextAttempt(), unknown: unknown.unknown, nested: unknown.nested });
@@ -934,6 +997,7 @@ function modelRequestJson(request) {
     ["turn", BigInt(request.turn)],
   ];
   if (request.mode !== null) entries.push([MODEL_MODE, request.mode]);
+  if (PROGRAM.blobs !== undefined) entries.push([MODEL_BLOBS, request.blobs.json()]);
   return object(entries);
 }
 
