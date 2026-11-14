@@ -40,6 +40,7 @@ pub const LISTING_CHANGE_PPM: u64 = 100_000;
 pub const INPUT_INVALID_PPM: u64 = 100_000;
 pub const DEFAULT_OMITTED_PPM: u64 = 500_000;
 pub const CHILD_NAMED_PPM: u64 = 500_000;
+pub const CHILD_SESSIONS_PER_SEED_MAX: usize = 16;
 pub const INVALID_INPUT_KINDS: u64 = 3;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const WORDS: [&str; 8] = [
@@ -1126,6 +1127,12 @@ impl SimWorld<'_> {
             return output;
         }
         let key = crate::ir::spawn_key(request.turn, request.seq);
+        if !self.children.contains_key(&key) && self.children.len() >= CHILD_SESSIONS_PER_SEED_MAX {
+            return Output::Failed(format!(
+                "{} refused: the host holds child_sessions_per_seed_max ({CHILD_SESSIONS_PER_SEED_MAX}) child sessions",
+                request.tool
+            ));
+        }
         if !self.children.contains_key(&key) {
             let seed = Rng::derive_keyed(self.seed, "child", &[request.turn, request.seq]).draw();
             let (result, stats) = crate::sim::run_child(

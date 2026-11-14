@@ -241,7 +241,7 @@ fn_equal() {
   same_program examples/subagents.hl examples/inlined/subagents.hl
   same_program docs/snippets/fn.hl docs/snippets/fn_inline.hl
   same_program examples/code_tasks.hl examples/inlined/code_tasks.hl
-  sed '/push agents spawned/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' examples/inlined/subagents.hl > "$scratch/planted.hl"
+  sed -e '/push context user("Summarize/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' -e 's#"../subagent_child.hl"#"../../examples/subagent_child.hl"#' examples/inlined/subagents.hl > "$scratch/planted.hl"
   "$hl" check "$scratch/planted.hl" > /dev/null
   if same_program examples/subagents.hl "$scratch/planted.hl" 2> /dev/null; then
     echo "fn: a written-out program with two pushes swapped still compares equal" >&2
