@@ -1495,13 +1495,13 @@ in a row.
 
 The planted bug `model_failure_unrecorded` writes no record for a failed
 call, as a harness that treats provider errors as transient might. A rerun
-asks the model again, and replaying the journal from nothing finds the call
-missing:
+asks the model again, and replaying the journal from nothing finds a model
+reply where the program runs a tool:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
-FAIL invariant=replay_equal seed=1 target=native-jsonl profile=errors mutation=model_failure_unrecorded: replaying the journal failed: Corrupt("replay of turn 3 needs seq 23, which the journal does not record")
-replay: hl sim --target native-jsonl --seeds 1..2 --mutation model_failure_unrecorded examples/claude_agent.hl
+FAIL invariant=liveness seed=2 target=native-jsonl profile=lying mutation=model_failure_unrecorded: turn 1: replay of turn 1 diverged at seq 2: the journal records a model reply, the program runs 'Bash' (1/2)
+replay: hl sim --target native-jsonl --seeds 2..3 --mutation model_failure_unrecorded examples/claude_agent.hl
 ```
 
 The checker's reply errors:
