@@ -246,7 +246,7 @@ fn run_seed_unguarded(
         result = match &records {
             Ok(records) => invariants::check(program, &world, turns, records).and_then(|()| {
                 if strict != strict::Mode::Off {
-                    strict::check(program, &world.target, records)
+                    strict::check(program, &world.target, records, &world.worst_faults)
                 } else {
                     Ok(())
                 }

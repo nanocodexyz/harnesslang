@@ -1,5 +1,5 @@
 use crate::ir::{BinaryOp, Expr, Type};
-use crate::prove::arith::{Alternatives, Prover, State, U64_MAX, product};
+use crate::prove::arith::{Alternatives, Prover, State, TEMPORARY, U64_MAX, product};
 use crate::prove::linear::{self, Extent, Linear};
 
 impl Prover<'_> {
@@ -54,6 +54,34 @@ impl Prover<'_> {
         }
     }
 
+    fn opaque(&mut self, state: &mut State, value: &Linear) -> Linear {
+        let low = self.extent(state, value, false);
+        let high = self.extent(state, value, true);
+        let var = Linear::var(self.fresh(state, &format!("{TEMPORARY}operand"), U64_MAX));
+        if let Extent::At(low) = low {
+            state.facts.extend(Linear::constant(low).subtract(&var));
+        }
+        if let Extent::At(high) = high {
+            state.facts.extend(var.plus(-high));
+        }
+        var
+    }
+
+    fn formed<T>(
+        &mut self,
+        state: &mut State,
+        left: &Linear,
+        right: &Linear,
+        form: impl Fn(&Linear, &Linear) -> Option<T>,
+    ) -> T {
+        if let Some(formed) = form(left, right) {
+            return formed;
+        }
+        let left = self.opaque(state, left);
+        let right = self.opaque(state, right);
+        form(&left, &right).expect("two u64 variables combine within i128")
+    }
+
     fn add(
         &mut self,
         state: &mut State,
@@ -61,8 +89,11 @@ impl Prover<'_> {
         right: &Linear,
         text: String,
     ) -> Option<Linear> {
-        let sum = left.add(right)?;
-        let goal = sum.plus(-U64_MAX)?;
+        let (sum, goal) = self.formed(state, left, right, |left, right| {
+            let sum = left.add(right)?;
+            let goal = sum.plus(-U64_MAX)?;
+            Some((sum, goal))
+        });
         self.obligation(
             state,
             goal,
@@ -79,8 +110,9 @@ impl Prover<'_> {
         right: &Linear,
         text: String,
     ) -> Option<Linear> {
-        let difference = left.subtract(right)?;
-        let goal = right.subtract(left)?;
+        let (difference, goal) = self.formed(state, left, right, |left, right| {
+            Some((left.subtract(right)?, right.subtract(left)?))
+        });
         self.obligation(
             state,
             goal,

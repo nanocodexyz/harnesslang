@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::ir::{Program, Type};
 use crate::run::engine;
 use crate::run::journal::{Outcome, Record};
@@ -154,15 +156,61 @@ fn kept(program: &Program, state: &[Value], when: &str) -> Result<(), Violation>
     Ok(())
 }
 
+fn records_of(records: &[Record]) -> BTreeMap<u64, u64> {
+    let mut counts = BTreeMap::new();
+    for record in records {
+        let turn = match record {
+            Record::Recovery { .. } => continue,
+            Record::Checkpoint { revision, .. } if *revision == session::ENTRY_REVISION => continue,
+            Record::Checkpoint { revision, .. } => *revision,
+            other => other
+                .turn()
+                .expect("every record but a checkpoint names its turn"),
+        };
+        *counts.entry(turn).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn within_worst(
+    program: &Program,
+    folded: &session::Session,
+    records: &[Record],
+) -> Result<(), Violation> {
+    let counts = records_of(records);
+    for (turn, log) in &folded.turns {
+        let handler = program
+            .handler(&log.handler)
+            .expect("a replayed turn names a handler");
+        let written = counts.get(turn).copied().unwrap_or(0);
+        let worst = handler.worst.records.total;
+        if written > worst {
+            return violation(
+                Invariant::WorstCase,
+                format!(
+                    "turn {turn} ({}) wrote {written} journal records besides recoveries, over the worst case of {worst}",
+                    log.handler
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn check(
     program: &Program,
     target: &target::Model,
     records: &[Record],
+    worst_faults: &[String],
 ) -> Result<(), Violation> {
+    if let Some(fault) = worst_faults.first() {
+        return violation(Invariant::WorstCase, fault.clone());
+    }
     let folded = session::fold(records).map_err(|error| Violation {
         invariant: Invariant::Liveness,
         detail: format!("the final journal does not fold: {error}"),
     })?;
+    within_worst(program, &folded, records)?;
     let mut state = turn::entry_state(program, &folded).map_err(|exit| Violation {
         invariant: Invariant::Liveness,
         detail: format!("the entry checkpoint does not load: {exit:?}"),

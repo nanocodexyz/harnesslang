@@ -19,10 +19,11 @@ pub enum Invariant {
     Panic,
     NoTrap,
     InvariantKept,
+    WorstCase,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -33,6 +34,7 @@ impl Invariant {
         Self::Panic,
         Self::NoTrap,
         Self::InvariantKept,
+        Self::WorstCase,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -47,6 +49,7 @@ impl Invariant {
             Self::Panic => "panic",
             Self::NoTrap => "no_trap",
             Self::InvariantKept => "invariant_kept",
+            Self::WorstCase => "worst_case",
         }
     }
 }

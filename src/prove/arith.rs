@@ -11,7 +11,7 @@ use crate::prove::{Finding, PROOF_CONSTRAINTS_MAX, PROOF_STEPS_PER_HANDLER_MAX, 
 
 const U64_MAX: i128 = u64::MAX as i128;
 const ZERO_STATE: &str = "(zero state)";
-const TEMPORARY: &str = crate::check::WILDCARD;
+pub(super) const TEMPORARY: &str = crate::check::WILDCARD;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Quantity {

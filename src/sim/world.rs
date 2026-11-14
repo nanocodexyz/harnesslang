@@ -62,6 +62,9 @@ pub struct SimWorld<'a> {
     pub stats: Stats,
     pub trace: Option<Trace>,
     pub edges: Option<Edges>,
+    pub worst_faults: Vec<String>,
+    run_effects: u64,
+    run_outbound: u64,
     rng: Rng,
     faults_left: u64,
     armed: bool,
@@ -95,6 +98,9 @@ impl<'a> SimWorld<'a> {
             stats: Stats::default(),
             trace: None,
             edges: None,
+            worst_faults: Vec::new(),
+            run_effects: 0,
+            run_outbound: 0,
             rng: Rng::derive(seed, "faults"),
             faults_left: 0,
             armed: faults,
@@ -157,6 +163,8 @@ impl<'a> SimWorld<'a> {
 
     pub fn begin_run(&mut self) -> Result<(Vec<Record>, u64), String> {
         self.stats.runs += 1;
+        self.run_effects = 0;
+        self.run_outbound = 0;
         if self.faults_left == 0 {
             self.armed = false;
         }
@@ -238,9 +246,12 @@ impl<'a> SimWorld<'a> {
                 return;
             }
         };
+        let counted = (self.run_effects, self.run_outbound);
+        (self.run_effects, self.run_outbound) = (0, 0);
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
+        (self.run_effects, self.run_outbound) = counted;
         if let Some(trace) = &mut self.trace {
             trace.exit(&ran);
         }
@@ -270,6 +281,49 @@ impl<'a> SimWorld<'a> {
             Type::Bool => Json::Bool(rng.draw() & 1 == 1),
             Type::Text => Json::String(Self::generated_text(rng)),
             other => panic!("the checker admits only scalar tool results, found {other:?}"),
+        }
+    }
+
+    fn count_effect(&mut self, outbound: bool) {
+        if self.edges.is_none() {
+            return;
+        }
+        let request = self.current.as_ref().expect("an effect runs within a turn");
+        let worst = &self
+            .program
+            .handler(&request.handler)
+            .expect("a turn request names a handler of the program")
+            .worst;
+        self.run_effects += 1;
+        let mut faults = Vec::new();
+        if self.run_effects == worst.effects.total + 1 {
+            faults.push(format!(
+                "{} effects, over the worst case of {}",
+                self.run_effects, worst.effects.total
+            ));
+        }
+        if outbound {
+            self.run_outbound += 1;
+            if self.run_outbound == worst.requests.total + 1 {
+                faults.push(format!(
+                    "{} outbound requests, over the worst case of {}",
+                    self.run_outbound, worst.requests.total
+                ));
+            }
+            if let Some(limit) = &self.target.limits.outbound_requests_per_invocation
+                && self.run_outbound == limit.value + 1
+            {
+                faults.push(format!(
+                    "{} outbound requests, over the limit of {} {}",
+                    self.run_outbound, limit.value, limit.unit
+                ));
+            }
+        }
+        for fault in faults {
+            self.worst_faults.push(format!(
+                "turn {} ({}): one run made {fault}",
+                request.turn, request.handler
+            ));
         }
     }
 
@@ -340,6 +394,7 @@ impl World for SimWorld<'_> {
     }
 
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        self.count_effect(true);
         let output = self.tool_output(request);
         self.record("tool", || {
             vec![
@@ -355,6 +410,7 @@ impl World for SimWorld<'_> {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        self.count_effect(true);
         let response = self.reply(request);
         let program = self.program;
         self.record("model", || {
@@ -383,6 +439,7 @@ impl World for SimWorld<'_> {
     }
 
     fn now(&mut self) -> u64 {
+        self.count_effect(false);
         let clock = match &self.edges {
             Some(edges) => edges.draw(&mut self.rng),
             None => {
@@ -395,6 +452,7 @@ impl World for SimWorld<'_> {
     }
 
     fn random(&mut self) -> u64 {
+        self.count_effect(false);
         let random = match &self.edges {
             Some(edges) => edges.draw(&mut self.rng),
             None => self.rng.draw(),
