@@ -63,7 +63,7 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
             .expect("writing to a string succeeds");
     }
     out.push_str(ENGINE);
-    for (index, handler) in program.handlers.iter().enumerate() {
+    for (index, handler) in program.handlers.iter().chain(&program.sides).enumerate() {
         out.push_str(&handler_function(program, index, handler));
     }
     out.push_str(adapter);
@@ -300,7 +300,27 @@ fn program_literal(program: &Program) -> String {
     for (index, handler) in program.handlers.iter().enumerate() {
         out.push_str(&handler_literal(program, index, handler));
     }
+    out.push_str("  ],\n  sides: [\n");
+    for (index, side) in program.sides.iter().enumerate() {
+        out.push_str(&handler_literal(
+            program,
+            program.handlers.len() + index,
+            side,
+        ));
+    }
     out.push_str("  ],\n");
+    match &program.idle {
+        Some(idle) => writeln!(
+            out,
+            "  idle: {{ handler: {}, due: {}, runs: {}, bound: {}n }},",
+            js_string(&idle.handler),
+            idle.due,
+            idle.runs,
+            idle.bound.value
+        )
+        .expect("writing to a string succeeds"),
+        None => out.push_str("  idle: null,\n"),
+    }
     if let Some(blobs) = &program.blobs {
         writeln!(
             out,

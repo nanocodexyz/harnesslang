@@ -40,23 +40,56 @@ pub struct WorstCase {
 pub struct Family {
     pub child: [u64; 3],
     pub total: [u64; 3],
+    pub sessions: u64,
+    pub depth: u64,
 }
 
-fn family(program: &Program, own: [u64; 3], spawns: &Cost) -> Result<Option<Family>, Overflow> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tree {
+    pub measures: [u64; 3],
+    pub sessions: u64,
+    pub depth: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Levels {
+    Tree,
+    One,
+}
+
+pub fn family_with(
+    program: &Program,
+    own: [u64; 3],
+    spawns: &Cost,
+    levels: Levels,
+) -> Result<Option<Family>, Overflow> {
     if spawns.total == 0 {
         return Ok(None);
     }
     let mut child = [0; 3];
+    let mut sessions = 0;
+    let mut depth = 0;
     for (_, spawn) in program.spawns() {
-        let worst = &spawn.child().worst;
-        let measured = [
-            worst.effects.total,
-            worst.records.total,
-            worst.requests.total,
-        ];
-        for (widest, value) in child.iter_mut().zip(measured) {
+        let tree = match levels {
+            Levels::Tree => spawn.tree(),
+            Levels::One => {
+                let worst = &spawn.child().worst;
+                Tree {
+                    measures: [
+                        worst.effects.total,
+                        worst.records.total,
+                        worst.requests.total,
+                    ],
+                    sessions: 1,
+                    depth: 0,
+                }
+            }
+        };
+        for (widest, value) in child.iter_mut().zip(tree.measures) {
             *widest = (*widest).max(value);
         }
+        sessions = sessions.max(tree.sessions);
+        depth = depth.max(tree.depth);
     }
     let mut total = [0; 3];
     for index in 0..3 {
@@ -69,7 +102,16 @@ fn family(program: &Program, own: [u64; 3], spawns: &Cost) -> Result<Option<Fami
                 loops: spawns.loops.clone(),
             })?;
     }
-    Ok(Some(Family { child, total }))
+    let sessions = spawns.total.checked_mul(sessions).ok_or_else(|| Overflow {
+        measure: MEASURES[5],
+        loops: spawns.loops.clone(),
+    })?;
+    Ok(Some(Family {
+        child,
+        total,
+        sessions,
+        depth: depth + 1,
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -405,10 +447,11 @@ pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overfl
         either(body.through, body.ended).expect("a block keeps a path through it or ending in it");
     let admission = costs(0, ADMISSION_RECORDS, 0, 0);
     let [effects, records, requests, wait_ms, blob_bytes, spawns] = combine(admission, longest)?;
-    let family = family(
+    let family = family_with(
         program,
         [effects.total, records.total, requests.total],
         &spawns,
+        Levels::Tree,
     )?;
     Ok(WorstCase {
         effects,

@@ -111,11 +111,17 @@ pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
     ])
 }
 
-pub fn spawn_output(turn: u64, seq: u64, tool: &str, output: Output) -> Output {
+pub const SPAWN_SCOPE_SEPARATOR: &str = "/";
+
+pub fn spawn_output(scope: &str, turn: u64, seq: u64, tool: &str, output: Output) -> Output {
     if !matches!(output, Output::Ok(_)) || !program::spawns(tool) {
         return output;
     }
-    Output::Ok(Json::String(format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")))
+    let key = format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}");
+    if scope.is_empty() {
+        return Output::Ok(Json::String(key));
+    }
+    Output::Ok(Json::String(format!("{scope}{SPAWN_SCOPE_SEPARATOR}{key}")))
 }
 
 pub fn wait_until(input: &Json) -> Option<u64> {
@@ -157,6 +163,40 @@ pub enum Ran {
     Finished(Finish),
     AlreadyFinished(Finish),
     Suspended(Suspension),
+    NotDue(NotDue),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotDue {
+    Busy,
+    Unarmed,
+    Early { due: u64, clock: u64 },
+}
+
+pub const IDLE_AT: &str = "at";
+pub const IDLE_DUE: &str = "due";
+
+pub fn idle_arguments(clock: u64, due: u64) -> Json {
+    Json::object(vec![(IDLE_AT, Json::Number(clock)), (IDLE_DUE, Json::Number(due))])
+}
+
+pub fn next_turn(start: Start, records: &[Record]) -> Result<u64, Exit> {
+    let session = fold_from(start, records).map_err(corrupt)?;
+    Ok(session.turns.last_key_value().map_or(session.start.first_turn(), |(last, _)| last + 1))
+}
+
+pub fn idle_due(start: Start, records: &[Record]) -> Result<Option<u64>, Exit> {
+    if program::IDLE_HANDLER.is_none() {
+        return Ok(None);
+    }
+    let session = fold_from(start, records).map_err(corrupt)?;
+    let next = match session.turns.last_key_value() {
+        Some((_, log)) if log.finished.is_none() => return Ok(None),
+        Some((last, _)) => last + 1,
+        None => session.start.first_turn(),
+    };
+    let state = state_before(&session, next)?;
+    Ok(program::idle_armed(&state))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +472,13 @@ pub trait World {
     fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop>;
     fn resume(&mut self, suspension: &Suspension) -> Option<Resume>;
     fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool);
+    fn scope(&self) -> String {
+        String::new()
+    }
+    fn side(&mut self, _turn: u64, _seq: u64) -> Option<program::SideArguments> {
+        None
+    }
+    fn sided(&mut self, _side: &program::SideArguments, _answer: &Result<SideAnswer, Exit>) {}
 }
 
 pub trait Host {
@@ -468,6 +515,13 @@ pub trait Host {
         None
     }
     fn resumed(&mut self, _suspension: &Suspension, _resume: &Resume, _matched: bool) {}
+    fn scope(&self) -> String {
+        String::new()
+    }
+    fn side(&mut self, _turn: u64, _seq: u64) -> Option<program::SideArguments> {
+        None
+    }
+    fn sided(&mut self, _side: &program::SideArguments, _answer: &Result<SideAnswer, Exit>) {}
 }
 
 pub struct Sent {
@@ -719,6 +773,7 @@ pub struct Engine<'a> {
     notices: BTreeMap<usize, String>,
     discovered: BTreeMap<usize, std::collections::BTreeSet<String>>,
     blobs: Blobs,
+    snapshot: Option<program::State>,
 }
 
 impl<'a> Engine<'a> {
@@ -741,7 +796,46 @@ impl<'a> Engine<'a> {
             notices: BTreeMap::new(),
             discovered: BTreeMap::new(),
             blobs: Blobs::default(),
+            snapshot: None,
         }
+    }
+
+    pub fn with_snapshot(mut self, snapshot: program::State) -> Self {
+        assert!(program::HAS_SIDES, "only a program with side handlers keeps the snapshot a side question reads");
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn run_side(mut self, mut state: program::State, side: &program::SideArguments) -> Result<Finish, Exit> {
+        match program::run_side_body(&mut self, &mut state, side) {
+            Ok(result) => self.finish(&state, Outcome::Completed, result),
+            Err(Halt::Trap(trap)) => self.finish(
+                &state,
+                Outcome::Failed,
+                Json::object(vec![("trap", Json::String(trap))]),
+            ),
+            Err(Halt::Suspend(_)) => panic!("{SIDE_REFUSED}: a side handler never suspends"),
+            Err(Halt::Exit(exit)) => Err(exit),
+        }
+    }
+
+    fn side_question(&mut self, seq: u64) -> Result<(), Halt> {
+        if !program::HAS_SIDES {
+            return Ok(());
+        }
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("a side question arrives only while a turn runs live")
+        };
+        let Some(side) = world.side(self.turn, seq) else {
+            return Ok(());
+        };
+        let state = self
+            .snapshot
+            .clone()
+            .expect("a live run of a program with side handlers keeps its snapshot");
+        let answer = run_side(&mut **world, state, self.blobs.clone(), &side);
+        world.sided(&side, &answer);
+        Ok(())
     }
 
     pub fn with_blobs(mut self, blobs: Blobs) -> Self {
@@ -1226,6 +1320,7 @@ impl<'a> Engine<'a> {
             }
             None => {
                 self.require_live(seq)?;
+                self.side_question(seq)?;
                 if site.kind != Kind::Model {
                     self.append(Record::Call {
                         turn: self.turn,
@@ -1334,7 +1429,7 @@ impl<'a> Engine<'a> {
                         admitted: admitted.as_deref(),
                         nested: None,
                     });
-                    spawn_output(turn, seq, &call.tool, {
+                    spawn_output(&world.scope(), turn, seq, &call.tool, {
                         checked_output(&call.tool, returns, output)
                     })
                 }
@@ -1523,10 +1618,14 @@ impl<'a> Engine<'a> {
             }
         }
         completed.sort_by_key(|(position, _)| *position);
+        let scope = match &self.mode {
+            Mode::Live { world, .. } => world.scope(),
+            Mode::Replay => String::new(),
+        };
         for (position, output) in completed {
             let (index, seq) = group[position];
             let output = checked_output(&calls[index].tool, returns(&calls[index].tool), output);
-            let output = spawn_output(turn, seq, &calls[index].tool, self.settled(&calls[index].tool, output));
+            let output = spawn_output(&scope, turn, seq, &calls[index].tool, self.settled(&calls[index].tool, output));
             self.append(Record::Result {
                 turn,
                 seq,
@@ -2031,6 +2130,11 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             result: finished.result.clone(),
         }));
     }
+    let idles = program::IDLE_HANDLER == Some(handler);
+    let fresh = !session.turns.contains_key(&request.turn);
+    if idles && fresh && session.turns.last_key_value().is_some_and(|(_, log)| log.finished.is_none()) {
+        return Ok(Ran::NotDue(NotDue::Busy));
+    }
     let state = state_before(&session, request.turn)?;
     let blobs = Blobs::of_session(&session).map_err(corrupt)?;
     blobs.check_state(&state).map_err(corrupt)?;
@@ -2039,7 +2143,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
     let mut nested = Vec::new();
     let log = match session.turns.get(&request.turn) {
         Some(log) => {
-            if log.handler != handler || log.arguments != arguments {
+            if log.handler != handler || (!idles && log.arguments != arguments) {
                 return Err(corrupt(format!(
                     "turn {} was admitted with other arguments",
                     request.turn
@@ -2062,6 +2166,18 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
                     request.turn
                 )));
             }
+            let arguments = if idles {
+                let Some(due) = program::idle_armed(&state) else {
+                    return Ok(Ran::NotDue(NotDue::Unarmed));
+                };
+                let clock = world.clock();
+                if clock < due {
+                    return Ok(Ran::NotDue(NotDue::Early { due, clock }));
+                }
+                idle_arguments(clock, due)
+            } else {
+                arguments
+            };
             pending = Some(Record::Admitted {
                 turn: request.turn,
                 handler: handler.to_owned(),
@@ -2070,7 +2186,11 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             TurnLog::new(handler.to_owned(), Json::Null)
         }
     };
+    let snapshot = program::HAS_SIDES.then(|| state.clone());
     let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log).with_next_cell(session.next_cell()).with_blobs(blobs);
+    if let Some(snapshot) = snapshot {
+        engine = engine.with_snapshot(snapshot);
+    }
     if let Some(record) = pending {
         engine.append(record);
     }
@@ -2089,6 +2209,132 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             End::Finished(finish) => Ran::Finished(finish),
             End::Suspended(suspension) => Ran::Suspended(suspension),
         })
+}
+
+pub const SIDE_TURN: u64 = 0;
+pub const SIDE_REFUSED: &str = "the checker refuses this effect in a side handler";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SideAnswer {
+    pub outcome: Outcome,
+    pub result: Json,
+}
+
+struct SideWorld<'w> {
+    host: &'w mut dyn World,
+    answered: Option<Finish>,
+}
+
+impl World for SideWorld<'_> {
+    fn hook(&mut self, _point: Point) -> Result<(), Stop> {
+        Ok(())
+    }
+
+    fn flush(&mut self, _epoch: u64, _records: &[Record]) -> Result<(), Stop> {
+        Ok(())
+    }
+
+    fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        assert_eq!(request.turn, SIDE_TURN, "a side question's tool calls carry the side turn");
+        assert!(request.nested.is_none(), "{SIDE_REFUSED}: a side question runs no cell");
+        self.host.tool(request)
+    }
+
+    fn listing(&mut self, _request: &ListingRequest<'_>) -> Output {
+        panic!("{SIDE_REFUSED}: a side question reads no listing")
+    }
+
+    fn tools(&mut self, _requests: &[ToolRequest<'_>], _limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+        panic!("{SIDE_REFUSED}: a side question dispatches no batch")
+    }
+
+    fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        assert_eq!(request.turn, SIDE_TURN, "a side question's model calls carry the side turn");
+        self.host.model(request)
+    }
+
+    fn now(&mut self) -> u64 {
+        panic!("{SIDE_REFUSED}: now")
+    }
+
+    fn random(&mut self) -> u64 {
+        panic!("{SIDE_REFUSED}: random")
+    }
+
+    fn acknowledge(&mut self, finish: &Finish) {
+        assert!(self.answered.is_none(), "a side question is answered once");
+        self.answered = Some(finish.clone());
+    }
+
+    fn cell_start(&mut self, _cell: u64, _script: &str) -> Step {
+        panic!("{SIDE_REFUSED}: a code cell")
+    }
+
+    fn cell_resume(&mut self, _cell: u64, _input: Input) -> Step {
+        panic!("{SIDE_REFUSED}: a code cell")
+    }
+
+    fn wait(&mut self, _wait: &Wait) -> Result<(), Stop> {
+        panic!("{SIDE_REFUSED}: a code cell's timer")
+    }
+
+    fn observe(&mut self, _event: &CellEvent) {
+        panic!("{SIDE_REFUSED}: a code cell")
+    }
+
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
+        assert_eq!(turn, SIDE_TURN, "a side question reads no turn's inbox");
+        Vec::new()
+    }
+
+    fn answer(&mut self, _turn: u64, _position: u64, _answers: &[(String, EventAnswer)]) {
+        panic!("a side question takes no events, so it answers none")
+    }
+
+    fn clock(&mut self) -> u64 {
+        panic!("{SIDE_REFUSED}: wait")
+    }
+
+    fn sleep(&mut self, _turn: u64, _seq: u64, _until_ms: u64) -> Result<u64, Stop> {
+        panic!("{SIDE_REFUSED}: wait")
+    }
+
+    fn resume(&mut self, _suspension: &Suspension) -> Option<Resume> {
+        panic!("{SIDE_REFUSED}: suspend")
+    }
+
+    fn resumed(&mut self, _suspension: &Suspension, _resume: &Resume, _matched: bool) {
+        panic!("{SIDE_REFUSED}: suspend")
+    }
+}
+
+pub fn run_side(world: &mut dyn World, state: program::State, blobs: Blobs, side: &program::SideArguments) -> Result<SideAnswer, Exit> {
+    let log = TurnLog::new(program::side_name(side).to_owned(), Json::Null);
+    let mut scratch = SideWorld { host: world, answered: None };
+    let engine = Engine::new(Mode::Live { world: &mut scratch, epoch: 0 }, SIDE_TURN, &log).with_blobs(blobs);
+    let finish = engine.run_side(state, side)?;
+    assert_eq!(scratch.answered.as_ref(), Some(&finish), "a side question's finish is its answer");
+    Ok(SideAnswer {
+        outcome: finish.outcome,
+        result: finish.result,
+    })
+}
+
+pub fn last_finished(session: &Session) -> u64 {
+    session
+        .turns
+        .iter()
+        .rev()
+        .find(|(_, log)| log.finished.is_some())
+        .map_or(session.start.first_turn() - 1, |(turn, _)| *turn)
+}
+
+pub fn answer_side(world: &mut dyn World, start: Start, records: &[Record], side: &program::SideArguments) -> Result<SideAnswer, Exit> {
+    let session = fold_from(start, records).map_err(corrupt)?;
+    let state = state_before(&session, last_finished(&session) + 1)?;
+    let blobs = Blobs::of_session(&session).map_err(corrupt)?;
+    blobs.check_state(&state).map_err(corrupt)?;
+    run_side(world, state, blobs, side)
 }
 
 pub fn self_check() {

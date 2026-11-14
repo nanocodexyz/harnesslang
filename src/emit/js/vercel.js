@@ -141,6 +141,15 @@ class StepWorld {
   async answer() {
     throw new Panic("a step answers no events: the workflow function does, by an answer step");
   }
+
+  async side(turn, seq) {
+    if (this.context.side === undefined) return null;
+    return this.context.side(turn, seq);
+  }
+
+  async sided(request, answer) {
+    if (this.context.sided !== undefined) await this.context.sided(request, answer);
+  }
 }
 
 class ProcessCells {
@@ -181,7 +190,12 @@ async function runStep(input, context) {
     await context.answer(input.turn, input.position, input.answers);
     return { lines: [] };
   }
-  assert(input.kind === "run", "a step acknowledges or runs");
+  if (input.kind === "idle") {
+    const records = input.lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false)));
+    const due = await idleDue({ target: VERCEL_TARGET, mutation: context.mutation ?? "none" }, records);
+    return { lines: [], due: due === null ? null : due.toString() };
+  }
+  assert(input.kind === "run", "a step acknowledges, answers, reads the idle due or runs");
   const records = input.lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false)));
   const request = decodeOrCorrupt(() => turnRequestFromJson(decodeJson(input.request)));
   const setup = { target: VERCEL_TARGET, mutation: context.mutation ?? "none" };
@@ -191,6 +205,7 @@ async function runStep(input, context) {
   try {
     const ran = await runTurn(setup, world, VERCEL_EPOCH, records, request);
     if (ran.ran === "suspended") return { lines: [], suspended: encodeJson(suspensionJson(ran.suspension)) };
+    if (ran.ran === "not_due") return { lines: [], notDue: true };
     throw new Panic(`a step ends at a flush, found the turn ${ran.ran}`);
   } catch (error) {
     if (error instanceof StepEnd) {
@@ -206,13 +221,28 @@ async function runStep(input, context) {
   }
 }
 
+async function side(lines, requestText, host) {
+  const records = lines.map((line) => decodeOrCorrupt(() => decodeLine(line, false)));
+  const request = decodeOrCorrupt(() => sideRequestFromJson(decodeJson(requestText)));
+  const world = { tool: (call) => host.tool(call), model: (call) => host.model(call) };
+  const answer = await answerSide({ target: VERCEL_TARGET, mutation: "none" }, world, records, request);
+  return encodeJson(sideAnswerJson(answer));
+}
+
 async function session(platform) {
   const lines = [];
   const folded = fold([]);
   for (let index = 0; index < platform.turnsMax; index++) {
-    const requestText = await platform.request(index);
+    const requestText = PROGRAM.idle === null ? await platform.request(index) : await idleOrRequest(platform, lines, folded, index);
     await driveTurn(platform, lines, folded, requestText);
   }
+}
+
+async function idleOrRequest(platform, lines, folded, index) {
+  const done = await platform.step(`idle ${index}`, { kind: "idle", lines: lines.slice() });
+  if (done.output.due === null) return platform.request(index);
+  const idle = encodeJson(object([["arguments", object([])], ["handler", PROGRAM.idle.handler], ["turn", BigInt(folded.lastTurn + 1)]]));
+  return platform.requestOrIdle(index, BigInt(done.output.due), idle);
 }
 
 async function driveTurn(platform, lines, folded, requestText) {
@@ -233,6 +263,7 @@ async function driveTurn(platform, lines, folded, requestText) {
     }
     const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice(), resume });
     resume = null;
+    if (done.output.notDue === true) return;
     if (done.output.suspended !== undefined) {
       const suspension = decodeOrCorrupt(() => suspensionFrom(decodeJson(done.output.suspended)));
       resume = await platform.resume(`turn ${request.turn} resume ${suspension.seq} at step ${step}`, suspension);
@@ -329,16 +360,35 @@ const WORKFLOW_BINDING = [
   "  });",
   "}",
   "",
+  "export async function harnessSide(lines, request) {",
+  "  return harness.side(lines, request, host());",
+  "}",
+  "",
   "export async function harnessSession(sessionId, turnsMax) {",
   "  \"use workflow\";",
   "  const inboxes = new Map();",
   "  const suspended = new Map();",
+  "  let prompts = 0;",
+  "  let prompt = null;",
+  "  const nextPrompt = () => {",
+  "    if (prompt === null) {",
+  "      const hook = createHook({ token: sessionId + \":\" + prompts });",
+  "      prompt = (async () => {",
+  "        const payload = await hook;",
+  "        prompts += 1;",
+  "        prompt = null;",
+  "        return payload.request;",
+  "      })();",
+  "    }",
+  "    return prompt;",
+  "  };",
   "  return harness.session({",
   "    turnsMax,",
-  "    async request(index) {",
-  "      const hook = createHook({ token: sessionId + \":\" + index });",
-  "      const payload = await hook;",
-  "      return payload.request;",
+  "    async request() {",
+  "      return nextPrompt();",
+  "    },",
+  "    async requestOrIdle(index, dueMs, idleRequest) {",
+  "      return Promise.race([nextPrompt(), sleep(new Date(Number(dueMs))).then(() => idleRequest)]);",
   "    },",
   "    async step(name, input) {",
   "      return { output: await harnessStep(input), live: true };",
@@ -379,6 +429,7 @@ const harness = {
   target: "vercel",
   runtime,
   session,
+  side,
   runStep,
   platformRandom,
   processCells: () => new ProcessCells(),

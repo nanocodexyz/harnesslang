@@ -132,7 +132,20 @@ pub fn sql_open(sql: &mut dyn Sql, journal: &mut SqlJournal) -> Result<Opened, O
     }
     let epoch = column(row, &ACQUIRE, "epoch")?;
     let head = column(row, &ACQUIRE, "head")?;
-    let values = journal.values(&LOAD, epoch, "");
+    let records = sql_load(sql, journal)?;
+    if records.len() as u64 != head {
+        return Err(OpenError::Corrupt(format!(
+            "the session's head is {head} but {} rows load",
+            records.len()
+        )));
+    }
+    journal.head = head;
+    journal.last_turn = rows_turn(&records, 0);
+    Ok(Opened { records, epoch })
+}
+
+pub fn sql_load(sql: &mut dyn Sql, journal: &SqlJournal) -> Result<Vec<Record>, OpenError> {
+    let values = journal.values(&LOAD, 0, "");
     let rows = sql
         .query(&LOAD, &values)
         .map_err(|error| OpenError::Sql(format!("load: {error:?}")))?;
@@ -148,15 +161,14 @@ pub fn sql_open(sql: &mut dyn Sql, journal: &mut SqlJournal) -> Result<Opened, O
             .ok_or_else(|| OpenError::Corrupt(format!("row {} has no record", index + 1)))?;
         records.push(decode_line(text, false).map_err(|error| OpenError::Corrupt(format!("row {}: {error}", index + 1)))?);
     }
-    if records.len() as u64 != head {
-        return Err(OpenError::Corrupt(format!(
-            "the session's head is {head} but {} rows load",
-            records.len()
-        )));
-    }
-    journal.head = head;
-    journal.last_turn = rows_turn(&records, 0);
-    Ok(Opened { records, epoch })
+    Ok(records)
+}
+
+pub fn sql_side<H: Host>(host: &mut H, sql: &mut dyn Sql, journal: &SqlJournal, side: &program::SideArguments) -> Result<SideAnswer, RunError> {
+    let records = sql_load(sql, journal).map_err(RunError::Open)?;
+    let mut scratch = journal.clone();
+    let mut world = SqlWorld { host, sql, journal: &mut scratch };
+    answer_side(&mut world, Start::Beginning, &records, side).map_err(RunError::Exit)
 }
 
 pub fn rows_turn(records: &[Record], before: u64) -> u64 {
@@ -282,6 +294,18 @@ impl<H: Host> World for SqlWorld<'_, H> {
 
     fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {
         self.host.resumed(suspension, resume, matched)
+    }
+
+    fn scope(&self) -> String {
+        self.host.scope()
+    }
+
+    fn side(&mut self, turn: u64, seq: u64) -> Option<program::SideArguments> {
+        self.host.side(turn, seq)
+    }
+
+    fn sided(&mut self, side: &program::SideArguments, answer: &Result<SideAnswer, Exit>) {
+        self.host.sided(side, answer)
     }
 }
 

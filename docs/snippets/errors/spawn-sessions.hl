@@ -1,0 +1,5 @@
+harness lead
+
+spawn planner runs plan_change from "../tree_planner.hl"
+
+on ping() -> u64 { return 1 }

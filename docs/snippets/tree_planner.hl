@@ -1,0 +1,28 @@
+harness planner
+
+const parts_max: u64 = 2
+
+type verdict = planned(text) | lost(text)
+
+spawn reviewer runs review_change from "spawn_child.hl"
+
+on resume
+
+state {
+  notes: text
+}
+
+on plan_change(change: text) -> verdict {
+  notes = ""
+  loop part below parts_max {
+    match reviewer(change) {
+      ok(agent) => {
+        let notes_of_part = join(agent)
+        notes = notes ++ notes_of_part
+      }
+      failed(error) => { return lost(error) }
+      unknown => { return lost("the spawn's outcome is unknown") }
+    }
+  }
+  return planned(notes)
+}

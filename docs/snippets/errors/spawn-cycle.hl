@@ -1,0 +1,7 @@
+harness echo
+
+const echoes_max: u64 = 4
+
+spawn again runs ping from "spawn-cycle.hl" sessions at most echoes_max
+
+on ping() -> u64 { return 1 }

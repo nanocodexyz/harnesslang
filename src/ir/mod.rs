@@ -175,10 +175,12 @@ pub struct Program {
     pub state: Vec<Field>,
     pub invariants: Vec<Invariant>,
     pub handlers: Vec<Handler>,
+    pub sides: Vec<Handler>,
     pub events: Events,
     pub cuts: Vec<u64>,
     pub notice: Option<VariantId>,
     pub blobs: Option<Blobs>,
+    pub idle: Option<Idle>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -221,6 +223,31 @@ impl Program {
 
     pub fn handler(&self, name: &str) -> Option<&Handler> {
         self.handlers.iter().find(|handler| handler.name == name)
+    }
+
+    pub fn side(&self, name: &str) -> Option<&Handler> {
+        self.sides.iter().find(|side| side.name == name)
+    }
+
+    pub fn kind_of(&self, handler: &Handler) -> &'static str {
+        if self.side(&handler.name).is_some() {
+            "side handler"
+        } else {
+            "handler"
+        }
+    }
+
+    pub fn idles(&self, handler: &str) -> bool {
+        self.idle
+            .as_ref()
+            .is_some_and(|idle| idle.handler == handler)
+    }
+
+    pub fn prompted(&self) -> Vec<&Handler> {
+        self.handlers
+            .iter()
+            .filter(|handler| !self.idles(&handler.name))
+            .collect()
     }
 
     pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
@@ -391,6 +418,7 @@ pub struct Spawn {
     pub file: String,
     pub handler: String,
     pub program: Box<Program>,
+    pub sessions: Option<Bound>,
 }
 
 impl Spawn {
@@ -403,13 +431,44 @@ impl Spawn {
     pub fn harness(&self) -> &str {
         &self.program.name
     }
+
+    pub fn tree(&self) -> worst::Tree {
+        let worst = &self.child().worst;
+        match &worst.family {
+            Some(family) => worst::Tree {
+                measures: family.total,
+                sessions: family.sessions.checked_add(1).expect(
+                    "the checker refuses a family whose sessions and the spawn's own pass u64",
+                ),
+                depth: family.depth,
+            },
+            None => worst::Tree {
+                measures: [
+                    worst.effects.total,
+                    worst.records.total,
+                    worst.requests.total,
+                ],
+                sessions: 1,
+                depth: 0,
+            },
+        }
+    }
 }
 
 pub fn spawn_key(turn: u64, seq: u64) -> String {
     format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")
 }
 
+pub fn scoped_spawn_key(scope: &str, turn: u64, seq: u64) -> String {
+    if scope.is_empty() {
+        return spawn_key(turn, seq);
+    }
+    format!("{scope}{SPAWN_SCOPE_SEPARATOR}{}", spawn_key(turn, seq))
+}
+
 pub const SPAWN_KEY_SEPARATOR: &str = ".";
+pub const SPAWN_SCOPE_SEPARATOR: &str = "/";
+pub const SPAWN_DEPTH_MAX: u64 = 16;
 
 #[derive(Clone, Debug)]
 pub struct Listing {
@@ -620,6 +679,18 @@ pub const HOOK_DECIDED_FIELD: &str = "_hook_decided";
 pub const HOOK_DENIED_FIELD: &str = "_hook_denied";
 pub const HOOK_REASON_FIELD: &str = "_hook_reason";
 pub const HOOK_INPUT_FIELD: &str = "_hook_input";
+pub const IDLE_RUNS_FIELD: &str = "_idle_runs";
+pub const IDLE_BOUNDED_INVARIANT: &str = "_idle_bounded";
+pub const IDLE_AT: &str = "at";
+pub const IDLE_DUE: &str = "due";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Idle {
+    pub handler: String,
+    pub due: FieldId,
+    pub bound: Bound,
+    pub runs: FieldId,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiteClass {
@@ -922,7 +993,7 @@ impl Program {
 
     pub fn find_cuts(&self) -> Vec<u64> {
         let mut cuts = Vec::new();
-        for handler in &self.handlers {
+        for handler in self.handlers.iter().chain(&self.sides) {
             block_cuts(&handler.body, &self.constants, &mut cuts);
         }
         cuts.sort_unstable();

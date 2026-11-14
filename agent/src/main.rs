@@ -1,9 +1,11 @@
 mod anthropic;
+mod children;
 mod json;
 mod stream;
 mod tools;
 
 include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
+include!(concat!(env!("OUT_DIR"), "/child_mod.rs"));
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -11,10 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anthropic::{Client, Usage};
 use harness::program::{self, Arguments};
-use harness::{
-    Exit, FileDisk, Finish, Host, Json, ListingRequest, ModelRequest, Output, Ran, RunError,
-    ToolRequest, TurnRequest,
-};
+use harness::{Exit, FileDisk, Finish, Json, Ran, RunError, TurnRequest};
 use json::Value;
 
 const EXIT_HARNESS_ERROR: i32 = 1;
@@ -22,7 +21,10 @@ const EXIT_USAGE: i32 = 2;
 const FIRST_TURN: u64 = 1;
 const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N]";
+const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
+const JOINS_PER_TURN_MAX: u64 = program::ROUNDS_MAX * program::CALLS_PER_ROUND_MAX;
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N]";
+const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 
 struct Options {
     instruction: PathBuf,
@@ -30,6 +32,7 @@ struct Options {
     model: String,
     journal: PathBuf,
     rounds: u64,
+    keep_warm: u64,
 }
 
 fn fail_usage(message: &str) -> ! {
@@ -44,6 +47,7 @@ fn options() -> Options {
     }
     let (mut instruction, mut cwd, mut model, mut journal, mut rounds) =
         (None, None, None, None, None);
+    let mut keep_warm = 0;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let value = rest
@@ -67,6 +71,17 @@ fn options() -> Options {
                 }
                 rounds = Some(parsed);
             }
+            "--keep-warm" => {
+                keep_warm = value.parse().unwrap_or_else(|_| {
+                    fail_usage(&format!("--keep-warm {value} is not a number"))
+                });
+                if keep_warm > program::CACHE_REFRESHES {
+                    fail_usage(&format!(
+                        "--keep-warm must be at most the harness's cache_refreshes ({})",
+                        program::CACHE_REFRESHES
+                    ));
+                }
+            }
             other => fail_usage(&format!("unknown flag {other}")),
         }
     }
@@ -76,6 +91,63 @@ fn options() -> Options {
         model: model.unwrap_or_else(|| fail_usage("--model is required")),
         journal: journal.unwrap_or_else(|| fail_usage("--journal is required")),
         rounds: rounds.unwrap_or(program::ROUNDS_MAX),
+        keep_warm,
+    }
+}
+
+fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
+    let mut refreshed = 0;
+    for _ in 0..refreshes * IDLE_REQUESTS_PER_REFRESH_MAX {
+        if refreshed == refreshes {
+            return;
+        }
+        let journal = match harness::JsonlJournal::open(disk) {
+            Ok(journal) => journal,
+            Err(error) => {
+                eprintln!("hl-agent: journal: {error}");
+                return;
+            }
+        };
+        let (due, turn) = match (journal.idle_due(), journal.next_turn()) {
+            (Ok(Some(due)), Ok(turn)) => (due, turn),
+            (Ok(None), _) => {
+                eprintln!("hl-agent: no prompt cache refresh is armed");
+                return;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                eprintln!("hl-agent: journal: {error:?}");
+                return;
+            }
+        };
+        let now = now_ms();
+        if due > now {
+            eprintln!(
+                "hl-agent: idle {} ms until the prompt cache refresh due at {due}",
+                due - now
+            );
+            std::thread::sleep(std::time::Duration::from_millis(due - now));
+        }
+        let request = TurnRequest {
+            turn,
+            arguments: Arguments::Refresh,
+        };
+        match journal.run(agent, &request) {
+            Ok((_, Ran::Finished(finish))) => {
+                refreshed += 1;
+                eprintln!("hl-agent: idle turn {turn}: {}", finish.result.encode());
+            }
+            Ok((_, Ran::NotDue(not_due))) => {
+                eprintln!("hl-agent: idle turn {turn} is not due: {not_due:?}")
+            }
+            Ok((_, other)) => {
+                eprintln!("hl-agent: idle turn {turn} ended {other:?}");
+                return;
+            }
+            Err(error) => {
+                eprintln!("hl-agent: idle turn {turn}: {error:?}");
+                return;
+            }
+        }
     }
 }
 
@@ -105,21 +177,19 @@ struct Agent {
     client: Client,
     workspace: tools::Workspace,
     ledger: Ledger,
+    children: Option<children::Children>,
+    label: String,
 }
 
 fn to_value(json: &Json) -> Value {
     Value::decode(&json.encode()).expect("the harness encodes valid JSON")
 }
 
-fn to_json(value: &Value) -> Json {
-    Json::decode(&value.encode()).expect("a reply the host built decodes as harness JSON")
-}
-
 impl Agent {
-    fn stream_file(&self, request: &ModelRequest<'_>) -> PathBuf {
+    fn stream_file(&self, turn: u64, seq: u64) -> PathBuf {
         self.workspace
             .state
-            .join(format!("stream-{}-{}.sse", request.turn, request.seq))
+            .join(format!("stream-{turn}-{seq}.sse"))
     }
 
     fn record_model(&mut self, used: Usage, outcome: &str) {
@@ -133,19 +203,13 @@ impl Agent {
             ("cache_write_tokens", Value::number(used.cache_write)),
         ]));
     }
-}
 
-impl Host for Agent {
-    fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
-        let input = to_value(request.input);
+    fn run_tool(&mut self, turn: u64, seq: u64, tool: &str, input: &Value) -> tools::Ran {
         self.ledger.append(Value::object([
             ("kind", Value::text("tool")),
             ("at_ms", Value::number(now_ms())),
-            ("tool", Value::text(request.tool)),
-            (
-                "call",
-                Value::text(&harness::call_id(request.turn, request.seq)),
-            ),
+            ("tool", Value::text(tool)),
+            ("call", Value::text(&harness::call_id(turn, seq))),
         ]));
         let shown = input
             .get("description")
@@ -154,45 +218,38 @@ impl Host for Agent {
             .and_then(Value::as_str)
             .unwrap_or("");
         eprintln!(
-            "hl-agent: {} {}: {shown}",
-            harness::call_id(request.turn, request.seq),
-            request.tool
+            "{}: {} {tool}: {shown}",
+            self.label,
+            harness::call_id(turn, seq)
         );
-        match self.workspace.run(request.tool, &input) {
-            tools::Ran::Ok(text) => Output::Ok(Json::String(text)),
-            tools::Ran::Image(bytes) => Output::Ok(harness::host_blob_bytes(&bytes)),
-            tools::Ran::Failed(text) => Output::Failed(text),
+        match &mut self.children {
+            Some(children) if tool == children::SPAWN_TOOL => children.spawn(turn, seq, input),
+            Some(children) if tool == children::LIST_TOOL => children.list(input),
+            None if tool == children::SUBMIT_TOOL => children::submitted(input),
+            _ => self.workspace.run(tool, input),
         }
     }
 
-    fn listing(&mut self, _request: &ListingRequest<'_>) -> Output {
-        Output::Ok(Json::Object(std::collections::BTreeMap::new()))
-    }
-
-    fn model(&mut self, request: &ModelRequest<'_>) -> Json {
-        let call = harness::call_id(request.turn, request.seq);
-        let context = to_value(&(request.context)());
-        let attached = |digest: &str| {
-            request.blobs.get(digest).map(|bytes| {
-                (
-                    tools::media_type(bytes).unwrap_or_default().to_owned(),
-                    harness::base64_encode(bytes),
-                )
-            })
-        };
-        let body = match self.client.body(&context, request.mode, &attached) {
+    fn run_model(
+        &mut self,
+        turn: u64,
+        seq: u64,
+        mode: Option<&str>,
+        context: &Value,
+        attached: &anthropic::Attached<'_>,
+    ) -> Value {
+        let call = harness::call_id(turn, seq);
+        let body = match self.client.body(context, mode, attached) {
             Ok(body) => body,
             Err(error) => {
-                return to_json(&anthropic::transient(
-                    &format!("context does not render: {error}"),
-                    0,
-                ));
+                return anthropic::transient(&format!("context does not render: {error}"), 0);
             }
         };
-        let partial = self.stream_file(request);
+        let partial = self.stream_file(turn, seq);
         if let Ok(cut) = std::fs::metadata(&partial) {
             eprintln!(
-                "hl-agent: {call} a crash cut the previous stream of this call after {} bytes; requesting it again",
+                "{}: {call} a crash cut the previous stream of this call after {} bytes; requesting it again",
+                self.label,
                 cut.len()
             );
             self.ledger.append(Value::object([
@@ -203,50 +260,101 @@ impl Host for Agent {
             ]));
         }
         if let Err(error) = std::fs::write(&partial, "") {
-            return to_json(&anthropic::transient(
-                &format!("{}: {error}", partial.display()),
-                0,
-            ));
+            return anthropic::transient(&format!("{}: {error}", partial.display()), 0);
         }
-        let mode = request
-            .mode
-            .map(|mode| format!(" mode {mode}"))
-            .unwrap_or_default();
-        eprintln!("hl-agent: {call} model {}{mode}", self.client.model);
+        let shown = mode.map(|mode| format!(" mode {mode}")).unwrap_or_default();
+        eprintln!("{}: {call} model {}{shown}", self.label, self.client.model);
         let (reply, used) = match self.client.send(&body, &partial) {
+            Ok((status, text, retry_after_ms)) if mode == Some(anthropic::MODE_REFRESH) => {
+                anthropic::interpret(status, &text, retry_after_ms)
+            }
             Ok((status, text, retry_after_ms)) => {
                 anthropic::interpret_stream(status, &text, retry_after_ms)
             }
             Err(error) => (anthropic::transient(&error, 0), Usage::default()),
         };
         if let Err(error) = std::fs::remove_file(&partial) {
-            eprintln!("hl-agent: {}: {error}", partial.display());
+            eprintln!("{}: {}: {error}", self.label, partial.display());
         }
         let outcome = match &reply {
             Value::Object(entries) if entries.len() == 1 => entries[0].0.clone(),
             _ => "reply".to_owned(),
         };
         if outcome != "ok" {
-            eprintln!("hl-agent: model call {outcome}: {}", reply.encode());
+            eprintln!("{}: model call {outcome}: {}", self.label, reply.encode());
         }
         self.record_model(used, &outcome);
-        to_json(&reply)
+        reply
     }
-
-    fn now(&mut self) -> u64 {
-        now_ms()
-    }
-
-    fn random(&mut self) -> u64 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the clock is after 1970")
-            .subsec_nanos();
-        u64::from(nanos) ^ now_ms().rotate_left(u32::BITS)
-    }
-
-    fn acknowledge(&mut self, _finish: &Finish) {}
 }
+
+fn random() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .subsec_nanos();
+    u64::from(nanos) ^ now_ms().rotate_left(u32::BITS)
+}
+
+macro_rules! host_for {
+    ($module:ident) => {
+        impl $module::Host for Agent {
+            fn tool(&mut self, request: &$module::ToolRequest<'_>) -> $module::Output {
+                let input =
+                    Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
+                match self.run_tool(request.turn, request.seq, request.tool, &input) {
+                    tools::Ran::Ok(text) => $module::Output::Ok($module::Json::String(text)),
+                    tools::Ran::Image(bytes) => {
+                        $module::Output::Ok($module::host_blob_bytes(&bytes))
+                    }
+                    tools::Ran::Failed(text) => $module::Output::Failed(text),
+                }
+            }
+
+            fn listing(&mut self, _request: &$module::ListingRequest<'_>) -> $module::Output {
+                $module::Output::Ok($module::Json::Object(std::collections::BTreeMap::new()))
+            }
+
+            fn model(&mut self, request: &$module::ModelRequest<'_>) -> $module::Json {
+                let context = Value::decode(&(request.context)().encode())
+                    .expect("the harness encodes valid JSON");
+                let attached = |digest: &str| {
+                    request.blobs.get(digest).map(|bytes| {
+                        (
+                            tools::media_type(bytes).unwrap_or_default().to_owned(),
+                            $module::base64_encode(bytes),
+                        )
+                    })
+                };
+                let reply =
+                    self.run_model(request.turn, request.seq, request.mode, &context, &attached);
+                $module::Json::decode(&reply.encode())
+                    .expect("a reply the host built decodes as harness JSON")
+            }
+
+            fn now(&mut self) -> u64 {
+                now_ms()
+            }
+
+            fn random(&mut self) -> u64 {
+                random()
+            }
+
+            fn acknowledge(&mut self, _finish: &$module::Finish) {}
+
+            fn resume(&mut self, suspension: &$module::Suspension) -> Option<$module::Resume> {
+                let answer = self.children.as_mut()?.join(&suspension.key)?;
+                Some($module::Resume {
+                    key: suspension.key.clone(),
+                    answer,
+                })
+            }
+        }
+    };
+}
+
+host_for!(harness);
+host_for!(child_harness);
 
 fn command_line(program: &str, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new(program)
@@ -335,6 +443,19 @@ struct Totals {
     requests: u64,
     tool_calls: u64,
     wall_ms: u64,
+    children: u64,
+}
+
+impl Totals {
+    fn add_child(&mut self, child: &Totals) {
+        self.usage.input += child.usage.input;
+        self.usage.output += child.usage.output;
+        self.usage.cache_read += child.usage.cache_read;
+        self.usage.cache_write += child.usage.cache_write;
+        self.requests += child.requests;
+        self.tool_calls += child.tool_calls;
+        self.children += 1;
+    }
 }
 
 fn totals(ledger: &Path) -> Result<Totals, String> {
@@ -377,7 +498,10 @@ fn totals(ledger: &Path) -> Result<Totals, String> {
 }
 
 fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), String> {
-    let totals = totals(&journal.join("usage.jsonl"))?;
+    let mut totals = totals(&journal.join("usage.jsonl"))?;
+    for ledger in children::ledgers(journal)? {
+        totals.add_child(&self::totals(&ledger)?);
+    }
     let usage = Value::object([
         ("model", Value::text(model)),
         ("input_tokens", Value::number(totals.usage.input)),
@@ -390,6 +514,7 @@ fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), String> 
         ("requests", Value::number(totals.requests)),
         ("tool_calls", Value::number(totals.tool_calls)),
         ("wall_ms", Value::number(totals.wall_ms)),
+        ("children", Value::number(totals.children)),
         ("finish", Value::text(finish)),
     ]);
     let temporary = journal.join("usage.json.new");
@@ -443,13 +568,26 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
         .append(true)
         .open(journal.join("usage.jsonl"))
         .map_err(|error| format!("usage.jsonl: {error}"))?;
-    let tools = Value::decode(TOOL_DEFINITIONS).expect("the bundled tool definitions are JSON");
+    let (tools, child_tools) = tool_definitions();
+    let system = system_prompt(&cwd, &state)?;
+    let children = children::Children::new(
+        &journal,
+        children::Setup {
+            base_url: base_url.clone(),
+            key: key.clone(),
+            model: options.model.clone(),
+            max_tokens,
+            system: system.clone(),
+            tools: child_tools,
+            cwd: cwd.clone(),
+        },
+    );
     let client = Client {
         base_url,
         key,
         model: options.model.clone(),
         max_tokens,
-        system: system_prompt(&cwd, &state)?,
+        system,
         tools,
         scratch: state.clone(),
     };
@@ -463,14 +601,57 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
             client,
             workspace,
             ledger: Ledger { file },
+            children: Some(children),
+            label: "hl-agent".to_owned(),
         },
         instruction,
     ))
 }
 
+fn tool_definitions() -> (Value, Value) {
+    let Ok(Value::Array(mut parent)) = Value::decode(TOOL_DEFINITIONS) else {
+        panic!("the bundled tool definitions are a JSON list");
+    };
+    let mut child = parent.clone();
+    let subagent = Value::decode(SUBAGENT_TOOL_DEFINITIONS)
+        .expect("the bundled subagent tool definitions are JSON");
+    let list = |name: &str| {
+        subagent
+            .get(name)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("the subagent tool definitions hold a {name} list"))
+            .to_vec()
+    };
+    parent.extend(list("parent"));
+    child.extend(list("child"));
+    (Value::Array(parent), Value::Array(child))
+}
+
+fn run_turn(
+    agent: &mut Agent,
+    disk: &mut FileDisk,
+    request: &TurnRequest,
+) -> Result<Ran, RunError> {
+    let mut ran = harness::run_jsonl(agent, disk, request);
+    let mut waited = None;
+    for _ in 0..JOINS_PER_TURN_MAX {
+        let Ok(Ran::Suspended(suspension)) = &ran else {
+            return ran;
+        };
+        if waited == Some(suspension.seq) {
+            return ran;
+        }
+        waited = Some(suspension.seq);
+        ran = harness::run_jsonl(agent, disk, request);
+    }
+    ran
+}
+
 fn main() {
     harness::self_check();
     harness::jsonl_self_check();
+    child_harness::self_check();
+    child_harness::jsonl_self_check();
     let options = options();
     let (mut agent, instruction) = setup(&options).unwrap_or_else(|error| {
         eprintln!("hl-agent: {error}");
@@ -489,7 +670,13 @@ fn main() {
         turn: FIRST_TURN,
         arguments: Arguments::Prompt(instruction, options.rounds),
     };
-    let ran = harness::run_jsonl(&mut agent, &mut disk, &request);
+    let ran = run_turn(&mut agent, &mut disk, &request);
+    if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
+        keep_warm(&mut agent, &mut disk, options.keep_warm);
+    }
+    if let Some(children) = agent.children.as_mut() {
+        children.finish();
+    }
     agent.ledger.append(Value::object([
         ("kind", Value::text("end")),
         ("at_ms", Value::number(now_ms())),
@@ -508,10 +695,14 @@ fn main() {
         }
         Ok(Ran::Suspended(suspension)) => {
             eprintln!(
-                "hl-agent: turn {} waits on suspend {} ({}), which this host never resumes",
+                "hl-agent: turn {} waits on suspend {} ({}), which this host could not resume",
                 suspension.turn, suspension.seq, suspension.key
             );
             ("suspended".to_owned(), EXIT_HARNESS_ERROR)
+        }
+        Ok(Ran::NotDue(not_due)) => {
+            eprintln!("hl-agent: the prompt turn was refused as an idle turn: {not_due:?}");
+            ("error".to_owned(), EXIT_HARNESS_ERROR)
         }
         Err(RunError::Open(error)) => {
             eprintln!("hl-agent: journal: {error}");

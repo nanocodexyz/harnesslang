@@ -211,6 +211,7 @@ invalid_fail() {
   expect_error examples/invalid/wait_uncapped.hl any "wait_bound: wait(after_ms) may sleep past its cap retry_cap_ms and trap with bound(retry_cap_ms)"
   expect_error examples/invalid/with_outside_model.hl any "with_outside_model.hl:13:23: error: 'with' adds an entry to the context a model call reads: it is only a model call's argument"
   expect_error examples/invalid/long_wait.hl vercel "handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds vercel's limit of 800000 milliseconds per wait"
+  expect_error examples/invalid/family_sessions.hl any "family_sessions.hl:7:37: error: spawn tool 'planner' starts up to 3 sessions per call (planner.plan_change and 2 descendant sessions, part below parts_max (2)), over sessions at most two_sessions (2)"
   expect_error examples/invalid/blob_row.hl cloudflare "tool 'photo': a result record of blob<photo_bytes_max> (2097152 bytes) holds up to 2796399 bytes, over cloudflare's limit of 2000000 bytes per journal row"
   local target
   for target in native-jsonl native-sqlite server-postgres vercel; do
@@ -272,6 +273,14 @@ rust_diff_one() {
 
 js_diff_one() {
   JS_DIFF_SEEDS=$js_diff_seeds JS_DIFF_TARGETS=$1 JS_DIFF_FILES=$2 scripts/js-diff.sh
+}
+
+scoped_diff_one() {
+  local file=docs/snippets/tree_planner.hl scope=1.1
+  case $1 in
+    cloudflare | vercel) JS_DIFF_SEEDS=$js_diff_seeds JS_DIFF_TARGETS=$1 JS_DIFF_FILES=$file JS_DIFF_SCOPE=$scope scripts/js-diff.sh ;;
+    *) RUST_DIFF_SEEDS=$rust_diff_seeds RUST_DIFF_TARGETS=$1 RUST_DIFF_FILES=$file RUST_DIFF_SCOPE=$scope scripts/rust-diff.sh ;;
+  esac
 }
 
 mutation_one() {
@@ -365,12 +374,12 @@ queue invalid invalid_fail
 queue fn fn_equal
 queue docs scripts/docs-check.sh
 queue strict scripts/strict.sh
-for file in $examples; do
+for file in $examples docs/snippets/keep.hl; do
   for target in $js_targets; do
     queue js-diff js_diff_one "$target" "$file"
   done
 done
-for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl; do
+for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
   done
@@ -378,10 +387,19 @@ done
 for target in $targets; do
   queue sim-twice sim_twice "$target"
 done
-for file in $examples; do
+for file in $examples docs/snippets/keep.hl; do
   for target in $rust_targets; do
     queue rust-diff rust_diff_one "$target" "$file"
   done
+done
+for target in $targets; do
+  queue scoped-diff scoped_diff_one "$target"
+done
+for target in $rust_targets; do
+  queue rust-diff rust_diff_one "$target" docs/snippets/side.hl
+done
+for target in $js_targets; do
+  queue js-diff js_diff_one "$target" docs/snippets/side.hl
 done
 for mutation in $(scripts/mutations.sh --plans); do
   queue mutations mutation_one "$mutation"

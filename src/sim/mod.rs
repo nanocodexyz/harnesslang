@@ -3,9 +3,11 @@ pub mod dump;
 pub mod events;
 pub mod exhaustive;
 pub mod faults;
+pub mod idle;
 pub mod invariants;
 pub mod park;
 pub mod rng;
+pub mod side;
 pub mod strict;
 pub mod trace;
 pub mod world;
@@ -38,6 +40,7 @@ pub struct Options {
     pub twice: bool,
     pub mutation: Mutation,
     pub strict: strict::Mode,
+    pub scope: String,
 }
 
 #[derive(Clone, Debug)]
@@ -114,7 +117,7 @@ fn drive_turn(
     program: &Program,
     world: &mut SimWorld<'_>,
     request: &TurnRequest,
-) -> Result<(), Violation> {
+) -> Result<idle::Requested, Violation> {
     let suspensions_max = program
         .handler(&request.handler)
         .expect("a turn request names a handler of the program")
@@ -135,12 +138,21 @@ fn drive_turn(
         if let Some(trace) = &mut world.trace {
             trace.exit(&ran);
         }
+        world.side_fault()?;
         match ran {
-            Ok(Ran::Finished(_)) => return Ok(()),
-            Ok(Ran::Suspended(suspension)) => world.suspended(&suspension)?,
+            Ok(Ran::Finished(_)) => return Ok(idle::Requested::Admitted),
+            Ok(Ran::NotDue(refusal)) => {
+                world.refused(request, &refusal);
+                return Ok(idle::Requested::Refused(refusal));
+            }
+            Ok(Ran::Suspended(suspension)) => {
+                world.suspended(&suspension)?;
+                let parked = format!("while turn {} is parked", request.turn);
+                world.side_between(side::SIDE_PARKED_PPM, parked)?;
+            }
             Ok(Ran::AlreadyFinished(finish)) => {
                 crate::run::World::acknowledge(world, &finish);
-                return Ok(());
+                return Ok(idle::Requested::Admitted);
             }
             Err(Exit::Stop(_)) => {}
             Err(Exit::Corrupt(error)) => {
@@ -165,7 +177,15 @@ pub fn run_seed_traced(
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
-    run_seed_checked(program, target, mutation, strict::Mode::Off, seed, trace)
+    run_seed_checked(
+        program,
+        target,
+        mutation,
+        strict::Mode::Off,
+        "",
+        seed,
+        trace,
+    )
 }
 
 pub fn run_seed_checked(
@@ -173,11 +193,12 @@ pub fn run_seed_checked(
     target: Target,
     mutation: Mutation,
     strict: strict::Mode,
+    scope: &str,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_seed_unguarded(program, target, mutation, strict, seed, trace)
+        run_seed_unguarded(program, target, mutation, strict, scope, seed, trace)
     }));
     ran.unwrap_or_else(|payload| {
         let detail = payload
@@ -204,6 +225,7 @@ fn run_seed_unguarded(
     target: Target,
     mutation: Mutation,
     strict: strict::Mode,
+    scope: &str,
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
@@ -215,6 +237,7 @@ fn run_seed_unguarded(
     };
     let turns = workload.range(1, turns_max);
     let mut world = SimWorld::new(program, target, mutation, seed, true);
+    world.scope = scope.to_owned();
     if strict != strict::Mode::Off {
         world.edges = Some(Edges::of(program));
         world.greedy = Rng::derive(seed, "persona").chance(strict::GREEDY_MODEL_PPM);
@@ -230,18 +253,24 @@ fn run_seed_unguarded(
     world.trace = trace;
     let profile_name = world.profile.name;
     world.record("seed", || {
-        vec![
+        let mut fields = vec![
             ("seed", Json::Number(seed)),
             ("target", Json::text(target.name())),
             ("mutation", Json::text(mutation.name())),
             ("profile", Json::text(profile_name)),
-        ]
+        ];
+        if !scope.is_empty() {
+            fields.push(("scope", Json::text(scope)));
+        }
+        fields
     });
     let faulty = world.profile.crash_ppm > 0 || world.profile.lease_ppm > 0;
     let profile = world.profile.name;
     let mut result = Ok(());
-    for turn in 1..=turns {
-        let handler = &program.handlers[workload.pick(program.handlers.len())];
+    let prompted = program.prompted();
+    let mut turn = 1;
+    for index in 1..=turns {
+        let handler = prompted[workload.pick(prompted.len())];
         let arguments = handler
             .params
             .iter()
@@ -255,20 +284,26 @@ fn run_seed_unguarded(
             handler: handler.name.clone(),
             arguments,
         };
-        world.begin_turn(&request, faulty);
-        let driven = drive_turn(program, &mut world, &request);
-        world.inbox.end_turn(turn);
-        if let Err(violation) = driven {
-            let specific = match world.medium.durable() {
-                Ok(records) => invariants::safety(&world, &records)
-                    .err()
-                    .or_else(|| invariants::checkpoint_compacted(program, &world, &records).err()),
-                Err(_) => None,
-            };
-            result = Err(specific.unwrap_or(violation));
+        if let Err(violation) = request_turn(program, &mut world, faulty, request) {
+            result = Err(violation);
             break;
         }
+        turn += 1;
+        if program.idle.is_none() {
+            continue;
+        }
+        let idled = idle::period(&mut world, turn, index == turns, |world, request| {
+            request_turn(program, world, faulty, request)
+        });
+        match idled {
+            Ok((next, _)) => turn = next,
+            Err(violation) => {
+                result = Err(violation);
+                break;
+            }
+        }
     }
+    let turns = turn - 1;
     let records = world.medium.durable();
     if result.is_ok() {
         result = match &records {
@@ -292,6 +327,7 @@ fn run_seed_unguarded(
             target,
             mutation,
             strict,
+            scope,
             seed,
             records,
             &world.acks,
@@ -327,11 +363,37 @@ fn run_seed_unguarded(
     (run, world.trace.take())
 }
 
+fn request_turn(
+    program: &Program,
+    world: &mut SimWorld<'_>,
+    faulty: bool,
+    request: TurnRequest,
+) -> Result<idle::Requested, Violation> {
+    world.begin_turn(&request, faulty);
+    let turn = request.turn;
+    let driven = drive_turn(program, world, &request).and_then(|requested| {
+        world
+            .side_between(side::SIDE_BETWEEN_TURNS_PPM, format!("after turn {turn}"))
+            .map(|()| requested)
+    });
+    world.inbox.end_turn(turn);
+    driven.map_err(|violation| {
+        let specific = match world.medium.durable() {
+            Ok(records) => invariants::safety(world, &records)
+                .err()
+                .or_else(|| invariants::checkpoint_compacted(program, world, &records).err()),
+            Err(_) => None,
+        };
+        specific.unwrap_or(violation)
+    })
+}
+
 fn sequential_twin(
     program: &Program,
     target: Target,
     mutation: Mutation,
     strict: strict::Mode,
+    scope: &str,
     seed: u64,
     records: &[Record],
     acks: &[Finish],
@@ -341,7 +403,7 @@ fn sequential_twin(
         !twin.has_parallel(),
         "the sequential twin runs one call at a time"
     );
-    let (run, _) = run_seed_unguarded(&twin, target, mutation, strict, seed, None);
+    let (run, _) = run_seed_unguarded(&twin, target, mutation, strict, scope, seed, None);
     if invariants::trapped_in_body(&run.acks) {
         return Ok(());
     }
@@ -405,13 +467,22 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.children += more.children;
     total.joined += more.joined;
     total.child_crashes += more.child_crashes;
+    total.side_questions += more.side_questions;
+    total.idle_turns += more.idle_turns;
+    total.idle_refused += more.idle_refused;
+}
+
+pub struct Placement<'a> {
+    pub target: Target,
+    pub mutation: Mutation,
+    pub seed: u64,
+    pub scope: &'a str,
+    pub family_left: usize,
 }
 
 pub fn run_child(
     program: &Program,
-    target: Target,
-    mutation: Mutation,
-    seed: u64,
+    placement: &Placement<'_>,
     handler: &str,
     input: &Json,
 ) -> (Result<String, Violation>, Stats) {
@@ -430,7 +501,15 @@ pub fn run_child(
             );
         }
     };
-    let mut world = SimWorld::new(program, target, mutation, seed, true);
+    let mut world = SimWorld::new(
+        program,
+        placement.target,
+        placement.mutation,
+        placement.seed,
+        true,
+    );
+    world.scope = placement.scope.to_owned();
+    world.family_left = placement.family_left;
     let faulty = world.profile.crash_ppm > 0 || world.profile.lease_ppm > 0;
     let request = TurnRequest {
         turn: 1,
@@ -440,7 +519,7 @@ pub fn run_child(
     world.begin_turn(&request, faulty);
     let driven = drive_turn(program, &mut world, &request);
     world.inbox.end_turn(request.turn);
-    let result = driven.and_then(|()| {
+    let result = driven.and_then(|_| {
         let records = world
             .medium
             .durable()
@@ -476,6 +555,7 @@ pub fn sweep_traced(
             options.target,
             options.mutation,
             options.strict,
+            &options.scope,
             seed,
             trace,
         );
@@ -494,6 +574,7 @@ pub fn sweep_traced(
                 options.target,
                 options.mutation,
                 options.strict,
+                &options.scope,
                 seed,
                 None,
             );
@@ -583,7 +664,7 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             stats.dispatches,
             stats.unknown,
             format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 if stats.cells > 0 {
                     format!(
                         " cells={} nested={} divergences={} waits={}",
@@ -607,8 +688,20 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                     )
                 } else {
                     String::new()
+                },
+                if stats.idle_turns + stats.idle_refused > 0 {
+                    format!(
+                        " idle_turns={} idle_refused={}",
+                        stats.idle_turns, stats.idle_refused
+                    )
+                } else {
+                    String::new()
                 }
-            ),
+            ) + &if stats.side_questions > 0 {
+                format!(" side_questions={}", stats.side_questions)
+            } else {
+                String::new()
+            },
         ),
     }
 }

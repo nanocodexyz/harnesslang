@@ -1,0 +1,75 @@
+harness keeper
+
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+const window_tokens: u64 = 200000
+const lifetime_ms: u64 = 300000
+const refreshes_max: u64 = 12
+const clock_ms_max: u64 = 8640000000000000
+
+type outcome = answered(text) | failed(text)
+type kept = refreshed(u64) | lapsed(text)
+
+model infer calls calls_max window window_tokens modes refresh
+
+state {
+  context: list<entry, entries_max>
+  requested_ms: u64
+  refresh_due: u64
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+fn kept_at(started: u64, opened: u64) {
+  refresh_due = 0
+  if started <= opened and opened <= clock_ms_max {
+    if (opened - started) * 2 < lifetime_ms {
+      requested_ms = started
+      refresh_due = started + lifetime_ms - (opened - started) * 2
+    }
+  }
+}
+
+on prompt(input: text) -> outcome
+  requires len(context) + 2 <= entries_max
+{
+  push context user(input)
+  let started = now()
+  match infer(context) {
+    ok(reply, _, _, _, _, _) => {
+      let opened = now()
+      kept_at(started, opened)
+      push context assistant(reply)
+      match reply {
+        answer(words) => { return answered(words) }
+        calls(_) => { return answered("") }
+      }
+    }
+    throttled(error, _) => { return failed(error) }
+    transient(error, _) => { return failed(error) }
+    rejected(error) => { return failed(error) }
+  }
+}
+
+on idle refresh() at refresh_due bound refreshes_max -> kept {
+  let started = now()
+  if started > clock_ms_max or requested_ms > clock_ms_max {
+    return lapsed("the clock reads past its range")
+  }
+  if started >= requested_ms + lifetime_ms {
+    return lapsed("the cache outlived its lifetime")
+  }
+  match infer(context) mode refresh {
+    ok(_, _, _, _, cache_read, cache_write) => {
+      let opened = now()
+      if cache_read == 0 or cache_write > 0 {
+        return lapsed("the refresh found the cache lapsed")
+      }
+      kept_at(started, opened)
+      return refreshed(cache_read)
+    }
+    throttled(error, _) => { return lapsed(error) }
+    transient(error, _) => { return lapsed(error) }
+    rejected(error) => { return lapsed(error) }
+  }
+}

@@ -139,9 +139,12 @@ An effect is anything whose result the program cannot recompute: a tool, the
 model, `now()`, `random()`, `wait(c)` (and `wait(e) at most c`) and `suspend(key)`. Each effect site is
 journaled. A `spawn` tool (`spawn name runs handler from "file"`) is an external
 tool whose `ok` result the runtime records as the child's key, its own turn
-and sequence number `T.S`; the host keeps the child's session under the
-parent's and that key, and `join(key)`, a suspend, ends the parent's run until
-the child's completion resumes it with the child's result.
+and sequence number `T.S` (`K/T.S` in a session spawned under key `K`, so a
+family of any depth keys every session apart); the host keeps the child's
+session under that key, and `join(key)`, a suspend, ends the parent's run until
+the child's completion resumes it with the child's result. A child may spawn
+in turn when its spawn tool declares `sessions at most c`, which bounds the
+sessions of the tree one call starts.
 
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
@@ -219,6 +222,19 @@ journal (its external calls recovered as unknown) leaves them for the next
 effect. The sender is answered once the record is durable.
 LANGUAGE.md has the details and `src/target/inbound.rs` each target's delivery
 path with its platform facts.
+
+### Idle turns
+
+`on idle name() at field bound N` declares the handler the host admits while
+the session idles, once the clock reaches the time the `u64` state field names:
+nanocode's prompt cache refresh (`agent/keep.rs`) written as a turn. The
+runtime, not the host's timer, decides admission (the last turn finished, the
+field armed, fewer than `N` idle turns since another, the clock at or past the
+due) and records `{"at","due"}` in the `admitted` record; a refused request
+writes nothing. The count is a hidden state field the checker maintains, so the
+prover bounds it and replay restores it. The Durable Object arms its alarm at
+the due, the Vercel session races its next prompt against a workflow
+`sleep()`, and `hl-agent --keep-warm` stays alive for the refreshes.
 
 ### Code mode
 
@@ -323,6 +339,13 @@ resume, `{key, answer}`; the run replays to the suspend, which records the
 answer as its `result` when the key matches and waits again when it does not.
 A wait reads the clock, appends `{"ms":c,"until":T}`, flushes and sleeps until
 `T`; its `result` is the clock at its wake. [LANGUAGE.md](LANGUAGE.md) has both.
+
+A side handler (`on side name(...)`, `Program::sides`) answers a question as a
+scratch run: a fresh engine over the state at the last finished turn, its
+flushes discarded and its model and tool requests sent with turn `0`, so it
+appends nothing to the session. Hosts ask between runs, and a running turn
+polls `World::side` before each effect it runs fresh; LANGUAGE.md's Side
+questions has the checker's refusals and the simulator's `side_isolated`.
 
 Code mode adds a code site: `SiteKind::Cell` with class `Cell` and durability `Cell`: its
 own `call` record is `none`, and its nested calls follow points 1 to 3 plus
@@ -591,6 +614,7 @@ Invariants, named as nanocode-sim names them:
 | `search_listed` | every name a journaled search found was listed by its turn's latest read of the listing before it (`search_unchecked` records searches unchecked) |
 | `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, a deferred one only after a search of its turn found it (`discovery_unchecked`), and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
 | `suspend_durable`, `resume_matched`, `wait_until`, `wall_limit` | waits and suspends, defined in [LANGUAGE.md](LANGUAGE.md#suspend-and-resume) |
+| `idle_due` | every idle turn was admitted at or after the due its state armed, at most its bound after each other turn, defined in [LANGUAGE.md](LANGUAGE.md#idle-turns) (`idle_early` admits a request before its due) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded`, `nested_enum_valid` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
@@ -651,6 +675,10 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
   - `emit/`: Rust, JavaScript and SQL generation
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
+- `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
+  subagent `examples/claude_code_child.hl` emitted as native-jsonl Rust and
+  hosted against the Anthropic API, each spawned child a session with its own
+  journal under the parent's (`children/T.S/`)
 - `oracle/`: the nanocode oracle, its own workspace
 - `scripts/`: the check, docs check, mutation, prover mutation, oracle,
   differential and crash drill scripts
@@ -659,9 +687,7 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
-- Subagent trees deeper than one level (a spawned harness spawns nothing
-  today), side questions answered from a snapshot of the transcript, and the
-  simulator at 100K children.
+- The simulator at 100K children.
 - Waits as durable sleeps outside the run: on Vercel a workflow `sleep()`
   between steps and on Cloudflare the object's alarm, so a wait spends no
   Function or alarm time.

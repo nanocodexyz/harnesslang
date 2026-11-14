@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
     Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
-    Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
+    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
     TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
@@ -431,10 +431,19 @@ impl<'a> Parser<'a> {
         let handler = self.name("the handler the child session runs")?;
         self.word("from")?;
         let file = self.text_value("the child harness's file, as text")?;
+        let sessions = if self.is_word("sessions") {
+            self.advance();
+            self.word("at")?;
+            self.word("most")?;
+            Some(self.bound("the most sessions one spawn starts")?)
+        } else {
+            None
+        };
         Ok(Spawn {
             name,
             handler,
             file,
+            sessions,
         })
     }
 
@@ -478,6 +487,18 @@ impl<'a> Parser<'a> {
             let params = self.params()?;
             let mut handler = self.handler(name, params)?;
             handler.ends_session = true;
+            return Ok(Some(Item::Handler(handler)));
+        }
+        if first == "idle" && second.is_some() {
+            self.word("idle")?;
+            let name = self.name("an idle handler name")?;
+            let params = self.params()?;
+            self.word("at")?;
+            let due = self.name("the state field that holds the idle turn's due time")?;
+            self.word("bound")?;
+            let bound = self.bound("the idle turns after each other turn")?;
+            let mut handler = self.handler(name, params)?;
+            handler.idle = Some(Idle { due, bound });
             return Ok(Some(Item::Handler(handler)));
         }
         let Some(kind) = HookKind::ALL.into_iter().find(|kind| {
@@ -534,6 +555,14 @@ impl<'a> Parser<'a> {
 
     fn handler_or_event(&mut self) -> Parsed<Item> {
         self.word("on")?;
+        if self.is_word("side") && matches!(self.peek_second(), Token::Name(_)) {
+            self.word("side")?;
+            let name = self.name("a side handler name")?;
+            let params = self.params()?;
+            let mut handler = self.handler(name, params)?;
+            handler.side = true;
+            return Ok(Item::Handler(handler));
+        }
         if let Some(item) = self.lifecycle()? {
             return Ok(item);
         }
@@ -580,6 +609,8 @@ impl<'a> Parser<'a> {
             requires,
             body,
             ends_session: false,
+            side: false,
+            idle: None,
         })
     }
 

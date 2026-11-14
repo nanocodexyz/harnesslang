@@ -24,9 +24,13 @@ const image_bytes_max: u64 = 1048576
 const images_kept: u64 = 100
 const mcp_tools_max: u64 = 64
 const tool_search_results_default: u64 = 5
+const cache_lifetime_ms: u64 = 300000
+const cache_refreshes: u64 = 12
+const clock_ms_max: u64 = 8640000000000000
 
 type outcome = completed(text) | failed(text) | exhausted
 type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
+type kept = refreshed(u64) | lapsed(text)
 
 tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
 tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text or blob<image_bytes_max> effect none
@@ -34,8 +38,13 @@ tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool
 tool Write(file_path: text, content: text) -> text effect external
 tool ToolSearch(query: text, max_results: u64 = tool_search_results_default) -> text effect none finds mcp
 tools from listing(mcp, mcp_tools_max) (arguments: text) effect external
+tool list_agents(include_completed: bool = false) -> text effect none
+tool wait_agent(agent_id: text) -> text effect none
+spawn spawn_agent runs delegated from "claude_code_child.hl"
 
-model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only
+model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only, refresh
+
+on resume
 
 state {
   context: list<entry, context_entries_max>
@@ -55,6 +64,9 @@ state {
   compaction_prompt: text
   summary_text: text
   summary_ready: bool
+  requested_ms: u64
+  refresh_due: u64
+  joins_requested: bool
 }
 
 invariant turns_bounded: turns <= turns_max
@@ -195,6 +207,46 @@ fn context_exceeded() {
 
 fn run_calls(requested: list<call, calls_per_round_max>) {
   pending_units = 0
+  joins_requested = false
+  for call in requested {
+    if call.tool == "wait_agent" { joins_requested = true }
+  }
+  if joins_requested {
+    run_joining(requested)
+  } else {
+    run_parallel(requested)
+  }
+  round_entries = 1 + len(requested)
+}
+
+fn run_joining(requested: list<call, calls_per_round_max>) {
+  for call in requested {
+    if call.tool == "wait_agent" {
+      let quote = after(before(call.input, "agent_id"), "{")
+      let named = before(after(call.input, ":" ++ quote), quote)
+      let cut = truncate_middle(join(named), direct_result_tokens_max)
+      pending_units = pending_units + len(cut)
+      push context result(call, cut)
+    } else {
+      match dispatch(call) {
+        ok(output) => {
+          let cut = truncate_middle(output, direct_result_tokens_max)
+          pending_units = pending_units + len(cut)
+          push context result(call, cut)
+        }
+        failed(error) => {
+          let cut = truncate_middle(error, direct_result_tokens_max)
+          pending_units = pending_units + len(cut)
+          push context error(call, cut)
+        }
+        blob(image) => { push context attached(call, image) }
+        unknown => { push context unknown(call) }
+      }
+    }
+  }
+}
+
+fn run_parallel(requested: list<call, calls_per_round_max>) {
   for call in requested parallel {
     match dispatch(call) {
       ok(output) => {
@@ -217,7 +269,16 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
       unknown => { push context unknown(call) }
     }
   }
-  round_entries = 1 + len(requested)
+}
+
+fn keep_cache(started: u64, opened: u64) {
+  refresh_due = 0
+  if started <= opened and opened <= clock_ms_max {
+    if (opened - started) * 2 < cache_lifetime_ms {
+      requested_ms = started
+      refresh_due = started + cache_lifetime_ms - (opened - started) * 2
+    }
+  }
 }
 
 on prompt(input: text, rounds: u64) -> outcome
@@ -255,11 +316,13 @@ on prompt(input: text, rounds: u64) -> outcome
         ok(_) => {}
         failed(_) => {}
       }
+      let started = now()
       match messages(context) {
         throttled(error, after_ms) => { back_off(error, after_ms, throttled_attempts_max, true) }
         transient(error, after_ms) => { back_off(error, after_ms, attempts_max, false) }
         rejected(error) => { return failed("provider rejected the request: " ++ error) }
         ok(reply, stop, input_tokens, output_tokens, cache_read, cache_write) => {
+          let opened = now()
           attempts = 0
           waited_ms = 0
           backoff_ms = retry_base_ms
@@ -271,10 +334,12 @@ on prompt(input: text, rounds: u64) -> outcome
               match stop {
                 "end" => {
                   push context assistant(reply)
+                  keep_cache(started, opened)
                   return completed(words)
                 }
                 "tool_use" => {
                   push context assistant(reply)
+                  keep_cache(started, opened)
                   return completed(words)
                 }
                 "max_tokens" => {
@@ -318,4 +383,27 @@ on prompt(input: text, rounds: u64) -> outcome
     }
   }
   return exhausted
+}
+
+on idle refresh() at refresh_due bound cache_refreshes -> kept {
+  let started = now()
+  if started > clock_ms_max or requested_ms > clock_ms_max {
+    return lapsed("the clock reads past its range")
+  }
+  if started >= requested_ms + cache_lifetime_ms {
+    return lapsed("the prompt cache outlived its lifetime")
+  }
+  match messages(context) mode refresh {
+    ok(_, _, _, _, cache_read, cache_write) => {
+      let opened = now()
+      if cache_read == 0 or cache_write > 0 {
+        return lapsed("a prompt cache refresh arrived after the cache lapsed; refreshing stops until the next request")
+      }
+      keep_cache(started, opened)
+      return refreshed(cache_read)
+    }
+    throttled(error, _) => { return lapsed("a prompt cache refresh failed; refreshing stops until the next request: " ++ error) }
+    transient(error, _) => { return lapsed("a prompt cache refresh failed; refreshing stops until the next request: " ++ error) }
+    rejected(error) => { return lapsed("a prompt cache refresh failed; refreshing stops until the next request: " ++ error) }
+  }
 }
