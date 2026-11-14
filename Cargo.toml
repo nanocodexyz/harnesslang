@@ -1,0 +1,16 @@
+[package]
+name = "harnesslang"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A language for durable agent harnesses, compiled to each platform's durability guarantees"
+repository = "https://github.com/nanocodexyz/harnesslang"
+
+[[bin]]
+name = "hl"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+debug = 1
