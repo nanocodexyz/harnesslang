@@ -1,0 +1,38 @@
+harness cell_push_unbounded
+
+const outputs_max: u64 = 16
+const cell_calls_max: u64 = 8
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 600000
+const cell_journal_bytes_max: u64 = 33554432
+const cell_yield_ms: u64 = 10000
+
+tool bash(command: text) -> text effect external
+
+model infer calls cell_calls_max
+
+code exec {
+  tools bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+}
+
+state {
+  outputs: list<text, outputs_max>
+}
+
+on run(script: text) -> text {
+  match exec(script) {
+    ok(output) => {
+      push outputs output
+      return output
+    }
+    failed(error) => { return error }
+    unknown => { return "unknown" }
+  }
+}

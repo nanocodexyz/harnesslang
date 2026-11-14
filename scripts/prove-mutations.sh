@@ -4,7 +4,9 @@ cd "$(dirname "$0")/.."
 
 hl=target/release/hl
 scratch=output/prove-mutations
-files="examples/agent.hl examples/reviewer.hl"
+files="examples/agent.hl examples/reviewer.hl examples/code_agent.hl"
+cell_files="examples/code_agent.hl"
+plain_files="examples/agent.hl examples/reviewer.hl"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 usage_exit=2
 mkdir -p "$scratch"
@@ -20,9 +22,18 @@ property_of() {
     idempotent_reported_unknown) echo idempotent_known ;;
     gate_releases_early) echo output_gate ;;
     recovery_reports_failed) echo unknown_reported ;;
-    rerun_rewrites_call) echo seq_unique ;;
+    rerun_rewrites_call | nested_ids_restart) echo seq_unique ;;
     checkpoint_hash_order) echo replay_equal ;;
     drop_requires | repeat_assign) echo invariant_preserved ;;
+    cell_header_rides_past_external | nested_flush_after_dispatch) echo durable_before_external ;;
+    cell_recovery_redispatches_external | cell_replay_ignores_journal | vercel_nested_retry_redispatches | postgres_cell_unfenced) echo external_once ;;
+    cell_recovery_reports_failed) echo unknown_nested_reported ;;
+    cell_rerun_after_finish | drop_cell_finish) echo cell_finish_once ;;
+    timeout_rides) echo header_before_wait ;;
+    divergence_dispatches) echo cell_replay_equal ;;
+    cell_limit_unchecked) echo cell_bounds ;;
+    cell_gate_releases_early) echo output_gate ;;
+    nested_idempotent_reported_unknown) echo nested_known ;;
     *) return 1 ;;
   esac
 }
@@ -45,9 +56,38 @@ if [ "$status" -ne "$usage_exit" ]; then
   exit 1
 fi
 mutations=$(sed -n 's/.*--mutation \([a-z_|]*\)\].*/\1/p' <<< "$usage" | tr '|' ' ')
+is_cell_mutation() {
+  case $1 in
+    cell_* | nested_* | timeout_rides | divergence_dispatches | vercel_nested_retry_redispatches | postgres_cell_unfenced | drop_cell_finish) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+check_untouched() {
+  local mutation=$1 file target status
+  for file in $plain_files; do
+    for target in $targets; do
+      set +e
+      "$hl" prove --target "$target" --mutation "$mutation" "$file" > /dev/null 2> "$scratch/$mutation.stderr"
+      status=$?
+      set -e
+      if [ "$status" -ne 0 ] && [ "$status" -ne "$usage_exit" ]; then
+        echo "mutation $mutation on $target: $file has no code tool, yet its proof failed (exit $status):"
+        cat "$scratch/$mutation.stderr"
+        return 1
+      fi
+    done
+  done
+  echo "cell mutation $mutation leaves $plain_files proved"
+}
+
 check_mutation() {
-  local mutation=$1 property=$2 file target status applied
-  for file in $files; do
+  local mutation=$1 property=$2 file target status applied mutated=$files
+  if is_cell_mutation "$mutation"; then
+    mutated=$cell_files
+    check_untouched "$mutation" || return 1
+  fi
+  for file in $mutated; do
     applied=0
     for target in $targets; do
       set +e
@@ -126,5 +166,16 @@ expect_error examples/invalid/invariant_return.hl "handler 'tally': invariant_pr
 expect_error examples/invalid/invariant_trap.hl "handler 'ask': invariant_preserved: invariant 'idle' (busy == 0) may not hold when the reply of think(history) fails to decode and the turn traps; path: entry; counterexample: busy = 1"
 expect_error examples/invalid/invariant_initial.hl "handler '(zero state)': invariant_initial: invariant 'started' (turns >= turns_min) may not hold in the zero state; path: the zero state; counterexample: turns = 0"
 expect_error examples/invalid/invariant_unsupported.hl "handler 'arm': invariant_preserved: invariant 'disarmed' (not ready) may not hold when the handler returns; path: entry; counterexample: the prover reasons only about u64 comparisons joined by and, or and not"
+expect_error examples/invalid/cell_journal_bytes.hl "handler '(code exec)': cell_bounds: journal_bytes (cell_journal_bytes_max = 67108864) exceeds nanocode's JOURNAL_LIMIT_BYTES (33554432); path: code exec"
+expect_error examples/invalid/cell_journal_floor.hl "handler '(code exec)': cell_bounds: journal_bytes (cell_journal_bytes_max = 4096) cannot hold the entries of 256 nested calls and 64 timers (20480 bytes at 32 bytes per entry at least); path: code exec"
+expect_error examples/invalid/cell_over_cloudflare.hl "handler 'prompt' on cloudflare: worst_case: worst case 16400 outbound requests (16384 of them nested calls in cells) exceeds cloudflare's limit of 10000 outbound requests per invocation; path: step below turn_steps_max (16) x call below calls_per_step_max (4)"
+expect_error examples/invalid/cell_push_unbounded.hl "handler 'run': push_bound: push onto outputs may find it full and trap with bound(outputs); path: match exec(script): ok; counterexample: len(outputs) = 16"
+for target in native-jsonl native-sqlite server-postgres vercel; do
+  if ! "$hl" prove --target "$target" examples/invalid/cell_over_cloudflare.hl > /dev/null 2> "$scratch/stderr"; then
+    echo "examples/invalid/cell_over_cloudflare.hl must prove on $target:" >&2
+    cat "$scratch/stderr" >&2
+    exit 1
+  fi
+done
 echo "prove: every prover invalid example fails with its expected error"
 echo "prove-mutations: every mutation is caught"

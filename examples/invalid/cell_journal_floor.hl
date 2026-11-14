@@ -1,0 +1,30 @@
+harness cell_journal_floor
+
+const cell_calls_max: u64 = 256
+const cell_parallel_max: u64 = 16
+const cell_timers_max: u64 = 64
+const cell_timer_ms_max: u64 = 600000
+const cell_journal_bytes_max: u64 = 4096
+const cell_yield_ms: u64 = 10000
+
+tool bash(command: text) -> text effect external
+
+model infer calls cell_calls_max
+
+code exec {
+  tools bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+}
+
+on run(script: text) -> text {
+  match exec(script) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "unknown" }
+  }
+}
