@@ -31,10 +31,14 @@ pub enum Mutation {
     NestedIdempotentReportedUnknown,
     EnumUnchecked,
     NestedEnumUnchecked,
+    ModelFailureUnrecorded,
+    BatchFlushAfterDispatch,
+    ResultsInCompletionOrder,
+    BatchPushesReversed,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 33] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -64,6 +68,10 @@ impl Mutation {
         Self::NestedIdempotentReportedUnknown,
         Self::EnumUnchecked,
         Self::NestedEnumUnchecked,
+        Self::ModelFailureUnrecorded,
+        Self::BatchFlushAfterDispatch,
+        Self::ResultsInCompletionOrder,
+        Self::BatchPushesReversed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -97,6 +105,10 @@ impl Mutation {
             Self::NestedIdempotentReportedUnknown => "nested_idempotent_reported_unknown",
             Self::EnumUnchecked => "enum_unchecked",
             Self::NestedEnumUnchecked => "nested_enum_unchecked",
+            Self::ModelFailureUnrecorded => "model_failure_unrecorded",
+            Self::BatchFlushAfterDispatch => "batch_flush_after_dispatch",
+            Self::ResultsInCompletionOrder => "results_in_completion_order",
+            Self::BatchPushesReversed => "batch_pushes_reversed",
         }
     }
 
@@ -143,7 +155,17 @@ impl Mutation {
                 Target::Cloudflare,
             ],
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
-            Self::CheckpointHashOrder | Self::EnumUnchecked => all,
+            Self::CheckpointHashOrder
+            | Self::EnumUnchecked
+            | Self::ModelFailureUnrecorded
+            | Self::ResultsInCompletionOrder
+            | Self::BatchPushesReversed => all,
+            Self::BatchFlushAfterDispatch => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Vercel,
+            ],
             Self::RecoverySkipped => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

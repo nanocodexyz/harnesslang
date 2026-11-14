@@ -15,7 +15,7 @@ const HTTP_NOT_FOUND = 404;
 const HTTP_INTERNAL_ERROR = 500;
 const HTTP_SERVICE_UNAVAILABLE = 503;
 const REQUESTS_QUEUED_MAX = 16;
-const NO_SIMULATION = { mutation: "none", hook() {}, gate() {} };
+const NO_SIMULATION = { mutation: "none", hook() {}, gate() {}, tools: undefined };
 
 class CloudflareWorld {
   constructor(object) {
@@ -80,6 +80,12 @@ class CloudflareWorld {
     const output = await this.object.host.tool(request);
     for (const record of this.deferred.splice(0)) this.object.insert(record);
     return output;
+  }
+
+  async tools(requests, limit) {
+    const simulated = this.object.simulation.tools;
+    if (simulated !== undefined) return simulated(this, requests, limit);
+    return dispatchConcurrently(this, requests, limit);
   }
 
   model(request) {

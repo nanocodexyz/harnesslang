@@ -393,7 +393,7 @@ examples/agent.hl: harness agent: 3 tool(s), 2 state field(s), 1 handler(s)
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
   proved zero state: invariant_initial: 2 invariant(s) hold
-  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4192 prover steps)
+  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4202 prover steps)
   proved handler prompt on cloudflare: durability: 1 external effect site(s) run only after a flush of their call and every record before it; 10 acknowledgement point(s) follow their status flush
   proved handler prompt on cloudflare: worst_case: 2115 journal records per run on the plan's longest path, as hl check counts (step below turn_steps_max (64) x call below calls_per_step_max (16))
   proved handler prompt on cloudflare: worst_case: 1088 outbound requests <= 10000 outbound requests per invocation (step below turn_steps_max (64) x call below calls_per_step_max (16))
@@ -401,6 +401,7 @@ examples/agent.hl: proved for cloudflare
 target cloudflare: runs in a Durable Object; journal: the object's SQLite; flush: OutputGate; atomic unit: Event; who else may run: AlarmAfterReset
   limit memory: 134217728 bytes per isolate (developers.cloudflare.com/durable-objects/platform/limits)
   limit outbound requests: 10000 outbound requests per invocation (developers.cloudflare.com/workers/platform/limits (Workers Paid default))
+  limit concurrent requests: 6 requests waiting for response headers per invocation (developers.cloudflare.com/workers/platform/limits (simultaneous open connections; relaxed to the wait for headers on 2026-04-09); a seventh fetch is queued by the runtime)
   fact: an outbound fetch or a response leaves only after the event's earlier writes commit (blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it)
   fact: writes with no await between them commit together, and none commits while the event runs synchronously (developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields)
   fact: a flush is committed once storage.sync() resolves; an awaited microtask commits nothing (developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit)
@@ -492,7 +493,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `calls` `fn` `in` `known` `maybe`
+Contextual words: `below` `calls` `fn` `in` `known` `maybe` `parallel` `reply`
 
 Builtin functions, whose names declarations may not take:
 
@@ -545,7 +546,7 @@ variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound ;
+model      = "model" name "calls" bound [ "reply" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -562,7 +563,7 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
-           | "for" name "in" expr block
+           | "for" name "in" expr [ "parallel" ] block
            | "return" expr
            | name "=" expr
            | name "(" [ expr { "," expr } ] ")" ;
@@ -688,8 +689,10 @@ on ping() -> u64 { return 1 }
 `model name calls bound` declares the model. Calling it, `name(context)`, takes a
 `list<entry, N>` and returns a `reply`; `bound` caps the tool calls in one
 reply, so `calls(requested)` binds a `list<call, bound>`. A reply with more
-calls, or one that does not decode, traps the turn. The `reply` and `entry` types
-exist only when a model is declared:
+calls, or one that does not decode, traps the turn. `model name calls bound
+reply type` declares the reply's type instead, and calling the model then
+returns `known<type>` ([Model replies](#model-replies)). The `reply` and
+`entry` types exist only when a model is declared:
 
 ```console
 $ hl check docs/snippets/errors/needs-model.hl
@@ -1053,7 +1056,8 @@ on ping() -> u64 { return count }
 Builtin sum types:
 
 - `call = call(text, text, text)`, read with `.id`, `.tool` and `.input`.
-- `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's `calls`.
+- `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's `calls`,
+  unless the model declares its reply type, which then takes `reply`'s place.
 - `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`.
 
 Rules:
@@ -1369,6 +1373,192 @@ type status = "completed" | "failed" | "completed"
 on ping() -> u64 { return 1 }
 ```
 
+### Model replies
+
+`model name calls bound reply type` declares the type of the model's replies,
+so a harness can branch on everything its provider reports, such as Claude's
+stop reasons. The type is a sum this harness declares, and:
+
+- Exactly one variant carries `list<call, bound>`, the model's calls; the
+  worst case multiplies that list's capacity like any `for` over it.
+- Every other field is `u64`, `bool`, `text` or a text enum, so every
+  target and the simulator can carry it.
+- No variant is named `failed`, the name a failed model call is recorded
+  under.
+- It takes the builtin `reply`'s place: `entry`'s `assistant` variant
+  carries it, and the name `reply` is free.
+
+Calling the model returns `known<type>`: the model is idempotent, so its
+outcome is never unknown, but the provider can fail. `failed(error)` is a
+host reporting a failure, as the reply `{"failed": "error"}`, or a reply that
+does not fit the type (`model reply: ...`, a list over the calls bound
+included), so the program handles both, typically by asking again under a
+named bound. Nothing traps. Matching the reply is exhaustive like any sum.
+
+```hl docs/snippets/model_reply.hl
+harness replies
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 16
+const attempts_max: u64 = 5
+const continuations_max: u64 = 3
+const context_max: u64 = 256
+
+type outcome = done(text) | stopped(text) | exhausted
+type turn_reply = answer(text, u64)
+  | calls(list<call, calls_max>, u64)
+  | truncated(text)
+  | refused(text)
+
+tool read(path: text) -> text effect none
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  failures: u64
+  continuations: u64
+}
+
+invariant failures_bounded: failures < attempts_max
+invariant continuations_bounded: continuations <= continuations_max
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  failures = 0
+  continuations = 0
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => {
+        if failures + 1 >= attempts_max { return stopped(error) }
+        failures = failures + 1
+      }
+      ok(reply) => {
+        failures = 0
+        push context assistant(reply)
+        match reply {
+          answer(words, _) => { return done(words) }
+          calls(requested, _) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+          truncated(partial) => {
+            if continuations >= continuations_max { return stopped(partial) }
+            continuations = continuations + 1
+          }
+          refused(reason) => { return stopped(reason) }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+The prover bounds both counters. Each holds its invariant where the loop
+starts and every iteration that falls through keeps it, so it holds at every
+iteration's start ([Invariants and requires](#invariants-and-requires)). Each
+retry and each continuation spends one of `rounds_max` rounds, so the worst
+case is the same as without them:
+
+```console
+$ hl check docs/snippets/model_reply.hl | grep -E 'worst case|no_overflow'
+  handler ask: worst case 80 effects, 147 journal records, 80 outbound requests
+  proved handler ask: no_overflow: 7 arithmetic operation(s) proved in range; invariant_preserved: 10 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (17036 prover steps)
+```
+
+The journal is unchanged. A `model` record holds the reply as the host
+returned it, and a failed call writes a `model` record too, holding
+`{"failed": error}`, so a rerun replays the failure and takes the same path:
+
+```console
+$ hl run docs/snippets/model_reply.hl --handler ask --arg hi --seed 2 | sed -n 2p
+{"crc":1388021480,"record":{"model":{"call_id":"1/1","response":{"failed":"think failed: epsilon-53"},"seq":1,"turn":"1"}}}
+```
+
+`hl sim` draws a failure in `MODEL_FAILURE_PPM` = 150000 calls per million to
+a model with a declared reply, and otherwise a variant of the type: one other
+than the calls' in `ANSWER_PPM` = 350000 replies per million, every one as
+likely as the next, and the calls' variant in the rest, with fields drawn as
+tool results are, values outside a text enum included.
+`examples/claude_agent.hl` ports Claude's stop reasons this way: `max_tokens`
+continues at most `continuations_max` times, `pause_turn` sends the context
+again, `model_context_window_exceeded` is handled once, `refusal` stops the
+turn, and a failed call is asked again up to `throttled_attempts_max` times
+in a row.
+
+The planted bug `model_failure_unrecorded` writes no record for a failed
+call, as a harness that treats provider errors as transient might. A rerun
+asks the model again, and replaying the journal from nothing finds a model
+reply where the program runs a tool:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation model_failure_unrecorded examples/claude_agent.hl
+FAIL invariant=liveness seed=2 target=native-jsonl profile=lying mutation=model_failure_unrecorded: turn 1: replay of turn 1 diverged at seq 2: the journal records a model reply, the program runs 'Bash' (1/2)
+replay: hl sim --target native-jsonl --seeds 2..3 --mutation model_failure_unrecorded examples/claude_agent.hl
+```
+
+The checker's reply errors:
+
+```console
+$ hl check examples/invalid/reply_two_call_lists.hl
+examples/invalid/reply_two_call_lists.hl:7:73: error: reply type 'split_reply' carries list<call, calls_max> in 'reads' and 'writes': exactly one variant carries the model's calls
+$ hl check examples/invalid/reply_no_call_list.hl
+examples/invalid/reply_no_call_list.hl:6:6: error: reply type 'text_reply' has no variant carrying list<call, calls_max>: exactly one variant carries the model's calls
+$ hl check examples/invalid/reply_unmatched_failure.hl
+examples/invalid/reply_unmatched_failure.hl:20:5: error: 'answer' is not a variant of known<turn_reply>
+$ hl check docs/snippets/errors/reply-failed-variant.hl
+docs/snippets/errors/reply-failed-variant.hl:5:65: error: reply type 'turn_reply' has a variant named 'failed', the name a failed model call is recorded under
+$ hl check docs/snippets/errors/reply-field.hl
+docs/snippets/errors/reply-field.hl:6:71: error: variant 'notes' of reply type 'turn_reply' carries list<text, notes_max>: a reply's fields are u64, bool, text, text enums and the one list<call, calls_max>
+$ hl check docs/snippets/errors/reply-builtin.hl
+docs/snippets/errors/reply-builtin.hl:9:15: error: unknown type 'reply': the model replies with 'turn_reply'
+```
+
+```hl docs/snippets/errors/reply-failed-variant.hl
+harness notes
+
+const calls_max: u64 = 4
+
+type turn_reply = answer(text) | calls(list<call, calls_max>) | failed(text)
+
+model think calls calls_max reply turn_reply
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/reply-field.hl
+harness notes
+
+const calls_max: u64 = 4
+const notes_max: u64 = 8
+
+type turn_reply = answer(text) | calls(list<call, calls_max>) | notes(list<text, notes_max>)
+
+model think calls calls_max reply turn_reply
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/reply-builtin.hl
+harness notes
+
+const calls_max: u64 = 4
+
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply
+
+on show(said: reply) -> u64 { return 1 }
+```
+
 ## Statements
 
 | Statement | Meaning |
@@ -1381,6 +1571,7 @@ on ping() -> u64 { return 1 }
 | `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas; a text enum's arms are its values, `"value" => { }` |
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
 | `for x in list { }` | runs the body once per element of the list as it was when the loop started |
+| `for call in list parallel { }` | dispatches every call of the list at once, then runs the arms in list order; see [Parallel tool calls](#parallel-tool-calls) |
 | `return e` | finish the turn with `e`, of the handler's result type |
 | `f(a, ...)` | run [fn](#fn) `f`'s body here |
 
@@ -1422,7 +1613,7 @@ Effects inside an expression run before the expression, left to right.
 | Class | Declared by | Result | When a crash lost its result |
 | --- | --- | --- | --- |
 | `none` | `effect none`, `now()`, `random()` | `known<T>` for a tool; `now()` and `random()` give a plain `u64` | runs again |
-| `idempotent` | `effect idempotent`, the model | `known<T>` for a tool; the model gives a plain `reply` | runs again with the same turn and sequence number, its idempotency key |
+| `idempotent` | `effect idempotent`, the model | `known<T>` for a tool; the model gives a plain `reply`, or `known<R>` when it declares its reply type `R` | runs again with the same turn and sequence number, its idempotency key |
 | `external` | `effect external`, a tool the program does not declare | `maybe<T>` | never runs again: the result is `unknown` |
 
 These are nanocode's `EffectClass`. `dispatch(call)` looks `call.tool` up among
@@ -1522,12 +1713,199 @@ points above, never less.
 | Before acknowledging | `status` and checkpoint written and synced | committed | committed, fenced | committed before the response leaves | committed at the step's end |
 | What a crash can do to the journal | lose the unsynced tail or tear the last line: each line's CRC-32 drops a torn tail, and the file is synced on open before it is trusted | nothing partial | nothing partial; a second owner may start after a lease expires | nothing partial; a reset object resumes from its alarm | a step retried after it ran |
 
+### Parallel tool calls
+
+`for call in requested parallel { ... }` runs a reply's tool calls at once, as
+nanocode runs the calls of a reply that its tools allow in parallel. Its body
+is one `match dispatch(call)` on the item it walks, whose arms only push
+values that run no effect. A turn runs it in three steps:
+
+1. In list order, each call takes the next sequence number and appends its
+   `call` record (a call the journal already holds is replayed). Nothing is
+   dispatched yet.
+2. The calls are dispatched in groups, in list order. Consecutive none and
+   idempotent calls form one group, dispatched at once; an external call is
+   a group of its own, as nanocode runs writers exclusively. Before the first
+   external call runs, one flush makes every `call` record of the batch
+   durable (durability point 1, once for the whole batch). Each group's
+   results are appended in list order, whatever order they completed in.
+3. The arms run in list order with each call's result.
+
+So the journal holds, per sequence number, exactly what the plain `for`
+writes: the same `call` and `result` records, the calls of a batch
+ahead of its results. A crash in the middle of a batch leaves each call as a
+crash leaves a plain one: a none or idempotent call runs again, and an
+external call whose record is durable is reported `unknown`, even one the
+batch had not dispatched yet. A push that finds its list full traps after
+every call of the batch ran, where the plain `for` would trap after the
+calls before it.
+
+Each target dispatches a group with its platform's own concurrency, at most
+as many calls at once as its model allows: native Rust starts one thread per
+call with `std::thread::scope` when the host offers `ConcurrentTools` (and
+calls them one by one otherwise), bounded by the list's capacity; Cloudflare
+runs at most `CLOUDFLARE_CONNECTIONS_WAITING_MAX` fetches at once inside the
+object's event, so none waits in the runtime's own queue; Vercel runs a group
+inside one step, which documents no concurrency limit. The simulator
+completes a group's calls in a random order and crashes between them.
+
+```hl docs/snippets/parallel.hl
+harness readers
+
+const calls_max: u64 = 8
+const context_max: u64 = 64
+
+tool Read(path: text) -> text effect none
+tool Grep(pattern: text) -> text effect none
+tool Edit(path: text, change: text) -> text effect external
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> text
+  requires len(context) + 2 + calls_max <= context_max
+{
+  push context user(question)
+  let reply = think(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => {
+      for call in requested parallel {
+        match dispatch(call) {
+          ok(output) => { push context result(call, output) }
+          failed(error) => { push context error(call, error) }
+          unknown => { push context unknown(call) }
+        }
+      }
+      return "ran the calls"
+    }
+  }
+}
+```
+
+Its worst case is the plain loop's, since the records are the same:
+
+```console
+$ hl check docs/snippets/parallel.hl | grep -E 'handler ask: worst|proved for'
+  handler ask: worst case 9 effects, 20 journal records, 9 outbound requests
+docs/snippets/parallel.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+$ hl sim --target cloudflare --seeds 0..200 docs/snippets/parallel.hl
+ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1462 crashes=958 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=1799 unknown=362
+```
+
+Anything else in the body is an error: a statement before the match, a match
+on something other than the item's dispatch, an arm that does more than push,
+and a parallel for inside another.
+
+```console
+$ hl check docs/snippets/errors/parallel-statement.hl
+docs/snippets/errors/parallel-statement.hl:11:9: error: the body of a parallel for is only a match on dispatch(call): found a let
+$ hl check docs/snippets/errors/parallel-dispatch.hl
+docs/snippets/errors/parallel-dispatch.hl:13:11: error: a parallel for matches on dispatch(call), the item it walks
+$ hl check docs/snippets/errors/parallel-arm.hl
+docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for only push: found a return
+$ hl check docs/snippets/errors/parallel-nested.hl
+docs/snippets/errors/parallel-nested.hl:11:5: error: a parallel for cannot be nested in another parallel for
+```
+
+```hl docs/snippets/errors/parallel-statement.hl
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    let name = call.tool
+    match dispatch(call) {
+      ok(output) => { push notes output }
+      failed(error) => { push notes error }
+      unknown => { push notes "lost" }
+    }
+  }
+  return 0
+}
+```
+
+```hl docs/snippets/errors/parallel-dispatch.hl
+harness readers
+
+const calls_max: u64 = 8
+
+tool Read(path: text) -> text effect none
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    match Read(call.input) {
+      ok(body) => { push notes body }
+      failed(error) => { push notes error }
+    }
+  }
+  return 0
+}
+```
+
+```hl docs/snippets/errors/parallel-arm.hl
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    match dispatch(call) {
+      ok(output) => { return 1 }
+      failed(error) => { push notes error }
+      unknown => { push notes "lost" }
+    }
+  }
+  return 0
+}
+```
+
+```hl docs/snippets/errors/parallel-nested.hl
+harness readers
+
+const calls_max: u64 = 8
+
+state {
+  notes: list<text, calls_max>
+}
+
+on run(requested: list<call, calls_max>) -> u64 {
+  for call in requested parallel {
+    for again in requested parallel {
+      match dispatch(again) {
+        ok(output) => { push notes output }
+        failed(error) => { push notes error }
+        unknown => { push notes "lost" }
+      }
+    }
+  }
+  return 0
+}
+```
+
 ### Traps
 
 A turn ends `failed` without running further when `requires` is false
 (`requires(handler)`, state unchanged), a `u64` operation overflows or
-underflows, a `push` finds its list full (`bound(list)`), or a model reply does
-not decode. A trap still writes `status` and is acknowledged once. The prover
+underflows, a `push` finds its list full (`bound(list)`), or a reply of a model
+without a declared reply type does not decode. A trap still writes `status` and is acknowledged once. The prover
 rules out the overflow and full-list traps, so in a proving program only the
 first and last remain.
 
@@ -1588,6 +1966,7 @@ The compiler's own bounds:
 | constraints per prover step | `PROOF_CONSTRAINTS_MAX` = 4,096 | policy; same |
 | nesting of a journal's JSON | `JSON_DEPTH_MAX` = 128 | policy |
 | Cloudflare outbound requests per invocation | `CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX` = 10,000 | Workers Paid default, developers.cloudflare.com/workers/platform/limits |
+| Cloudflare requests of a parallel for in flight | `CLOUDFLARE_CONNECTIONS_WAITING_MAX` = 6 | simultaneous open connections waiting for response headers, developers.cloudflare.com/workers/platform/limits |
 | Cloudflare isolate memory | `CLOUDFLARE_ISOLATE_MEMORY_BYTES_MAX` = 134,217,728 | developers.cloudflare.com/durable-objects/platform/limits; reported, not checked |
 | Vercel Function duration, seconds | `VERCEL_FUNCTION_DURATION_SECONDS_MAX` = 800 | Pro and Enterprise, vercel.com/docs/functions/limitations; reported, not checked |
 | Vercel step attempts | `VERCEL_STEP_ATTEMPTS_MAX` = 4 | `maxRetries` 3 by default, workflow-sdk.dev |
@@ -1601,6 +1980,58 @@ and proves each obligation by showing its negation has no solution. A failure
 names the handler, the property, the path and, where it can, values that
 reach it. Those values solve the prover's facts; after a branch join or a loop
 they can be values no run reaches.
+
+Inside a loop the prover assumes an invariant at every iteration's start when
+the invariant holds where the loop starts and every iteration that goes on to
+the next keeps it. A counter that a guard keeps below its bound, such as a
+retry count, then proves ([Model replies](#model-replies)); without the guard
+it does not:
+
+```console
+$ cat examples/invalid/retry_unbounded.hl
+harness retry_unbounded
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 16
+const attempts_max: u64 = 5
+const context_max: u64 = 64
+
+type outcome = done(text) | stopped(text) | exhausted
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  failures: u64
+}
+
+invariant failures_bounded: failures < attempts_max
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max <= context_max
+{
+  push context user(question)
+  failures = 0
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => { failures = failures + 1 }
+      ok(reply) => {
+        failures = 0
+        push context assistant(reply)
+        match reply {
+          answer(words) => { return done(words) }
+          calls(requested) => { return stopped("no tools") }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+$ hl check examples/invalid/retry_unbounded.hl > /dev/null
+examples/invalid/retry_unbounded.hl: error: handler 'ask': invariant_preserved: invariant 'failures_bounded' (failures < attempts_max) may not hold when the handler returns; path: entry; counterexample: failures = 16
+examples/invalid/retry_unbounded.hl: error: 1 proof obligation(s) failed for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+```
 
 The prover's own examples, under `examples/invalid/`:
 
@@ -1718,4 +2149,13 @@ enum's last one instead:
 $ hl sim --target native-jsonl --seeds 0..200 --mutation nested_enum_unchecked examples/code_tasks.hl
 FAIL invariant=nested_enum_valid seed=10 target=native-jsonl profile=async mutation=nested_enum_unchecked: nested call 1/6/code-2 (lookup) records "blocked", but the tool returned [Ok(String("beta-44"))]: a result outside its text enum must be recorded as failed
 replay: hl sim --target native-jsonl --seeds 10..11 --mutation nested_enum_unchecked examples/code_tasks.hl
+```
+
+A harness with a code tool dispatches a reply's calls with a sequential
+`for`: a dispatch there may run a cell, whose nested calls, timers and journal
+updates run one cell at a time, so the checker refuses a parallel for:
+
+```console
+$ hl check examples/invalid/code_parallel_for.hl
+examples/invalid/code_parallel_for.hl:39:7: error: a parallel for dispatches tool calls at once, but code 'exec' makes a dispatch able to run a cell, which runs one at a time with its journal: use a sequential for
 ```

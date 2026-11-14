@@ -154,12 +154,20 @@ fn model(
         program.model = Some(ir::Model {
             name: model.name.text.clone(),
             calls,
+            reply: ir::Reply::Builtin,
         });
     }
     Ok(())
 }
 
-fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
+fn declared_reply(source: &ast::Program) -> Option<&ast::Name> {
+    source.items.iter().find_map(|item| match item {
+        Item::Model(model) => model.reply.as_ref(),
+        _ => None,
+    })
+}
+
+fn builtin_sums(program: &ir::Program, declared: Option<&str>) -> Vec<Sum> {
     let call = Sum {
         name: BUILTIN_SUM_NAMES[ir::CALL].to_owned(),
         kind: SumKind::Tagged,
@@ -188,13 +196,20 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
         element: Box::new(Type::Sum(ir::CALL)),
         capacity: model.calls.clone(),
     };
-    let reply = Sum {
-        name: BUILTIN_SUM_NAMES[ir::REPLY].to_owned(),
-        kind: SumKind::Tagged,
-        variants: vec![
-            variant("answer", vec![Type::Text]),
-            variant("calls", vec![calls]),
-        ],
+    let reply = match declared {
+        Some(name) => Sum {
+            name: name.to_owned(),
+            kind: SumKind::Tagged,
+            variants: Vec::new(),
+        },
+        None => Sum {
+            name: BUILTIN_SUM_NAMES[ir::REPLY].to_owned(),
+            kind: SumKind::Tagged,
+            variants: vec![
+                variant("answer", vec![Type::Text]),
+                variant("calls", vec![calls]),
+            ],
+        },
     };
     let call_type = Type::Sum(ir::CALL);
     let entry = Sum {
@@ -212,35 +227,33 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
 }
 
 fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals) -> Checked<()> {
-    program.sums = builtin_sums(program);
+    let reply = declared_reply(source);
+    program.sums = builtin_sums(program, reply.map(|name| name.text.as_str()));
     for (id, name) in BUILTIN_SUM_NAMES.iter().enumerate() {
-        globals.types.insert((*name).to_owned(), id);
+        if id != ir::REPLY || reply.is_none() {
+            globals.types.insert((*name).to_owned(), id);
+        }
     }
     let mut declared = Vec::new();
     for item in &source.items {
         let Item::Type(definition) = item else {
             continue;
         };
-        let name = &definition.name;
-        if BUILTIN_TYPES.contains(&name.text.as_str()) || globals.types.contains_key(&name.text) {
-            return error(
-                name.at,
-                format!("type '{}' is already declared or builtin", name.text),
-            );
-        }
-        let kind = match definition.body {
-            TypeBody::Variants(_) => SumKind::Tagged,
-            TypeBody::Values(_) => SumKind::Text,
-        };
-        globals.types.insert(name.text.clone(), program.sums.len());
-        program.sums.push(Sum {
-            name: name.text.clone(),
-            kind,
-            variants: Vec::new(),
-        });
+        register(program, globals, definition, reply)?;
         declared.push(definition);
     }
-    for definition in declared {
+    if let Some(reply) = reply
+        && globals.types.get(&reply.text) != Some(&ir::REPLY)
+    {
+        return error(
+            reply.at,
+            format!(
+                "the model's reply type '{}' is not a type this harness declares",
+                reply.text
+            ),
+        );
+    }
+    for definition in &declared {
         let id = globals.types[&definition.name.text];
         program.sums[id].variants = match &definition.body {
             TypeBody::Variants(variants) => {
@@ -249,7 +262,149 @@ fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals)
             TypeBody::Values(values) => text_values(definition, values)?,
         };
     }
-    acyclic(source, program, globals)
+    acyclic(source, program, globals)?;
+    let Some(reply) = reply else {
+        return Ok(());
+    };
+    let definition = declared
+        .iter()
+        .find(|definition| definition.name.text == reply.text)
+        .expect("the reply type is declared, checked above");
+    let shape = reply_shape(program, definition)?;
+    program
+        .model
+        .as_mut()
+        .expect("a declared reply belongs to the model")
+        .reply = shape;
+    Ok(())
+}
+
+fn register(
+    program: &mut ir::Program,
+    globals: &mut Globals,
+    definition: &ast::TypeDef,
+    reply: Option<&ast::Name>,
+) -> Checked<()> {
+    let name = &definition.name;
+    if BUILTIN_TYPES.contains(&name.text.as_str()) || globals.types.contains_key(&name.text) {
+        return error(
+            name.at,
+            format!("type '{}' is already declared or builtin", name.text),
+        );
+    }
+    let kind = match definition.body {
+        TypeBody::Variants(_) => SumKind::Tagged,
+        TypeBody::Values(_) => SumKind::Text,
+    };
+    if !reply.is_some_and(|reply| reply.text == name.text) {
+        globals.types.insert(name.text.clone(), program.sums.len());
+        program.sums.push(Sum {
+            name: name.text.clone(),
+            kind,
+            variants: Vec::new(),
+        });
+        return Ok(());
+    }
+    if kind == SumKind::Text {
+        return error(
+            name.at,
+            format!(
+                "reply type '{}' is a text enum: a reply is a sum whose variants carry fields",
+                name.text
+            ),
+        );
+    }
+    globals.types.insert(name.text.clone(), ir::REPLY);
+    Ok(())
+}
+
+fn reply_shape(program: &ir::Program, definition: &ast::TypeDef) -> Checked<ir::Reply> {
+    let model = program
+        .model
+        .as_ref()
+        .expect("a declared reply belongs to the model");
+    let TypeBody::Variants(declared) = &definition.body else {
+        unreachable!("a text enum reply is refused when it is declared");
+    };
+    let reply = &definition.name.text;
+    let calls = Type::List {
+        element: Box::new(Type::Sum(ir::CALL)),
+        capacity: model.calls.clone(),
+    };
+    let sum = &program.sums[ir::REPLY];
+    let mut carrier: Option<(usize, usize)> = None;
+    for (index, (variant, source)) in sum.variants.iter().zip(declared).enumerate() {
+        if variant.name == ir::MODEL_FAILED {
+            return error(
+                source.name.at,
+                format!(
+                    "reply type '{reply}' has a variant named '{}', the name a failed model call is recorded under",
+                    ir::MODEL_FAILED
+                ),
+            );
+        }
+        for (field_index, (field, at)) in variant.fields.iter().zip(&source.fields).enumerate() {
+            if *field == calls {
+                if let Some((previous, _)) = carrier {
+                    return error(
+                        at.at(),
+                        format!(
+                            "reply type '{reply}' carries {} in '{}' and '{}': exactly one variant carries the model's calls",
+                            field.name(program),
+                            sum.variants[previous].name,
+                            variant.name
+                        ),
+                    );
+                }
+                carrier = Some((index, field_index));
+                continue;
+            }
+            reply_field(program, reply, &variant.name, field, &calls, at.at())?;
+        }
+    }
+    let Some((calls_variant, field)) = carrier else {
+        return error(
+            definition.name.at,
+            format!(
+                "reply type '{reply}' has no variant carrying {}: exactly one variant carries the model's calls",
+                calls.name(program)
+            ),
+        );
+    };
+    Ok(ir::Reply::Declared {
+        calls: calls_variant,
+        field,
+    })
+}
+
+fn reply_field(
+    program: &ir::Program,
+    reply: &str,
+    variant: &str,
+    field: &Type,
+    calls: &Type,
+    at: Position,
+) -> Checked<()> {
+    let scalar = matches!(field, Type::U64 | Type::Bool | Type::Text);
+    if scalar || program.text_enum(field).is_some() {
+        return Ok(());
+    }
+    let what = match field {
+        Type::List { element, .. } if **element == Type::Sum(ir::CALL) => format!(
+            "carries {}, but the model's calls bound is {}",
+            field.name(program),
+            calls.name(program)
+        ),
+        _ => format!(
+            "carries {}: a reply's fields are u64, bool, text, text enums and the one {}",
+            field.name(program),
+            calls.name(program)
+        ),
+    };
+    error(
+        at,
+        format!("variant '{variant}' of reply type '{reply}' {what}"),
+    )
 }
 
 pub fn quoted(text: &str) -> String {
@@ -382,6 +537,17 @@ pub fn resolve(program: &ir::Program, globals: &Globals, ty: &TypeExpr) -> Check
                     )
                 }
                 Some(&sum) => Ok(Type::Sum(sum)),
+                None if other == BUILTIN_SUM_NAMES[ir::REPLY]
+                    && program.model.as_ref().is_some_and(ir::Model::declared) =>
+                {
+                    error(
+                        name.at,
+                        format!(
+                            "unknown type 'reply': the model replies with '{}'",
+                            program.sums[ir::REPLY].name
+                        ),
+                    )
+                }
                 None => error(name.at, format!("unknown type '{other}'")),
             },
         },

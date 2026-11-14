@@ -1,4 +1,6 @@
-use crate::ir::{Durability, Expr, Handler, Program, SiteClass, SiteKind, Stmt, Type};
+use crate::ir::{
+    self, Durability, Expr, Handler, Program, SiteClass, SiteKind, Stmt, SumKind, Type,
+};
 
 pub fn program(program: &Program) {
     assert!(
@@ -21,9 +23,48 @@ pub fn program(program: &Program) {
             "an invariant reads only state and constants"
         );
     }
+    reply(program);
     for handler in &program.handlers {
         self::handler(program, handler);
     }
+}
+
+fn reply(program: &Program) {
+    let Some(model) = &program.model else {
+        return;
+    };
+    let sum = &program.sums[ir::REPLY];
+    assert_eq!(sum.kind, SumKind::Tagged, "a reply is a tagged sum");
+    let calls = Type::List {
+        element: Box::new(Type::Sum(ir::CALL)),
+        capacity: model.calls.clone(),
+    };
+    let carriers: Vec<(usize, usize)> = sum
+        .variants
+        .iter()
+        .enumerate()
+        .flat_map(|(variant, definition)| {
+            definition
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| **field == calls)
+                .map(move |(field, _)| (variant, field))
+        })
+        .collect();
+    assert_eq!(
+        carriers,
+        vec![model.calls_at()],
+        "exactly one reply variant carries the model's list of calls, where the model says"
+    );
+    assert!(
+        !model.declared()
+            || sum
+                .variants
+                .iter()
+                .all(|variant| variant.name != ir::MODEL_FAILED),
+        "a declared reply has no variant named like a failed model call"
+    );
 }
 
 fn reads_local(value: &Expr) -> bool {
@@ -63,6 +104,14 @@ fn handler(program: &Program, handler: &Handler) {
                 site.result,
                 Type::Maybe(Box::new(Type::Text)),
                 "a cell yields maybe<text>"
+            );
+        }
+        if site.kind == SiteKind::Model {
+            let model = program.model.as_ref().expect("a model site needs a model");
+            assert_eq!(
+                site.result,
+                model.result(),
+                "a model site yields the model's result"
             );
         }
         if site.kind == SiteKind::Dispatch {
@@ -139,6 +188,33 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 assert!(!bound.name.is_empty(), "every loop has a named bound");
                 block(program, handler, body, used);
             }
+            Stmt::Parallel(parallel) => {
+                assert!(
+                    !parallel.bound.name.is_empty(),
+                    "every loop has a named bound"
+                );
+                assert_eq!(
+                    handler.sites[parallel.site].kind,
+                    SiteKind::Dispatch,
+                    "a parallel for dispatches"
+                );
+                assert!(
+                    matches!(parallel.args.as_slice(), [Expr::Local(item)] if *item == parallel.item),
+                    "a parallel for dispatches its own item"
+                );
+                assert!(
+                    parallel_pushes_only(&parallel.body),
+                    "the body of a parallel for only pushes after its dispatch"
+                );
+                expr(handler, &parallel.list);
+                block(
+                    program,
+                    handler,
+                    std::slice::from_ref(&parallel.dispatch()),
+                    used,
+                );
+                block(program, handler, &parallel.body, used);
+            }
             Stmt::Effect { site, args, result } => {
                 assert!(*result < handler.locals.len(), "an effect binds a local");
                 assert_eq!(
@@ -151,6 +227,14 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
             Stmt::Finish { value } => expr(handler, value),
         }
     }
+}
+
+fn parallel_pushes_only(statements: &[Stmt]) -> bool {
+    statements.iter().all(|statement| match statement {
+        Stmt::Push { .. } => true,
+        Stmt::Match { arms, .. } => arms.iter().all(|arm| parallel_pushes_only(&arm.body)),
+        _ => false,
+    })
 }
 
 fn expr(handler: &Handler, value: &Expr) {

@@ -154,6 +154,17 @@ fn generate(program: &Program, target: Target) -> String {
         &mut out,
         format!("pub const TARGET: &str = {:?};", target.name()),
     );
+    let concurrent = crate::target::model(target)
+        .limits
+        .concurrent_requests
+        .map_or_else(
+            || "None".to_owned(),
+            |limit| format!("Some({})", limit.value),
+        );
+    line(
+        &mut out,
+        format!("pub const CONCURRENT_REQUESTS_MAX: Option<u64> = {concurrent};"),
+    );
     if let Some(model) = &program.model {
         line(
             &mut out,

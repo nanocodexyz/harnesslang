@@ -15,7 +15,8 @@ use crate::target;
 pub const TURNS_PER_SESSION_MAX: u64 = 12;
 pub const OVER_CAPACITY_PPM: u64 = 50_000;
 pub const EDGE_PPM: u64 = 500_000;
-pub const ALLOWED_TRAPS: [&str; 2] = ["requires(", "model reply: "];
+pub const MODEL_REPLY_TRAP: &str = "model reply: ";
+pub const ALLOWED_TRAPS: [&str; 2] = ["requires(", MODEL_REPLY_TRAP];
 pub const ENTRY_DRAWS_MAX: u64 = 64;
 pub const GREEDY_MODEL_PPM: u64 = 250_000;
 const U64_BITS: u64 = u64::BITS as u64;
@@ -116,8 +117,15 @@ fn violation<T>(invariant: Invariant, detail: String) -> Result<T, Violation> {
     Err(Violation { invariant, detail })
 }
 
-fn allowed(trap: &str) -> bool {
-    ALLOWED_TRAPS.iter().any(|prefix| trap.starts_with(prefix))
+fn allowed(program: &Program, trap: &str) -> bool {
+    let declared = program
+        .model
+        .as_ref()
+        .is_some_and(crate::ir::Model::declared);
+    ALLOWED_TRAPS
+        .iter()
+        .filter(|prefix| !(declared && **prefix == MODEL_REPLY_TRAP))
+        .any(|prefix| trap.starts_with(prefix))
 }
 
 fn trap_of(outcome: Outcome, result: &Json) -> Option<&str> {
@@ -230,7 +238,7 @@ pub fn check(
             .as_ref()
             .expect("the safety invariants require every turn finished");
         if let Some(trap) = trap_of(finished.outcome, &finished.result)
-            && !allowed(trap)
+            && !allowed(program, trap)
         {
             return violation(
                 Invariant::NoTrap,

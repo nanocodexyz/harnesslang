@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::Stmt;
+use crate::ir::{Expr, Stmt};
 use crate::prove::arith::{
     LoopKind, Prover, Quantity, State, U64_MAX, capacity, modified, quantity_name,
 };
@@ -15,6 +15,20 @@ struct Summary {
 }
 
 const INDEX_SLOPES: [i128; 2] = [-1, 1];
+
+fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
+    match condition {
+        Expr::Field(field) => {
+            quantities.contains(&Quantity::Field(*field))
+                || quantities.contains(&Quantity::FieldLen(*field))
+        }
+        Expr::U64(_) | Expr::Bool(_) | Expr::Text(_) | Expr::Constant(_) | Expr::Local(_) => false,
+        Expr::Member { base, .. } => reads(base, quantities),
+        Expr::Construct { fields, .. } => fields.iter().any(|field| reads(field, quantities)),
+        Expr::Binary { left, right, .. } => reads(left, quantities) || reads(right, quantities),
+        Expr::Not(operand) | Expr::Len(operand) => reads(operand, quantities),
+    }
+}
 
 fn finite(extent: Extent) -> Option<i128> {
     match extent {
@@ -124,13 +138,13 @@ impl Prover<'_> {
         }
     }
 
-    fn summarize_body(
+    fn iteration_start(
         &mut self,
         state: &State,
         kind: LoopKind<'_>,
-        body: &[Stmt],
         quantities: &BTreeSet<Quantity>,
-    ) -> Option<Summary> {
+        assumed: &[usize],
+    ) -> (State, BTreeMap<Quantity, Var>) {
         let mut start = state.clone();
         let mut anchors = BTreeMap::new();
         for quantity in quantities {
@@ -145,6 +159,75 @@ impl Prover<'_> {
             anchors.insert(*quantity, var);
         }
         self.bind_iteration(&mut start, kind, None);
+        (self.assume_invariants(start, assumed), anchors)
+    }
+
+    fn assume_invariants(&mut self, mut state: State, assumed: &[usize]) -> State {
+        let program = self.program;
+        for index in assumed {
+            state = self.assume(state, &program.invariants[*index].condition, true);
+        }
+        state
+    }
+
+    fn inductive(
+        &mut self,
+        state: &State,
+        kind: LoopKind<'_>,
+        body: &[Stmt],
+        quantities: &BTreeSet<Quantity>,
+    ) -> Vec<usize> {
+        let program = self.program;
+        let mut kept = Vec::new();
+        let candidates: Vec<usize> = (0..program.invariants.len())
+            .filter(|index| reads(&program.invariants[*index].condition, quantities))
+            .collect();
+        if candidates.is_empty() {
+            return kept;
+        }
+        let (free, _) = self.iteration_start(state, kind, quantities, &[]);
+        for index in candidates {
+            let condition = &program.invariants[index].condition;
+            if !self.implied(&free, condition) && self.implied(state, condition) {
+                kept.push(index);
+            }
+        }
+        let rounds_max = kept.len();
+        for _ in 0..=rounds_max {
+            if kept.is_empty() {
+                return kept;
+            }
+            let (start, _) = self.iteration_start(state, kind, quantities, &kept);
+            self.quiet += 1;
+            let end = self.block(body, start);
+            self.quiet -= 1;
+            let Some(end) = end else {
+                return kept;
+            };
+            let before = kept.len();
+            let mut preserved = Vec::new();
+            for index in kept {
+                if self.implied(&end, &program.invariants[index].condition) {
+                    preserved.push(index);
+                }
+            }
+            kept = preserved;
+            if kept.len() == before {
+                return kept;
+            }
+        }
+        unreachable!("every round before the last drops an invariant, so the rounds end with none")
+    }
+
+    fn summarize_body(
+        &mut self,
+        state: &State,
+        kind: LoopKind<'_>,
+        body: &[Stmt],
+        quantities: &BTreeSet<Quantity>,
+        assumed: &[usize],
+    ) -> Option<Summary> {
+        let (start, anchors) = self.iteration_start(state, kind, quantities, assumed);
         self.quiet += 1;
         let end = self.block(body, start);
         self.quiet -= 1;
@@ -279,7 +362,8 @@ impl Prover<'_> {
         }
         let mut quantities = BTreeSet::new();
         modified(body, self.program, &mut quantities);
-        let summary = self.summarize_body(&state, kind, body, &quantities);
+        let assumed = self.inductive(&state, kind, body, &quantities);
+        let summary = self.summarize_body(&state, kind, body, &quantities, &assumed);
         let label = self.label(kind);
         let mut iteration = state.clone();
         let counter = self.fresh(&mut iteration, &format!("iteration of {label}"), U64_MAX);
@@ -313,10 +397,12 @@ impl Prover<'_> {
             }
         }
         self.bind_iteration(&mut iteration, kind, Some(counter));
+        let iteration = self.assume_invariants(iteration, &assumed);
         self.path.push(label);
         self.block(body, iteration);
         self.path.pop();
         let exit = self.exit(state, kind, &count, &quantities, summary.as_ref())?;
+        let exit = self.assume_invariants(exit, &assumed);
         Some(self.compact(exit))
     }
 

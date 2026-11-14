@@ -120,7 +120,9 @@ on prompt(input: text) -> outcome
 - Builtins every program has:
   - `call = call(id: text, tool: text, input: text)`, with fields `id`, `tool`, `input`
   - `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's
-    `calls` bound
+    `calls` bound, unless the model declares its own reply type
+    (`model name calls M reply type`), whose one variant carrying
+    `list<call, M>` the worst case multiplies
   - `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`
   - `known<T> = ok(T) | failed(text)` and `maybe<T> = ok(T) | failed(text) | unknown`
 
@@ -133,7 +135,7 @@ sessions and waiting on them are not in the language yet (see Next).
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
 | `none` | `effect none`, `now()`, `random()` | `known<T>` (`now` and `random` return `u64`) | run again |
-| `idempotent` | `effect idempotent`, the model | `known<T>` (the model returns `reply`) | run again with the same idempotency key |
+| `idempotent` | `effect idempotent`, the model | `known<T>` (the model returns `reply`, or `known<R>` for a declared reply type `R`, whose `failed` is a provider failure or a reply that does not fit) | run again with the same idempotency key |
 | `external` | `effect external`, `dispatch` of a tool the program does not declare | `maybe<T>` | never run again: the result is `unknown` |
 
 These are nanocode's `EffectClass` (`None`, `Idempotent`, `External`), and an
@@ -146,6 +148,10 @@ yields `unknown`.
 
 `let`, assignment to a state field, `push list value`, `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
+`for call in list parallel` (one `match dispatch(call)` whose arms only push:
+every call record is appended before any dispatch, none and idempotent calls
+run at once, an external call alone after one flush of the batch, results in
+list order),
 `return value`, and a call of a `fn`, whose body the checker inlines at each
 call before lowering, in a scope that sees only its parameters and the
 harness's declarations. There is no recursion (a fn may not call itself,
@@ -182,7 +188,7 @@ journal and a nanocode journal fold the same way:
 | `admitted` | a handler starts | turn, handler, arguments |
 | `call` | before an effect runs | sequence, tool, effect class, input |
 | `result` | after it returns | sequence, `ok` or `failed` and the value |
-| `model` | after the model returns | sequence, the reply |
+| `model` | after the model returns | sequence, the reply, or `{"failed": error}` for a failed call to a model with a declared reply type |
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
@@ -224,7 +230,8 @@ with its named capacity, and `known`/`maybe` with fixed variants `ok`,
 
 A handler is a tree of statements: `Let`, `Assign` and `Push` on state
 fields, `If`, `Match` with one arm per variant in variant order, `Loop` and
-`For` with their named bound, `Effect` and `Finish`. Expressions are pure:
+`For` with their named bound, `Parallel` (a `For` over calls whose one
+dispatch site runs as a batch, with its push-only arms), `Effect` and `Finish`. Expressions are pure:
 lowering hoists every effect out of the expression it appears in into an
 `Effect` statement that binds a temporary local, so a statement's effects run
 first, left to right, then its expression. `and` and `or` evaluate both sides.
@@ -362,8 +369,9 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | `cell_bounds` | `journal_bytes` is at most nanocode's `JOURNAL_LIMIT_BYTES` and holds the entries of `calls` nested calls and `timers` timers at `ENTRY_BYTES` each; the runner enforces the limits (a check of the lowering) |
 
 With `no_overflow` and `push_bound` proved, a turn of a proving program
-finishes `failed` only when its `requires` is false or a model reply does not
-decode: never by a trap in its own code. A push that may
+finishes `failed` only when its `requires` is false or a reply of a model
+without a declared reply type does not decode: never by a trap in its own
+code. A push that may
 find its list full is an error, not a warning: `requires` bounds the room a
 turn needs, as `examples/minimal.hl` does.
 
@@ -393,6 +401,9 @@ How:
   iteration; iteration `k` then starts from the entry value plus `k` times
   that change, and the loop exits after its exact count (`loop` runs its
   bound, `for` the list's length at entry, which the interpreter snapshots).
+  An invariant that holds where a loop starts, and still holds at the end of
+  a body run from any state satisfying it, is assumed at every iteration's
+  start and at the exit, so a counter a guard keeps below its bound proves.
   At a branch join the prover keeps the facts both sides imply and the hull
   of each changed quantity. A product of two variables is bounded by the
   product of their upper bounds. Every approximation drops facts and never
@@ -455,7 +466,8 @@ pushed without room.
 ### Deterministic simulation
 
 `hl sim` runs a program on a simulated target from a seed: a scripted model
-(answers and tool calls drawn from the seed), a tool host that counts real
+(answers and tool calls drawn from the seed, or a declared reply type's
+variants and provider failures), a tool host that counts real
 dispatches per call, and the target's fault model:
 
 - crashes at any effect or durability point, before or after the write;
@@ -480,6 +492,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded`, `nested_enum_valid` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 

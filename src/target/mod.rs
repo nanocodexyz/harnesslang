@@ -41,6 +41,7 @@ impl Target {
 
 pub const CLOUDFLARE_ISOLATE_MEMORY_BYTES_MAX: u64 = 128 * 1024 * 1024;
 pub const CLOUDFLARE_SUBREQUESTS_PER_INVOCATION_MAX: u64 = 10_000;
+pub const CLOUDFLARE_CONNECTIONS_WAITING_MAX: u64 = 6;
 pub const VERCEL_FUNCTION_DURATION_SECONDS_MAX: u64 = 800;
 pub const VERCEL_STEP_ATTEMPTS_MAX: u64 = 4;
 pub const BLOCK_DEVICE_SECTOR_BYTES: usize = 512;
@@ -126,6 +127,7 @@ pub struct Limits {
     pub memory: Option<Limit>,
     pub outbound_requests_per_invocation: Option<Limit>,
     pub duration_per_invocation: Option<Limit>,
+    pub concurrent_requests: Option<Limit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +159,7 @@ const NO_LIMITS: Limits = Limits {
     memory: None,
     outbound_requests_per_invocation: None,
     duration_per_invocation: None,
+    concurrent_requests: None,
 };
 
 const CLOUDFLARE_LIMITS: Limits = Limits {
@@ -171,6 +174,11 @@ const CLOUDFLARE_LIMITS: Limits = Limits {
         source: "developers.cloudflare.com/workers/platform/limits (Workers Paid default)",
     }),
     duration_per_invocation: None,
+    concurrent_requests: Some(Limit {
+        value: CLOUDFLARE_CONNECTIONS_WAITING_MAX,
+        unit: "requests waiting for response headers per invocation",
+        source: "developers.cloudflare.com/workers/platform/limits (simultaneous open connections; relaxed to the wait for headers on 2026-04-09); a seventh fetch is queued by the runtime",
+    }),
 };
 
 const CLOUDFLARE_FACTS: &[Fact] = &[
@@ -262,6 +270,7 @@ const VERCEL_LIMITS: Limits = Limits {
         unit: "seconds per Function invocation",
         source: "vercel.com/docs/functions/limitations (Pro and Enterprise, fluid compute)",
     }),
+    concurrent_requests: None,
 };
 
 pub const fn model(target: Target) -> Model {
@@ -392,6 +401,7 @@ pub fn describe(model: &Model) -> String {
             model.limits.outbound_requests_per_invocation,
         ),
         ("duration", model.limits.duration_per_invocation),
+        ("concurrent requests", model.limits.concurrent_requests),
     ];
     for (what, limit) in limits {
         if let Some(limit) = limit {

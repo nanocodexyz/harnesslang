@@ -81,7 +81,8 @@ than one `code` tool, each with its own tool set.
 
 Checker rules: the nested set is non-empty, names declared tools only and
 not a `code` tool; every limit is a named constant; `parallel <= calls`;
-`code` needs a `model`; a target whose model says `cells: unsupported`
+`code` needs a `model`; a harness with a `code` tool has no parallel for,
+since a dispatch may run a cell and cells run one at a time; a target whose model says `cells: unsupported`
 refuses the declaration with the reason the target model gives.
 
 ## IR

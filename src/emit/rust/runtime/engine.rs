@@ -144,6 +144,7 @@ pub trait World {
     fn hook(&mut self, point: Point) -> Result<(), Stop>;
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop>;
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
+    fn tools(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop>;
     fn model(&mut self, request: &ModelRequest<'_>) -> Json;
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
@@ -159,6 +160,9 @@ pub trait Host {
         Ok(())
     }
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
+    fn concurrent(&self) -> Option<&dyn ConcurrentTools> {
+        None
+    }
     fn model(&mut self, request: &ModelRequest<'_>) -> Json;
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
@@ -192,6 +196,69 @@ pub fn host_wait<H: Host>(host: &mut H, wait: &Wait) -> Result<(), Stop> {
 }
 
 pub const NO_CELL_ENGINE: &str = "the host runs no cell engine, so no code tool can run";
+
+pub trait ConcurrentTools: Sync {
+    fn tool(&self, request: &ToolRequest<'_>) -> Output;
+}
+
+pub fn batch_width(count: usize, limit: Option<u64>) -> usize {
+    match limit {
+        Some(limit) => {
+            assert!(limit > 0, "a concurrency limit admits at least one request");
+            usize::try_from(limit).map_or(count, |limit| limit.min(count))
+        }
+        None => count,
+    }
+}
+
+pub fn dispatch_concurrently(tools: &dyn ConcurrentTools, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Vec<(usize, Output)> {
+    let width = batch_width(requests.len(), limit);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..width {
+            let sender = sender.clone();
+            let next = &next;
+            scope.spawn(move || {
+                for _ in 0..requests.len() {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if index >= requests.len() {
+                        break;
+                    }
+                    let output = tools.tool(&requests[index]);
+                    sender
+                        .send((index, output))
+                        .expect("the receiver outlives the dispatching threads");
+                }
+            });
+        }
+    });
+    drop(sender);
+    let completed: Vec<(usize, Output)> = receiver.into_iter().collect();
+    assert_eq!(completed.len(), requests.len(), "every request of a batch completes once");
+    completed
+}
+
+pub fn host_tools<H: Host>(host: &mut H, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Result<Vec<(usize, Output)>, Stop> {
+    for request in requests {
+        host.hook(Point::BeforeRun(Kind::Dispatch, request.effect))?;
+    }
+    let concurrent = host
+        .concurrent()
+        .map(|tools| dispatch_concurrently(tools, requests, limit));
+    let completed = match concurrent {
+        Some(completed) => completed,
+        None => requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| (index, host.tool(request)))
+            .collect(),
+    };
+    for (index, _) in &completed {
+        host.hook(Point::AfterRun(Kind::Dispatch, requests[*index].effect))?;
+    }
+    Ok(completed)
+}
 
 pub enum Run<'a> {
     Tool(Returns),
@@ -564,6 +631,103 @@ impl<'a> Engine<'a> {
         Ok(Answer::Output(output))
     }
 
+    pub fn parallel(&mut self, calls: Vec<Call>, returns: Returns, limit: Option<u64>) -> Result<Vec<Answer>, Halt> {
+        let mut answers: Vec<Option<Answer>> = (0..calls.len()).map(|_| None).collect();
+        let mut pending: Vec<(usize, u64)> = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            self.seq += 1;
+            let seq = self.seq;
+            match self.sites.get(&seq).cloned() {
+                Some(SiteLog::Done(recorded, output)) => {
+                    self.same(seq, &recorded, call)?;
+                    answers[index] = Some(Answer::Output(output));
+                }
+                Some(SiteLog::Reply(_)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+                Some(SiteLog::Unknown(recorded)) => {
+                    self.same(seq, &recorded, call)?;
+                    answers[index] = Some(Answer::Unknown);
+                }
+                Some(SiteLog::Open(recorded)) => {
+                    self.same(seq, &recorded, call)?;
+                    self.require_live(seq)?;
+                    assert!(
+                        !call.effect.may_be_unknown(),
+                        "recovery turns every open external call unknown before the turn runs again"
+                    );
+                    pending.push((index, seq));
+                }
+                None => {
+                    self.require_live(seq)?;
+                    self.append(Record::Call {
+                        turn: self.turn,
+                        seq,
+                        tool: call.tool.clone(),
+                        effect: call.effect,
+                        input: call.input.clone(),
+                    });
+                    self.sites.insert(seq, SiteLog::Open(call.clone()));
+                    pending.push((index, seq));
+                }
+            }
+        }
+        let mut start = 0;
+        while start < pending.len() {
+            let alone = calls[pending[start].0].effect.may_be_unknown();
+            let mut end = start + 1;
+            while !alone && end < pending.len() && !calls[pending[end].0].effect.may_be_unknown() {
+                end += 1;
+            }
+            self.batch_group(&calls, &pending[start..end], returns, limit, &mut answers)?;
+            start = end;
+        }
+        Ok(answers
+            .into_iter()
+            .map(|answer| answer.expect("every call of a parallel for has an answer before its pushes"))
+            .collect())
+    }
+
+    fn batch_group(&mut self, calls: &[Call], group: &[(usize, u64)], returns: Returns, limit: Option<u64>, answers: &mut [Option<Answer>]) -> Result<(), Halt> {
+        let external = calls[group[0].0].effect.may_be_unknown();
+        assert!(!external || group.len() == 1, "an external call of a parallel for runs alone");
+        if external {
+            self.flush()?;
+            assert!(
+                self.buffer.is_empty(),
+                "every call record of a parallel for is durable before an external call of it runs"
+            );
+        }
+        let turn = self.turn;
+        let requests: Vec<ToolRequest<'_>> = group
+            .iter()
+            .map(|(index, seq)| ToolRequest {
+                turn,
+                seq: *seq,
+                tool: &calls[*index].tool,
+                effect: calls[*index].effect,
+                input: &calls[*index].input,
+                returns,
+            })
+            .collect();
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("replay never runs an effect");
+        };
+        let mut completed = world.tools(&requests, limit)?;
+        assert_eq!(completed.len(), group.len(), "a batch returns one output per request");
+        completed.sort_by_key(|(position, _)| *position);
+        for (position, output) in completed {
+            let (index, seq) = group[position];
+            let output = checked_output(&calls[index].tool, returns, output);
+            self.append(Record::Result {
+                turn,
+                seq,
+                output: output.clone(),
+            });
+            self.sites.insert(seq, SiteLog::Done(calls[index].clone(), output.clone()));
+            answers[index] = Some(Answer::Output(output));
+        }
+        Ok(())
+    }
+
     fn same(&self, seq: u64, recorded: &Call, call: &Call) -> Result<(), Halt> {
         if recorded.tool != call.tool {
             return Err(self.diverged(seq, &recorded.tool, &call.tool));
@@ -667,6 +831,28 @@ pub fn scalar(engine: &Engine<'_>, answer: Answer) -> Result<u64, Halt> {
             .ok_or_else(|| engine.corrupt(format!("{} is not u64", json.encode()))),
         Answer::Output(Output::Failed(error)) => Err(engine.corrupt(format!("Failed({error:?}) does not fit U64"))),
         Answer::Reply(_) | Answer::Unknown => panic!("a clock or random site gets an output"),
+    }
+}
+
+pub const MODEL_FAILED: &str = "failed";
+
+pub fn model_failure(response: &Json) -> Option<&str> {
+    match response {
+        Json::Object(map) if map.len() == 1 => map.get(MODEL_FAILED).and_then(Json::as_str),
+        _ => None,
+    }
+}
+
+pub fn known_reply<T>(answer: Answer, parse: fn(&Json) -> Result<T, String>) -> Known<T> {
+    match answer {
+        Answer::Reply(response) => match model_failure(&response) {
+            Some(error) => Known::Failed(error.to_owned()),
+            None => match parse(&response) {
+                Ok(reply) => Known::Ok(reply),
+                Err(error) => Known::Failed(format!("model reply: {error}")),
+            },
+        },
+        Answer::Output(_) | Answer::Unknown => panic!("a model site gets a reply"),
     }
 }
 

@@ -176,6 +176,8 @@ impl Prover<'_> {
                 Record::Call(slot) => format!("call of {}", self.slot_name(*slot)),
                 Record::Result(slot) => format!("result of {}", self.slot_name(*slot)),
                 Record::Model(site) => format!("reply of {}", self.handler.sites[*site]),
+                Record::BatchCall(site) => format!("call of {}", self.handler.sites[*site]),
+                Record::BatchResult(site) => format!("result of {}", self.handler.sites[*site]),
                 Record::Status => "status".to_owned(),
                 Record::Checkpoint => "checkpoint".to_owned(),
                 Record::CellHeader(site) => {
@@ -386,6 +388,10 @@ impl Prover<'_> {
                 }
             }
             Record::Model(site) => state.settle(Slot::Site(site)),
+            Record::BatchCall(site) => {
+                state.open_calls.insert(Slot::Site(site));
+            }
+            Record::BatchResult(_) => {}
             Record::Status => {
                 if state.phase != Phase::Running {
                     self.finding(
@@ -527,7 +533,10 @@ impl Prover<'_> {
     }
 
     fn external(&mut self, slot: Slot, what: &str, state: &State, pending: &str) {
-        self.external_sites.insert(slot);
+        self.external_sites.insert(match slot {
+            Slot::Site(site) => Slot::Site(self.handler.real[site]),
+            Slot::Nested(..) => slot,
+        });
         if !state.pending.is_empty() {
             self.finding(
                 "durable_before_external",
@@ -665,6 +674,19 @@ fn enter(mut state: State, entry: Entry) -> Option<State> {
         }
         Entry::Recorded(slot) => {
             state.recorded.insert(slot);
+        }
+        Entry::ReopenedInBatch(site) => {
+            if !replaying(&state) {
+                return None;
+            }
+            state.reopened.insert(Slot::Site(site));
+            state.open_calls.insert(Slot::Site(site));
+            state.durable_calls.insert(Slot::Site(site));
+        }
+        Entry::Has(site) => {
+            if !state.open_calls.contains(&Slot::Site(site)) {
+                return None;
+            }
         }
         Entry::FirstAttempt(slot) => state.attempt = Some((slot, true)),
         Entry::LaterAttempt(slot) => state.attempt = Some((slot, false)),

@@ -86,6 +86,12 @@ class StepWorld {
     return this.context.host.tool(request);
   }
 
+  async tools(requests, limit) {
+    const simulated = this.context.tools;
+    if (simulated !== undefined) return simulated(this, requests, limit);
+    return dispatchConcurrently(this, requests, limit);
+  }
+
   model(request) {
     return this.context.host.model(request);
   }

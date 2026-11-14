@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::effect::EffectClass;
-use crate::ir::{self, BinaryOp, Expr, Handler, Program, Site, SiteClass, SiteKind, Stmt, Type};
+use crate::ir::{
+    self, BinaryOp, Expr, Handler, Parallel, Program, Site, SiteClass, SiteKind, Stmt, Type,
+};
 use crate::run::cell::{self, CellEvent, CellHost, CellOutcome, CellPoint, Input, Step, Wait};
 use crate::run::cell_journal::{CellLog, divergence_text};
 use crate::run::journal::{Outcome, Output, Record, call_id};
@@ -81,6 +83,14 @@ pub trait World {
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop>;
     fn attempt(&mut self, turn: u64, seq: u64) -> Result<u64, Stop>;
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
+    fn tools(
+        &mut self,
+        requests: &[ToolRequest<'_>],
+        limit: Option<u64>,
+    ) -> Result<Vec<(usize, Output)>, Stop> {
+        let order: Vec<usize> = (0..requests.len()).collect();
+        run_batch(self, requests, limit, &order)
+    }
     fn model(&mut self, request: &ModelRequest<'_>) -> Json;
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
@@ -97,6 +107,81 @@ pub trait World {
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn waited(&mut self, wait: &Wait) -> bool;
     fn observe(&mut self, event: &CellEvent);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Batch {
+    Start(usize),
+    Complete(usize),
+}
+
+pub fn batch_width(count: usize, limit: Option<u64>) -> usize {
+    match limit {
+        Some(limit) => {
+            assert!(limit > 0, "a concurrency limit admits at least one request");
+            usize::try_from(limit).map_or(count, |limit| limit.min(count))
+        }
+        None => count,
+    }
+}
+
+pub fn schedule(count: usize, limit: Option<u64>, order: &[usize]) -> Vec<Batch> {
+    assert_eq!(order.len(), count, "a batch completes each of its requests");
+    let width = batch_width(count, limit);
+    let mut events = Vec::with_capacity(2 * count);
+    let mut started = 0;
+    let mut done = vec![false; count];
+    while started < width {
+        events.push(Batch::Start(started));
+        started += 1;
+    }
+    for &index in order {
+        assert!(index < started, "a request completes only after it started");
+        assert!(!done[index], "a request completes once");
+        done[index] = true;
+        events.push(Batch::Complete(index));
+        if started < count {
+            events.push(Batch::Start(started));
+            started += 1;
+        }
+    }
+    assert_eq!(started, count, "every request of a batch starts");
+    events
+}
+
+pub fn run_batch<W: World + ?Sized>(
+    world: &mut W,
+    requests: &[ToolRequest<'_>],
+    limit: Option<u64>,
+    order: &[usize],
+) -> Result<Vec<(usize, Output)>, Stop> {
+    let mut outputs: Vec<Option<Output>> = vec![None; requests.len()];
+    let mut completed = Vec::with_capacity(requests.len());
+    for event in schedule(requests.len(), limit, order) {
+        match event {
+            Batch::Start(index) => {
+                let effect = requests[index].effect;
+                world.hook(Point::BeforeRun(SiteKind::Dispatch, effect))?;
+                outputs[index] = Some(world.tool(&requests[index]));
+            }
+            Batch::Complete(index) => {
+                let effect = requests[index].effect;
+                world.hook(Point::AfterRun(SiteKind::Dispatch, effect))?;
+                let output = outputs[index]
+                    .take()
+                    .expect("a started request has an output");
+                completed.push((index, output));
+            }
+        }
+    }
+    Ok(completed)
+}
+
+struct Pending {
+    index: usize,
+    seq: u64,
+    call: Call,
+    reopened: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -376,6 +461,7 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            Stmt::Parallel(parallel) => self.parallel(parallel)?,
             Stmt::Effect { site, args, result } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
@@ -387,6 +473,216 @@ impl<'a> Engine<'a> {
             Stmt::Finish { value } => return Ok(Flow::Return(self.eval(value)?)),
         }
         Ok(Flow::Next)
+    }
+
+    fn parallel(&mut self, parallel: &Parallel) -> Result<(), Halt> {
+        let items = match self.eval(&parallel.list)? {
+            Value::List(items) => items,
+            other => panic!("the checker types a parallel for's list, found {other:?}"),
+        };
+        assert!(
+            items.len() as u64 <= parallel.bound.value,
+            "a list holds at most its capacity"
+        );
+        let mut values: Vec<Option<Value>> = vec![None; items.len()];
+        let mut pending = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            if let Some(waiting) = self.batch_call(parallel, index, item, &mut values)? {
+                pending.push(waiting);
+            }
+        }
+        let mut start = 0;
+        while start < pending.len() {
+            let alone = pending[start].call.effect.may_be_unknown();
+            let mut end = start + 1;
+            while !alone && end < pending.len() && !pending[end].call.effect.may_be_unknown() {
+                end += 1;
+            }
+            self.batch_group(parallel, &pending[start..end], &mut values)?;
+            start = end;
+        }
+        let mut ordered: Vec<(usize, Value)> = items.into_iter().enumerate().collect();
+        if self.mutation == Mutation::BatchPushesReversed {
+            ordered.reverse();
+        }
+        for (index, item) in ordered {
+            let value = values[index]
+                .take()
+                .expect("every item of a parallel for has a result before its pushes");
+            self.locals[parallel.item] = Some(item);
+            self.locals[parallel.result] = Some(value);
+            if let Flow::Return(_) = self.block(&parallel.body)? {
+                panic!("the body of a parallel for only pushes");
+            }
+        }
+        Ok(())
+    }
+
+    fn batch_call(
+        &mut self,
+        parallel: &Parallel,
+        index: usize,
+        item: &Value,
+        values: &mut [Option<Value>],
+    ) -> Result<Option<Pending>, Halt> {
+        let site = &self.handler.sites[parallel.site];
+        self.seq += 1;
+        let seq = self.seq;
+        let call = self.resolve(site, std::slice::from_ref(item));
+        match self.sites.get(&seq).cloned() {
+            Some(SiteLog::Done(recorded, output)) => {
+                self.same(seq, &recorded, &call)?;
+                values[index] = Some(self.decode(site, &output)?);
+                Ok(None)
+            }
+            Some(SiteLog::Reply(_)) => Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Unknown(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                values[index] = Some(Value::Variant(ir::UNKNOWN, Vec::new()));
+                Ok(None)
+            }
+            Some(SiteLog::Open(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                self.require_live(seq)?;
+                let in_step = matches!(self.target.recovery, Recovery::InStep { .. });
+                assert!(
+                    !call.effect.may_be_unknown()
+                        || in_step
+                        || matches!(
+                            self.mutation,
+                            Mutation::RecoveryRedispatchesExternal
+                                | Mutation::RecoveryReportsFailed
+                        ),
+                    "recovery turns every open external call unknown before the turn runs again"
+                );
+                Ok(Some(Pending {
+                    index,
+                    seq,
+                    call,
+                    reopened: true,
+                }))
+            }
+            None => {
+                self.require_live(seq)?;
+                self.append(Record::Call {
+                    turn: self.turn,
+                    seq,
+                    tool: call.tool.clone(),
+                    effect: call.effect,
+                    input: call.input.clone(),
+                });
+                self.sites.insert(seq, SiteLog::Open(call.clone()));
+                Ok(Some(Pending {
+                    index,
+                    seq,
+                    call,
+                    reopened: false,
+                }))
+            }
+        }
+    }
+
+    fn batch_group(
+        &mut self,
+        parallel: &Parallel,
+        group: &[Pending],
+        values: &mut [Option<Value>],
+    ) -> Result<(), Halt> {
+        let external = group[0].call.effect.may_be_unknown();
+        assert!(
+            !external || group.len() == 1,
+            "an external call of a parallel for runs alone"
+        );
+        let gate = self.target.gate_before_outbound;
+        let in_step = external && matches!(self.target.recovery, Recovery::InStep { .. });
+        let late = external && !gate && self.mutation == Mutation::BatchFlushAfterDispatch;
+        if (external || gate) && !late {
+            self.flush()?;
+            assert!(
+                self.buffer.is_empty(),
+                "every call record of a parallel for is durable before an external call of it runs"
+            );
+        }
+        if in_step {
+            let first = &group[0];
+            let attempt = match &mut self.mode {
+                Mode::Live { world, .. } => world.attempt(self.turn, first.seq)?,
+                Mode::Replay => unreachable!("replay never runs an effect"),
+            };
+            if first.reopened && attempt > 1 && self.mutation != Mutation::VercelRetryRedispatches {
+                values[first.index] = Some(self.unknown(first.seq, first.call.clone())?);
+                return Ok(());
+            }
+            assert!(
+                first.reopened || attempt == 1,
+                "a fresh external step starts at its first attempt"
+            );
+        }
+        let completed = self.batch_dispatch(group)?;
+        let site = self.handler.sites[parallel.site].clone();
+        for (position, output) in completed {
+            let waiting = &group[position];
+            self.append(Record::Result {
+                turn: self.turn,
+                seq: waiting.seq,
+                output: output.clone(),
+            });
+            self.sites.insert(
+                waiting.seq,
+                SiteLog::Done(waiting.call.clone(), output.clone()),
+            );
+            values[waiting.index] = Some(self.decode(&site, &output)?);
+        }
+        if late || in_step {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn batch_dispatch(&mut self, group: &[Pending]) -> Result<Vec<(usize, Output)>, Halt> {
+        let returns = Type::Text;
+        let requests: Vec<ToolRequest<'_>> = group
+            .iter()
+            .map(|waiting| ToolRequest {
+                turn: self.turn,
+                seq: waiting.seq,
+                tool: &waiting.call.tool,
+                effect: waiting.call.effect,
+                input: &waiting.call.input,
+                returns: &returns,
+                nested: None,
+            })
+            .collect();
+        let limit = self
+            .target
+            .limits
+            .concurrent_requests
+            .map(|limit| limit.value);
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("replay never runs an effect");
+        };
+        let mut completed = world.tools(&requests, limit)?;
+        assert_eq!(
+            completed.len(),
+            group.len(),
+            "a batch returns one output per request"
+        );
+        if self.mutation != Mutation::ResultsInCompletionOrder {
+            completed.sort_by_key(|(position, _)| *position);
+        }
+        let checked = completed
+            .into_iter()
+            .map(|(position, output)| {
+                let tool = &group[position].call.tool;
+                let output = if self.mutation == Mutation::EnumUnchecked {
+                    value::fallback_output(self.program, &returns, output)
+                } else {
+                    value::checked_output(self.program, tool, &returns, output)
+                };
+                (position, output)
+            })
+            .collect();
+        Ok(checked)
     }
 
     fn push(&mut self, field: usize, value: &Expr) -> Result<(), Halt> {
@@ -769,6 +1065,9 @@ impl<'a> Engine<'a> {
                     context: &args[0],
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
+                if self.reply_unrecorded(&response) {
+                    return self.reply(&response);
+                }
                 self.append(Record::Model {
                     turn: self.turn,
                     seq,
@@ -816,8 +1115,22 @@ impl<'a> Engine<'a> {
     }
 
     fn reply(&self, response: &Json) -> Result<Value, Halt> {
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        if model.declared() {
+            return Ok(value::model_outcome(self.program, response));
+        }
         value::from_json(self.program, &Type::Sum(ir::REPLY), response)
             .map_err(|error| Halt::Trap(format!("model reply: {error}")))
+    }
+
+    fn reply_unrecorded(&self, response: &Json) -> bool {
+        self.mutation == Mutation::ModelFailureUnrecorded
+            && self.program.model.as_ref().is_some_and(ir::Model::declared)
+            && value::model_failure(response).is_some()
     }
 
     fn decode(&self, site: &Site, output: &Output) -> Result<Value, Halt> {

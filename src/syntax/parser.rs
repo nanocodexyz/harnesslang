@@ -324,7 +324,13 @@ impl<'a> Parser<'a> {
         let name = self.name("a model name")?;
         self.word("calls")?;
         let calls = self.bound("the calls in one model reply")?;
-        Ok(Model { name, calls })
+        let reply = if self.is_word("reply") {
+            self.advance();
+            Some(self.name("the model's reply type")?)
+        } else {
+            None
+        };
+        Ok(Model { name, calls, reply })
     }
 
     fn state(&mut self) -> Parsed<State> {
@@ -496,11 +502,16 @@ impl<'a> Parser<'a> {
                 let name = self.name("a loop variable name")?;
                 self.word("in")?;
                 let list = self.expr()?;
+                let parallel = self.is_word("parallel");
+                if parallel {
+                    self.advance();
+                }
                 let body = self.block()?;
                 Ok(Stmt::For {
                     at,
                     name,
                     list,
+                    parallel,
                     body,
                 })
             }

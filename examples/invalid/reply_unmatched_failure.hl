@@ -1,0 +1,23 @@
+harness reply_unmatched_failure
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = done(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 2 <= context_max
+{
+  push context user(question)
+  match think(context) {
+    answer(words) => { return done(words) }
+    calls(requested) => { return stopped("no tools") }
+  }
+}

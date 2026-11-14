@@ -4,7 +4,9 @@ use crate::effect::EffectClass;
 use crate::ir::{self, Program, Type};
 use crate::run::cell::{CellEngine, CellEvent, Input, Step, Wait};
 use crate::run::cell_journal::Entry;
-use crate::run::engine::{Finish, ModelRequest, Point, Stop, ToolRequest, World};
+use crate::run::engine::{
+    Finish, ModelRequest, Point, Stop, ToolRequest, World, batch_width, run_batch,
+};
 use crate::run::journal::{self, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
@@ -24,6 +26,7 @@ pub const ANSWER_PPM: u64 = 350_000;
 pub const UNDECLARED_TOOL_PPM: u64 = 250_000;
 pub const OVER_CAPACITY_PPM: u64 = 5_000;
 pub const TOOL_FAILURE_PPM: u64 = 150_000;
+pub const MODEL_FAILURE_PPM: u64 = 150_000;
 pub const TEXT_ENUM_INVALID_PPM: u64 = 100_000;
 pub const CLOCK_STEP_MAX: u64 = 1_000;
 pub const CLOCK_JUMP_MS_MAX: u64 = 60_000;
@@ -132,6 +135,7 @@ pub struct SimWorld<'a> {
     clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
     run_epoch: u64,
+    batch_calls: BTreeMap<(u64, u64), u64>,
 }
 
 impl<'a> SimWorld<'a> {
@@ -179,6 +183,7 @@ impl<'a> SimWorld<'a> {
             clock: 0,
             model_calls: BTreeMap::new(),
             run_epoch: 0,
+            batch_calls: BTreeMap::new(),
         }
     }
 
@@ -540,6 +545,29 @@ impl World for SimWorld<'_> {
         output
     }
 
+    fn tools(
+        &mut self,
+        requests: &[ToolRequest<'_>],
+        limit: Option<u64>,
+    ) -> Result<Vec<(usize, Output)>, Stop> {
+        let order = self.completion_order(requests, limit);
+        self.record("batch", || {
+            vec![
+                (
+                    "order",
+                    Json::Array(
+                        order
+                            .iter()
+                            .map(|index| Json::Number(*index as u64))
+                            .collect(),
+                    ),
+                ),
+                ("limit", limit.map_or(Json::Null, Json::Number)),
+            ]
+        });
+        run_batch(self, requests, limit, &order)
+    }
+
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         self.count_effect(true);
         let response = self.reply(request);
@@ -795,6 +823,27 @@ impl SimWorld<'_> {
         output
     }
 
+    fn completion_order(&mut self, requests: &[ToolRequest<'_>], limit: Option<u64>) -> Vec<usize> {
+        let first = requests.first().expect("a batch has a request");
+        let count = self.batch_calls.entry((first.turn, first.seq)).or_insert(0);
+        *count += 1;
+        let mut rng = Rng::derive_keyed(self.seed, "batch", &[first.turn, first.seq, *count]);
+        let width = batch_width(requests.len(), limit);
+        let mut running: Vec<usize> = (0..width).collect();
+        let mut next = width;
+        let mut order = Vec::with_capacity(requests.len());
+        for _ in 0..requests.len() {
+            let finished = running.remove(rng.pick(running.len()));
+            order.push(finished);
+            if next < requests.len() {
+                running.push(next);
+                next += 1;
+            }
+        }
+        assert!(running.is_empty(), "every request of a batch completes");
+        order
+    }
+
     fn reply(&mut self, request: &ModelRequest<'_>) -> Json {
         let count = self
             .model_calls
@@ -802,9 +851,61 @@ impl SimWorld<'_> {
             .or_insert(0);
         *count += 1;
         let mut rng = Rng::derive_keyed(self.seed, "model", &[request.turn, request.seq, *count]);
-        if !self.greedy && rng.chance(ANSWER_PPM) {
-            return Json::object([("answer", Json::String(Self::generated_text(&mut rng)))]);
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        if model.declared() && !self.greedy && rng.chance(MODEL_FAILURE_PPM) {
+            let error = format!("{} failed: {}", model.name, Self::generated_text(&mut rng));
+            return Json::object([(ir::MODEL_FAILED, Json::String(error))]);
         }
+        let (calls_variant, calls_field) = model.calls_at();
+        let variants = &self.program.sums[ir::REPLY].variants;
+        let others: Vec<usize> = (0..variants.len())
+            .filter(|variant| *variant != calls_variant)
+            .collect();
+        if !others.is_empty() && !self.greedy && rng.chance(ANSWER_PPM) {
+            let variant = match others.as_slice() {
+                [only] => *only,
+                _ => others[rng.pick(others.len())],
+            };
+            let fields = variants[variant]
+                .fields
+                .iter()
+                .map(|field| Self::tool_value(self.program, &mut rng, field, self.edges.as_ref()))
+                .collect();
+            return Self::variant_json(&variants[variant].name, fields);
+        }
+        let calls = self.drawn_calls(&mut rng, request);
+        let definition = &self.program.sums[ir::REPLY].variants[calls_variant];
+        let mut calls = Some(calls);
+        let fields = (0..definition.fields.len())
+            .map(|field| {
+                if field == calls_field {
+                    calls.take().expect("one field carries the calls")
+                } else {
+                    Self::tool_value(
+                        self.program,
+                        &mut rng,
+                        &definition.fields[field],
+                        self.edges.as_ref(),
+                    )
+                }
+            })
+            .collect();
+        Self::variant_json(&definition.name, fields)
+    }
+
+    fn variant_json(name: &str, mut fields: Vec<Json>) -> Json {
+        match fields.len() {
+            0 => Json::String(name.to_owned()),
+            1 => Json::object([(name, fields.pop().expect("one field"))]),
+            _ => Json::object([(name, Json::Array(fields))]),
+        }
+    }
+
+    fn drawn_calls(&self, rng: &mut Rng, request: &ModelRequest<'_>) -> Json {
         let over_ppm = match (self.greedy, self.edges.is_some()) {
             (true, _) => 0,
             (false, true) => strict::OVER_CAPACITY_PPM,
@@ -827,11 +928,11 @@ impl SimWorld<'_> {
                     program: self.program,
                     code,
                 };
-                let ops = plan.ops(&mut rng);
+                let ops = plan.ops(rng);
                 (code.name.clone(), crate::sim::cell::script(&ops))
             } else {
-                let tool = self.tool_name(&mut rng);
-                (tool, Self::generated_text(&mut rng))
+                let tool = self.tool_name(rng);
+                (tool, Self::generated_text(rng))
             };
             let mut fields = BTreeMap::new();
             fields.insert(
@@ -848,7 +949,7 @@ impl SimWorld<'_> {
             );
             calls.push(Json::Object(fields));
         }
-        Json::object([("calls", Json::Array(calls))])
+        Json::Array(calls)
     }
 
     pub fn cell_fault(&mut self, invariant: Invariant, detail: String) {

@@ -232,7 +232,36 @@ pub struct Tool {
 pub struct Model {
     pub name: String,
     pub calls: Bound,
+    pub reply: Reply,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    Builtin,
+    Declared { calls: VariantId, field: usize },
+}
+
+impl Model {
+    pub const fn calls_at(&self) -> (VariantId, usize) {
+        match self.reply {
+            Reply::Builtin => (CALLS, 0),
+            Reply::Declared { calls, field } => (calls, field),
+        }
+    }
+
+    pub fn result(&self) -> Type {
+        match self.reply {
+            Reply::Builtin => Type::Sum(REPLY),
+            Reply::Declared { .. } => Type::Known(Box::new(Type::Sum(REPLY))),
+        }
+    }
+
+    pub const fn declared(&self) -> bool {
+        matches!(self.reply, Reply::Declared { .. })
+    }
+}
+
+pub const MODEL_FAILED: &str = "failed";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
@@ -258,6 +287,12 @@ pub struct Site {
     pub class: SiteClass,
     pub result: Type,
     pub durability: Durability,
+}
+
+impl Site {
+    pub fn traps_on_decode(&self) -> bool {
+        self.kind == SiteKind::Model && !matches!(self.result, Type::Known(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +393,7 @@ pub enum Stmt {
         bound: Bound,
         body: Vec<Stmt>,
     },
+    Parallel(Parallel),
     Effect {
         site: SiteId,
         args: Vec<Expr>,
@@ -366,6 +402,123 @@ pub enum Stmt {
     Finish {
         value: Expr,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct Parallel {
+    pub item: LocalId,
+    pub list: Expr,
+    pub bound: Bound,
+    pub site: SiteId,
+    pub args: Vec<Expr>,
+    pub result: LocalId,
+    pub body: Vec<Stmt>,
+}
+
+impl Parallel {
+    pub fn dispatch(&self) -> Stmt {
+        Stmt::Effect {
+            site: self.site,
+            args: self.args.clone(),
+            result: self.result,
+        }
+    }
+
+    pub fn sequential(&self) -> Stmt {
+        let mut body = Vec::with_capacity(self.body.len() + 1);
+        body.push(self.dispatch());
+        body.extend(sequential_block(&self.body));
+        Stmt::For {
+            item: self.item,
+            list: self.list.clone(),
+            bound: self.bound.clone(),
+            body,
+        }
+    }
+}
+
+pub fn sequential_block(statements: &[Stmt]) -> Vec<Stmt> {
+    statements.iter().map(sequential_statement).collect()
+}
+
+fn sequential_statement(statement: &Stmt) -> Stmt {
+    match statement {
+        Stmt::Parallel(parallel) => parallel.sequential(),
+        Stmt::If {
+            condition,
+            then,
+            otherwise,
+        } => Stmt::If {
+            condition: condition.clone(),
+            then: sequential_block(then),
+            otherwise: sequential_block(otherwise),
+        },
+        Stmt::Match { subject, ty, arms } => Stmt::Match {
+            subject: subject.clone(),
+            ty: ty.clone(),
+            arms: arms
+                .iter()
+                .map(|arm| Arm {
+                    variant: arm.variant,
+                    bindings: arm.bindings.clone(),
+                    body: sequential_block(&arm.body),
+                })
+                .collect(),
+        },
+        Stmt::Loop { index, bound, body } => Stmt::Loop {
+            index: *index,
+            bound: bound.clone(),
+            body: sequential_block(body),
+        },
+        Stmt::For {
+            item,
+            list,
+            bound,
+            body,
+        } => Stmt::For {
+            item: *item,
+            list: list.clone(),
+            bound: bound.clone(),
+            body: sequential_block(body),
+        },
+        Stmt::Let { .. }
+        | Stmt::Assign { .. }
+        | Stmt::Push { .. }
+        | Stmt::Effect { .. }
+        | Stmt::Finish { .. } => statement.clone(),
+    }
+}
+
+pub fn has_parallel(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Stmt::Parallel(_) => true,
+        Stmt::If {
+            then, otherwise, ..
+        } => has_parallel(then) || has_parallel(otherwise),
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| has_parallel(&arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => has_parallel(body),
+        Stmt::Let { .. }
+        | Stmt::Assign { .. }
+        | Stmt::Push { .. }
+        | Stmt::Effect { .. }
+        | Stmt::Finish { .. } => false,
+    })
+}
+
+impl Program {
+    pub fn has_parallel(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| has_parallel(&handler.body))
+    }
+
+    pub fn sequential(&self) -> Self {
+        let mut program = self.clone();
+        for handler in &mut program.handlers {
+            handler.body = sequential_block(&handler.body);
+        }
+        program
+    }
 }
 
 #[derive(Clone, Debug)]

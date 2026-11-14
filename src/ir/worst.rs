@@ -299,6 +299,7 @@ fn statement_cost(
             };
             repeat(block(program, handler, body)?, &factor, true)
         }
+        Stmt::Parallel(parallel) => statement_cost(program, handler, &parallel.sequential()),
         Stmt::For {
             item, bound, body, ..
         } => {

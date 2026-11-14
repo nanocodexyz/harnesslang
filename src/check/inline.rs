@@ -387,6 +387,7 @@ impl<'a> Inliner<'a> {
                 at,
                 name,
                 list,
+                parallel,
                 body,
             } => {
                 self.expr(walk, list)?;
@@ -396,6 +397,7 @@ impl<'a> Inliner<'a> {
                     at: *at,
                     name: name.clone(),
                     list: list.clone(),
+                    parallel: *parallel,
                     body,
                 })
             }
