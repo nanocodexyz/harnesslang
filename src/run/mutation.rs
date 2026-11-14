@@ -16,6 +16,11 @@ pub enum Mutation {
     CheckpointHashOrder,
     RecoverySkipped,
     EnumUnchecked,
+    EventRedelivered,
+    EventAckEarly,
+    EventReadUnstamped,
+    EventDrainOnReplay,
+    BatchDrainsReplayed,
     ModelFailureUnrecorded,
     RetireSkipped,
     SealSkipped,
@@ -28,7 +33,7 @@ pub enum Mutation {
 }
 
 impl Mutation {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 28] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -43,6 +48,11 @@ impl Mutation {
         Self::CheckpointHashOrder,
         Self::RecoverySkipped,
         Self::EnumUnchecked,
+        Self::EventRedelivered,
+        Self::EventAckEarly,
+        Self::EventReadUnstamped,
+        Self::EventDrainOnReplay,
+        Self::BatchDrainsReplayed,
         Self::ModelFailureUnrecorded,
         Self::RetireSkipped,
         Self::SealSkipped,
@@ -70,6 +80,11 @@ impl Mutation {
             Self::CheckpointHashOrder => "checkpoint_hash_order",
             Self::RecoverySkipped => "recovery_skipped",
             Self::EnumUnchecked => "enum_unchecked",
+            Self::EventRedelivered => "event_redelivered",
+            Self::EventAckEarly => "event_ack_early",
+            Self::EventReadUnstamped => "event_read_unstamped",
+            Self::EventDrainOnReplay => "event_drain_on_replay",
+            Self::BatchDrainsReplayed => "batch_drains_replayed",
             Self::ModelFailureUnrecorded => "model_failure_unrecorded",
             Self::RetireSkipped => "retire_skipped",
             Self::SealSkipped => "seal_skipped",
@@ -127,6 +142,8 @@ impl Mutation {
             Self::RerunRewritesCall => vec![Target::NativeJsonl, Target::Cloudflare],
             Self::CheckpointHashOrder
             | Self::EnumUnchecked
+            | Self::EventReadUnstamped
+            | Self::EventDrainOnReplay
             | Self::ModelFailureUnrecorded
             | Self::RetireSkipped
             | Self::SealSkipped
@@ -135,6 +152,12 @@ impl Mutation {
             | Self::ListingUnchecked
             | Self::ListedClassDropped
             | Self::InputUnchecked => all,
+            Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Cloudflare,
+            ],
             Self::BatchFlushAfterDispatch => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

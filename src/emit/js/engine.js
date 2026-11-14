@@ -12,7 +12,41 @@ class Engine {
     this.attempts = log.attempts;
     this.buffer = [];
     this.acknowledged = false;
+    this.events = log.events.slice();
+    this.taken = 0;
     this.admitted = new Map();
+  }
+
+  cancelled() {
+    return this.events.some((event) => event.delivery.kind === "cancel" && event.at <= this.seq);
+  }
+
+  take() {
+    const visible = this.events.filter((event) => event.delivery.kind === "steer" && event.at <= this.seq);
+    assert(this.taken <= visible.length, "the steers a turn sees only grow");
+    const fresh = visible.slice(this.taken).map((event) => event.delivery.message);
+    this.taken = visible.length;
+    return fresh;
+  }
+
+  async drain() {
+    if (this.target.inbound !== "after_run" || !eventsTaken() || !this.mode.live) return;
+    const world = this.mode.world;
+    const arrived = await world.inbox(this.turn);
+    if (arrived.length === 0) return;
+    const position = this.seq;
+    const answers = [];
+    let recorded = false;
+    for (const delivery of arrived) {
+      const admitted = admitEvent(this.turn, this.events, position, delivery);
+      if (admitted.record !== null) {
+        this.append(admitted.record);
+        recorded = true;
+      }
+      answers.push([delivery.id, admitted.answer]);
+    }
+    if (recorded) await this.flush();
+    await world.answer(this.turn, position, answers);
   }
 
   append(record) {
@@ -55,6 +89,7 @@ class Engine {
     assert(this.buffer.length === 0, "a turn's status is durable before it is acknowledged");
     await this.hook(POINT_BEFORE_ACKNOWLEDGE);
     await this.acknowledge(finish);
+    if (eventsTaken() && this.mode.live) await closeInbox(this.mode.world, this.turn, this.seq, this.events);
     return finish;
   }
 
@@ -288,6 +323,7 @@ class Engine {
     });
     const batch = requests.length === 0 ? [] : await this.mode.world.tools(requests, CONCURRENT_REQUESTS_MAX);
     assert(batch.length === sent.length, "a batch returns one output per request");
+    if (this.sites.get(this.seq)?.kind === "open") await this.drain();
     const completed = batch.map(([position, output]) => [sent[position], output]);
     for (let position = 0; position < group.length; position++) {
       if (gates[position].refused !== undefined) completed.push([position, { tag: "failed", error: gates[position].refused }]);
@@ -311,6 +347,7 @@ class Engine {
       const callsMax = PROGRAM.model === null ? 0n : PROGRAM.model.calls;
       const response = await world.model({ turn: this.turn, seq, callsMax, context: args[0] });
       await this.hook(runPoint("after_run", site.kind, call.effect));
+      await this.drain();
       this.append({ kind: "model", turn: this.turn, seq, response });
       this.sites.set(seq, { kind: "reply", response });
       return this.reply(response);
@@ -335,6 +372,7 @@ class Engine {
       }
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));
+    await this.drain();
     this.append({ kind: "result", turn: this.turn, seq, output });
     this.sites.set(seq, { kind: "done", call, output });
     if (step) await this.flush();
@@ -418,6 +456,12 @@ class Engine {
   }
 }
 
+async function closeInbox(world, turn, position, events) {
+  const arrived = await world.inbox(turn);
+  if (arrived.length === 0) return;
+  await world.answer(turn, position, closingAnswers(events, arrived));
+}
+
 function decodeOrCorrupt(decode) {
   try {
     return decode();
@@ -431,6 +475,7 @@ async function replayTurn(setup, turn, log, state) {
   const handler = handlerNamed(log.handler);
   if (handler === null) throw new Corrupt(`turn ${turn} ran handler '${log.handler}', which the program lacks`);
   const args = decodeOrCorrupt(() => argumentsFromJson(handler, log.arguments));
+  checkEvents(turn, log);
   if (log.finished === null) throw new Corrupt(`turn ${turn} is replayed before it finished`);
   const replaySetup = { target: setup.target, mutation: "none" };
   const ran = await new Engine(replaySetup, handler, { live: false }, turn, state, log).run(args);
@@ -472,7 +517,7 @@ function recoverAtLoad(log) {
 }
 
 function cloneLog(log) {
-  return { ...log, sites: new Map(log.sites) };
+  return { ...log, sites: new Map(log.sites), events: log.events.slice() };
 }
 
 async function runTurn(setup, world, epoch, records, request) {
@@ -482,6 +527,7 @@ async function runTurn(setup, world, epoch, records, request) {
   const args = argumentsJson(handler, request.arguments);
   const existing = session.turns.get(request.turn);
   if (existing !== undefined && existing.finished !== null) {
+    if (eventsTaken()) await closeInbox(world, request.turn, existing.finished.last, existing.events);
     return { ran: "already_finished", finish: { turn: request.turn, outcome: existing.finished.outcome, result: existing.finished.result } };
   }
   const state = await stateBefore(setup, session, request.turn);
@@ -492,6 +538,7 @@ async function runTurn(setup, world, epoch, records, request) {
     if (existing.handler !== request.handler || !jsonEqual(existing.arguments, args)) {
       throw new Corrupt(`turn ${request.turn} was admitted with other arguments`);
     }
+    checkEvents(request.turn, existing);
     log = cloneLog(existing);
     if (setup.target.recovery === "at_load") unknown = recoverAtLoad(log);
   } else {
@@ -594,4 +641,5 @@ const runtime = {
   Panic, Trap, Corrupt, DecodeError, HostError,
   encodeJson, decodeJson, crc32, encodeLine, decodeLine, encodeLines, decodeLines,
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
+  deliveryJson, deliveryFrom,
 };

@@ -1,0 +1,7 @@
+harness worker
+
+const steers_max: u64 = 4
+
+on steer(note: text) bound steers_max
+
+on run() -> u64 { return 1 }

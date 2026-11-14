@@ -22,7 +22,12 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
             quantities.contains(&Quantity::Field(*field))
                 || quantities.contains(&Quantity::FieldLen(*field))
         }
-        Expr::U64(_) | Expr::Bool(_) | Expr::Text(_) | Expr::Constant(_) | Expr::Local(_) => false,
+        Expr::U64(_)
+        | Expr::Bool(_)
+        | Expr::Text(_)
+        | Expr::Constant(_)
+        | Expr::Local(_)
+        | Expr::Cancelled => false,
         Expr::Member { base, .. } => reads(base, quantities),
         Expr::Construct { fields, .. } => fields.iter().any(|field| reads(field, quantities)),
         Expr::Binary { left, right, .. } => reads(left, quantities) || reads(right, quantities),

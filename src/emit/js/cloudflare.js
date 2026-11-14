@@ -1,4 +1,4 @@
-const CLOUDFLARE_TARGET = { recovery: "at_load", gateBeforeOutbound: true };
+const CLOUDFLARE_TARGET = { recovery: "at_load", gateBeforeOutbound: true, inbound: "after_run" };
 const CLOUDFLARE_EPOCH = 0;
 const JOURNAL_SCHEMA = "CREATE TABLE IF NOT EXISTS hl_journal (position INTEGER PRIMARY KEY, record TEXT NOT NULL)";
 const JOURNAL_INSERT = "INSERT INTO hl_journal (position, record) VALUES (?, ?)";
@@ -6,7 +6,8 @@ const JOURNAL_LOAD = "SELECT position, record FROM hl_journal ORDER BY position"
 const ALARM_RESUME_DELAY_MS = 1000;
 const HARNESS_BINDING = "HARNESS";
 const TURN_PATH = "/turn";
-const SESSION_TURN_PATH = /^\/sessions\/([^/]+)\/turn$/;
+const EVENT_PATH = "/event";
+const SESSION_PATH = /^\/sessions\/([^/]+)\/(turn|event)$/;
 const RAN_HEADER = "hl-ran";
 const HTTP_BAD_REQUEST = 400;
 const HTTP_NOT_FOUND = 404;
@@ -84,6 +85,19 @@ class CloudflareWorld {
     assert(this.finish === null, "a run acknowledges its turn once");
     this.finish = finish;
   }
+
+  async inbox(turn) {
+    if (this.object.simulation.inbox !== undefined) return this.object.simulation.inbox(turn);
+    return this.object.arrived(turn);
+  }
+
+  async answer(turn, position, answers) {
+    if (this.object.simulation.answer !== undefined) {
+      await this.object.simulation.answer(turn, position, answers);
+      return;
+    }
+    this.object.answered(turn, answers);
+  }
 }
 
 class HarnessObject {
@@ -106,6 +120,44 @@ class HarnessObject {
     this.queued = 0;
     this.tail = Promise.resolve();
     this.storageWrites = [];
+    this.runningTurn = null;
+    this.waiting = [];
+  }
+
+  arrived(turn) {
+    return this.waiting.filter((entry) => entry.turn === turn).map((entry) => entry.delivery);
+  }
+
+  answered(turn, answers) {
+    for (const [id, answer] of answers) {
+      const index = this.waiting.findIndex((entry) => entry.turn === turn && entry.delivery.id === id);
+      if (index >= 0) this.waiting.splice(index, 1)[0].resolve(answer);
+    }
+  }
+
+  async deliver(request) {
+    let turn;
+    let delivery;
+    try {
+      const body = decodeJson(await request.text());
+      turn = smallNumber(body.turn, "an event's turn");
+      delivery = deliveryFrom(body.event);
+    } catch (error) {
+      if (error instanceof DecodeError) return new Response(error.message, { status: HTTP_BAD_REQUEST });
+      throw error;
+    }
+    const answered = (answer) => new Response(encodeJson(object([["answer", answer]])), { headers: { "content-type": "application/json" } });
+    if (this.runningTurn !== turn) {
+      const log = fold(this.load()).turns.get(turn);
+      if (log === undefined || log.finished === null) return new Response("not_running", { status: HTTP_SERVICE_UNAVAILABLE });
+      return answered(closingAnswers(log.events, [delivery])[0][1]);
+    }
+    if (BigInt(this.waiting.length) >= PROGRAM.events.recordsMax) {
+      return new Response(`${this.waiting.length} events already wait for turn ${turn}`, { status: HTTP_SERVICE_UNAVAILABLE });
+    }
+    const answer = await new Promise((resolve) => this.waiting.push({ turn, delivery, resolve }));
+    if (answer === "not_running") return new Response(answer, { status: HTTP_SERVICE_UNAVAILABLE });
+    return answered(answer);
   }
 
   async serialized(work) {
@@ -159,6 +211,7 @@ class HarnessObject {
   async drive(request) {
     assert(!this.running, "one turn runs at a time in an object");
     this.running = true;
+    this.runningTurn = request.turn;
     try {
       const records = this.load();
       const world = new CloudflareWorld(this);
@@ -173,11 +226,14 @@ class HarnessObject {
       throw error;
     } finally {
       this.running = false;
+      this.runningTurn = null;
+      for (const entry of this.waiting.splice(0)) entry.resolve("not_running");
     }
   }
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === EVENT_PATH) return this.deliver(request);
     if (request.method !== "POST" || url.pathname !== TURN_PATH) return new Response("not found", { status: HTTP_NOT_FOUND });
     let turn;
     try {
@@ -222,11 +278,12 @@ class HarnessObject {
 const worker = {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const match = SESSION_TURN_PATH.exec(url.pathname);
+    const match = SESSION_PATH.exec(url.pathname);
     if (request.method !== "POST" || match === null) return new Response("not found", { status: HTTP_NOT_FOUND });
     const namespace = env[HARNESS_BINDING];
     const stub = namespace.get(namespace.idFromName(decodeURIComponent(match[1])));
-    return stub.fetch(new URL(TURN_PATH, url.origin), { method: "POST", body: await request.text(), headers: { "content-type": "application/json" } });
+    const path = match[2] === "event" ? EVENT_PATH : TURN_PATH;
+    return stub.fetch(new URL(path, url.origin), { method: "POST", body: await request.text(), headers: { "content-type": "application/json" } });
   },
 };
 
@@ -237,6 +294,7 @@ const harness = {
   statements: { schema: JOURNAL_SCHEMA, insert: JOURNAL_INSERT, load: JOURNAL_LOAD },
   ranHeader: RAN_HEADER,
   turnPath: TURN_PATH,
+  eventPath: EVENT_PATH,
 };
 
 export { HarnessObject, harness };

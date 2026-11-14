@@ -1,4 +1,5 @@
 pub mod dump;
+pub mod events;
 pub mod exhaustive;
 pub mod faults;
 pub mod invariants;
@@ -219,7 +220,9 @@ fn run_seed_unguarded(
             arguments,
         };
         world.begin_turn(&request, faulty);
-        if let Err(violation) = drive_turn(program, &mut world, &request) {
+        let driven = drive_turn(program, &mut world, &request);
+        world.inbox.end_turn(turn);
+        if let Err(violation) = driven {
             let specific = match world.medium.durable() {
                 Ok(records) => invariants::safety(&world, &records)
                     .err()
@@ -248,6 +251,7 @@ fn run_seed_unguarded(
     if result.is_ok()
         && profile == "clean"
         && program.has_parallel()
+        && world.inbox.scheduled.is_empty()
         && let Ok(records) = &records
     {
         result = sequential_twin(
@@ -262,6 +266,7 @@ fn run_seed_unguarded(
     }
     let mut stats = world.stats.clone();
     stats.unknown = records.map_or(0, |records| unknown_count(&records));
+    stats.events = program.events.any().then_some(world.inbox.recorded);
     let journal = world.medium.bytes();
     let acks = world.acks.len() as u64;
     let outcome = match &result {
@@ -351,6 +356,10 @@ fn add(total: &mut Stats, more: &Stats) {
     total.takeovers += more.takeovers;
     total.dispatches += more.dispatches;
     total.unknown += more.unknown;
+    total.events = match (total.events, more.events) {
+        (None, None) => None,
+        (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
+    };
     total.entry_states += more.entry_states;
 }
 
@@ -453,7 +462,7 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             )
         }
         None => format!(
-            "ok target={} mutation={} seeds={}..{} ({} seeds{}{}): turns={} runs={} crashes={} power_losses={} torn_writes={} takeovers={} fenced={} dispatches={} unknown={}",
+            "ok target={} mutation={} seeds={}..{} ({} seeds{}{}): turns={} runs={} crashes={} power_losses={} torn_writes={} takeovers={} fenced={} dispatches={} unknown={}{}",
             options.target.name(),
             options.mutation.name(),
             options.seeds.start,
@@ -476,7 +485,10 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
             stats.takeovers,
             stats.fenced,
             stats.dispatches,
-            stats.unknown
+            stats.unknown,
+            stats
+                .events
+                .map_or_else(String::new, |events| format!(" events={events}"))
         ),
     }
 }

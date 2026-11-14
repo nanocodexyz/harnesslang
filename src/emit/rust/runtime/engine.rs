@@ -239,6 +239,29 @@ pub struct ModelRequest<'a> {
     pub context: &'a dyn Fn() -> Json,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventAnswer {
+    Recorded,
+    Duplicate,
+    Full,
+    Undeclared,
+    Finished,
+    NotRunning,
+}
+
+impl EventAnswer {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Duplicate => "duplicate",
+            Self::Full => "full",
+            Self::Undeclared => "undeclared",
+            Self::Finished => "finished",
+            Self::NotRunning => "not_running",
+        }
+    }
+}
+
 pub trait World {
     fn hook(&mut self, point: Point) -> Result<(), Stop>;
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop>;
@@ -249,6 +272,8 @@ pub trait World {
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
     fn acknowledge(&mut self, finish: &Finish);
+    fn inbox(&mut self, turn: u64) -> Vec<Delivery>;
+    fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]);
 }
 
 pub trait Host {
@@ -264,6 +289,112 @@ pub trait Host {
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
     fn acknowledge(&mut self, finish: &Finish);
+    fn inbox(&mut self, _turn: u64) -> Vec<Delivery> {
+        Vec::new()
+    }
+    fn answer(&mut self, _turn: u64, _position: u64, _answers: &[(String, EventAnswer)]) {}
+}
+
+pub struct Sent {
+    pub turn: u64,
+    pub delivery: Delivery,
+    pub reply: std::sync::mpsc::Sender<EventAnswer>,
+}
+
+pub struct Inbox {
+    receiver: std::sync::mpsc::Receiver<Sent>,
+    waiting: Vec<Sent>,
+}
+
+impl Inbox {
+    pub fn channel(capacity: usize) -> (std::sync::mpsc::SyncSender<Sent>, Self) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        let inbox = Self {
+            receiver,
+            waiting: Vec::with_capacity(capacity),
+        };
+        (sender, inbox)
+    }
+
+    pub fn arrived(&mut self, turn: u64) -> Vec<Delivery> {
+        while let Ok(sent) = self.receiver.try_recv() {
+            if sent.turn == turn {
+                self.waiting.push(sent);
+            } else {
+                let _ = sent.reply.send(EventAnswer::NotRunning);
+            }
+        }
+        self.waiting.iter().map(|sent| sent.delivery.clone()).collect()
+    }
+
+    pub fn answer(&mut self, turn: u64, answers: &[(String, EventAnswer)]) {
+        for (id, answer) in answers {
+            let found = self
+                .waiting
+                .iter()
+                .position(|sent| sent.turn == turn && sent.delivery.id == *id);
+            if let Some(index) = found {
+                let sent = self.waiting.remove(index);
+                let _ = sent.reply.send(*answer);
+            }
+        }
+    }
+}
+
+pub const fn events_taken() -> bool {
+    program::TAKES_CANCEL || program::STEER_EVENT.is_some()
+}
+
+pub fn event_seq(turn: u64, index: u64) -> Option<u64> {
+    assert!(index >= 1, "an event's index in its turn counts from 1");
+    turn.checked_sub(1)?.checked_mul(program::EVENT_RECORDS_MAX)?.checked_add(index)
+}
+
+pub fn steer_count(events: &[Recorded]) -> u64 {
+    events
+        .iter()
+        .filter(|event| matches!(event.delivery.inbound, Inbound::Steer(_)))
+        .count() as u64
+}
+
+pub fn close_inbox(world: &mut dyn World, turn: u64, position: u64, events: &[Recorded]) {
+    let arrived = world.inbox(turn);
+    if arrived.is_empty() {
+        return;
+    }
+    let answers: Vec<(String, EventAnswer)> = arrived
+        .into_iter()
+        .map(|delivery| {
+            let recorded = events.iter().any(|event| event.delivery.id == delivery.id);
+            let answer = if recorded { EventAnswer::Duplicate } else { EventAnswer::Finished };
+            (delivery.id, answer)
+        })
+        .collect();
+    world.answer(turn, position, &answers);
+}
+
+fn check_events(turn: u64, log: &TurnLog) -> Result<(), Exit> {
+    for event in &log.events {
+        let taken = match &event.delivery.inbound {
+            Inbound::Cancel => program::TAKES_CANCEL,
+            Inbound::Steer(_) => program::STEER_EVENT.is_some(),
+        };
+        if !taken {
+            return Err(corrupt(format!(
+                "turn {turn} records a {} event, which the program does not take",
+                event.delivery.inbound.name()
+            )));
+        }
+    }
+    let steers = steer_count(&log.events);
+    if let Some((name, bound)) = program::STEER_EVENT
+        && steers > bound
+    {
+        return Err(corrupt(format!(
+            "turn {turn} records {steers} steers, more than {name} ({bound})"
+        )));
+    }
+    Ok(())
 }
 
 pub trait ConcurrentTools: Sync {
@@ -375,6 +506,8 @@ pub struct Engine<'a> {
     attempts: u64,
     buffer: Vec<Record>,
     acknowledged: bool,
+    events: Vec<Recorded>,
+    taken: usize,
     admitted: BTreeMap<usize, BTreeMap<String, String>>,
 }
 
@@ -388,8 +521,94 @@ impl<'a> Engine<'a> {
             attempts: log.attempts,
             buffer: Vec::new(),
             acknowledged: false,
+            events: log.events.clone(),
+            taken: 0,
             admitted: BTreeMap::new(),
         }
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| event.delivery.inbound == Inbound::Cancel && event.at <= self.seq)
+    }
+
+    pub fn take_steers(&mut self) -> Vec<String> {
+        let visible: Vec<String> = self
+            .events
+            .iter()
+            .filter(|event| event.at <= self.seq)
+            .filter_map(|event| match &event.delivery.inbound {
+                Inbound::Steer(message) => Some(message.clone()),
+                Inbound::Cancel => None,
+            })
+            .collect();
+        assert!(self.taken <= visible.len(), "the steers a turn sees only grow");
+        let fresh = visible[self.taken..].to_vec();
+        self.taken = visible.len();
+        fresh
+    }
+
+    fn drain(&mut self) -> Result<(), Halt> {
+        if !events_taken() {
+            return Ok(());
+        }
+        let Mode::Live { world, .. } = &mut self.mode else {
+            return Ok(());
+        };
+        let arrived = world.inbox(self.turn);
+        if arrived.is_empty() {
+            return Ok(());
+        }
+        let position = self.seq;
+        let mut answers = Vec::with_capacity(arrived.len());
+        for delivery in arrived {
+            let answer = self.admit_event(position, &delivery);
+            answers.push((delivery.id, answer));
+        }
+        if answers.iter().any(|(_, answer)| *answer == EventAnswer::Recorded) {
+            self.flush()?;
+        }
+        if let Mode::Live { world, .. } = &mut self.mode {
+            world.answer(self.turn, position, &answers);
+        }
+        Ok(())
+    }
+
+    fn admit_event(&mut self, position: u64, delivery: &Delivery) -> EventAnswer {
+        if self.events.iter().any(|event| event.delivery.id == delivery.id) {
+            return EventAnswer::Duplicate;
+        }
+        match &delivery.inbound {
+            Inbound::Cancel if !program::TAKES_CANCEL => return EventAnswer::Undeclared,
+            Inbound::Cancel => {
+                if self.events.iter().any(|event| event.delivery.inbound == Inbound::Cancel) {
+                    return EventAnswer::Duplicate;
+                }
+            }
+            Inbound::Steer(_) => {
+                let Some((_, bound)) = program::STEER_EVENT else {
+                    return EventAnswer::Undeclared;
+                };
+                if steer_count(&self.events) >= bound {
+                    return EventAnswer::Full;
+                }
+            }
+        }
+        let Some(seq) = event_seq(self.turn, self.events.len() as u64 + 1) else {
+            return EventAnswer::Full;
+        };
+        self.append(Record::Event {
+            turn: self.turn,
+            seq,
+            at: position,
+            delivery: delivery.clone(),
+        });
+        self.events.push(Recorded {
+            at: position,
+            delivery: delivery.clone(),
+        });
+        EventAnswer::Recorded
     }
 
     pub fn append(&mut self, record: Record) {
@@ -444,6 +663,11 @@ impl<'a> Engine<'a> {
             if let Mode::Live { world, .. } = &mut self.mode {
                 world.acknowledge(&finish);
             }
+        }
+        if events_taken()
+            && let Mode::Live { world, .. } = &mut self.mode
+        {
+            close_inbox(&mut **world, self.turn, self.seq, &self.events);
         }
         Ok(finish)
     }
@@ -567,6 +791,7 @@ impl<'a> Engine<'a> {
                     context,
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
+                self.drain()?;
                 self.append(Record::Model {
                     turn,
                     seq,
@@ -602,6 +827,7 @@ impl<'a> Engine<'a> {
             },
         };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
+        self.drain()?;
         self.append(Record::Result {
             turn,
             seq,
@@ -730,6 +956,9 @@ impl<'a> Engine<'a> {
         };
         let mut completed = if requests.is_empty() { Vec::new() } else { world.tools(&requests, limit)? };
         assert_eq!(completed.len(), sent.len(), "a batch returns one output per request");
+        if matches!(self.sites.get(&self.seq), Some(SiteLog::Open(_))) {
+            self.drain()?;
+        }
         for (position, _) in &mut completed {
             *position = sent[*position];
         }
@@ -967,6 +1196,7 @@ pub fn replay(turn: u64, log: &TurnLog, state: program::State) -> Result<program
         )),
         program::ArgumentsError::Invalid(error) => corrupt(error),
     })?;
+    check_events(turn, log)?;
     let finished = log
         .finished
         .as_ref()
@@ -1037,6 +1267,9 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
     if let Some(log) = session.turns.get(&request.turn)
         && let Some(finished) = &log.finished
     {
+        if events_taken() {
+            close_inbox(world, request.turn, finished.last, &log.events);
+        }
         return Ok(Ran::AlreadyFinished(Finish {
             turn: request.turn,
             outcome: finished.outcome,
@@ -1054,6 +1287,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
                     request.turn
                 )));
             }
+            check_events(request.turn, log)?;
             let mut log = log.clone();
             unknown = recover(&mut log);
             log
@@ -1080,6 +1314,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
                 sites: BTreeMap::new(),
                 attempts: 0,
                 finished: None,
+                events: Vec::new(),
             }
         }
     };
