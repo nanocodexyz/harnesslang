@@ -339,3 +339,89 @@ Measurements (5-core Hand shared with two other agents, `nice`, `CHECK_JOBS=2`):
 - `scripts/check.sh` on the merge (96df1dc) ran 906 s before failing in diff-plants: the `enum_unchecked` plant's anchored `sed` no longer matched the line `spawn_output` had wrapped; the checked output keeps its own line now.
 
 Commands: `hl check examples/hooks.hl`, `hl check --target cloudflare docs/snippets/spawn.hl`, `hl sim --target T --seeds 0..200 [--mutation deny_dispatches|spawn_key_unscoped] docs/snippets/{hooks,spawn}.hl`, `hl sim --target native-jsonl --seeds 0..6 --strict examples/subagents.hl`, `RUST_DIFF_FILES=examples/subagents.hl scripts/rust-diff.sh`, `JS_DIFF_FILES=examples/hooks.hl scripts/js-diff.sh`, `scripts/mutations.sh --census`, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
+
+
+## 2026-11-14: spawn trees deeper than one level, and side questions answered from the last finished turn
+
+What this establishes (branch cc-tree, from master eae1320; side questions written on cc-tree-side and merged at c30aede):
+
+- **Spawn trees.** A spawned harness may declare spawn tools of its own. A spawn whose child spawns must say how many sessions one call starts, the child's and every descendant's: `spawn name runs handler from "file" sessions at most c` (`ast::Spawn.sessions`, `ir::Spawn.sessions`; `sessions` is a new contextual word). Without it the checker refuses the spawn and names the clause; with it, a tree past `c` is refused (`examples/invalid/family_sessions.hl`: 3 sessions per call over `two_sessions` (2)). This is caller policy, as AGENTS.md allows: nanocode has no total either (`DEFAULT_MAX_SUBAGENTS` is `usize::MAX`, `crates/runtime/subagents/src/lib.rs:41`).
+- **Cycles and depth.** `main.rs`'s loader keeps the chain of files it is checking, by canonical path, and refuses a file that is already on it ("the spawn tree returns to a harness it is inside", `docs/snippets/errors/spawn-cycle.hl`). It also refuses a chain deeper than `ir::SPAWN_DEPTH_MAX` = 16, as does the checker from a child's family depth. TigerStyle asks for an explicit bound on a walk over input. nanocode bounds no depth, since `durable.rs:2805` counts up to the agent count, but keeps `DEFAULT_MAX_RESIDENT_SUBAGENTS` = 16 resident per root session's tree (`lib.rs:45`, `runtime.rs:6392`). A chain deeper than 16 cannot be resident at once there.
+- **Worst case.** `worst::family_with` builds the family from the bottom up. Each spawn tool's `Spawn::tree` is its child's own family, its totals and `1 + sessions`, or the child alone. The handler's family is its own measures plus the spawns on its longest path times the widest tree, and its `sessions` and `depth` as well. `hl check` prints each child line with its tree's totals and "N sessions with its descendants (sessions at most ...)". A tree deeper than one level also gets "sessions in its tree: N, D levels below it". One-level output is unchanged byte for byte (every example's and snippet's `hl check` output against master's binary).
+- **Keys are scoped.** A session spawned under key `K` records its children as `K/T.S` (`ir::scoped_spawn_key`, `SPAWN_SCOPE_SEPARATOR` "/"). A root's scope is empty, so its keys stay `T.S` and no existing journal moves. The scope comes from the host:
+  - the interpreter's `World::scope` (default empty);
+  - generated Rust `World::scope`/`Host::scope`, forwarded by `JsonlWorld` and `SqlWorld`;
+  - the turn request's optional `scope` field in generated JavaScript. Cloudflare's `POST /turn` and Vercel's request text carry it; an absent field is a root.
+- **Prover.** `prove::children` now lowers every descendant's handler for the same target and recomputes the family from the plans. It takes records, outbound requests and sessions on each plan's longest path, times the spawns on the parent's plan. It asserts the result is at most what the IR counts. It checks each descendant's own outbound requests against the target's per-invocation limit and each spawn's tree against its `sessions at most`. A failure gives the path of spawns, such as `top.go > middle runs middle.work > heavy runs over_cloudflare.prompt (step below ...)`. Effects are not recomputed from plans: a cell's effects are not one op each. A tree deeper than one level gets a second proved line.
+- **Simulator.**
+  - A grandchild runs as a child does: `run_child` takes a `Placement` with target, mutation, seed, scope and the family's sessions left. Each level gets its seed derived from its parent's, its own faults and every invariant, and its violations propagate as "child session K: ...".
+  - `CHILD_SESSIONS_PER_SEED_MAX` (16) now bounds the whole tree per seed, as nanocode's resident limit is per root session. The parent subtracts what each child's subtree started (`SimWorld.family_left`, deterministic and clone-safe). `Child` records its turn, tool and subtree sessions.
+  - `children` counts every session of the tree. `child_crashes` counts each descendant crash once, where adding a grandchild's stats would otherwise have counted it twice. One-level programs' seeds and outputs are unchanged (subagents.hl, spawn.hl, hooks.hl and agent.hl, seeds 0..150, on all five targets, against master).
+- **Invariants and mutations** (38 invariants):
+  - `child_scoped` now requires `scope/T.S` at every level. `grandchild_unscoped`, a runtime that keys a child by `T.S` without its session's scope, is caught on all five targets.
+  - New `family_bounded`: the sessions a turn's tree starts stay within its handler's family worst case, and each spawn's subtree within its `sessions at most`. `family_one_level`, a worst case that counts only the direct children (`worst::Levels::One`), is caught on all five targets.
+- **hl sim --scope K** runs a harness as if spawned under `K`. The trace's seed event carries `scope`, the Rust and JavaScript differential drivers pass it on, and `RUST_DIFF_SCOPE`/`JS_DIFF_SCOPE` select it. `scripts/check.sh` runs `docs/snippets/tree_planner.hl` under `1.1` on every target. The differential plans take an optional scope field: `rust grandchild_unscoped` and `js grandchild_unscoped` (generated code that drops the scope) are caught by `backend_equal` on every Rust and JavaScript target.
+- **Side questions.** `on side name(params) -> T [requires c] { ... }` declares a side handler (`Program::sides`, kept apart from `handlers`, so nothing that admits turns, lowers plans or picks a sim handler sees one).
+  - The checker refuses, at the statement and through inlined fns: assignment, push, clear, keep, keep blobs and parallel for. It refuses idempotent, external, spawn and code tools, dispatch, listing reads, wait, suspend, join, now, random, `cancelled` and `take`.
+  - It inlines no hook, and requires is evaluated on the snapshot. An ended session answers no side question, like nanocode's `AgentStopped`.
+  - `hl check` prints "side handler NAME: worst case N effects, 0 journal records, M outbound requests". Cloudflare's per-invocation limit applies. finish_once and the arithmetic proofs cover sides; the durability plans do not.
+- **Side snapshot and journaling.** A side question runs over the state after the latest finished turn (`state_before(last + 1)`), the state a running or parked turn started from. It is a scratch run: a fresh engine over a copy of that state, its flushes discarded, its model and tool requests sent with turn 0, which no turn has. It appends nothing anywhere, writes no checkpoint, takes no lease and moves no sequence number. Side answers are not journaled, as nanocode persists none; a crash loses the question.
+- **Side paths per backend.**
+  - Interpreter: `run::side::answer` between runs and while parked. Mid-turn, `World::side` is polled before every fresh effect.
+  - Generated Rust: `JsonlJournal::side` and `sql_side`; the latter uses the new `sql_load`, LOAD without ACQUIRE.
+  - Cloudflare: `POST /side`, also routed as `/sessions/ID/side`. It is not serialized behind a running turn and reads only the object's rows, never the turn's memory.
+  - Vercel: `harness.side(lines, request, host)` and `harnessSide`, outside any step.
+- **Side simulation.** Only programs with sides draw, so no other seed moves. The draws are `SIDE_AT_EFFECT_PPM` = 100,000 before fresh effects and `SIDE_BETWEEN_TURNS_PPM` and `SIDE_PARKED_PPM` = 500,000, from rngs keyed "side*". New invariant `side_isolated` requires two things:
+  - the medium and the engine's buffered records are unchanged by each question;
+  - the answer equals an oracle `side::run` over the durable journal's finished turns before the asking turn, with the same requests (seq, mode, context) and replies.
+
+  `side_live_state` and `side_journaled` are caught on all five targets. The differential drivers carry side questions, and generated Rust and JavaScript answer as the interpreter does.
+- **Docs.** LANGUAGE.md has "Spawn trees" at the end of Spawn and join, with `docs/snippets/tree.hl` → `tree_planner.hl` → `spawn_child.hl`, three levels. It has a new "Side questions" section with `docs/snippets/side.hl`, using nanocode's `SIDE_QUESTION_REMINDER` verbatim through `with`. The grammar and Contextual words gain `sessions` and `side`. ARCHITECTURE.md drops both items from Next.
+
+Departures from nanocode and losses, kept:
+
+- **Sessions bound.** `sessions at most` is a bound nanocode does not have. nanocode only evicts past 16 resident subagents.
+- **Mid-turn snapshot.** Mid-turn, nanocode's side question sees the live transcript; harnesslang's sees the last finished turn. Mid-turn state rests on records that may not be durable, so a crash can roll it back. A Durable Object or a Workflow step cannot read another run's memory. The snapshot is the same on every target.
+- **Postgres takeover.** An owner whose lease was taken answers from the turn it started until its next flush is fenced.
+- **Vercel journal lines.** `harnessSide` needs the run's journal lines, which the host obtains itself.
+- **Mid-turn polling.** On Cloudflare and Vercel, mid-turn polling is a simulation hook only. Real hosts ask through `POST /side` or `harnessSide`.
+- **Cloudflare status rows.** A `POST /side` that interleaves with a finishing turn may read its uncommitted status row. The output gate holds the response until the commit, which rests on the existing output-gate fact.
+- **hl-agent and claude_code.hl.** hl-agent neither starts children nor asks side questions, and `examples/claude_code.hl` gains no side handler, since beat-baseline owns that file.
+- **Untested inputs.** Side handlers with non-text parameters, or calling a `finds` or blob tool, are not exercised by the simulator.
+
+Measurements (5-core Hand shared with several agents, `nice`, `CARGO_BUILD_JOBS=2`):
+
+- `hl sim --seeds 0..2000 docs/snippets/tree.hl` (about 1 to 2 s per target):
+
+  | Target | Runs | Crashes | Children | Joined | Child crashes | Other |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | native-jsonl | 35,618 | 16,997 | 6,702 | 5,505 | 9,253 | |
+  | native-sqlite | 31,721 | | 7,524 | 6,486 | 6,443 | |
+  | server-postgres | 31,683 | | 7,560 | 6,181 | 5,910 | 1,992 takeovers, 1,271 fenced |
+  | cloudflare | 32,543 | | 7,524 | 6,486 | 7,265 | |
+  | vercel | 38,097 | | 8,731 | 7,409 | 9,073 | |
+
+- `hl sim --seeds 0..2000 docs/snippets/side.hl` (6 to 9 s per target):
+
+  | Target | Runs | Crashes | Suspensions | Side questions | Other |
+  | --- | --- | --- | --- | --- | --- |
+  | native-jsonl | 30,318 | 15,450 | 9,836 | 9,258 | |
+  | native-sqlite | 24,790 | | | 9,084 | |
+  | server-postgres | 25,176 | | | 9,142 | 1,117 takeovers |
+  | cloudflare | 26,576 | | | 9,331 | |
+  | vercel | 25,890 | | | 9,136 | |
+
+  `--strict --seeds 0..300` passes on all five. Before the oracle replayed only the turns before the asking turn, the strict sweep found the Postgres takeover case (seed 23).
+- **First failing seeds** (seeds 0..200, `--twice`):
+  - `grandchild_unscoped`: seed 1 on every target.
+  - `family_one_level`: seed 0 or 1.
+  - `side_live_state`: seed 0, seed 5 on cloudflare.
+  - `side_journaled`: seed 0 everywhere.
+- **Prover.** `hl check docs/snippets/tree.hl` proves on all five targets with 0 prover steps (no arithmetic): 3 sessions, 8 effects, 28 journal records and 5 outbound requests in the tree. `docs/snippets/side.hl`: the side handler takes 6 prover steps and the prompt handler 4,526. Every other example's `hl check` output is unchanged.
+- **Differential runs.**
+  - `tree.hl` and `spawn.hl`: Rust seeds 0..200 and JavaScript seeds 0..100.
+  - `tree_planner.hl` under `--scope 1.1`: Rust 0..200 (server-postgres 16,280 events, 538 resumes) and JavaScript 0..100 (vercel 2,348 steps).
+  - `side.hl`: Rust 0..200 (server-postgres 947 side questions, as many as the interpreter) and JavaScript 0..100 (cloudflare 465, vercel 449, equal to the simulator's).
+- **check.sh.** A first `CHECK_JOBS=2 nice scripts/check.sh` on 07e89f9, the spawn trees before the merge, passed every stage it reached, through the mutations, js-mutations and prove stages. A runtime restart then killed it (exit 143).
+
+Commands: `hl check --target T docs/snippets/tree.hl`, `hl check examples/invalid/family_sessions.hl`, `hl check docs/snippets/errors/spawn-{sessions,cycle}.hl`, `hl sim --target T --seeds 0..2000 docs/snippets/{tree,side}.hl`, `hl sim --target T --seeds 0..200 --scope 1.1 docs/snippets/tree_planner.hl`, `MUTATIONS='grandchild_unscoped family_one_level side_live_state side_journaled' scripts/mutations.sh`, `scripts/mutations.sh --diff {rust,js}:grandchild_unscoped:T`, `RUST_DIFF_FILES=docs/snippets/tree_planner.hl RUST_DIFF_SCOPE=1.1 scripts/rust-diff.sh`, `JS_DIFF_FILES=docs/snippets/side.hl scripts/js-diff.sh`, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
