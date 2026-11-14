@@ -733,11 +733,19 @@ fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> 
         else {
             continue;
         };
-        let answered = world
+        let answered: Vec<&Option<String>> = world
             .model_modes
             .get(&(*turn, *seq))
-            .and_then(|sent| sent.iter().rev().find(|(_, reply)| reply == response));
-        let Some((sent, _)) = answered else {
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter(|(_, reply)| reply == response)
+            .map(|(sent, _)| sent)
+            .collect();
+        let Some(sent) = answered
+            .iter()
+            .find(|sent| **sent == mode)
+            .or(answered.last())
+        else {
             return violation(
                 Invariant::ModeSent,
                 format!(
@@ -746,7 +754,7 @@ fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> 
                 ),
             );
         };
-        if sent != mode {
+        if *sent != mode {
             return violation(
                 Invariant::ModeSent,
                 format!(
