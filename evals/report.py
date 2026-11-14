@@ -147,6 +147,9 @@ def main():
     print("\n".join(per_task(rows, agents)))
     print()
     print("\n".join(paired(rows, agents)))
+    for agent in agents:
+        dropped = [row["id"] for row in rows if row["agent"] == agent and (row.get("meter") or {}).get("statuses", {}).get("0")]
+        print("%s rows with a request the upstream connection dropped: %d %s" % (agent, len(dropped), " ".join(dropped)))
     errors = [row for row in rows if row["outcome"] == "errored"]
     for row in errors:
         print("errored: " + row["id"] + ": " + str(row.get("note")))
