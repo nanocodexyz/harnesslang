@@ -521,6 +521,14 @@ impl<'a> Engine<'a> {
             }
             return self.dispatch(site_id, seq, &call, args, true);
         }
+        assert!(
+            !call.effect.may_be_unknown()
+                || matches!(
+                    self.mutation,
+                    Mutation::RecoveryRedispatchesExternal | Mutation::RecoveryReportsFailed
+                ),
+            "recovery turns every open external call unknown before the turn runs again"
+        );
         if self.mutation == Mutation::RerunRewritesCall && !call.effect.may_be_unknown() {
             self.append(Record::Call {
                 turn: self.turn,
