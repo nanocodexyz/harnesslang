@@ -7,8 +7,10 @@ use crate::run::journal::{self, Output, Record};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::turn::{Ran, TurnRequest, run_turn};
+use crate::run::value;
 use crate::sim::faults::{PowerLoss, Profile, SECTOR_PERSISTED_PPM};
 use crate::sim::rng::Rng;
+use crate::sim::trace::{self, Trace};
 use crate::target::medium::Medium;
 use crate::target::{self, Target};
 
@@ -56,6 +58,7 @@ pub struct SimWorld<'a> {
     pub ack_faults: Vec<String>,
     pub owner_faults: Vec<String>,
     pub stats: Stats,
+    pub trace: Option<Trace>,
     rng: Rng,
     faults_left: u64,
     armed: bool,
@@ -87,6 +90,7 @@ impl<'a> SimWorld<'a> {
             ack_faults: Vec::new(),
             owner_faults: Vec::new(),
             stats: Stats::default(),
+            trace: None,
             rng: Rng::derive(seed, "faults"),
             faults_left: 0,
             armed: faults,
@@ -98,7 +102,37 @@ impl<'a> SimWorld<'a> {
         }
     }
 
+    pub fn record(&mut self, name: &str, fields: impl FnOnce() -> Vec<(&'static str, Json)>) {
+        if let Some(trace) = &mut self.trace {
+            trace.event(name, fields());
+        }
+    }
+
+    fn opened(&mut self, name: &str, epoch: u64, bytes: Option<Vec<u8>>) {
+        if let (Some(trace), Some(bytes)) = (&mut self.trace, bytes) {
+            trace.opened(name, epoch, &bytes);
+        }
+    }
+
+    fn traced_bytes(&self) -> Option<Vec<u8>> {
+        self.trace.as_ref().map(|_| self.medium.bytes())
+    }
+
     pub fn begin_turn(&mut self, request: &TurnRequest, faults: bool) {
+        let program = self.program;
+        self.record("turn", || {
+            let handler = program
+                .handler(&request.handler)
+                .expect("a turn request names a handler of the program");
+            vec![
+                ("turn", Json::Number(request.turn)),
+                ("handler", Json::text(&request.handler)),
+                (
+                    "arguments",
+                    crate::run::turn::arguments_json(program, handler, &request.arguments),
+                ),
+            ]
+        });
         self.current = Some(request.clone());
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
         self.armed = faults;
@@ -111,12 +145,20 @@ impl<'a> SimWorld<'a> {
         if self.faults_left == 0 {
             self.armed = false;
         }
-        let records = self.medium.open()?;
+        let bytes = self.traced_bytes();
+        let records = match self.medium.open() {
+            Ok(records) => records,
+            Err(error) => {
+                self.opened("run", 0, bytes);
+                return Err(error);
+            }
+        };
         let epoch = match &mut self.medium {
             Medium::Rows(rows) if self.target.target == Target::ServerPostgres => rows.take_over(),
             Medium::Rows(rows) => rows.epoch,
             Medium::Jsonl(_) => 0,
         };
+        self.opened("run", epoch, bytes);
         Ok((records, epoch))
     }
 
@@ -171,6 +213,8 @@ impl<'a> SimWorld<'a> {
             panic!("only the postgres target has leases");
         };
         let epoch = rows.take_over();
+        let bytes = self.traced_bytes();
+        self.opened("owner", epoch, bytes);
         let records = match self.medium.open() {
             Ok(records) => records,
             Err(error) => {
@@ -182,6 +226,9 @@ impl<'a> SimWorld<'a> {
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
+        if let Some(trace) = &mut self.trace {
+            trace.exit(&ran);
+        }
         match ran {
             Ok(Ran::Finished(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => self.acknowledge(&finish),
@@ -215,22 +262,135 @@ impl<'a> SimWorld<'a> {
 }
 
 impl World for SimWorld<'_> {
-    fn hook(&mut self, _point: Point) -> Result<(), Stop> {
+    fn hook(&mut self, point: Point) -> Result<(), Stop> {
+        let record = |answer: Json| {
+            move || {
+                let mut fields = trace::point_fields(point);
+                fields.push(("answer", answer));
+                fields
+            }
+        };
         if self.nested {
+            self.record("hook", record(Json::text("ok")));
             return Ok(());
         }
         let lease = self.target.target == Target::ServerPostgres && !self.lease_spent;
         if lease && self.armed && self.rng.chance(self.profile.lease_ppm) {
+            self.record("hook", record(Json::text("owner")));
             self.second_owner();
             return Ok(());
         }
-        if self.fault(self.profile.crash_ppm) {
-            return Err(self.crash());
-        }
-        Ok(())
+        let result = if self.fault(self.profile.crash_ppm) {
+            Err(self.crash())
+        } else {
+            Ok(())
+        };
+        self.record("hook", record(trace::answer(&result)));
+        result
     }
 
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
+        let result = self.flush_medium(epoch, records);
+        let checksum = match &self.medium {
+            Medium::Jsonl(file) => file.checksum,
+            Medium::Rows(_) => false,
+        };
+        self.record("flush", || {
+            let bytes = journal::encode_lines(records, checksum);
+            vec![
+                ("epoch", Json::Number(epoch)),
+                (
+                    "bytes",
+                    Json::String(String::from_utf8(bytes).expect("encoded lines are utf-8")),
+                ),
+                ("answer", trace::answer(&result)),
+            ]
+        });
+        result
+    }
+
+    fn attempt(&mut self, turn: u64, seq: u64) -> Result<u64, Stop> {
+        let attempt = self.count_attempt(turn, seq)?;
+        self.record("attempt", || {
+            vec![
+                ("turn", Json::Number(turn)),
+                ("seq", Json::Number(seq)),
+                ("answer", Json::Number(attempt)),
+            ]
+        });
+        Ok(attempt)
+    }
+
+    fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        let output = self.tool_output(request);
+        self.record("tool", || {
+            vec![
+                ("turn", Json::Number(request.turn)),
+                ("seq", Json::Number(request.seq)),
+                ("tool", Json::text(request.tool)),
+                ("effect", Json::text(request.effect.name())),
+                ("input", request.input.clone()),
+                ("output", journal::output_json(&output)),
+            ]
+        });
+        output
+    }
+
+    fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        let response = self.reply(request);
+        let program = self.program;
+        self.record("model", || {
+            let context = Json::Array(
+                request
+                    .context
+                    .as_list()
+                    .iter()
+                    .map(|entry| value::to_json(program, &Type::Sum(ir::ENTRY), entry))
+                    .collect(),
+            );
+            vec![
+                ("turn", Json::Number(request.turn)),
+                ("seq", Json::Number(request.seq)),
+                ("calls_max", Json::Number(request.calls_max)),
+                (
+                    "context_crc",
+                    Json::Number(u64::from(crate::run::crc::crc32(
+                        context.encode().as_bytes(),
+                    ))),
+                ),
+                ("response", response.clone()),
+            ]
+        });
+        response
+    }
+
+    fn now(&mut self) -> u64 {
+        self.clock += self.rng.range(1, CLOCK_STEP_MAX);
+        let clock = self.clock;
+        self.record("now", || vec![("answer", Json::Number(clock))]);
+        clock
+    }
+
+    fn random(&mut self) -> u64 {
+        let random = self.rng.draw();
+        self.record("random", || vec![("answer", Json::Number(random))]);
+        random
+    }
+
+    fn acknowledge(&mut self, finish: &Finish) {
+        self.record("ack", || {
+            vec![
+                ("turn", Json::Number(finish.turn)),
+                ("outcome", Json::text(finish.outcome.name())),
+                ("result", finish.result.clone()),
+            ]
+        });
+        self.check_acknowledge(finish);
+    }
+}
+
+impl SimWorld<'_> {
+    fn flush_medium(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
         let fence = self.mutation != Mutation::PostgresNoFence
             && self.target.target == Target::ServerPostgres;
         if let Medium::Rows(rows) = &mut self.medium {
@@ -261,14 +421,14 @@ impl World for SimWorld<'_> {
         Ok(())
     }
 
-    fn attempt(&mut self, turn: u64, seq: u64) -> Result<u64, Stop> {
+    fn count_attempt(&mut self, turn: u64, seq: u64) -> Result<u64, Stop> {
         match &mut self.medium {
             Medium::Rows(rows) => Ok(rows.attempt(turn, seq)),
             Medium::Jsonl(_) => panic!("only step targets count attempts"),
         }
     }
 
-    fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+    fn tool_output(&mut self, request: &ToolRequest<'_>) -> Output {
         let call = journal::call_id(request.turn, request.seq);
         let entry = self.dispatched.entry(call).or_default();
         entry.tool = request.tool.to_owned();
@@ -299,7 +459,7 @@ impl World for SimWorld<'_> {
         output
     }
 
-    fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+    fn reply(&mut self, request: &ModelRequest<'_>) -> Json {
         let count = self
             .model_calls
             .entry((request.turn, request.seq))
@@ -342,16 +502,7 @@ impl World for SimWorld<'_> {
         Json::object([("calls", Json::Array(calls))])
     }
 
-    fn now(&mut self) -> u64 {
-        self.clock += self.rng.range(1, CLOCK_STEP_MAX);
-        self.clock
-    }
-
-    fn random(&mut self) -> u64 {
-        self.rng.draw()
-    }
-
-    fn acknowledge(&mut self, finish: &Finish) {
+    fn check_acknowledge(&mut self, finish: &Finish) {
         let durable = self.durable_status(finish.turn);
         let agrees = matches!(&durable, Some(Record::Status { outcome, result, .. }) if *outcome == finish.outcome && *result == finish.result);
         if !agrees {

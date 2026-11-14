@@ -110,7 +110,7 @@ fn turn_text(turn: u64) -> Json {
     Json::String(turn.to_string())
 }
 
-fn output_json(output: &Output) -> Json {
+pub fn output_json(output: &Output) -> Json {
     match output {
         Output::Ok(value) => Json::object([("ok", value.clone())]),
         Output::Failed(error) => Json::object([("failed", Json::text(error))]),

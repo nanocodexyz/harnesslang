@@ -1,6 +1,7 @@
 pub mod faults;
 pub mod invariants;
 pub mod rng;
+pub mod trace;
 pub mod world;
 
 use std::ops::Range;
@@ -8,6 +9,7 @@ use std::ops::Range;
 use crate::ir::{Program, Type};
 use crate::run::engine::{Exit, Finish};
 use crate::run::journal::Record;
+use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::turn::{Ran, TurnRequest, run_turn};
 use crate::run::value::Value;
@@ -100,7 +102,11 @@ fn drive_turn(
         })?;
         let model = world.target;
         let mutation = world.mutation;
-        match run_turn(program, &model, mutation, world, epoch, &records, request) {
+        let ran = run_turn(program, &model, mutation, world, epoch, &records, request);
+        if let Some(trace) = &mut world.trace {
+            trace.exit(&ran);
+        }
+        match ran {
             Ok(Ran::Finished(_)) => return Ok(()),
             Ok(Ran::AlreadyFinished(finish)) => {
                 crate::run::World::acknowledge(world, &finish);
@@ -119,9 +125,29 @@ fn drive_turn(
 }
 
 pub fn run_seed(program: &Program, target: Target, mutation: Mutation, seed: u64) -> SeedRun {
+    run_seed_traced(program, target, mutation, seed, None).0
+}
+
+pub fn run_seed_traced(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    seed: u64,
+    trace: Option<trace::Trace>,
+) -> (SeedRun, Option<trace::Trace>) {
     let mut workload = Rng::derive(seed, "workload");
     let turns = workload.range(1, TURNS_PER_SESSION_MAX);
     let mut world = SimWorld::new(program, target, mutation, seed, true);
+    world.trace = trace;
+    let profile_name = world.profile.name;
+    world.record("seed", || {
+        vec![
+            ("seed", Json::Number(seed)),
+            ("target", Json::text(target.name())),
+            ("mutation", Json::text(mutation.name())),
+            ("profile", Json::text(profile_name)),
+        ]
+    });
     let faulty = world.profile.crash_ppm > 0 || world.profile.lease_ppm > 0;
     let profile = world.profile.name;
     let mut result = Ok(());
@@ -158,13 +184,31 @@ pub fn run_seed(program: &Program, target: Target, mutation: Mutation, seed: u64
     }
     let mut stats = world.stats.clone();
     stats.unknown = records.map_or(0, |records| unknown_count(&records));
-    SeedRun {
-        journal: world.medium.bytes(),
+    let journal = world.medium.bytes();
+    let acks = world.acks.len() as u64;
+    let outcome = match &result {
+        Ok(()) => "ok",
+        Err(violation) => violation.invariant.name(),
+    };
+    world.record("end", || {
+        vec![
+            ("journal_bytes", Json::Number(journal.len() as u64)),
+            (
+                "journal_crc",
+                Json::Number(u64::from(crate::run::crc::crc32(&journal))),
+            ),
+            ("acks", Json::Number(acks)),
+            ("result", Json::text(outcome)),
+        ]
+    });
+    let run = SeedRun {
+        journal,
         acks: world.acks.clone(),
         stats,
         profile,
         result,
-    }
+    };
+    (run, world.trace.take())
 }
 
 fn unknown_count(records: &[Record]) -> u64 {
@@ -204,9 +248,25 @@ fn add(total: &mut Stats, more: &Stats) {
 }
 
 pub fn sweep(program: &Program, options: &Options) -> Summary {
+    sweep_traced(program, options, None).expect("a sweep without a trace writes nothing")
+}
+
+pub fn sweep_traced(
+    program: &Program,
+    options: &Options,
+    mut sink: Option<&mut dyn std::io::Write>,
+) -> Result<Summary, String> {
     let mut summary = Summary::default();
     for seed in options.seeds.clone() {
-        let first = run_seed(program, options.target, options.mutation, seed);
+        let trace = sink.as_ref().map(|_| trace::Trace::default());
+        let (first, trace) =
+            run_seed_traced(program, options.target, options.mutation, seed, trace);
+        if let (Some(sink), Some(trace)) = (sink.as_mut(), trace) {
+            for line in &trace.lines {
+                writeln!(sink, "{line}")
+                    .map_err(|error| format!("trace: cannot write: {error}"))?;
+            }
+        }
         summary.seeds += 1;
         add(&mut summary.stats, &first.stats);
         let mut result = first.result.clone();
@@ -235,10 +295,10 @@ pub fn sweep(program: &Program, options: &Options) -> Summary {
                 profile: first.profile,
                 violation,
             });
-            return summary;
+            return Ok(summary);
         }
     }
-    summary
+    Ok(summary)
 }
 
 pub fn report(summary: &Summary, options: &Options, file: &str) -> String {

@@ -15,7 +15,7 @@ const FAILURE_EXIT: u8 = 1;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] FILE\n       hl emit --target {targets} FILE",
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--mutation {mutations}] [--trace PATH] FILE\n       hl emit --target {targets} FILE",
         targets = Target::names(),
         mutations = Mutation::names()
     );
@@ -63,6 +63,7 @@ struct Flags {
     handler: Option<String>,
     arguments: Vec<String>,
     seed: u64,
+    trace: Option<String>,
 }
 
 fn flags(args: &[String]) -> Option<Flags> {
@@ -75,6 +76,7 @@ fn flags(args: &[String]) -> Option<Flags> {
         handler: None,
         arguments: Vec::new(),
         seed: 0,
+        trace: None,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -86,6 +88,7 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--handler" => flags.handler = Some(rest.next()?.clone()),
             "--arg" => flags.arguments.push(rest.next()?.clone()),
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
+            "--trace" => flags.trace = Some(rest.next()?.clone()),
             file if !file.starts_with("--") && flags.file.is_none() => {
                 flags.file = Some(file.to_owned())
             }
@@ -280,13 +283,30 @@ fn sim_command(args: &[String]) -> ExitCode {
         twice: flags.twice,
         mutation: flags.mutation,
     };
-    let summary = sim::sweep(&program, &options);
+    let summary = match &flags.trace {
+        None => sim::sweep(&program, &options),
+        Some(path) => match traced_sweep(&program, &options, path) {
+            Ok(summary) => summary,
+            Err(error) => {
+                eprintln!("{path}: error: {error}");
+                return ExitCode::from(FAILURE_EXIT);
+            }
+        },
+    };
     println!("{}", sim::report(&summary, &options, &file));
     if summary.failure.is_some() {
         ExitCode::from(FAILURE_EXIT)
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn traced_sweep(program: &Program, options: &Options, path: &str) -> Result<sim::Summary, String> {
+    let file = std::fs::File::create(path).map_err(|error| format!("cannot create: {error}"))?;
+    let mut sink = std::io::BufWriter::new(file);
+    let summary = sim::sweep_traced(program, options, Some(&mut sink))?;
+    std::io::Write::flush(&mut sink).map_err(|error| format!("cannot write: {error}"))?;
+    Ok(summary)
 }
 
 fn emit_command(args: &[String]) -> ExitCode {
