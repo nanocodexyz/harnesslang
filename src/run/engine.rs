@@ -447,7 +447,7 @@ impl<'a> Engine<'a> {
             });
             self.sites
                 .insert(suspension.seq, SiteLog::Done(call, output));
-            self.write().map_err(halt_exit)?;
+            self.flush().map_err(halt_exit)?;
             assert!(
                 self.buffer.is_empty(),
                 "a resume's result is durable before it is answered"
@@ -1304,6 +1304,10 @@ impl<'a> Engine<'a> {
             Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 self.require_live(seq)?;
+                if let Some(answer) = self.take_resume(seq, &recorded)? {
+                    let site = &self.handler.sites[site_id];
+                    return self.decode(site, &answer);
+                }
                 self.suspend(seq, &recorded)
             }
             Some(SiteLog::Reply(_)) => Err(self.diverged(seq, "a model reply", &call.tool)),
@@ -1312,6 +1316,27 @@ impl<'a> Engine<'a> {
                 self.suspend_fresh(seq, call)
             }
         }
+    }
+
+    fn take_resume(&mut self, seq: u64, call: &Call) -> Result<Option<Output>, Halt> {
+        let key = call
+            .input
+            .get(SUSPEND_KEY)
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let suspension = Suspension {
+            turn: self.turn,
+            seq,
+            key,
+        };
+        let Some(resume) = self.world().resume(&suspension) else {
+            return Ok(None);
+        };
+        if !self.resume(&suspension, &resume).map_err(Halt::Exit)? {
+            return Ok(None);
+        }
+        Ok(Some(Output::Ok(Json::String(resume.answer))))
     }
 
     fn suspend_fresh(&mut self, seq: u64, call: Call) -> Result<Value, Halt> {
@@ -1542,13 +1567,6 @@ impl<'a> Engine<'a> {
         match &mut self.mode {
             Mode::Live { world, .. } => &mut **world,
             Mode::Replay => unreachable!("cells, waits and resumes run only live"),
-        }
-    }
-
-    pub fn live_world(&mut self) -> Option<&mut dyn World> {
-        match &mut self.mode {
-            Mode::Live { world, .. } => Some(&mut **world),
-            Mode::Replay => None,
         }
     }
 

@@ -143,7 +143,7 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Cell(_) => "null".to_owned(),
     };
     let ms = match site.kind {
-        SiteKind::Wait(constant) => program.constants[constant].value.to_string(),
+        SiteKind::Wait(constant) => format!("{}n", program.constants[constant].value),
         _ => "null".to_owned(),
     };
     let code = match site.kind {

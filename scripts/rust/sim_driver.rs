@@ -6,7 +6,7 @@ mod store;
 use std::io::BufRead;
 
 use harness::program;
-use harness::{CellEvent, CellPoint, Delivery, EventAnswer, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Step, Stop, ToolRequest, TurnRequest, Wait, World};
+use harness::{CellEvent, CellPoint, Delivery, EventAnswer, Exit, Finish, Input, Json, ModelRequest, Output, Point, Ran, Record, Resume, Step, Stop, Suspension, ToolRequest, TurnRequest, Wait, World};
 
 pub struct Events {
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
@@ -92,6 +92,8 @@ pub struct Stats {
     pub steps: u64,
     pub nested: u64,
     pub waits: u64,
+    pub sleeps: u64,
+    pub resumes: u64,
 }
 
 pub struct Driver {
@@ -131,6 +133,7 @@ impl Driver {
         let result = match &ran {
             Ok(Ran::Finished(_)) => "finished",
             Ok(Ran::AlreadyFinished(_)) => "already_finished",
+            Ok(Ran::Suspended(_)) => "suspended",
             Err(Exit::Stop(Stop::Crash)) => "crash",
             Err(Exit::Stop(Stop::Fenced)) => "fenced",
             Err(Exit::Corrupt(_)) => "corrupt",
@@ -400,6 +403,41 @@ impl World for Driver {
             .collect()
     }
 
+    fn clock(&mut self) -> u64 {
+        number(&self.events.next("clock"), "answer")
+    }
+
+    fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        let event = self.events.next("sleep");
+        expect(&event, "turn", &Json::Number(turn));
+        expect(&event, "seq", &Json::Number(seq));
+        expect(&event, "until", &Json::Number(until_ms));
+        self.stats.sleeps += 1;
+        match text(&event, "answer") {
+            "ok" => Ok(number(&event, "clock")),
+            "crash" => Err(Stop::Crash),
+            other => fail(&format!("unknown sleep answer {other}")),
+        }
+    }
+
+    fn resume(&mut self, suspension: &Suspension) -> Option<Resume> {
+        if self.events.peek().and_then(|event| event.get("event")).and_then(Json::as_str) != Some("resume") {
+            return None;
+        }
+        let event = self.events.next("resume");
+        expect(&event, "turn", &Json::Number(suspension.turn));
+        expect(&event, "seq", &Json::Number(suspension.seq));
+        Some(Resume { key: text(&event, "key").to_owned(), answer: text(&event, "answer").to_owned() })
+    }
+
+    fn resumed(&mut self, suspension: &Suspension, _resume: &Resume, matched: bool) {
+        let event = self.events.next("resumed");
+        expect(&event, "turn", &Json::Number(suspension.turn));
+        expect(&event, "seq", &Json::Number(suspension.seq));
+        expect(&event, "matched", &Json::Bool(matched));
+        self.stats.resumes += 1;
+    }
+
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]) {
         let event = self.events.next("answer");
         expect(&event, "turn", &Json::Number(turn));
@@ -446,7 +484,7 @@ fn main() {
     }
     let stats = &driver.stats;
     println!(
-        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={}",
+        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={} hooks={} cells={} cell_steps={} nested_calls={} waits={} sleeps={} resumes={}",
         program::TARGET,
         program::HARNESS_NAME,
         stats.seeds,
@@ -463,6 +501,8 @@ fn main() {
         stats.cells,
         stats.steps,
         stats.nested,
-        stats.waits
+        stats.waits,
+        stats.sleeps,
+        stats.resumes
     );
 }

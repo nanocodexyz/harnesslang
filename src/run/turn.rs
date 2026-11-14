@@ -364,39 +364,8 @@ pub fn run_turn(
             output: Output::Failed(error),
         });
     }
-    if let Some(suspension) = suspended(program, request.turn, &log) {
-        let arrived = engine
-            .live_world()
-            .and_then(|world| world.resume(&suspension));
-        if let Some(resume) = arrived {
-            engine.resume(&suspension, &resume)?;
-        }
-    }
     engine.run(&request.arguments).map(|ran| match ran.end {
         End::Finished(finish) => Ran::Finished(finish),
         End::Suspended(suspension) => Ran::Suspended(suspension),
-    })
-}
-
-pub fn suspended(program: &Program, turn: u64, log: &TurnLog) -> Option<Suspension> {
-    if !program.events.resume || log.finished.is_some() {
-        return None;
-    }
-    let (seq, site) = log.sites.last_key_value()?;
-    let (SiteLog::Open(call) | SiteLog::Unknown(call)) = site else {
-        return None;
-    };
-    if call.tool != crate::ir::SUSPEND_TOOL {
-        return None;
-    }
-    let key = call
-        .input
-        .get(crate::run::engine::SUSPEND_KEY)
-        .and_then(Json::as_str)?
-        .to_owned();
-    Some(Suspension {
-        turn,
-        seq: *seq,
-        key,
     })
 }

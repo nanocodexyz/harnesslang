@@ -101,37 +101,30 @@ impl SimWorld<'_> {
     }
 
     pub fn deliver_resume(&mut self, suspension: &Suspension) -> Option<Resume> {
-        if self.nested {
-            return None;
-        }
         let resume = match &self.parking.pending {
-            Some((waiting, resume)) if waiting == suspension => Some(resume.clone()),
+            Some((waiting, resume)) if waiting == suspension && !self.nested => {
+                Some(resume.clone())
+            }
             _ => None,
         };
-        if let Some(resume) = &resume {
-            self.parking.sent.push((
-                suspension.turn,
-                suspension.seq,
-                resume.key.clone(),
-                resume.answer.clone(),
-            ));
-        }
+        let Some(resume) = resume else {
+            return None;
+        };
+        self.parking.sent.push((
+            suspension.turn,
+            suspension.seq,
+            resume.key.clone(),
+            resume.answer.clone(),
+        ));
         self.record("resume", || {
             vec![
                 ("turn", Json::Number(suspension.turn)),
                 ("seq", Json::Number(suspension.seq)),
-                (
-                    "resume",
-                    resume.as_ref().map_or(Json::Null, |resume| {
-                        Json::object([
-                            ("key", Json::text(&resume.key)),
-                            ("answer", Json::text(&resume.answer)),
-                        ])
-                    }),
-                ),
+                ("key", Json::text(&resume.key)),
+                ("answer", Json::text(&resume.answer)),
             ]
         });
-        resume
+        Some(resume)
     }
 
     pub fn answer_resume(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {

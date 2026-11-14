@@ -309,6 +309,22 @@ impl<H: Host> World for SqlWorld<'_, H> {
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, EventAnswer)]) {
         self.host.answer(turn, position, answers)
     }
+
+    fn clock(&mut self) -> u64 {
+        self.host.clock()
+    }
+
+    fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        self.host.sleep(turn, seq, until_ms)
+    }
+
+    fn resume(&mut self, suspension: &Suspension) -> Option<Resume> {
+        self.host.resume(suspension)
+    }
+
+    fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {
+        self.host.resumed(suspension, resume, matched)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
