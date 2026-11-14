@@ -158,7 +158,7 @@ impl Workspace {
         }
     }
 
-fn receipt(&self, turn: u64, seq: u64, suffix: &str) -> PathBuf {
+    fn receipt(&self, turn: u64, seq: u64, suffix: &str) -> PathBuf {
         self.state
             .join(RECEIPTS)
             .join(format!("{turn}.{seq}.{suffix}"))
@@ -215,7 +215,9 @@ fn receipt(&self, turn: u64, seq: u64, suffix: &str) -> PathBuf {
     }
 
     fn recover_write(&self, input: &Value) -> Recovered {
-        let (Ok(content), Ok(file_path)) = (text_field(input, "content"), text_field(input, "file_path")) else {
+        let (Ok(content), Ok(file_path)) =
+            (text_field(input, "content"), text_field(input, "file_path"))
+        else {
             return Recovered::Unknown;
         };
         let Ok(path) = self.resolve(file_path) else {
@@ -392,7 +394,9 @@ fn receipt(&self, turn: u64, seq: u64, suffix: &str) -> PathBuf {
     pub fn bash_job(&self, input: &Value, room: bool) -> Bashed {
         match self.bash(input, room) {
             Ok(bashed) => bashed,
-            Err(error) => Bashed::Ran(Ran::Failed(format!("<tool_use_error>{error}</tool_use_error>"))),
+            Err(error) => Bashed::Ran(Ran::Failed(format!(
+                "<tool_use_error>{error}</tool_use_error>"
+            ))),
         }
     }
 
@@ -540,7 +544,8 @@ pub fn settled(started: Started, status: std::process::ExitStatus, timed_out: bo
         (true, _) => TIMED_OUT_STATUS,
         (false, Some(code)) => code,
         (false, None) => {
-            SHELL_SIGNAL_STATUS + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
+            SHELL_SIGNAL_STATUS
+                + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
         }
     };
     Shell {

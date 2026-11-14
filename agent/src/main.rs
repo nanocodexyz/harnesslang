@@ -216,7 +216,9 @@ impl Agent {
     ) -> tools::Ran {
         let receipted = tool == "Bash" && self.children.is_some();
         if receipted && let Err(error) = self.workspace.dispatching(turn, seq) {
-            return tools::Ran::Failed(format!("<tool_use_error>receipt: {error}</tool_use_error>"));
+            return tools::Ran::Failed(format!(
+                "<tool_use_error>receipt: {error}</tool_use_error>"
+            ));
         }
         self.ledger.append(Value::object([
             ("kind", Value::text("tool")),
@@ -258,7 +260,10 @@ impl Agent {
                     .is_some_and(|value| matches!(value, Value::Bool(true)));
                 let command = input.get("command").and_then(Value::as_str).unwrap_or("");
                 self.jobs.start(&key, started, command, held);
-                eprintln!("{}: {turn}/{seq} Bash became background job {key}", self.label);
+                eprintln!(
+                    "{}: {turn}/{seq} Bash became background job {key}",
+                    self.label
+                );
                 tools::Ran::Job(jobs::started_text(&key, &message, held))
             }
         }
@@ -349,7 +354,8 @@ macro_rules! host_for {
             fn tool(&mut self, request: &$module::ToolRequest<'_>) -> $module::Output {
                 let input =
                     Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
-                let ran = self.run_tool(request.turn, request.seq, request.tool, &input, request.job);
+                let ran =
+                    self.run_tool(request.turn, request.seq, request.tool, &input, request.job);
                 output_of!($module, ran)
             }
 
@@ -374,7 +380,10 @@ macro_rules! host_for {
                     ("kind", Value::text("recover")),
                     ("at_ms", Value::number(now_ms())),
                     ("tool", Value::text(request.tool)),
-                    ("call", Value::text(&harness::call_id(request.turn, request.seq))),
+                    (
+                        "call",
+                        Value::text(&harness::call_id(request.turn, request.seq)),
+                    ),
                     (
                         "answer",
                         Value::text(match &recovered {
@@ -385,7 +394,9 @@ macro_rules! host_for {
                     ),
                 ]));
                 match recovered {
-                    tools::Recovered::Reply(ran) => $module::Recovered::Reply(output_of!($module, ran)),
+                    tools::Recovered::Reply(ran) => {
+                        $module::Recovered::Reply(output_of!($module, ran))
+                    }
                     tools::Recovered::NotDispatched => $module::Recovered::NotDispatched,
                     tools::Recovered::Unknown => $module::Recovered::Unknown,
                 }
@@ -425,7 +436,12 @@ macro_rules! host_for {
                     .collect()
             }
 
-            fn answer(&mut self, _turn: u64, _position: u64, answers: &[(String, $module::EventAnswer)]) {
+            fn answer(
+                &mut self,
+                _turn: u64,
+                _position: u64,
+                answers: &[(String, $module::EventAnswer)],
+            ) {
                 for (id, answer) in answers {
                     let delivered = matches!(
                         answer,
@@ -434,7 +450,6 @@ macro_rules! host_for {
                     self.jobs.answered(id, delivered);
                 }
             }
-
 
             fn listing(&mut self, _request: &$module::ListingRequest<'_>) -> $module::Output {
                 $module::Output::Ok($module::Json::Object(std::collections::BTreeMap::new()))

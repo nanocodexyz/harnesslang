@@ -51,7 +51,10 @@ impl Jobs {
             })
             .collect();
         for key in done {
-            let job = self.running.remove(&key).expect("a finished job was running");
+            let job = self
+                .running
+                .remove(&key)
+                .expect("a finished job was running");
             let mut started = job.started;
             let status = started.child.wait().expect("wait for a finished job");
             let shell = tools::settled(started, status, false);
