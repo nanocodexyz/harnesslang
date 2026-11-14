@@ -85,10 +85,11 @@ pub enum Mutation {
     ClimbRevertSkipped,
     ClimbLedgerDropsLosses,
     ClimbBudgetUnchecked,
+    ClimbCostDoubleCounted,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 83] = [
+    pub const ALL: [Self; 84] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -172,6 +173,7 @@ impl Mutation {
         Self::ClimbRevertSkipped,
         Self::ClimbLedgerDropsLosses,
         Self::ClimbBudgetUnchecked,
+        Self::ClimbCostDoubleCounted,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -259,6 +261,7 @@ impl Mutation {
             Self::ClimbRevertSkipped => "climb_revert_skipped",
             Self::ClimbLedgerDropsLosses => "climb_ledger_drops_losses",
             Self::ClimbBudgetUnchecked => "climb_budget_unchecked",
+            Self::ClimbCostDoubleCounted => "climb_cost_double_counted",
         }
     }
 
@@ -356,7 +359,8 @@ impl Mutation {
             | Self::ClimbAcceptAny
             | Self::ClimbRevertSkipped
             | Self::ClimbLedgerDropsLosses
-            | Self::ClimbBudgetUnchecked => all,
+            | Self::ClimbBudgetUnchecked
+            | Self::ClimbCostDoubleCounted => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

@@ -1,0 +1,43 @@
+harness noisy
+
+const cycles_max: u64 = 6
+const trials_max: u64 = 5
+const wins_needed: u64 = 4
+const cost_max: u64 = 16
+const propose_cost_max: u64 = 1
+const trial_cost_max: u64 = 1
+const ledger_max: u64 = 16
+const nanos_max: u64 = 60000000000
+
+tool suggest(base: text) -> text effect idempotent
+tool bench(subject: text) -> u64 effect idempotent
+
+state {
+  config: text
+  log: list<cycle, ledger_max>
+}
+
+on prompt(start: text) -> text {
+  climb speed over config from start ledger log
+    cycles cycles_max trials trials_max
+    cost cost_max propose propose_cost_max trial trial_cost_max
+    metric nanos lower at most nanos_max
+    accept sign at least wins_needed
+  {
+    propose(base) {
+      match suggest(base) {
+        ok(change) => { yield candidate(change, "try " ++ change) }
+        failed(_) => {}
+      }
+      yield cost propose_cost_max
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(nanos) => { yield score(nanos) }
+        failed(_) => {}
+      }
+      yield cost trial_cost_max
+    }
+  }
+  return config
+}

@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::check::{Checked, Globals, bound, error, quoted};
 use crate::ir::{self, Type};
 use crate::run::mutation::Mutation;
-use crate::syntax::ast::{self, Block, Climb, Expr, Item, Name, Param, Rule, Stmt, TypeExpr, Yield};
+use crate::syntax::ast::{
+    self, Block, Climb, Expr, Item, Name, Param, Rule, Stmt, TypeExpr, Yield,
+};
 use crate::syntax::parser::{NESTING_DEPTH_MAX, Parser};
 use crate::syntax::{Position, lexer};
 
@@ -19,6 +21,7 @@ pub const CYCLE_BASELINE_SCORE: usize = 5;
 pub const CYCLE_CANDIDATE_SCORE: usize = 6;
 pub const CYCLE_WINS: usize = 7;
 pub const CYCLE_TRIALS: usize = 8;
+pub const CYCLE_COST: usize = 9;
 pub const CYCLE_SPENT: usize = 10;
 pub const CYCLE_VERDICT: usize = 11;
 pub const CYCLE_INDEX: usize = 1;
@@ -38,7 +41,14 @@ const ENDS: [&str; 8] = [
     "full",
 ];
 const RULE_NAMES: usize = 3;
-const PURE_BUILTINS: [&str; 6] = ["len", "contains", "before", "after", "trim", "truncate_middle"];
+const PURE_BUILTINS: [&str; 6] = [
+    "len",
+    "contains",
+    "before",
+    "after",
+    "trim",
+    "truncate_middle",
+];
 
 fn prefix(climb: &Climb) -> String {
     format!("{PREFIX}{}_", climb.name.text)
@@ -121,7 +131,14 @@ fn declarations(climbs: &[&Climb]) -> String {
         let mut fields: Vec<(String, String)> = Vec::new();
         let mut numbers = vec!["evaluated", "pair", "wins", "pairs"];
         if climb.cost.is_some() {
-            numbers.extend(["spent", "propose_spent", "trial_spent", "yielded", "cost", "propose_cost"]);
+            numbers.extend([
+                "spent",
+                "propose_spent",
+                "trial_spent",
+                "yielded",
+                "cost",
+                "propose_cost",
+            ]);
         }
         if climb.failures.is_some() {
             numbers.push("streak");
@@ -135,7 +152,9 @@ fn declarations(climbs: &[&Climb]) -> String {
         for name in numbers {
             fields.push((name.to_owned(), "u64".to_owned()));
         }
-        for name in ["running", "breach", "scored", "ok", "kept", "gated", "accepted"] {
+        for name in [
+            "running", "breach", "scored", "ok", "kept", "gated", "accepted",
+        ] {
             fields.push((name.to_owned(), "bool".to_owned()));
         }
         for name in ["breach_reason", "reason", "gate_reason"] {
@@ -171,14 +190,22 @@ fn reserved(source: &ast::Program) -> Checked<()> {
             Item::Tool(tool) => names.push((&tool.name, "tool")),
             Item::Function(function) => names.push((&function.name, "fn")),
             Item::Invariant(invariant) => names.push((&invariant.name, "invariant")),
-            Item::State(state) => names.extend(state.fields.iter().map(|field| (&field.name, "state field"))),
+            Item::State(state) => names.extend(
+                state
+                    .fields
+                    .iter()
+                    .map(|field| (&field.name, "state field")),
+            ),
             _ => {}
         }
     }
     match names.iter().find(|(name, _)| name.text.starts_with(PREFIX)) {
         Some((name, what)) => error(
             name.at,
-            format!("{what} '{}': names starting with '_' are reserved", name.text),
+            format!(
+                "{what} '{}': names starting with '_' are reserved",
+                name.text
+            ),
         ),
         None => Ok(()),
     }
@@ -379,7 +406,9 @@ impl Plan<'_> {
         let mut text = format!(
             "clear {p}proposals\n{}{p}breach = false\n{p}breach_reason = \"\"\n{SLOT}propose()\n{}",
             self.costed("{p}propose_spent = 0\n"),
-            self.costed("{p}spent = {p}spent + {p}propose_spent\n{p}propose_cost = {p}propose_spent\n")
+            self.costed(
+                "{p}spent = {p}spent + {p}propose_spent\n{p}propose_cost = {p}propose_spent\n"
+            )
         );
         text.push_str(&format!(
             "if {p}breach {{ clear {p}proposals {} }}\n",
@@ -483,10 +512,15 @@ impl Plan<'_> {
         } else {
             checked
         };
+        let charge = if self.mutation == Mutation::ClimbCostDoubleCounted {
+            "{p}spent = {p}spent + {p}trial_spent + {p}trial_spent\n{p}cost = {p}cost + {p}trial_spent\n"
+        } else {
+            "{p}spent = {p}spent + {p}trial_spent\n{p}cost = {p}cost + {p}trial_spent\n"
+        };
         format!(
             "{p}scored = false\n{}{SLOT}{slot}()\n{}{checked}",
             self.costed("{p}trial_spent = 0\n{p}breach = false\n"),
-            self.costed("{p}spent = {p}spent + {p}trial_spent\n{p}cost = {p}cost + {p}trial_spent\n"),
+            self.costed(charge),
         )
     }
 
@@ -586,9 +620,15 @@ impl Plan<'_> {
                 continue;
             };
             let beyond = if metric.higher {
-                format!("{p}cand_{index} + {k} * {s} < {p}base_{index}", s = slack.text)
+                format!(
+                    "{p}cand_{index} + {k} * {s} < {p}base_{index}",
+                    s = slack.text
+                )
             } else {
-                format!("{p}cand_{index} > {p}base_{index} + {k} * {s}", s = slack.text)
+                format!(
+                    "{p}cand_{index} > {p}base_{index} + {k} * {s}",
+                    s = slack.text
+                )
             };
             text.push_str(&format!(
                 "if {p}kept {{ if {beyond} {{ {p}kept = false {p}verdict = \"regressed\" {p}reason = {} }} }}\n",
@@ -769,7 +809,10 @@ impl Yields<'_> {
             Stmt::Climb(inner) => {
                 return error(
                     inner.at,
-                    format!("climb '{}' cannot sit inside climb '{name}'", inner.name.text),
+                    format!(
+                        "climb '{}' cannot sit inside climb '{name}'",
+                        inner.name.text
+                    ),
                 );
             }
             Stmt::If {
@@ -916,7 +959,6 @@ impl Yields<'_> {
     }
 }
 
-
 fn pure(expr: &Expr, what: &str) -> Checked<()> {
     let mut pending = vec![expr];
     while let Some(expr) = pending.pop() {
@@ -1006,7 +1048,10 @@ fn validate(
     if *over_ty != Type::Text {
         return error(
             climb.over.at,
-            format!("climb '{name}' improves a text state field (a revision or a configuration): '{}' is not text", climb.over.text),
+            format!(
+                "climb '{name}' improves a text state field (a revision or a configuration): '{}' is not text",
+                climb.over.text
+            ),
         );
     }
     let cycle = globals.types[CYCLE_TYPE];
@@ -1016,7 +1061,10 @@ fn validate(
         _ => {
             return error(
                 climb.ledger.at,
-                format!("climb '{name}' keeps its ledger in a list<{CYCLE_TYPE}, N> state field: '{}' is not one", climb.ledger.text),
+                format!(
+                    "climb '{name}' keeps its ledger in a list<{CYCLE_TYPE}, N> state field: '{}' is not one",
+                    climb.ledger.text
+                ),
             );
         }
     };
@@ -1025,14 +1073,20 @@ fn validate(
         if *end_ty != Type::Sum(globals.types[END_TYPE]) {
             return error(
                 end.at,
-                format!("climb '{name}' writes why it ended to a {END_TYPE} state field: '{}' is not one", end.text),
+                format!(
+                    "climb '{name}' writes why it ended to a {END_TYPE} state field: '{}' is not one",
+                    end.text
+                ),
             );
         }
     }
     let positive = |constant: &Name, what: &str| -> Checked<u64> {
         let value = bound(program, globals, constant, what)?.value;
         if value == 0 {
-            return error(constant.at, format!("{what} of climb '{name}' is at least 1"));
+            return error(
+                constant.at,
+                format!("{what} of climb '{name}' is at least 1"),
+            );
         }
         Ok(value)
     };
@@ -1055,8 +1109,12 @@ fn validate(
     }
     validate_metrics(program, globals, climb)?;
     let rule = match &climb.rule {
-        Rule::Mean(margin) => ir::ClimbRule::Mean(bound(program, globals, margin, "a margin")?.value),
-        Rule::Best(margin) => ir::ClimbRule::Best(bound(program, globals, margin, "a margin")?.value),
+        Rule::Mean(margin) => {
+            ir::ClimbRule::Mean(bound(program, globals, margin, "a margin")?.value)
+        }
+        Rule::Best(margin) => {
+            ir::ClimbRule::Best(bound(program, globals, margin, "a margin")?.value)
+        }
         Rule::Sign(wins) => {
             let needed = positive(wins, "the wins a sign rule needs")?;
             if needed > trials {
@@ -1071,7 +1129,10 @@ fn validate(
             if names.len() != RULE_NAMES {
                 return error(
                     condition.at(),
-                    format!("accept when binds (baseline, candidate, wins): {RULE_NAMES} names, found {}", names.len()),
+                    format!(
+                        "accept when binds (baseline, candidate, wins): {RULE_NAMES} names, found {}",
+                        names.len()
+                    ),
                 );
             }
             pure(condition, "an accept rule")?;
@@ -1125,7 +1186,6 @@ fn validate_metrics(program: &ir::Program, globals: &Globals, climb: &Climb) -> 
     Ok(())
 }
 
-
 fn lower(
     climb: &Climb,
     capacity: String,
@@ -1147,14 +1207,18 @@ fn lower(
         cancel: program.events.cancel,
         mutation,
     };
-    let text_ty = || TypeExpr::Named(Name {
-        text: "text".to_owned(),
-        at: climb.at,
-    });
-    let u64_ty = || TypeExpr::Named(Name {
-        text: "u64".to_owned(),
-        at: climb.at,
-    });
+    let text_ty = || {
+        TypeExpr::Named(Name {
+            text: "text".to_owned(),
+            at: climb.at,
+        })
+    };
+    let u64_ty = || {
+        TypeExpr::Named(Name {
+            text: "u64".to_owned(),
+            at: climb.at,
+        })
+    };
     let named = |text: String| Expr::Name(Name { text, at: climb.at });
     let scoped = |what: &str, arguments: Vec<(Param, Expr)>, body: Block| Stmt::Inlined {
         at: body.at,
@@ -1211,22 +1275,20 @@ fn lower(
             },
         ));
     }
-    let mut statements = BTreeMap::from([
-        (
-            format!("{SLOT}propose"),
-            vec![scoped(
-                "propose",
-                vec![(
-                    Param {
-                        name: climb.propose.param.clone(),
-                        ty: text_ty(),
-                    },
-                    named(climb.over.text.clone()),
-                )],
-                propose,
+    let mut statements = BTreeMap::from([(
+        format!("{SLOT}propose"),
+        vec![scoped(
+            "propose",
+            vec![(
+                Param {
+                    name: climb.propose.param.clone(),
+                    ty: text_ty(),
+                },
+                named(climb.over.text.clone()),
             )],
-        ),
-    ]);
+            propose,
+        )],
+    )]);
     for (side, subject) in [
         ("baseline", climb.over.text.clone()),
         ("candidate", format!("{p}candidate")),
@@ -1323,10 +1385,7 @@ impl Lowering<'_> {
                 return lower(climb, capacity, self.program, self.mutation);
             }
             Stmt::Yield { at, .. } => {
-                return error(
-                    *at,
-                    "yield belongs in a climb's propose or measure block",
-                );
+                return error(*at, "yield belongs in a climb's propose or measure block");
             }
             Stmt::If {
                 at,
@@ -1534,10 +1593,15 @@ pub fn expand(
                 let mut handler = handler.clone();
                 let mut inner = Vec::new();
                 collect_block(&handler.body, &mut inner);
-                if handler.side && let Some(climb) = inner.first() {
+                if handler.side
+                    && let Some(climb) = inner.first()
+                {
                     return error(
                         climb.at,
-                        format!("climb '{}' writes state, so it cannot run in a side handler", climb.name.text),
+                        format!(
+                            "climb '{}' writes state, so it cannot run in a side handler",
+                            climb.name.text
+                        ),
                     );
                 }
                 handler.body = lowering.block(&handler.body)?;
@@ -1561,7 +1625,11 @@ pub fn expand(
                 if let Some(climb) = inner.first() {
                     return error(
                         climb.at,
-                        format!("climb '{}' runs in a handler, not in '{}'", climb.name.text, hook.kind.describe()),
+                        format!(
+                            "climb '{}' runs in a handler, not in '{}'",
+                            climb.name.text,
+                            hook.kind.describe()
+                        ),
                     );
                 }
                 items.push(item.clone());
@@ -1577,4 +1645,3 @@ pub fn expand(
         items,
     }))
 }
-

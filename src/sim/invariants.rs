@@ -60,10 +60,14 @@ pub enum Invariant {
     SettingsSent,
     ForkStateEqual,
     CellSettledAtTurnEnd,
+    ClimbKeptValid,
+    ClimbStateFollows,
+    ClimbLedgerComplete,
+    ClimbCostBalanced,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 49] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -109,6 +113,10 @@ impl Invariant {
         Self::SettingsSent,
         Self::ForkStateEqual,
         Self::CellSettledAtTurnEnd,
+        Self::ClimbKeptValid,
+        Self::ClimbStateFollows,
+        Self::ClimbLedgerComplete,
+        Self::ClimbCostBalanced,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -158,6 +166,10 @@ impl Invariant {
             Self::SettingsSent => "settings_sent",
             Self::ForkStateEqual => "fork_state_equal",
             Self::CellSettledAtTurnEnd => "cell_settled_at_turn_end",
+            Self::ClimbKeptValid => "climb_kept_valid",
+            Self::ClimbStateFollows => "climb_state_follows",
+            Self::ClimbLedgerComplete => "climb_ledger_complete",
+            Self::ClimbCostBalanced => "climb_cost_balanced",
         }
     }
 }
@@ -449,6 +461,7 @@ pub fn check(
     idempotent_known(&calls, records)?;
     checkpoint_compacted(program, world, records)?;
     liveness_and_replay(program, world, turns, records)?;
+    crate::sim::climb::check(program, world, records)?;
     world.inbox.kept(records)?;
     crate::sim::idle::check(program, world, records)?;
     world.jobs.check(program, records)?;

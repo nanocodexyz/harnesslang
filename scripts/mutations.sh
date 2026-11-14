@@ -82,7 +82,12 @@ job_lost_all docs/snippets/in_flight.hl --twice job_once
 fork_live_state docs/snippets/fork.hl --twice fork_state_equal
 fork_hook_skipped docs/snippets/fork.hl --twice fork_state_equal
 cell_leaks docs/snippets/code_wait.hl --twice cell_settled_at_turn_end
-cell_cancel_ignored docs/snippets/code_stop.hl --twice interrupt_honored"
+cell_cancel_ignored docs/snippets/code_stop.hl --twice interrupt_honored
+climb_accept_any docs/snippets/climb_noise.hl --strict climb_kept_valid
+climb_revert_skipped docs/snippets/climb_noise.hl --strict climb_state_follows
+climb_ledger_drops_losses docs/snippets/climb_noise.hl --strict climb_ledger_complete
+climb_budget_unchecked docs/snippets/climb_noise.hl --strict invariant_kept
+climb_cost_double_counted docs/snippets/climb_noise.hl --strict climb_cost_balanced"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

@@ -1,4 +1,5 @@
 pub mod cell;
+pub mod climb;
 pub mod dump;
 pub mod events;
 pub mod exhaustive;
