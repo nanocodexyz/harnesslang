@@ -83,7 +83,9 @@ rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postg
 rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
 js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
-js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal"
+js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal
+rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 
