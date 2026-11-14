@@ -312,12 +312,7 @@ pub fn run(site: CellSite<'_>, host: &mut dyn CellHost) -> Result<CellOutcome, S
         Err(Interrupt::Stop(stop)) => return Err(stop),
         Err(Interrupt::Threw(error)) => CellOutcome::Threw(error),
         Err(Interrupt::Diverged(reason)) => {
-            let cell = runner.cell;
-            runner.host.observe(&CellEvent::Diverged {
-                cell,
-                reason: reason.clone(),
-            });
-            CellOutcome::Unknown(divergence_text(cell, &reason))
+            CellOutcome::Unknown(divergence_text(runner.cell, &reason))
         }
         Err(Interrupt::Overflow) => {
             let reason = format!(
