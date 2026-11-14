@@ -100,6 +100,9 @@ echo "sim: every example passes seeds $seeds on every target, and agent.hl seeds
 scripts/mutations.sh
 scripts/prove-mutations.sh
 scripts/docs-check.sh
+scripts/js-diff.sh > "$scratch/js-diff.log" 2>&1 || { cat "$scratch/js-diff.log" >&2; exit 1; }
+tail -n 1 "$scratch/js-diff.log"
+scripts/js-mutations.sh
 if [ "${HL_ORACLE:-0}" = 1 ]; then
   scripts/oracle.sh
 fi

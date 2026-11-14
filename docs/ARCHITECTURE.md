@@ -146,9 +146,6 @@ number the checker computes.
 
 ### Code mode
 
-Not built yet: the parser has no `code` declaration and no target runs a cell.
-This is what the design adds.
-
 `code exec { tools read, edit, bash  calls cell_calls_max  parallel ...  timers ...  timer_ms ...  journal_bytes ...  yield_ms ... }`
 offers a tool through which the model writes a JavaScript cell that calls the
 listed tools as nested calls. `exec(script)` and `dispatch` of it have type
@@ -181,7 +178,7 @@ journal and a nanocode journal fold the same way:
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
-| `cell` (code mode, not built yet) | a code cell's header, entries, nested call states and finish, as nanocode's `CellJournalUpdate` | cell, session, update |
+| `cell` (code mode) | a code cell's header, entries, nested call states and finish, as nanocode's `CellJournalUpdate` | cell, session, update |
 
 ### Durability points
 
@@ -236,7 +233,7 @@ trap ends the turn the same way with outcome `failed`. A target may flush
 more often than the IR asks (the output gate before every outbound request, a
 step boundary after every external step) but never less.
 
-Code mode, not built yet, adds a code site: `SiteKind::Cell` with class `Cell` and durability `Cell`: its
+Code mode adds a code site: `SiteKind::Cell` with class `Cell` and durability `Cell`: its
 own `call` record is `none`, and its nested calls follow points 1 to 3 plus
 C1 (header durable before a nested external) and C2 (header durable before a
 timer wait); see [CODE_MODE.md](CODE_MODE.md).
@@ -290,7 +287,7 @@ What the compiler does differently per target:
   attempt number and returns `unknown` on any attempt after the first, since
   a retried step may follow a dispatch whose result was lost.
 
-Where a code cell will run, once code mode is built: the host's engine in the process (native, Postgres),
+Where a code cell runs: the host's engine in the process (native, Postgres),
 a dynamic Worker isolate with no network whose steps are RPC calls into the
 session's Durable Object (Cloudflare), the re-executed workflow function with
 every nested call a step (Vercel). A target whose platform cannot give that
@@ -470,7 +467,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
-| `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md), not built yet |
+| `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
 target adapter) that the simulator must catch, as tempoxyz/zempo and
@@ -523,7 +520,6 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
   them into nanocode drivers.
 - Subagent trees as sessions spawned by a `spawn` effect and joined by `wait`,
   simulated at 100K children.
-- Code mode, as [CODE_MODE.md](CODE_MODE.md) designs it.
 - Cloudflare continuations: split a handler whose worst case exceeds the
   per-invocation request limit at a loop boundary into continuations driven
   by the alarm, instead of refusing it.
