@@ -4,8 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use crate::prove::linear::system::{
-    Hashing, MultiplyRotate, Row, cheapest, contradiction, eliminate, prepare, project_rows,
-    variables,
+    Dense, Hashing, MultiplyRotate, Row, cheapest, contradiction, dense, eliminate, project_rows,
 };
 
 pub type Var = usize;
@@ -178,31 +177,24 @@ struct Outcome {
     steps: u64,
 }
 
-fn index_of(names: &[Var], var: Var) -> i128 {
-    let index = names
-        .binary_search(&var)
-        .expect("a projection's variable is named");
-    i128::try_from(index).expect("a variable index fits i128")
-}
-
 fn length_of(items: usize) -> i128 {
     i128::try_from(items).expect("a length fits i128")
 }
 
-fn projection_key(rows: &[Row], doomed: &[Var], names: &[Var]) -> Key {
+fn projection_key(rows: &[Row], doomed: &[Var]) -> Key {
     let terms: usize = rows.iter().map(|row| row.terms.len()).sum();
     let mut key = Vec::with_capacity(2 + 2 * rows.len() + 2 * terms + doomed.len());
     key.push(length_of(rows.len()));
     for row in rows {
         key.push(length_of(row.terms.len()));
         for (var, coefficient) in &row.terms {
-            key.push(index_of(names, *var));
+            key.push(length_of(*var));
             key.push(*coefficient);
         }
         key.push(row.constant);
     }
     key.push(length_of(doomed.len()));
-    key.extend(doomed.iter().map(|var| index_of(names, *var)));
+    key.extend(doomed.iter().map(|var| length_of(*var)));
     let mut hasher = MultiplyRotate::default();
     for word in &key {
         hasher.write_i128(*word);
@@ -214,28 +206,31 @@ fn projection_key(rows: &[Row], doomed: &[Var], names: &[Var]) -> Key {
 }
 
 impl Budget {
-    fn projected(&mut self, rows: Vec<Row>, doomed: Vec<Var>) -> Result<Vec<Row>, Unsure> {
-        let names = variables(&rows);
-        let key = projection_key(&rows, &doomed, &names);
+    fn projected(&mut self, system: Dense, keep: &BTreeSet<Var>) -> Result<Vec<Row>, Unsure> {
+        let Dense { rows, names } = system;
+        let doomed: Vec<Var> = (0..names.len())
+            .filter(|index| !keep.contains(&names[*index]))
+            .collect();
+        let key = projection_key(&rows, &doomed);
+        let restore = |rows: &Vec<Row>| rows.iter().map(|row| row.restored(&names)).collect();
         if let Some(outcome) = self.memo.get(&key)
             && outcome.steps <= self.steps_left
         {
             self.steps_left -= outcome.steps;
-            let restore = |rows: Vec<Row>| rows.iter().map(|row| row.restored(&names)).collect();
-            return outcome.projected.clone().map(restore);
+            return outcome
+                .projected
+                .as_ref()
+                .map(restore)
+                .map_err(|unsure| *unsure);
         }
         let steps_before = self.steps_left;
-        let projected = project_rows(rows, doomed, self);
+        let projected = project_rows(rows, doomed, names.len(), self);
         let steps = steps_before - self.steps_left;
+        let restored = projected.as_ref().map(restore).map_err(|unsure| *unsure);
         if projected != Err(Unsure::Budget) && self.memo.len() < self.memo_entries_max {
-            let rename = |rows: &Vec<Row>| rows.iter().map(|row| row.renamed(&names)).collect();
-            let outcome = Outcome {
-                projected: projected.as_ref().map(rename).map_err(|unsure| *unsure),
-                steps,
-            };
-            self.memo.insert(key, outcome);
+            self.memo.insert(key, Outcome { projected, steps });
         }
-        projected
+        restored
     }
 }
 
@@ -244,12 +239,7 @@ fn projected_rows(
     keep: &BTreeSet<Var>,
     budget: &mut Budget,
 ) -> Result<Vec<Row>, Unsure> {
-    let rows = prepare(constraints)?;
-    let doomed = variables(&rows)
-        .into_iter()
-        .filter(|var| !keep.contains(var))
-        .collect();
-    budget.projected(rows, doomed)
+    budget.projected(dense(constraints)?, keep)
 }
 
 pub fn project(
@@ -325,7 +315,7 @@ pub fn lower(
 
 pub type Interval = (Option<i128>, Option<i128>);
 
-fn bounds_of(rows: &[Row], var: Var, values: &BTreeMap<Var, i128>) -> Option<Interval> {
+fn bounds_of(rows: &[Row], var: Var, values: &[i128]) -> Option<Interval> {
     let mut low: Option<i128> = None;
     let mut high: Option<i128> = None;
     for row in rows {
@@ -335,8 +325,7 @@ fn bounds_of(rows: &[Row], var: Var, values: &BTreeMap<Var, i128>) -> Option<Int
         let mut rest = row.constant;
         for (other, other_coefficient) in &row.terms {
             if *other != var {
-                let value = values.get(other).copied().unwrap_or(0);
-                rest = rest.checked_add(other_coefficient.checked_mul(value)?)?;
+                rest = rest.checked_add(other_coefficient.checked_mul(values[*other])?)?;
             }
         }
         if coefficient > 0 {
@@ -367,25 +356,26 @@ fn candidate(
     constraints: &[Linear],
     budget: &mut Budget,
 ) -> Result<Option<BTreeMap<Var, i128>>, Unsure> {
-    let mut rows = prepare(constraints)?;
-    let mut stages = Vec::new();
-    let mut remaining = variables(&rows);
-    let rounds_max = remaining.len();
-    for _ in 0..rounds_max {
+    let Dense { mut rows, names } = dense(constraints)?;
+    let vars = names.len();
+    let mut stages = Vec::with_capacity(vars);
+    let mut remaining: Vec<Var> = (0..vars).collect();
+    for _ in 0..vars {
         if contradiction(&rows) {
             return Ok(None);
         }
-        let Some(var) = cheapest(&rows, &remaining) else {
+        let Some(var) = cheapest(&rows, &remaining, vars) else {
             break;
         };
         remaining.retain(|candidate| *candidate != var);
-        let next = eliminate(rows.clone(), var, budget)?;
+        let next = eliminate(rows.clone(), var, vars, budget)?;
         stages.push((var, std::mem::replace(&mut rows, next)));
     }
     if contradiction(&rows) {
         return Ok(None);
     }
-    let mut values = BTreeMap::new();
+    let mut values = vec![0; vars];
+    let mut assigned = BTreeMap::new();
     for (var, stage) in stages.iter().rev() {
         let Some((low, high)) = bounds_of(stage, *var, &values) else {
             return Ok(None);
@@ -396,7 +386,8 @@ fn candidate(
             (None, Some(high)) => high.min(0),
             (None, None) => 0,
         };
-        values.insert(*var, value);
+        values[*var] = value;
+        assigned.insert(names[*var], value);
     }
-    Ok(Some(values))
+    Ok(Some(assigned))
 }

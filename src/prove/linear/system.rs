@@ -184,7 +184,7 @@ pub fn contradiction(rows: &[Row]) -> bool {
     rows.iter().any(Row::absurd)
 }
 
-pub fn subsume(mut rows: Vec<Row>) -> Vec<Row> {
+pub fn subsume(mut rows: Vec<Row>, vars: usize) -> Vec<Row> {
     rows.sort_unstable();
     let mut strongest: Vec<Row> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -195,25 +195,18 @@ pub fn subsume(mut rows: Vec<Row>) -> Vec<Row> {
             _ => strongest.push(row),
         }
     }
-    let bounds = boxed(&strongest);
+    let bounds = boxed(&strongest, vars);
     strongest.retain(|row| row.terms.len() < 2 || !box_implies(&bounds, row));
     strongest
 }
 
-fn boxed(rows: &[Row]) -> Vec<(Var, Interval)> {
-    let mut bounds: Vec<(Var, Interval)> = Vec::new();
+fn boxed(rows: &[Row], vars: usize) -> Vec<Interval> {
+    let mut bounds: Vec<Interval> = vec![(None, None); vars];
     for row in rows {
         let [(var, coefficient)] = row.terms[..] else {
             continue;
         };
-        if bounds.last().is_none_or(|last| last.0 != var) {
-            assert!(
-                bounds.last().is_none_or(|last| last.0 < var),
-                "single-term rows sort by their variable"
-            );
-            bounds.push((var, (None, None)));
-        }
-        let entry = &mut bounds.last_mut().expect("an entry was pushed").1;
+        let entry = &mut bounds[var];
         if coefficient > 0 {
             let Some(negated) = row.constant.checked_neg() else {
                 continue;
@@ -227,32 +220,42 @@ fn boxed(rows: &[Row]) -> Vec<(Var, Interval)> {
     bounds
 }
 
-fn box_implies(bounds: &[(Var, Interval)], row: &Row) -> bool {
-    let mut highest = Some(row.constant);
+fn box_implies(bounds: &[Interval], row: &Row) -> bool {
+    let mut highest = row.constant;
     for (var, coefficient) in &row.terms {
-        let (low, high) = bounds
-            .binary_search_by_key(var, |bound| bound.0)
-            .map_or((None, None), |index| bounds[index].1);
+        let (low, high) = bounds[*var];
         let extreme = if *coefficient > 0 { high } else { low };
-        highest = highest
-            .zip(extreme)
-            .and_then(|(total, value)| total.checked_add(coefficient.checked_mul(value)?));
+        let Some(value) = extreme else {
+            return false;
+        };
+        let Some(total) = coefficient
+            .checked_mul(value)
+            .and_then(|term| highest.checked_add(term))
+        else {
+            return false;
+        };
+        highest = total;
     }
-    highest.is_some_and(|value| value <= 0)
+    highest <= 0
 }
 
-pub fn prepare(constraints: &[Linear]) -> Result<Vec<Row>, Unsure> {
-    let mut rows = Vec::with_capacity(constraints.len());
-    for constraint in constraints {
-        let row = Row::of(constraint).normalized().ok_or(Unsure::Overflow)?;
+pub fn prepare(rows: Vec<Row>, vars: usize) -> Result<Vec<Row>, Unsure> {
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row.normalized().ok_or(Unsure::Overflow)?;
         if !row.trivial() {
-            rows.push(row);
+            prepared.push(row);
         }
     }
-    Ok(subsume(rows))
+    Ok(subsume(prepared, vars))
 }
 
-pub fn eliminate(rows: Vec<Row>, var: Var, budget: &mut Budget) -> Result<Vec<Row>, Unsure> {
+pub fn eliminate(
+    rows: Vec<Row>,
+    var: Var,
+    vars: usize,
+    budget: &mut Budget,
+) -> Result<Vec<Row>, Unsure> {
     let mut kept = Vec::with_capacity(rows.len());
     let mut above = Vec::new();
     let mut below = Vec::new();
@@ -288,32 +291,30 @@ pub fn eliminate(rows: Vec<Row>, var: Var, budget: &mut Budget) -> Result<Vec<Ro
             kept.push(combined);
         }
     }
-    Ok(subsume(kept))
+    Ok(subsume(kept, vars))
 }
 
-pub fn cheapest(rows: &[Row], candidates: &[Var]) -> Option<Var> {
-    let mut counts = vec![(0_usize, 0_usize); candidates.len()];
+pub fn cheapest(rows: &[Row], candidates: &[Var], vars: usize) -> Option<Var> {
+    let mut counts = vec![(0_usize, 0_usize); vars];
     for row in rows {
         for (var, coefficient) in &row.terms {
-            if let Ok(index) = candidates.binary_search(var) {
-                if *coefficient > 0 {
-                    counts[index].0 += 1;
-                } else {
-                    counts[index].1 += 1;
-                }
+            if *coefficient > 0 {
+                counts[*var].0 += 1;
+            } else {
+                counts[*var].1 += 1;
             }
         }
     }
     candidates
         .iter()
-        .zip(&counts)
-        .min_by_key(|(_, (above, below))| above.saturating_mul(*below))
-        .map(|(var, _)| *var)
+        .min_by_key(|var| counts[**var].0.saturating_mul(counts[**var].1))
+        .copied()
 }
 
 pub fn project_rows(
     mut rows: Vec<Row>,
     mut doomed: Vec<Var>,
+    vars: usize,
     budget: &mut Budget,
 ) -> Result<Vec<Row>, Unsure> {
     let rounds_max = doomed.len();
@@ -321,11 +322,34 @@ pub fn project_rows(
         if contradiction(&rows) {
             break;
         }
-        let Some(var) = cheapest(&rows, &doomed) else {
+        let Some(var) = cheapest(&rows, &doomed, vars) else {
             break;
         };
         doomed.retain(|candidate| *candidate != var);
-        rows = eliminate(rows, var, budget)?;
+        rows = eliminate(rows, var, vars, budget)?;
     }
     Ok(rows)
+}
+
+pub struct Dense {
+    pub rows: Vec<Row>,
+    pub names: Vec<Var>,
+}
+
+pub fn dense(constraints: &[Linear]) -> Result<Dense, Unsure> {
+    let rows: Vec<Row> = constraints.iter().map(Row::of).collect();
+    let names = variables(&rows);
+    let renamed = rows.iter().map(|row| row.renamed(&names)).collect();
+    let prepared = prepare(renamed, names.len())?;
+    let present = variables(&prepared);
+    if present.len() == names.len() {
+        return Ok(Dense {
+            rows: prepared,
+            names,
+        });
+    }
+    Ok(Dense {
+        rows: prepared.iter().map(|row| row.renamed(&present)).collect(),
+        names: present.iter().map(|index| names[*index]).collect(),
+    })
 }
