@@ -7,6 +7,7 @@ use crate::ir::{
 use crate::target::{self, Target};
 
 const RUNTIME: &str = include_str!("runtime.js");
+const BLOB: &str = include_str!("blob.js");
 const CELL_JOURNAL: &str = include_str!("cell_journal.js");
 const CELL_RUNNER: &str = include_str!("cell_runner.js");
 const CELL_ENGINE: &str = include_str!("cell_engine.js");
@@ -52,11 +53,12 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     }
     out.push_str(&program_literal(program));
     out.push_str(RUNTIME);
+    out.push_str(BLOB);
     out.push_str(CELL_JOURNAL);
     out.push_str(CELL_RUNNER);
     out.push_str(CELL_ENGINE);
     if target == Target::Cloudflare {
-        let isolate = [CELL_ISOLATE, RUNTIME, CELL_JOURNAL, CELL_ENGINE].concat();
+        let isolate = [CELL_ISOLATE, RUNTIME, BLOB, CELL_JOURNAL, CELL_ENGINE].concat();
         writeln!(out, "const CELL_ISOLATE_SOURCE = {};", js_string(&isolate))
             .expect("writing to a string succeeds");
     }
@@ -114,6 +116,11 @@ fn type_literal(ty: &Type) -> String {
         ),
         Type::Known(inner) => format!("{{ known: {} }}", type_literal(inner)),
         Type::Maybe(inner) => format!("{{ maybe: {} }}", type_literal(inner)),
+        Type::Blob(bytes) => format!(
+            "{{ blob: {}n, bound: {} }}",
+            bytes.value,
+            js_string(&bytes.name)
+        ),
     }
 }
 
@@ -219,9 +226,15 @@ fn program_literal(program: &Program) -> String {
     }
     out.push_str("  ],\n  tools: [\n");
     for tool in &program.tools {
+        let finds = tool
+            .finds
+            .map_or_else(String::new, |listing| format!(", finds: {listing}"));
+        let attaches = tool.attaches.as_ref().map_or_else(String::new, |bytes| {
+            format!(", attaches: {}", type_literal(&Type::Blob(bytes.clone())))
+        });
         writeln!(
             out,
-            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\" }},",
+            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\"{finds}{attaches} }},",
             js_string(&tool.name),
             fields_literal(&tool.params),
             defaults_literal(&tool.defaults),
@@ -281,7 +294,18 @@ fn program_literal(program: &Program) -> String {
     for (index, handler) in program.handlers.iter().enumerate() {
         out.push_str(&handler_literal(program, index, handler));
     }
-    out.push_str("  ],\n};\n");
+    out.push_str("  ],\n");
+    if let Some(blobs) = &program.blobs {
+        writeln!(
+            out,
+            "  blobs: {{ bytes: {}, dispatched: {}, attached: {} }},",
+            type_literal(&Type::Blob(blobs.bytes.clone())),
+            blobs.dispatched,
+            blobs.attached
+        )
+        .expect("writing to a string succeeds");
+    }
+    out.push_str("};\n");
     out
 }
 
@@ -392,6 +416,9 @@ impl Writer<'_> {
         let program = self.program;
         let depth = self.depth;
         match statement {
+            Stmt::KeepBlobs { field, count } => {
+                self.line(&format!("rt.keepBlobs({field}, {}n);", count.value))
+            }
             Stmt::Let { local, value } => {
                 self.line(&format!("local_{local} = {};", expr(program, value)))
             }
@@ -543,6 +570,7 @@ fn binary(op: BinaryOp, left: String, right: String) -> String {
 
 fn expr(program: &Program, expression: &Expr) -> String {
     match expression {
+        Expr::ListingNotice(listing) => format!("rt.notice({listing})"),
         Expr::U64(value) => format!("{value}n"),
         Expr::Bool(value) => value.to_string(),
         Expr::Text(value) => js_string(value),

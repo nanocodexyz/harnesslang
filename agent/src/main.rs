@@ -160,18 +160,27 @@ impl Host for Agent {
         );
         match self.workspace.run(request.tool, &input) {
             tools::Ran::Ok(text) => Output::Ok(Json::String(text)),
+            tools::Ran::Image(bytes) => Output::Ok(harness::host_blob_bytes(&bytes)),
             tools::Ran::Failed(text) => Output::Failed(text),
         }
     }
 
-    fn listing(&mut self, request: &ListingRequest<'_>) -> Output {
-        Output::Failed(format!("this host lists no tools for {}", request.listing))
+    fn listing(&mut self, _request: &ListingRequest<'_>) -> Output {
+        Output::Ok(Json::Object(std::collections::BTreeMap::new()))
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         let call = harness::call_id(request.turn, request.seq);
         let context = to_value(&(request.context)());
-        let body = match self.client.body(&context, request.mode) {
+        let attached = |digest: &str| {
+            request.blobs.get(digest).map(|bytes| {
+                (
+                    tools::media_type(bytes).unwrap_or_default().to_owned(),
+                    harness::base64_encode(bytes),
+                )
+            })
+        };
+        let body = match self.client.body(&context, request.mode, &attached) {
             Ok(body) => body,
             Err(error) => {
                 return to_json(&anthropic::transient(
@@ -444,7 +453,11 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
         tools,
         scratch: state.clone(),
     };
-    let workspace = tools::Workspace { root: cwd, state };
+    let workspace = tools::Workspace {
+        root: cwd,
+        state,
+        image_bytes_max: program::blob_bound("Read").map(|(_, bytes)| bytes),
+    };
     Ok((
         Agent {
             client,

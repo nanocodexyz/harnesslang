@@ -154,9 +154,18 @@ pub enum Returns {
         name: &'static str,
         values: &'static [&'static str],
     },
+    Blob {
+        name: &'static str,
+        bytes: u64,
+    },
 }
 
 pub fn checked_output(tool: &str, returns: Returns, output: Output) -> Output {
+    if let Some((name, bytes)) = program::blob_bound(tool)
+        && (matches!(returns, Returns::Blob { .. }) || matches!(&output, Output::Ok(Json::Object(_))))
+    {
+        return checked_blob(tool, name, bytes, output);
+    }
     let Output::Ok(json) = &output else {
         return output;
     };
@@ -168,6 +177,7 @@ pub fn checked_output(tool: &str, returns: Returns, output: Output) -> Output {
             json.as_str().is_some_and(|text| values.contains(&text)),
             format!("a value of {name}"),
         ),
+        Returns::Blob { .. } => unreachable!("a tool that returns a blob has a blob bound"),
     };
     if fits {
         return output;
@@ -236,6 +246,63 @@ pub fn not_admitted(tool: &str, listing: &str, name: &str) -> String {
     format!("{tool} was not admitted: listing {listing} did not list {name} in this turn")
 }
 
+pub fn not_discovered(tool: &str, listing: &str) -> String {
+    format!("{tool} was not discovered: no search of listing {listing} found it in this turn")
+}
+
+pub fn not_found(tool: &str, found: &str, listing: &str) -> String {
+    format!("{tool} found {found}, which listing {listing} did not list in this turn")
+}
+
+pub const SEARCH_SEPARATOR: char = '\n';
+
+pub fn found_names(text: &str) -> Vec<&str> {
+    text.split(SEARCH_SEPARATOR).filter(|line| !line.is_empty()).collect()
+}
+
+pub fn checked_search(tool: &str, listing: usize, admitted: Option<&BTreeMap<String, String>>, output: Output) -> Output {
+    let Output::Ok(Json::String(text)) = &output else {
+        return output;
+    };
+    let (name, bound_name, bound) = program::LISTINGS[listing];
+    let names = found_names(text);
+    if names.len() as u64 > bound {
+        return Output::Failed(format!(
+            "{tool} found {} tools, over listing {name}'s bound {bound_name} ({bound})",
+            names.len()
+        ));
+    }
+    for found in names {
+        let listed_now = listed(found)
+            .filter(|(id, _)| *id == listing)
+            .is_some_and(|(_, bare)| admitted.is_some_and(|tools| tools.contains_key(bare)));
+        if !listed_now {
+            return Output::Failed(not_found(tool, found, name));
+        }
+    }
+    output
+}
+
+pub fn listing_change(listing: &str, before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> String {
+    let named = |name: &str| format!("{listing}{LISTED_TOOL_SEPARATOR}{name}");
+    let added: Vec<String> = after.keys().filter(|name| !before.contains_key(*name)).map(|name| named(name)).collect();
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|(name, fingerprint)| before.get(*name).is_some_and(|old| old != *fingerprint))
+        .map(|(name, _)| named(name))
+        .collect();
+    let removed: Vec<String> = before.keys().filter(|name| !after.contains_key(*name)).map(|name| named(name)).collect();
+    let parts: Vec<String> = [("added", added), ("changed", changed), ("removed", removed)]
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(what, names)| format!("{what} {}", names.join(", ")))
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("tools of listing {listing} changed: {}", parts.join("; "))
+}
+
 pub fn admitted_tools(json: &Json) -> Result<BTreeMap<String, String>, String> {
     let Json::Object(map) = json else {
         return Err(format!("a listing is an object, found {}", json.encode()));
@@ -299,6 +366,7 @@ pub struct ModelRequest<'a> {
     pub calls_max: u64,
     pub mode: Option<&'a str>,
     pub context: &'a dyn Fn() -> Json,
+    pub blobs: &'a Blobs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -626,6 +694,10 @@ pub struct Engine<'a> {
     events: Vec<Recorded>,
     taken: usize,
     admitted: BTreeMap<usize, BTreeMap<String, String>>,
+    listed: BTreeMap<usize, BTreeMap<String, String>>,
+    notices: BTreeMap<usize, String>,
+    discovered: BTreeMap<usize, std::collections::BTreeSet<String>>,
+    blobs: Blobs,
 }
 
 impl<'a> Engine<'a> {
@@ -644,7 +716,24 @@ impl<'a> Engine<'a> {
             events: log.events.clone(),
             taken: 0,
             admitted: BTreeMap::new(),
+            listed: BTreeMap::new(),
+            notices: BTreeMap::new(),
+            discovered: BTreeMap::new(),
+            blobs: Blobs::default(),
         }
+    }
+
+    pub fn with_blobs(mut self, blobs: Blobs) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    pub fn blobs(&self) -> &Blobs {
+        &self.blobs
+    }
+
+    pub fn listing_notice(&self, listing: usize) -> String {
+        self.notices.get(&listing).cloned().unwrap_or_default()
     }
 
     pub fn with_next_cell(mut self, next_cell: u64) -> Self {
@@ -1087,6 +1176,7 @@ impl<'a> Engine<'a> {
                 if let Run::Listing(listing) = run {
                     self.admit_listing(listing, &output)?;
                 }
+                self.discover(&call.tool, &output);
                 Ok(Answer::Output(output))
             }
             Some(SiteLog::Reply(response, recorded)) => {
@@ -1164,6 +1254,7 @@ impl<'a> Engine<'a> {
             Run::Listing(listing) => Some(listing),
             _ => None,
         };
+        let tool = matches!(run, Run::Tool(_));
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
@@ -1175,6 +1266,7 @@ impl<'a> Engine<'a> {
                     calls_max,
                     mode: site.mode,
                     context,
+                    blobs: &self.blobs,
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
                 self.drain()?;
@@ -1224,6 +1316,7 @@ impl<'a> Engine<'a> {
                 }
             },
         };
+        let output = if tool { self.settled(&call.tool, output) } else { output };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
         self.drain()?;
         self.append(Record::Result {
@@ -1231,11 +1324,38 @@ impl<'a> Engine<'a> {
             seq,
             output: output.clone(),
         });
-        self.sites.insert(seq, SiteLog::Done(call, output.clone()));
         if let Some(listing) = listing {
             self.admit_listing(listing, &output)?;
         }
+        self.discover(&call.tool, &output);
+        self.sites.insert(seq, SiteLog::Done(call, output.clone()));
         Ok(Answer::Output(output))
+    }
+
+    fn settled(&mut self, tool: &str, output: Output) -> Output {
+        let output = match program::search_of(tool) {
+            Some(listing) => checked_search(tool, listing, self.admitted.get(&listing), output),
+            None => output,
+        };
+        match output {
+            Output::Ok(json) if program::blob_bound(tool).is_some() && host_data(&json).is_some() => {
+                let data = host_data(&json).expect("matched above");
+                Output::Ok(self.blobs.journaled(data))
+            }
+            output => output,
+        }
+    }
+
+    fn discover(&mut self, tool: &str, output: &Output) {
+        let (Some(listing), Output::Ok(Json::String(text))) = (program::search_of(tool), output) else {
+            return;
+        };
+        let found = self.discovered.entry(listing).or_default();
+        for name in found_names(text) {
+            if let Some((_, bare)) = listed(name) {
+                found.insert(bare.to_owned());
+            }
+        }
     }
 
     fn gate(&self, call: &Call) -> Result<Option<String>, String> {
@@ -1247,26 +1367,37 @@ impl<'a> Engine<'a> {
         let Some((listing, name)) = listed(&call.tool) else {
             return Ok(None);
         };
-        match self.admitted.get(&listing).and_then(|tools| tools.get(name)) {
-            Some(fingerprint) => Ok(Some(fingerprint.clone())),
-            None => Err(not_admitted(&call.tool, program::LISTINGS[listing].0, name)),
+        let Some(fingerprint) = self.admitted.get(&listing).and_then(|tools| tools.get(name)) else {
+            return Err(not_admitted(&call.tool, program::LISTINGS[listing].0, name));
+        };
+        let found = self.discovered.get(&listing).is_some_and(|found| found.contains(name));
+        if program::DEFERRED[listing] && !found {
+            return Err(not_discovered(&call.tool, program::LISTINGS[listing].0));
         }
+        Ok(Some(fingerprint.clone()))
     }
 
     fn admit_listing(&mut self, listing: usize, output: &Output) -> Result<(), Halt> {
         match output {
             Output::Ok(json) => {
                 let tools = admitted_tools(json).map_err(|error| self.corrupt(error))?;
+                let notice = match self.listed.get(&listing) {
+                    Some(before) => listing_change(program::LISTINGS[listing].0, before, &tools),
+                    None => String::new(),
+                };
+                self.notices.insert(listing, notice);
+                self.listed.insert(listing, tools.clone());
                 self.admitted.insert(listing, tools);
             }
             Output::Failed(_) => {
+                self.notices.insert(listing, String::new());
                 self.admitted.remove(&listing);
             }
         }
         Ok(())
     }
 
-    pub fn parallel(&mut self, calls: Vec<Call>, returns: Returns, limit: Option<u64>) -> Result<Vec<Answer>, Halt> {
+    pub fn parallel(&mut self, calls: Vec<Call>, returns: fn(&str) -> Returns, limit: Option<u64>) -> Result<Vec<Answer>, Halt> {
         let mut answers: Vec<Option<Answer>> = (0..calls.len()).map(|_| None).collect();
         let mut pending: Vec<(usize, u64)> = Vec::with_capacity(calls.len());
         for (index, call) in calls.iter().enumerate() {
@@ -1275,6 +1406,7 @@ impl<'a> Engine<'a> {
             match self.sites.get(&seq).cloned() {
                 Some(SiteLog::Done(recorded, output)) => {
                     self.same(seq, &recorded, call)?;
+                    self.discover(&call.tool, &output);
                     answers[index] = Some(Answer::Output(output));
                 }
                 Some(SiteLog::Reply(..)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
@@ -1321,7 +1453,7 @@ impl<'a> Engine<'a> {
             .collect())
     }
 
-    fn batch_group(&mut self, calls: &[Call], group: &[(usize, u64)], returns: Returns, limit: Option<u64>, answers: &mut [Option<Answer>]) -> Result<(), Halt> {
+    fn batch_group(&mut self, calls: &[Call], group: &[(usize, u64)], returns: fn(&str) -> Returns, limit: Option<u64>, answers: &mut [Option<Answer>]) -> Result<(), Halt> {
         let external = calls[group[0].0].effect.may_be_unknown();
         assert!(!external || group.len() == 1, "an external call of a parallel for runs alone");
         if external {
@@ -1344,7 +1476,7 @@ impl<'a> Engine<'a> {
                     tool: &calls[index].tool,
                     effect: calls[index].effect,
                     input: &calls[index].input,
-                    returns,
+                    returns: returns(&calls[index].tool),
                     admitted: gates[*position].as_ref().ok().and_then(Option::as_deref),
                     nested: None,
                 }
@@ -1369,13 +1501,15 @@ impl<'a> Engine<'a> {
         completed.sort_by_key(|(position, _)| *position);
         for (position, output) in completed {
             let (index, seq) = group[position];
-            let output = checked_output(&calls[index].tool, returns, output);
+            let output = checked_output(&calls[index].tool, returns(&calls[index].tool), output);
+            let output = self.settled(&calls[index].tool, output);
             self.append(Record::Result {
                 turn,
                 seq,
                 output: output.clone(),
             });
             self.sites.insert(seq, SiteLog::Done(calls[index].clone(), output.clone()));
+            self.discover(&calls[index].tool, &output);
             answers[index] = Some(Answer::Output(output));
         }
         Ok(())
@@ -1874,6 +2008,8 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
         }));
     }
     let state = state_before(&session, request.turn)?;
+    let blobs = Blobs::of_session(&session).map_err(corrupt)?;
+    blobs.check_state(&state).map_err(corrupt)?;
     let mut pending = None;
     let mut unknown = Vec::new();
     let mut nested = Vec::new();
@@ -1910,7 +2046,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             TurnLog::new(handler.to_owned(), Json::Null)
         }
     };
-    let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log).with_next_cell(session.next_cell());
+    let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log).with_next_cell(session.next_cell()).with_blobs(blobs);
     if let Some(record) = pending {
         engine.append(record);
     }
@@ -1933,4 +2069,5 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
 
 pub fn self_check() {
     assert_eq!(crc32(CRC32_CHECK_INPUT), CRC32_CHECK, "CRC-32 matches its catalogued check value");
+    blob_self_check();
 }

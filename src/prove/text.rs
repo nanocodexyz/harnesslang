@@ -102,6 +102,9 @@ impl<'a> Names<'a> {
                 format!("{}({})", op.name(), args.join(", "))
             }
             Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
+            Expr::ListingNotice(listing) => {
+                format!("notice of {}", self.program.listings[*listing].name)
+            }
         }
     }
 
@@ -144,6 +147,7 @@ fn collect<'a>(
             | Stmt::Assign { .. }
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
+            | Stmt::KeepBlobs { .. }
             | Stmt::Finish { .. } => {}
         }
     }

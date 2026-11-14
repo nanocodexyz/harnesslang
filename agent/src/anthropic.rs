@@ -122,6 +122,26 @@ impl Transcript {
         Ok(())
     }
 
+    fn attached(&mut self, call: &Value, media_type: &str, data: &str) -> Result<(), String> {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("a call has no id")?;
+        let source = Value::object([
+            ("type", Value::text("base64")),
+            ("media_type", Value::text(media_type)),
+            ("data", Value::text(data)),
+        ]);
+        let image = Value::object([("type", Value::text("image")), ("source", source)]);
+        let block = Value::object([
+            ("type", Value::text("tool_result")),
+            ("tool_use_id", Value::text(id)),
+            ("content", Value::Array(vec![image])),
+        ]);
+        self.push("user", block);
+        Ok(())
+    }
+
     fn content(&mut self, content: &str) -> Result<(), String> {
         let blocks = Value::decode(content)
             .map_err(|error| format!("a reply's content is not JSON: {error}"))?;
@@ -175,7 +195,9 @@ fn tagged(value: &Value) -> Result<(&str, Option<&Value>), String> {
     }
 }
 
-pub fn messages(context: &Value) -> Result<Vec<Value>, String> {
+pub type Attached<'a> = dyn Fn(&str) -> Option<(String, String)> + 'a;
+
+pub fn messages(context: &Value, attached: &Attached<'_>) -> Result<Vec<Value>, String> {
     let mut transcript = Transcript {
         messages: Vec::new(),
     };
@@ -208,6 +230,23 @@ pub fn messages(context: &Value) -> Result<Vec<Value>, String> {
                 tools::unknown_outcome(),
                 true,
             )?,
+            "notice" => transcript.text(
+                "user",
+                payload
+                    .and_then(Value::as_str)
+                    .ok_or("a notice entry has no text")?,
+            ),
+            "attached" => {
+                let fields = fields(2)?;
+                let digest = fields[1]
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .ok_or("an attached entry has no blob digest")?;
+                let (media_type, data) = attached(digest).ok_or_else(|| {
+                    format!("context holds blob {digest}, which the session does not hold")
+                })?;
+                transcript.attached(&fields[0], &media_type, &data)?;
+            }
             other => return Err(format!("context holds an unknown entry {other}")),
         }
     }
@@ -232,7 +271,12 @@ pub fn messages(context: &Value) -> Result<Vec<Value>, String> {
 }
 
 impl Client {
-    pub fn body(&self, context: &Value, mode: Option<&str>) -> Result<Value, String> {
+    pub fn body(
+        &self,
+        context: &Value,
+        mode: Option<&str>,
+        attached: &Attached<'_>,
+    ) -> Result<Value, String> {
         let mut tools = self.tools.clone();
         if let Value::Array(items) = &mut tools
             && let Some(last) = items.last_mut()
@@ -244,7 +288,7 @@ impl Client {
             ("max_tokens", Value::number(self.max_tokens)),
             ("system", self.system.clone()),
             ("tools", tools),
-            ("messages", Value::Array(messages(context)?)),
+            ("messages", Value::Array(messages(context, attached)?)),
             ("stream", Value::Bool(true)),
         ]);
         match mode {

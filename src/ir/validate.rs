@@ -117,7 +117,12 @@ fn reply(program: &Program) {
 
 fn reads_local(value: &Expr) -> bool {
     match value {
-        Expr::U64(_) | Expr::Bool(_) | Expr::Text(_) | Expr::Constant(_) | Expr::Field(_) => false,
+        Expr::U64(_)
+        | Expr::Bool(_)
+        | Expr::Text(_)
+        | Expr::Constant(_)
+        | Expr::Field(_)
+        | Expr::ListingNotice(_) => false,
         Expr::Local(_) => true,
         Expr::Member { base, .. } => reads_local(base),
         Expr::Construct { fields, .. } => fields.iter().any(reads_local),
@@ -142,6 +147,7 @@ fn reads_events(value: &Expr) -> bool {
         | Expr::Text(_)
         | Expr::Constant(_)
         | Expr::Field(_)
+        | Expr::ListingNotice(_)
         | Expr::Local(_) => false,
         Expr::Cancelled => true,
         Expr::Member { base, .. } => reads_events(base),
@@ -248,8 +254,8 @@ fn handler(program: &Program, handler: &Handler) {
             );
             assert_eq!(
                 site.result,
-                Type::Maybe(Box::new(Type::Text)),
-                "dispatch yields maybe<text>"
+                program.dispatch_result(),
+                "dispatch yields maybe<text>, or dispatched when a tool returns a blob"
             );
         }
     }
@@ -283,6 +289,16 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     "assignments target state fields"
                 );
                 expr(program, handler, value);
+            }
+            Stmt::KeepBlobs { field, .. } => {
+                assert!(
+                    program.blobs.is_some(),
+                    "a program that keeps blobs has blobs"
+                );
+                assert!(
+                    matches!(&program.state[*field].ty, Type::List { element, .. } if **element == Type::Sum(ir::ENTRY)),
+                    "keep blobs targets a context"
+                );
             }
             Stmt::Shrink { field, kept } => {
                 assert!(
@@ -396,6 +412,16 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
             "only a harness with 'on cancel' reads it"
         ),
         Expr::U64(_) | Expr::Bool(_) | Expr::Text(_) | Expr::Constant(_) | Expr::Field(_) => {}
+        Expr::ListingNotice(listing) => {
+            assert!(
+                *listing < program.listings.len(),
+                "a notice reads a declared listing"
+            );
+            assert!(
+                program.notice.is_some(),
+                "a notice is an entry of a program with a listing"
+            );
+        }
         Expr::Local(local) => assert!(*local < handler.locals.len(), "a local exists"),
         Expr::Member { base, .. } => expr(program, handler, base),
         Expr::Construct { fields, .. } => fields

@@ -58,6 +58,11 @@ fn main() -> ExitCode {
         CRC32_CHECK,
         "CRC-32 matches its catalogued check value"
     );
+    assert_eq!(
+        harnesslang::run::blob::sha256_hex(harnesslang::run::blob::SHA256_CHECK_INPUT),
+        harnesslang::run::blob::SHA256_CHECK,
+        "SHA-256 matches its catalogued check value"
+    );
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = args.split_first() else {
         return usage();
@@ -162,6 +167,13 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
             worst.wait_ms.describe_loops()
         ));
     }
+    if worst.blob_bytes.total > 0 {
+        lines.push(format!(
+            "    blob bytes journaled: {}, {}",
+            worst.blob_bytes.total,
+            worst.blob_bytes.describe_loops()
+        ));
+    }
     lines.push("    plus one recovery record per restart".to_owned());
     let events = &program.events;
     if events.any() {
@@ -224,6 +236,16 @@ fn check_command(args: &[String]) -> ExitCode {
     }
     if program.events.any() {
         println!("{}", target::inbound::describe(target));
+    }
+    if let Some(limit) = model
+        .limits
+        .record_bytes
+        .filter(|_| program.blobs.is_some())
+    {
+        println!(
+            "  limit record bytes: {} {} ({})",
+            limit.value, limit.unit, limit.source
+        );
     }
     if let Some(limit) = model.limits.memory {
         println!(

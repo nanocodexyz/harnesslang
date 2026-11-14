@@ -65,11 +65,29 @@ impl Edges {
     }
 }
 
+pub fn blobless(program: &Program, variants: &[crate::ir::Variant], rng: &mut Rng) -> usize {
+    let plain: Vec<usize> = (0..variants.len())
+        .filter(|index| {
+            !variants[*index]
+                .fields
+                .iter()
+                .any(|field| field.holds_blob(program))
+        })
+        .collect();
+    assert!(
+        !plain.is_empty(),
+        "every sum the simulator draws has a variant without a blob"
+    );
+    plain[rng.pick(plain.len())]
+}
+
 pub fn draw(program: &Program, ty: &Type, rng: &mut Rng, edges: &Edges) -> Value {
     match ty {
         Type::U64 => Value::U64(edges.draw(rng)),
         Type::Bool => Value::Bool(rng.draw() & 1 == 1),
         Type::Text => Value::Text(SimWorld::generated_text(rng)),
+        Type::Blob(_) => panic!("the simulator draws no blob: blobs come from tools"),
+        Type::List { element, .. } if element.holds_blob(program) => Value::List(Vec::new()),
         Type::List { element, capacity } => {
             let length = edges.length(rng, capacity.value);
             Value::List(
@@ -80,7 +98,7 @@ pub fn draw(program: &Program, ty: &Type, rng: &mut Rng, edges: &Edges) -> Value
         }
         Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => {
             let variants = ty.variants(program).expect("a sum has variants");
-            let variant = rng.pick(variants.len());
+            let variant = blobless(program, &variants, rng);
             let fields = variants[variant]
                 .fields
                 .iter()

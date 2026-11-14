@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `reply` `take` `tools` `window` `with`
+Contextual words: `after` `at` `below` `blob` `blobs` `bound` `calls` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `reply` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -544,7 +544,7 @@ item       = const | type | tool | listing | code | model | state | invariant | 
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
-tool       = "tool" name tool_params "->" type_expr "effect" effect_class ;
+tool       = "tool" name tool_params "->" type_expr "effect" effect_class [ "finds" name ] ;
 tool_params = "(" [ tool_param { "," tool_param } ] ")" ;
 tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
@@ -561,12 +561,14 @@ bound      = name ;
 type_expr  = "list" "<" type_expr "," bound ">"
            | "known" "<" type_expr ">"
            | "maybe" "<" type_expr ">"
+           | "blob" "<" bound ">"
            | name ;
 block      = "{" { statement } "}" ;
 statement  = "let" name [ ":" type_expr ] "=" expr
            | "push" name expr
            | "clear" name
            | "keep" name "last" expr [ "after" expr ]
+           | "keep" name "blobs" "last" bound
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
@@ -597,7 +599,7 @@ Notes the grammar leaves out:
 - Operators bind, loosest first: `or`, `and`, `not`, comparisons, `+ - ++`,
   `*`, `.`. Binary operators are left associative; a comparison does not chain
   (`a < b < c` is a parse error).
-- `known` and `maybe` start a type only when `<` follows. A field name after
+- `known`, `maybe` and `blob` start a type only when `<` follows. A field name after
   `.` may be any name.
 - A `bound` is a name: a number there is an error that names the number.
 - Nesting of blocks, types and expressions is bounded by
@@ -757,7 +759,7 @@ on ping() -> u64 { return 1 }
 
 ```console
 $ hl check docs/snippets/errors/tool-returns.hl
-docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text or a text enum
+docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text, a text enum or a blob
 ```
 
 ```hl docs/snippets/errors/tool-returns.hl
@@ -901,7 +903,7 @@ examples/invalid/listing_unknown.hl:11:5: error: 'unknown' is not a variant of k
 $ hl check docs/snippets/errors/listing-name.hl
 docs/snippets/errors/listing-name.hl:5:20: error: listing 'team__docs' names its tools 'team__docs__NAME', so its name holds no '__' and does not end with '_'
 $ hl check docs/snippets/errors/listing-arguments.hl
-docs/snippets/errors/listing-arguments.hl:8:9: error: listing 'docs' takes 0 argument(s), found 1
+docs/snippets/errors/listing-arguments.hl:8:14: error: cannot append a notice to 'query': it is a local binding, and only state fields change
 $ hl check docs/snippets/errors/listing-bound.hl
 docs/snippets/errors/listing-bound.hl:3:26: error: the tools one listing may hold must be a named constant, found number 16
 ```
@@ -937,6 +939,129 @@ harness notes
 tools from listing(docs, 16) (query: text) effect none
 
 on ping() -> u64 { return 1 }
+```
+
+### Listing notices and tool search
+
+A listing can change while a turn runs, as nanocode's dynamic tools do: its
+Claude backend reads the tool list again before every request
+(`refresh_dynamic_tools`) and tells the model in a system message which tools
+were added or removed since the prompt it cached. Two additions write that.
+
+`name(context)` reads the listing like `name()` and then, when this read's
+fingerprints differ from the turn's previous successful read of the same
+listing, appends the builtin entry `notice(text)` to `context`, a state field
+of type `list<entry, _>`. The text names each tool the read added, changed
+(its fingerprint differs) or removed, in sorted order; the first read of a
+turn and a failed read append nothing. The notice is a function of the
+journaled listing results, so a replay appends the same entries; it is one
+more push, so the prover counts it against the context's capacity like any
+other. The `notice` variant exists in every program with a model and a
+listing.
+
+`tool T(...) -> text effect C finds L` declares `T` a search over listing
+`L`, as nanocode's `ToolSearch` discovers deferred tools. Its result is the
+names it found, one per line. Each must be `L__NAME` for a tool the turn's
+latest read of `L` listed, and there may be at most `L`'s bound of them;
+otherwise the result is recorded as the call's failure (`search found
+mcp__zeta, which listing mcp did not list in this turn`), checked at run
+time against the journaled read. A listing that a tool finds is deferred:
+`dispatch` admits its tools only once a search result of the same turn named
+them (`mcp__alpha was not discovered: no search of listing mcp found it in
+this turn`), on top of the listing's own admission and fingerprint check. A
+search changes nothing, so its class is `none` or `idempotent`:
+
+```hl docs/snippets/catalog.hl
+harness catalog
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const mcp_max: u64 = 8
+
+type outcome = done(text) | stopped(text) | exhausted
+
+tool search(query: text) -> text effect none finds mcp
+tools from listing(mcp, mcp_max) (query: text) effect external
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (2 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    match mcp(context) {
+      ok(listed) => {}
+      failed(error) => { return stopped(error) }
+    }
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+```console
+$ hl check docs/snippets/catalog.hl | grep -E 'worst case'
+  handler ask: worst case 48 effects, 91 journal records, 48 outbound requests
+$ hl run docs/snippets/catalog.hl --handler ask --arg hi --seed 12 | grep -o 'tools of listing mcp changed: [^\\]*' | head -n 2
+tools of listing mcp changed: removed mcp__epsilon
+tools of listing mcp changed: added mcp__eta
+$ hl run docs/snippets/catalog.hl --handler ask --arg hi --seed 12 | grep -o '"failed":"[a-z_]* found [^"]*"' | head -n 1
+"failed":"search found mcp__zeta, which listing mcp did not list in this turn"
+$ hl run docs/snippets/catalog.hl --handler ask --arg hi --seed 12 | grep -o '"failed":"mcp__[a-z]* was not discovered[^"]*"' | head -n 1
+"failed":"mcp__alpha was not discovered: no search of listing mcp found it in this turn"
+$ hl check docs/snippets/errors/search-external.hl
+docs/snippets/errors/search-external.hl:6:6: error: tool 'search' finds tools of listing 'mcp': a search changes nothing, so its effect is none or idempotent
+```
+
+```hl docs/snippets/errors/search-external.hl
+harness notes
+
+const calls_max: u64 = 4
+const mcp_max: u64 = 8
+
+tool search(query: text) -> text effect external finds mcp
+tools from listing(mcp, mcp_max) (query: text) effect none
+
+model think calls calls_max
+
+on ping() -> u64 { return 1 }
+```
+
+The simulator answers a search with up to `FOUND_TOOLS_MAX` = 3 names drawn
+from the listing as it stands, `UNLISTED_TOOL_PPM` of them names it may not
+hold. `search_listed` requires that every name a journaled search found was
+listed by its turn's latest read before it, and `tool_admitted` that a
+deferred tool ran only after a search of its turn found it. `search_unchecked`
+records a search without checking its names, `discovery_unchecked` admits
+deferred tools without a search, and `notice_dropped` leaves the notice out
+of the live run, which replay appends:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation search_unchecked docs/snippets/catalog.hl | head -n 1
+FAIL invariant=search_listed seed=2 target=native-jsonl profile=lying mutation=search_unchecked: search 2/5 (search) recorded "mcp__zeta" as found, which the latest read of listing mcp in turn 2 did not list
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation discovery_unchecked docs/snippets/catalog.hl | head -n 1
+FAIL invariant=tool_admitted seed=2 target=native-jsonl profile=lying mutation=discovery_unchecked: listed call 2/3 (mcp__beta) ran although no search in turn 2 found it: listing mcp is deferred
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation notice_dropped docs/snippets/catalog.hl | head -n 1
+FAIL invariant=checkpoint_compacted seed=4 target=native-jsonl profile=async mutation=notice_dropped: checkpoint 1 holds 7 entries of context where replaying the journal to turn 1 gives 8 entries of context: a checkpoint must hold the lists as clear and keep left them
 ```
 
 ### model
@@ -1545,13 +1670,17 @@ on ping() -> u64 { return count }
 | `list<T, N>` | up to `N` values of `T` | `push` (state fields only), `for`, `len(list)` |
 | `known<T>` | `ok(T)`, `failed(text)` | `match` |
 | `maybe<T>` | `ok(T)`, `failed(text)`, `unknown` | `match`, which must have an `unknown` arm |
+| `blob<N>` | at most `N` opaque bytes, journaled by digest | a list or a variant's field, `attached` ([Blobs](#blobs)) |
 
 Builtin sum types:
 
 - `call = call(text, text, text)`, read with `.id`, `.tool` and `.input`.
 - `reply = answer(text) | calls(list<call, M>)`, where `M` is the model's `calls`,
   unless the model declares its reply type, which then takes `reply`'s place.
-- `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`.
+- `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`,
+  then `notice(text)` in a program with a listing ([Listing notices and tool
+  search](#listing-notices-and-tool-search)) and `attached(call, blob<N>)` in one
+  whose tools return blobs ([Blobs](#blobs)).
 
 Rules:
 
@@ -2379,6 +2508,148 @@ and the checkpoint it writes no longer matches the journal's replay:
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --twice --mutation truncate_uncut docs/snippets/recovery.hl | head -n 1
 FAIL invariant=checkpoint_compacted seed=39 target=native-jsonl profile=errors mutation=truncate_uncut: checkpoint 1 holds 4 entries of context where replaying the journal to turn 1 gives 4 entries of context: a checkpoint must hold the lists as clear and keep left them
+```
+
+### Blobs
+
+`blob<N>` is an opaque value of at most `N` bytes, `N` a named constant: an
+image a tool read, a screenshot, a structured result the model sees as an
+attachment. A program cannot look inside a blob, compare it or build one; it
+can receive one from a tool, keep it in a list or a variant, and give it to
+the model.
+
+- `tool T(...) -> blob<N> effect C` returns a blob. `tool T(...) -> text or
+  blob<N> effect C` returns either, as nanocode's `Read` returns text for a
+  text file and an image block for an image; such a tool is called only
+  through `dispatch`. Every blob a tool returns has the same bound.
+- In such a program `dispatch(call)` returns the builtin sum `dispatched =
+  ok(text) | failed(text) | unknown | blob(blob<N>)` in place of
+  `maybe<text>`, so a `match` on it must take the blob, and the builtin
+  entry `attached(call, blob<N>)` puts it in the context. A tool, a handler
+  parameter or a code cell's tool cannot take a blob.
+- A host returns a blob as `{"data": BASE64}`. Data that is not base64, or
+  that decodes to more than `N` bytes, is recorded as the call's failure. The
+  result record holds `{"blob": SHA256, "data": BASE64}` the first time the
+  session journals those bytes and `{"blob": SHA256}` after, and a blob is
+  `{"blob": SHA256}` everywhere else: in the state, in checkpoints and in the
+  context a model request carries, with the session's bytes beside it. A
+  load reads every journaled blob, refuses data whose digest differs, and
+  refuses a state that holds a blob no record holds.
+- `keep L blobs last N`, `L` a `list<entry, _>` and `N` a named constant,
+  keeps at most the newest `N` attached blobs of `L` and turns each older one
+  into `result(call, "[image omitted from this request, which keeps only the
+  newest N images: sha256:DIGEST]")`, nanocode's image window: it evicts in
+  batches of half of `N`, rounded up, so the cached prefix of the requests
+  that follow changes once a batch rather than at every new image. A list of
+  blobs, `list<blob<N>, M>`, is bounded by `keep L last n` like any list.
+- The worst case counts the bytes of blobs a handler may journal, and a
+  target whose journal stores a record per row checks that a blob's record
+  fits one: Cloudflare's 2,000,000-byte row, SQLite's default string length
+  and Postgres's 1 GB field.
+
+```hl docs/snippets/images.hl
+harness viewer
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const image_bytes_max: u64 = 1048576
+const images_kept: u64 = 4
+const shots_max: u64 = 2
+
+type outcome = done(text) | exhausted
+
+tool screenshot(url: text) -> blob<image_bytes_max> effect idempotent
+tool read(path: text) -> text or blob<image_bytes_max> effect none
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+  shots: list<blob<image_bytes_max>, shots_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    keep context blobs last images_kept
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            blob(image) => {
+              push context attached(call, image)
+              keep shots last shots_max - 1
+              push shots image
+            }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+```console
+$ hl check docs/snippets/images.hl | grep -E 'worst case|blob bytes'
+  handler ask: worst case 40 effects, 75 journal records, 40 outbound requests
+    blob bytes journaled: 33554432, round below rounds_max (8) x call below calls_max (4)
+$ hl run docs/snippets/images.hl --handler ask --arg hi --seed 10 | grep -o '"ok":{"blob":"[0-9a-f]*"[^}]*}' | head -n 2
+"ok":{"blob":"6351825030155836664876686dcff61b6a91254a0458537072a1b26ad151b5ce","data":"YWw="}
+"ok":{"blob":"3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea","data":"ZQ=="}
+$ hl run docs/snippets/images.hl --handler ask --arg hi --seed 10 | grep -o '"ok":{"blob":"[0-9a-f]*"}}' | head -n 1
+"ok":{"blob":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
+$ hl run docs/snippets/images.hl --handler ask --arg hi --seed 10 | grep -o 'image omitted[^]]*' | head -n 1
+image omitted from this request, which keeps only the newest 4 images: sha256:6351825030155836664876686dcff61b6a91254a0458537072a1b26ad151b5ce
+$ hl check --target cloudflare examples/invalid/blob_row.hl 2>&1 > /dev/null | tail -n 1
+examples/invalid/blob_row.hl: error: tool 'photo': a result record of blob<photo_bytes_max> (2097152 bytes) holds up to 2796399 bytes, over cloudflare's limit of 2000000 bytes per journal row
+$ hl check docs/snippets/errors/blob-direct.hl
+docs/snippets/errors/blob-direct.hl:11:9: error: tool 'read' returns text or a blob: call it through dispatch, whose blob arm takes the blob
+```
+
+```hl docs/snippets/errors/blob-direct.hl
+harness notes
+
+const calls_max: u64 = 4
+const image_bytes_max: u64 = 1048576
+
+tool read(path: text) -> text or blob<image_bytes_max> effect none
+
+model think calls calls_max
+
+on peek(path: text) -> u64 {
+  match read(path) {
+    ok(_) => { return 1 }
+    failed(_) => { return 0 }
+  }
+}
+```
+
+The simulator answers a blob tool with short repeating byte strings, so the
+same bytes come back often and later records hold only the digest, with whole
+blobs at the bound in `BLOB_WHOLE_PPM` = 10000, blobs one byte over it in
+`BLOB_OVER_PPM` = 20000 and data that is not base64 in `BLOB_INVALID_PPM` =
+50000 cases per million; a `text or blob` tool answers a blob in
+`BLOB_ATTACHED_PPM` = 250000. `blob_journaled` requires that every journaled
+blob's data hashes to its digest, that a record without data follows one with
+it, and that every checkpoint's blobs are held. `blob_unjournaled` journals
+only digests, and `blobs_unevicted` keeps every blob in the live run, which
+replay evicts:
+
+```console
+$ hl sim --target cloudflare --seeds 0..200 --twice --mutation blob_unjournaled docs/snippets/images.hl | head -n 1
+FAIL invariant=blob_journaled seed=0 target=cloudflare profile=errors mutation=blob_unjournaled: result 1/3 (screenshot): blob 4cdfd556037e71f444cec02bf05421e860141c49d5701afdd109d29ab9c8ed29 is journaled without its data, and no earlier record holds it
+$ hl sim --target vercel --seeds 0..200 --twice --mutation blobs_unevicted docs/snippets/images.hl | head -n 1
+FAIL invariant=checkpoint_compacted seed=0 target=vercel profile=errors mutation=blobs_unevicted: checkpoint 4 holds 29 entries of context where replaying the journal to turn 4 gives 29 entries of context: a checkpoint must hold the lists as clear and keep left them
 ```
 
 ## Statements

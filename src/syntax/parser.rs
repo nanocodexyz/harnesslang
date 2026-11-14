@@ -268,13 +268,27 @@ impl<'a> Parser<'a> {
         let (params, defaults) = self.tool_params()?;
         self.symbol(Symbol::Arrow)?;
         let returns = self.type_expr()?;
+        let attaches = if self.is_word("or") {
+            self.advance();
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
         let effect = self.effect_class()?;
+        let finds = if self.is_word("finds") {
+            self.advance();
+            Some(self.name("the listing a search finds tools of")?)
+        } else {
+            None
+        };
         Ok(Tool {
             name,
             params,
             defaults,
             returns,
+            attaches,
             effect,
+            finds,
         })
     }
 
@@ -538,6 +552,12 @@ impl<'a> Parser<'a> {
             } else {
                 TypeExpr::Maybe { at, inner }
             }
+        } else if self.is_word("blob") && self.peek_second() == &Token::Symbol(Symbol::Less) {
+            self.advance();
+            self.symbol(Symbol::Less)?;
+            let bytes = self.bound("the bytes a blob may hold")?;
+            self.symbol(Symbol::Greater)?;
+            TypeExpr::Blob { at, bytes }
         } else {
             TypeExpr::Named(self.name("a type")?)
         };
@@ -596,6 +616,12 @@ impl<'a> Parser<'a> {
             "keep" => {
                 self.advance();
                 let list = self.name("a list to keep the end of")?;
+                if self.is_word("blobs") {
+                    self.advance();
+                    self.word("last")?;
+                    let count = self.bound("the blobs a keep leaves")?;
+                    return Ok(Stmt::KeepBlobs { at, list, count });
+                }
                 self.word("last")?;
                 let count = self.expr()?;
                 let first = if self.is_word("after") {
