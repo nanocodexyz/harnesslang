@@ -133,6 +133,19 @@ yields `unknown`.
 a handler is straight-line code over bounded loops, so its worst case is a
 number the checker computes.
 
+### Code mode
+
+`code exec { tools read, edit, bash  calls cell_calls_max  parallel ...  timers ...  timer_ms ...  journal_bytes ...  yield_ms ... }`
+offers a tool through which the model writes a JavaScript cell that calls the
+listed tools as nested calls. `exec(script)` and `dispatch` of it have type
+`maybe<text>`: `unknown` only when the cell could not be resumed. A nested
+external call is journaled and flushed with the cell's header before it runs
+and is never dispatched twice; an interrupted cell is replayed from its
+journal, and an open nested external call is delivered to the script as
+nanocode's unknown outcome. [CODE_MODE.md](CODE_MODE.md) is the whole design:
+construct, IR, cell journal records and durability points C1 and C2, recovery
+and placement per target, simulator invariants, proofs, mutations and oracle.
+
 ## Execution model
 
 A session is a journal. A handler runs as ordinary code; each effect site gets
@@ -154,6 +167,7 @@ journal and a nanocode journal fold the same way:
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
+| `cell` | a code cell's header, entries, nested call states and finish, as nanocode's `CellJournalUpdate` | cell, session, update |
 
 ### Durability points
 
@@ -208,6 +222,11 @@ trap ends the turn the same way with outcome `failed`. A target may flush
 more often than the IR asks (the output gate before every outbound request, a
 step boundary after every external step) but never less.
 
+A code site is `SiteKind::Cell` with class `Cell` and durability `Cell`: its
+own `call` record is `none`, and its nested calls follow points 1 to 3 plus
+C1 (header durable before a nested external) and C2 (header durable before a
+timer wait); see [CODE_MODE.md](CODE_MODE.md).
+
 Each handler also carries its worst case: effects, journal records and
 outbound requests, each with the chain of loops that multiplies into it.
 
@@ -243,6 +262,12 @@ What the compiler does differently per target:
   since a retried step may follow a dispatch whose result was lost. Adjacent
   `none` and `idempotent` effects with no external effect between them are
   grouped into one step, so a turn costs fewer queue round trips.
+
+Where a code cell runs: the host's engine in the process (native, Postgres),
+a dynamic Worker isolate with no network whose steps are RPC calls into the
+session's Durable Object (Cloudflare), the re-executed workflow function with
+every nested call a step (Vercel). A target whose platform cannot give that
+says `cells: unsupported` and `hl check` refuses `code` there.
 
 ## Verification
 
@@ -392,6 +417,7 @@ Invariants, named as nanocode-sim names them:
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
+| `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
 target adapter) that the simulator must catch, as tempoxyz/zempo and

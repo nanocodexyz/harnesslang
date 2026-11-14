@@ -104,3 +104,19 @@ Measurements (5-core Linux Hand shared with another agent): 12 full default dril
 Measurements (5-core Linux Hand shared with another agent, rustc 1.100.0, release build, mean of 20 runs, all five targets): `hl prove` examples/minimal.hl 6.6 ms, examples/agent.hl 11.3 ms, examples/reviewer.hl 194 ms (186 ms on one target: the arithmetic proof, 70,913 elimination steps for `review_change`, dominates and is target independent; agent.hl takes 4,098 steps, minimal.hl 3,227). `scripts/prove-mutations.sh`: 11.1 s sequential, 3.3 s with one process per mutation.
 
 Commands: `target/release/hl prove [--target T] [--mutation M] FILE`, `scripts/prove-mutations.sh`.
+
+## 2026-11-14: code mode design (docs/CODE_MODE.md)
+
+Code mode is specified, not built: `docs/CODE_MODE.md` holds the `code` declaration, the IR additions, the cell journal, recovery and placement per target, the simulator's faults and invariants, the prover's obligations, the mutations and the oracle's checks. It follows nanocode at 395967f, read on 2026-11-14 in /home/hand/ref/nanocode: `crates/runtime/code-mode/src/code_mode/replay.rs` (`CellJournal`, `CellJournalUpdate`, `JournaledCall`, `CellJournal::fold`, `UNKNOWN_OUTCOME`, `unknown_outcome()`, `divergence_text`), `code_mode/mod.rs` (`Nested::Recover` falling back to the unknown outcome, `resume_replayed`: queued calls dispatched, running calls without an outcome recovered, `CellGuard`, `Limits.nested`), `crates/runtime/code-mode-engine/src/journal.rs` (`JournalEntry`, `same_step`, `JOURNAL_LIMIT_BYTES` 32 MiB), `crates/runtime/agent/src/one_log.rs` (`OneLogJournals::save`: a row commits when an update carries a running call whose tool `needs_row()`, or a `Timeout` while the header is new or unsaved), `crates/core/turnlog/src/{record,fold}.rs` (`Record::Cell`, `Record::Forget`, `Fold::unknown` = every open external call) and nanocode's DECISIONS.md entry of 2026-11-14 on first saves (rows per turn: reply 2, `text("ok")` cell 2, timer cell 3, `tools.charge` cell 3). `code_mode_policy.rs` in the Claude and Codex backends only routes workspace tools and marks writers exclusive, which harnesslang's nested tools do not need. durable-cloudflare runs cells in the session's Durable Object (nanocode-ts's djs wasm, cell memory 32 MiB, half of the 64 MiB runtime budget); durable-vercel in the Function; both moved to the first-save rule on 2026-11-14 and their drills pass.
+
+Decisions the design takes:
+
+- The engine is an interface (nanocode's journal protocol), not part of harnesslang: a std-only compiler cannot embed djs. Native hosts bind djs; the simulator has its own deterministic engine whose cells also carry their JavaScript, so `oracle/` runs them in djs and compares the `JournalEntry` streams.
+- Cloudflare runs a cell in a Worker Loader isolate with `globalOutbound: null`, so the isolate cannot send anything the output gate does not hold; Vercel runs it in the re-executed workflow function with each nested call a step. Both rest on platform facts not yet read from the vendor pages (listed in CODE_MODE.md); where one is false the target refuses `code` rather than weaken at-most-once.
+- The code site's own `call` record is class `none`: the cell is replayable and its external work is journaled per nested call. nanocode's `Effects` must declare code tools `none` in the oracle.
+- `calls` bounds nested calls across all tools (nanocode's guard is per tool), so the prover multiplies one number.
+- harnesslang writes the nested `call` record's `turn`, which nanocode leaves `None`; no `forget` or `stored` records.
+- No yield or `wait` yet: a turn blocks on its cell; the header carries `yield_time_ms` for nanocode's fold.
+- Simulator policy: cells in 20% of tool-call replies, engine divergence in 1% of replays.
+
+No code changed, so there is nothing to measure; `scripts/check.sh` passes on this commit as on its parent.
