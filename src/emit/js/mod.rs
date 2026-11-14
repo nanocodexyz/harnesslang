@@ -63,7 +63,13 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
             .expect("writing to a string succeeds");
     }
     out.push_str(ENGINE);
-    for (index, handler) in program.handlers.iter().chain(&program.sides).enumerate() {
+    for (index, handler) in program
+        .handlers
+        .iter()
+        .chain(&program.sides)
+        .chain(&program.forked)
+        .enumerate()
+    {
         out.push_str(&handler_function(program, index, handler));
     }
     out.push_str(adapter);
@@ -231,10 +237,10 @@ fn program_literal(program: &Program) -> String {
         let finds = tool
             .finds
             .map_or_else(String::new, |listing| format!(", finds: {listing}"));
-        let spawns = if tool.spawn.is_some() {
-            ", spawn: true"
-        } else {
-            ""
+        let spawns = match (tool.spawn.is_some(), tool.fork) {
+            (true, _) => ", spawn: true".to_owned(),
+            (false, Some(at)) => format!(", fork: {}", js_string(at.name())),
+            (false, None) => String::new(),
         };
         let attaches = tool.attaches.as_ref().map_or_else(String::new, |bytes| {
             format!(", attaches: {}", type_literal(&Type::Blob(bytes.clone())))
@@ -333,6 +339,14 @@ fn program_literal(program: &Program) -> String {
         ));
     }
     out.push_str("  ],\n");
+    if let Some(forked) = &program.forked {
+        out.push_str("  forked:\n");
+        out.push_str(&handler_literal(
+            program,
+            program.handlers.len() + program.sides.len(),
+            forked,
+        ));
+    }
     match &program.idle {
         Some(idle) => writeln!(
             out,
@@ -377,7 +391,7 @@ fn bound_literal(bound: &crate::ir::Bound) -> String {
 fn code_literal(code: &crate::ir::Code) -> String {
     let tools: Vec<String> = code.tools.iter().map(ToString::to_string).collect();
     format!(
-        "    {{ name: {}, tools: [{}], calls: {}, parallel: {}, timers: {}, timerMs: {}, journalBytes: {}, yieldMs: {} }},\n",
+        "    {{ name: {}, tools: [{}], calls: {}, parallel: {}, timers: {}, timerMs: {}, journalBytes: {}, yieldMs: {}, waits: {}, cancel: {} }},\n",
         js_string(&code.name),
         tools.join(", "),
         bound_literal(&code.calls),
@@ -385,7 +399,17 @@ fn code_literal(code: &crate::ir::Code) -> String {
         bound_literal(&code.timers),
         bound_literal(&code.timer_ms),
         bound_literal(&code.journal_bytes),
-        bound_literal(&code.yield_ms)
+        bound_literal(&code.yield_ms),
+        code.waits.as_ref().map_or_else(
+            || "null".to_owned(),
+            |waits| format!(
+                "{{ name: {}, params: {}, defaults: {} }}",
+                js_string(&waits.name),
+                fields_literal(&waits.params),
+                defaults_literal(&waits.defaults)
+            )
+        ),
+        code.interrupts.cancel
     )
 }
 

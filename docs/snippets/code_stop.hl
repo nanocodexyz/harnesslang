@@ -1,0 +1,62 @@
+harness worker
+
+const steps_max: u64 = 6
+const calls_max: u64 = 3
+const entries_max: u64 = 256
+const cell_calls_max: u64 = 4
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 60000
+const cell_journal_bytes_max: u64 = 1048576
+const cell_yield_ms: u64 = 10000
+
+type outcome = done(text) | stopped | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+code exec {
+  tools read, bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+  waits wait
+  interruptible by cancel
+}
+
+model infer calls calls_max
+
+on cancel
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+        if cancelled { return stopped }
+      }
+    }
+  }
+  return exhausted
+}

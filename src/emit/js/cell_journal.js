@@ -314,6 +314,11 @@ function cellLogApply(log, update) {
   log.finished = update.finished;
 }
 
+function cellLogStopped(log, session) {
+  assert(!log.finished, "only a running cell is stopped");
+  return { sessionId: session, cellId: log.cell, seq: log.nextSeq, header: null, entriesFrom: log.entries.length, entries: [], calls: [], finished: true };
+}
+
 function cellLogBytes(log) {
   return log.entries.reduce((sum, entry) => sum + entryBytes(entry), 0n);
 }
@@ -328,7 +333,10 @@ function nestedKey(seq, nested) {
 
 function nestedCallFold(log, record) {
   const site = log.sites.get(record.seq);
-  if (site === undefined || site.kind !== "open") {
+  const cell = log.cells.get(record.seq);
+  const lastSeq = Math.max(...log.sites.keys());
+  const continued = cell !== undefined && !cell.finished && log.sites.get(lastSeq).kind === "open";
+  if (!continued && (site === undefined || site.kind !== "open")) {
     throw new Corrupt(`nested call ${record.seq}/${record.nested} of turn ${record.turn} comes from a site that is not running`);
   }
   const last = log.lastNested.get(record.seq);

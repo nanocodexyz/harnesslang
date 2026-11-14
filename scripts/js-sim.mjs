@@ -65,7 +65,7 @@ function parseTrace(path) {
     const event = rt.decodeJson(line);
     if (rt.encodeJson(event) !== line) throw new Error(`the JavaScript codec does not round-trip trace line ${short(line)}`);
     if (event.event === "seed") {
-      current = { seed: event.seed, profile: event.profile, scope: event.scope, events: [], acks: [], turns: 0 };
+      current = { seed: event.seed, profile: event.profile, scope: event.scope, entry: event.entry ?? [], events: [], acks: [], turns: 0 };
       seeds.push(current);
     }
     if (event.event === "ack") current.acks.push(event);
@@ -556,6 +556,7 @@ class FakeStorage {
 
 async function cloudflareSeed(seed) {
   const storage = new FakeStorage(harness.statements);
+  storage.rows = seed.seed.entry.map((record, index) => ({ position: index + 1, record }));
   const ctx = { storage };
   const fetchCheck = (request) => {
     if (storage.pendingRows.length > 0) {
@@ -651,6 +652,7 @@ class SimWorkflow {
     this.seed = seed;
     this.state = state;
     this.turnsMax = seed.seed.turns;
+    this.entry = seed.seed.entry;
     this.stepIndex = 0;
     this.statusLive = false;
     this.notDueLive = false;
@@ -814,7 +816,7 @@ async function vercelSeed(seed) {
     jobsAsked: new Map(),
     host: seed.host(() => {}),
     lines() {
-      return this.log.flatMap((entry) => entry.output.lines);
+      return [...seed.seed.entry, ...this.log.flatMap((entry) => entry.output.lines)];
     },
   };
   while (seed.cursor.peek()?.event === "turn") {

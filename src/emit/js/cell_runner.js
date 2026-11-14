@@ -33,9 +33,21 @@ function cellRefusal(error) {
   return [encodeJson(object([["code", CALL_LIMIT], ["error", error], ["isError", true], ["retryable", false]])), false];
 }
 
+const RUNNING_KEY = "running";
+const RUNNING_TEXT = "Script running with cell ID ";
+const TERMINATED_TEXT = "Script terminated";
+const NOT_FOUND_TEXT = "exec cell ID not found";
+const STOPPED_TEXT = "Tool execution stopped by the user. The cell was terminated and no nested tool call was left running.";
+const STOPPED_UNKNOWN_TEXT = "Tool execution stopped by the user. The cell was terminated while a nested tool call was still running; that call's outcome is unknown. Do not assume it did not run or automatically repeat it.";
+
+function cellStopped(unknown) {
+  return { kind: "done", text: unknown ? STOPPED_UNKNOWN_TEXT : STOPPED_TEXT };
+}
+
 function cellOutcomeOutput(outcome) {
   if (outcome.kind === "done") return { tag: "ok", value: outcome.text };
   if (outcome.kind === "threw") return { tag: "failed", error: outcome.text };
+  if (outcome.kind === "running") return { tag: "ok", value: object([[RUNNING_KEY, outcome.text]]) };
   return { tag: "ok", value: object([[UNKNOWN_KEY, outcome.text]]) };
 }
 
@@ -43,7 +55,8 @@ function cellOutcomeFrom(output) {
   if (output.tag === "failed") return { kind: "threw", text: output.error };
   if (typeof output.value === "string") return { kind: "done", text: output.value };
   if (isObject(output.value) && typeof output.value[UNKNOWN_KEY] === "string") return { kind: "unknown", text: output.value[UNKNOWN_KEY] };
-  throw new DecodeError(`cell output ${encodeJson(output.value)} is neither text nor unknown`);
+  if (isObject(output.value) && typeof output.value[RUNNING_KEY] === "string") return { kind: "running", text: output.value[RUNNING_KEY] };
+  throw new DecodeError(`cell output ${encodeJson(output.value)} is neither text, unknown nor running`);
 }
 
 function headerTools(code) {
@@ -61,8 +74,14 @@ async function runCell(site, host) {
     outcome = await runner.drive();
   } catch (error) {
     if (!(error instanceof CellInterrupt)) throw error;
+    if (error.kind === "stopped") return runner.finish(cellStopped(error.text));
+    if (error.kind === "yield") {
+      if (await host.cellCancelled(site.code, false)) return runner.finish(cellStopped(false));
+      return runner.yielded();
+    }
     outcome = await runner.interrupted(error);
   }
+  if (await host.cellCancelled(site.code, false)) return runner.finish(cellStopped(false));
   return runner.finish(outcome);
 }
 
@@ -97,7 +116,8 @@ class CellRunner {
     this.cursor = 0;
     this.freshEntries = [];
     this.changedCalls = new Map();
-    this.headerUnsaved = false;
+    this.headerUnsaved = site.headerBuffered === true;
+    this.deadline = null;
     this.calls = new Map();
     this.queue = [];
     this.issued = 0n;
@@ -136,6 +156,7 @@ class CellRunner {
       replay: this.replay.filter((entry) => !entryIsInput(entry)),
       limits: { timers: this.code.timers, timerMs: this.code.timerMs, unchecked: this.unchecked() },
     };
+    if (this.live) await this.armDeadline();
     let step = await this.host.start(this.cell, this.script, context);
     const stepsMax = cellStepsMax(this.code);
     for (let index = 0; index < stepsMax; index++) {
@@ -349,6 +370,7 @@ class CellRunner {
     if (this.live) return;
     assert(this.cursor === this.replay.length, "a cell goes live at its journal's end");
     this.live = true;
+    await this.armDeadline();
     if (this.site.mutation === "nested_ids_restart") {
       let last = 0;
       for (const id of this.calls.keys()) last = Math.max(last, id);
@@ -418,6 +440,7 @@ class CellRunner {
   }
 
   async dispatch(id, fresh) {
+    if (await this.host.cellCancelled(this.site.code, false)) throw new CellInterrupt("stopped", false);
     const call = this.calls.get(id);
     const effect = call.tool.effect;
     this.emit(false);
@@ -449,6 +472,10 @@ class CellRunner {
       assert(attempt === 1 || this.site.mutation === "cell_replay_ignores_journal", "a fresh nested external step starts at its first attempt");
     }
     const output = await this.runTool(id);
+    if (required && (await this.host.cellCancelled(this.site.code, true))) {
+      this.host.abandoned(this.site.seq, this.recordId(id));
+      throw new CellInterrupt("stopped", true);
+    }
     if (required) this.host.append({ kind: "nested_result", turn: this.site.turn, seq: this.site.seq, nested: this.recordId(id), output });
     if (step || late) {
       await this.host.flush();
@@ -507,6 +534,7 @@ class CellRunner {
       if (earliest === null || until < earliest[0] || (until === earliest[0] && id < earliest[1])) earliest = [until, id];
     }
     if (earliest === null) throw new CellInterrupt("threw", "the cell waits with no nested call running and no timer armed");
+    if (this.deadline !== null && earliest[0] > this.deadline) throw new CellInterrupt("yield", null);
     return this.fire(earliest[1], earliest[0]);
   }
 
@@ -542,7 +570,10 @@ class CellRunner {
   }
 
   async deliver(id) {
-    if (this.calls.get(id).output === null) await this.dispatch(id, false);
+    if (this.calls.get(id).output === null) {
+      await this.dispatch(id, false);
+      if (await this.host.cellCancelled(this.site.code, true)) throw new CellInterrupt("stopped", false);
+    }
     const output = this.calls.get(id).output;
     assert(output !== null, "a delivered call has its output");
     const [encoded, success] = output;
@@ -562,10 +593,26 @@ class CellRunner {
       this.headerUnsaved = false;
     }
     await this.host.waitTimer({ cell: this.cell, code: this.site.code, timer: id, delayMs, untilMs });
+    if (await this.host.cellCancelled(this.site.code, true)) throw new CellInterrupt("stopped", false);
     this.timers.delete(id);
     await this.appendEntry({ kind: "timer", id });
     this.emit(false);
     return { kind: "timer", id };
+  }
+
+  async armDeadline() {
+    if (this.code.waits === null) return;
+    const clock = BigInt(await this.host.deadline(this.site.site, this.cell));
+    const deadline = clock + this.code.yieldMs.value;
+    this.deadline = deadline > U64_MAX ? U64_MAX : deadline;
+  }
+
+  async yielded() {
+    assert(this.live, "a cell yields only while it runs live");
+    assert(this.running() === 0n, "a cell yields only with no nested call running");
+    this.emit(false);
+    await this.host.observe({ kind: "yielded", cell: this.cell });
+    return { kind: "running", text: RUNNING_TEXT + this.cell };
   }
 
   async finish(outcome) {

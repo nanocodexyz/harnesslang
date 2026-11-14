@@ -37,6 +37,11 @@ pub fn program(program: &Program) {
         self::handler(program, side);
         side_reads_only(side);
     }
+    if let Some(forked) = &program.forked {
+        self::handler(program, forked);
+        assert!(forked.sites.is_empty(), "on forked runs no effect");
+        assert!(forked.requires.is_none(), "on forked has no requires");
+    }
 }
 
 fn side_reads_only(side: &ir::Handler) {

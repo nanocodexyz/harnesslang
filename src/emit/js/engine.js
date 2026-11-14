@@ -13,7 +13,7 @@ const SIDE_REFUSED = "the checker refuses this effect in a side handler";
 
 function spawnOutput(tool, scope, turn, seq, output) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
-  if (output.tag !== "ok" || declared === undefined || !declared.spawn) return output;
+  if (output.tag !== "ok" || declared === undefined || (!declared.spawn && declared.fork === undefined)) return output;
   const key = String(turn) + SPAWN_KEY_SEPARATOR + String(seq);
   return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };
 }
@@ -65,6 +65,25 @@ class Engine {
     this.discovered = new Map();
     this.blobs = new Blobs();
     this.snapshot = null;
+    this.forkBase = null;
+  }
+
+  async forkCall(seq, call) {
+    const at = forkOf(call.tool);
+    if (at === null || !isObject(call.input)) return call;
+    assert(this.forkBase !== null, "a live turn of a program with fork tools keeps the journal a fork reads");
+    const selected = forkSelect(this.forkBase, forkRequested(at, call.input));
+    if (selected.missing !== undefined) return call;
+    const key = String(this.turn) + SPAWN_KEY_SEPARATOR + String(seq);
+    const origin = this.mode.scope === ROOT_SCOPE || this.mode.scope === undefined ? key : this.mode.scope + SPAWN_SCOPE_SEPARATOR + key;
+    const payload = await forkPayload({ target: this.target, mutation: "none" }, this.forkBase, selected, origin);
+    return { ...call, input: forkInput(selected, origin, payload) };
+  }
+
+  forkRefused(call) {
+    const at = forkOf(call.tool);
+    if (at === null || !isObject(call.input) || call.input[FORK_STATE] !== undefined) return null;
+    return forkMissing(forkRequested(at, call.input) ?? 0);
   }
 
   async sideQuestion(seq) {
@@ -210,9 +229,32 @@ class Engine {
 
   append(record) {
     if (this.mode.live) {
+      if (record.kind === "cell" && cellsYield()) this.foldCell(record);
       this.buffer.push(record);
       this.mode.world.append(record);
     }
+  }
+
+  foldCell(record) {
+    if (record.fresh) {
+      const [, seq] = parseAnyCallId(record.update.header.originCallId);
+      this.cells.set(seq, cellLogStart(record.update));
+      return;
+    }
+    const log = [...this.cells.values()].find((candidate) => candidate.cell === record.cell);
+    assert(log !== undefined, "an update follows its cell's header");
+    cellLogApply(log, record.update);
+  }
+
+  stopCell(origin) {
+    const log = this.cells.get(origin);
+    this.append({ kind: "cell", cell: log.cell, fresh: false, session: PROGRAM.name, update: cellLogStopped(log, PROGRAM.name) });
+  }
+
+  stopCells() {
+    if (!cellsYield()) return;
+    const running = [...this.cells.entries()].filter(([, log]) => !log.finished).map(([seq]) => seq).sort((left, right) => left - right);
+    for (const origin of running) this.stopCell(origin);
   }
 
   nextAttempt() {
@@ -243,6 +285,7 @@ class Engine {
 
   async finish(outcome, result) {
     const finish = { turn: this.turn, outcome, result };
+    this.stopCells();
     this.append({ kind: "status", turn: this.turn, last: this.seq, outcome, result });
     this.append({ kind: "checkpoint", revision: this.turn, state: PROGRAM.name, payload: encodeJson(stateJson(this.state)) });
     await this.flush();
@@ -348,6 +391,8 @@ class Engine {
     this.seq += 1;
     const seq = this.seq;
     const call = this.resolve(site, args);
+    const waits = site.kind === "dispatch" ? waitsNamed(call.tool) : null;
+    if (waits !== null) return this.waitCellSite(waits, seq, { ...call, effect: "none" });
     const code = site.kind === "cell" ? site.code : site.kind === "dispatch" ? codeNamed(call.tool) : null;
     if (code !== null) return this.cellSite(code, seq, { ...call, effect: "none" });
     if (site.kind === "suspend") return this.suspendSite(siteId, seq, call);
@@ -359,11 +404,12 @@ class Engine {
     if (logged !== undefined) return this.recorded(siteId, seq, call, args, logged);
     this.requireLive(seq);
     await this.sideQuestion(seq);
+    const filled = await this.forkCall(seq, call);
     if (site.kind !== "model") {
-      this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
-      this.sites.set(seq, { kind: "open", call });
+      this.append({ kind: "call", turn: this.turn, seq, tool: filled.tool, effect: filled.effect, input: filled.input });
+      this.sites.set(seq, { kind: "open", call: filled });
     }
-    return this.execute(siteId, seq, call, args);
+    return this.execute(siteId, seq, filled, args);
   }
 
   async recorded(siteId, seq, call, args, logged) {
@@ -371,7 +417,7 @@ class Engine {
     switch (logged.kind) {
       case "done":
         this.same(seq, logged.call, call);
-        return this.settle(site, call, logged.output);
+        return this.settle(site, logged.call, logged.output);
       case "reply":
         if (site.kind !== "model") throw this.diverged(seq, "a model reply", call.tool);
         if (logged.mode !== site.mode) {
@@ -383,11 +429,11 @@ class Engine {
         return this.reply(logged.response);
       case "unknown":
         this.same(seq, logged.call, call);
-        if (!reportsUnknown(site.result)) return this.reopen(siteId, seq, call, args);
+        if (!reportsUnknown(site.result)) return this.reopen(siteId, seq, logged.call, args);
         return variant(VARIANT_UNKNOWN, []);
       case "open":
         this.same(seq, logged.call, call);
-        return this.reopen(siteId, seq, call, args);
+        return this.reopen(siteId, seq, logged.call, args);
       default:
         throw new Panic(`unknown site log ${logged.kind}`);
     }
@@ -501,8 +547,13 @@ class Engine {
       this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
       this.sites.set(seq, { kind: "open", call });
     }
-    const outcome = await this.runCell(code, seq, call);
-    const output = cellOutcomeOutput(outcome);
+    let output;
+    const settled = this.cells.get(seq)?.finished === true;
+    if ((logged === undefined || settled) && this.cellPreempted(code)) {
+      output = { tag: "ok", value: STOPPED_TEXT };
+    } else {
+      output = cellOutcomeOutput(await this.runCell(code, seq, call));
+    }
     this.append({ kind: "result", turn: this.turn, seq, output });
     this.sites.set(seq, { kind: "done", call, output });
     return this.decodeCell(output);
@@ -525,14 +576,105 @@ class Engine {
       script: call.input,
       cell: existing === undefined ? { kind: "fresh", id: this.nextCell } : { kind: "existing", log: existing },
       nested: new Map(this.nested),
+      site: seq,
     };
     if (existing === undefined) this.nextCell += 1;
     return runCell(site, new EngineCellHost(this));
   }
 
+  async waitCellSite(code, seq, call) {
+    const logged = this.sites.get(seq);
+    let rerun = false;
+    if (logged !== undefined) {
+      switch (logged.kind) {
+        case "done":
+          this.same(seq, logged.call, call);
+          return this.decodeCell(logged.output);
+        case "unknown":
+          this.same(seq, logged.call, call);
+          return variant(VARIANT_UNKNOWN, []);
+        case "reply":
+          throw this.diverged(seq, "a model reply", call.tool);
+        case "open":
+          this.same(seq, logged.call, call);
+          this.requireLive(seq);
+          rerun = true;
+          break;
+        default:
+          throw new Panic(`unknown site log ${logged.kind}`);
+      }
+    } else {
+      this.requireLive(seq);
+      this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
+      this.sites.set(seq, { kind: "open", call });
+    }
+    const output = await this.collectCell(code, seq, call, rerun);
+    this.append({ kind: "result", turn: this.turn, seq, output });
+    this.sites.set(seq, { kind: "done", call, output });
+    return this.decodeCell(output);
+  }
+
+  cellPreempted(code) {
+    return PROGRAM.codes[code].cancel && this.mutation !== "cell_cancel_ignored" && this.preempted(CELL_INTERRUPTS);
+  }
+
+  waitedCell(code, seq, id) {
+    const name = PROGRAM.codes[code].name;
+    const origins = [...this.cells.keys()].filter((origin) => origin < seq).sort((left, right) => left - right);
+    for (const origin of origins) {
+      const log = this.cells.get(origin);
+      const site = this.sites.get(origin);
+      if (String(log.cell) === id && site !== undefined && site.kind === "done" && site.call.tool === name) return [origin, log];
+    }
+    return null;
+  }
+
+  async collectCell(code, seq, call, rerun) {
+    const input = call.input;
+    if (typeof input === "string") {
+      const typed = toolInput(call.tool, input);
+      assert(typed.kind === "invalid", "a wait call keeps its raw input only when it does not fit");
+      return { tag: "failed", error: typed.error };
+    }
+    const id = typeof input.cell_id === "string" ? input.cell_id : "";
+    const terminate = input.terminate === true;
+    const found = this.waitedCell(code, seq, id);
+    const settled = found === null || found[1].finished;
+    if ((!rerun || settled) && this.cellPreempted(code)) {
+      if (found !== null && !found[1].finished) this.stopCell(found[0]);
+      return { tag: "ok", value: STOPPED_TEXT };
+    }
+    if (found === null) return { tag: "failed", error: NOT_FOUND_TEXT };
+    const [origin, log] = found;
+    if (log.finished) {
+      if (!rerun) return { tag: "failed", error: NOT_FOUND_TEXT };
+      if (terminate) return { tag: "ok", value: TERMINATED_TEXT };
+      return cellOutcomeOutput({ kind: "unknown", text: divergenceText(log.cell, "it finished but its result was lost with the journal's tail") });
+    }
+    if (terminate) {
+      this.stopCell(origin);
+      return { tag: "ok", value: TERMINATED_TEXT };
+    }
+    const headerBuffered = this.buffer.some((record) => record.kind === "cell" && record.fresh && record.cell === log.cell);
+    const site = {
+      code,
+      target: this.target,
+      mutation: this.mutation,
+      session: PROGRAM.name,
+      turn: this.turn,
+      seq: origin,
+      script: log.header.script,
+      cell: { kind: "existing", log: cellLogClone(log) },
+      nested: new Map(this.nested),
+      headerBuffered,
+      site: seq,
+    };
+    return cellOutcomeOutput(await runCell(site, new EngineCellHost(this)));
+  }
+
   decodeCell(output) {
     const outcome = decodeOrCorrupt(() => cellOutcomeFrom(output));
-    if (outcome.kind === "done") return variant(VARIANT_OK, [outcome.text]);
+    if (outcome.kind === "done" || outcome.kind === "running") return variant(VARIANT_OK, [outcome.text]);
     if (outcome.kind === "threw") return variant(VARIANT_FAILED, [outcome.text]);
     return variant(VARIANT_UNKNOWN, []);
   }
@@ -816,7 +958,8 @@ class Engine {
     } else {
       const returns = site.result.known ?? site.result.maybe ?? (reportsUnknown(site.result) ? dispatchedReturns(call.tool) : undefined);
       assert(returns !== undefined, "a tool site yields known or maybe");
-      const gate = site.kind === "dispatch" ? this.gate(call) : { admitted: null };
+      const forkRefused = this.forkRefused(call);
+      const gate = forkRefused !== null ? { refused: forkRefused } : site.kind === "dispatch" ? this.gate(call) : { admitted: null };
       if (gate.refused !== undefined) {
         output = { tag: "failed", error: gate.refused };
       } else {
@@ -951,7 +1094,9 @@ class Engine {
 
   same(seq, recorded, call) {
     if (recorded.tool !== call.tool) throw this.diverged(seq, recorded.tool, call.tool);
-    if (recorded.effect !== call.effect || !jsonEqual(recorded.input, call.input)) {
+    const at = forkOf(recorded.tool);
+    const input = at === null ? recorded.input : forkRequestOf(at, recorded.input);
+    if (recorded.effect !== call.effect || !jsonEqual(input, call.input)) {
       throw new Corrupt(`replay of turn ${this.turn} diverged at seq ${seq}: tool '${call.tool}' was recorded with another class or input`);
     }
   }
@@ -1007,6 +1152,14 @@ class EngineCellHost {
     return this.world.nestedAttempt(this.engine.turn, seq, nested);
   }
 
+  abandoned(seq, nested) {
+    const engine = this.engine;
+    engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]], replied: [], undispatched: [] });
+    const key = nestedKey(seq, nested);
+    const site = engine.nested.get(key);
+    if (site !== undefined && site.kind === "open") engine.nested.set(key, { kind: "unknown", call: site.call });
+  }
+
   async recovered(seq, nested) {
     const engine = this.engine;
     engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]], replied: [], undispatched: [] });
@@ -1018,6 +1171,17 @@ class EngineCellHost {
 
   clock() {
     return this.world.now();
+  }
+
+  async cellCancelled(code, drain) {
+    if (!PROGRAM.codes[code].cancel) return false;
+    if (drain) await this.engine.drain();
+    return this.engine.mutation !== "cell_cancel_ignored" && this.engine.preempted(CELL_INTERRUPTS);
+  }
+
+  deadline(site, cell) {
+    if (this.world.cellDeadline === undefined) return this.world.now();
+    return this.world.cellDeadline(this.engine.turn, site, cell);
   }
 
   random() {
@@ -1038,6 +1202,8 @@ class EngineCellHost {
     return this.world.observe(event);
   }
 }
+
+const CELL_INTERRUPTS = { cancel: true, steer: false };
 
 function codeNamed(name) {
   const index = PROGRAM.codes.findIndex((code) => code.name === name);
@@ -1220,6 +1386,7 @@ async function runTurn(setup, world, epoch, records, request) {
   assert(typeof scope === "string", "a turn request's scope is text");
   const engine = new Engine(setup, handler, { live: true, world, epoch, scope }, request.turn, state, log);
   if (PROGRAM.sides.length > 0) engine.snapshot = stateFromJson(stateJson(state));
+  if (programForks()) engine.forkBase = session;
   engine.nextCell = nextCell(session);
   engine.blobs = blobs;
   engine.jobs = new Map(session.jobs);
@@ -1354,6 +1521,100 @@ class SideWorld {
   async hold() {
     throw new Panic(SIDE_REFUSED + ": hold");
   }
+}
+
+
+const FORKED_HOST_KEY = "forked";
+const FORK_TURN = "turn";
+const FORK_ORIGIN = "origin";
+const FORK_DISCARDED = "discarded";
+const FORK_STATE = "state";
+const ENTRY_REVISION = 0;
+
+function forkOf(tool) {
+  const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  return declared === undefined || declared.fork === undefined ? null : declared.fork;
+}
+
+function programForks() {
+  return PROGRAM.tools.some((tool) => tool.fork !== undefined);
+}
+
+function forkMissing(turn) {
+  return "no finished turn " + String(turn) + " to fork from";
+}
+
+function forkSelect(session, at) {
+  const turn = at === null ? lastFinished(session) : at;
+  const log = session.turns.get(turn);
+  const finished = log !== undefined && log.finished !== null;
+  if (turn !== ENTRY_REVISION && !finished) return { missing: turn };
+  let discarded = 0;
+  for (const [later, laterLog] of session.turns) {
+    if (later > turn && laterLog.finished !== null) discarded += 1;
+  }
+  return { turn, discarded };
+}
+
+function forkRequested(at, input) {
+  if (at !== "turn") return null;
+  const turn = isObject(input) ? input[FORK_TURN] : undefined;
+  if (typeof turn !== "bigint" || turn > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(turn);
+}
+
+function forkRequestOf(at, input) {
+  if (!isObject(input) || input[FORK_STATE] === undefined) return input;
+  if (at === "latest") return object([]);
+  return object([[FORK_TURN, input[FORK_TURN] ?? null]]);
+}
+
+async function runForked(setup, state, origin, discarded) {
+  if (PROGRAM.forked === undefined) return state;
+  const scratch = new SideWorld(null);
+  const engine = new Engine(setup, PROGRAM.forked, { live: true, world: scratch, epoch: 0, scope: ROOT_SCOPE }, SIDE_TURN, state, newTurnLog(PROGRAM.forked.name, null));
+  const ran = await engine.run([origin, BigInt(discarded)]);
+  assert(ran.suspended === undefined && ran.finish.outcome === "completed", "on forked runs to its end");
+  return ran.state;
+}
+
+async function forkPayload(setup, session, selected, origin) {
+  const before = await stateBefore(setup, session, selected.turn + 1);
+  const state = await runForked({ target: setup.target, mutation: "none" }, before, origin, selected.discarded);
+  return encodeJson(stateJson(state));
+}
+
+function forkInput(selected, origin, payload) {
+  return object([
+    [FORK_DISCARDED, BigInt(selected.discarded)],
+    [FORK_ORIGIN, origin],
+    [FORK_STATE, payload],
+    [FORK_TURN, BigInt(selected.turn)],
+  ]);
+}
+
+function forkRecords(input) {
+  const number = (key) => {
+    const value = input[key];
+    if (typeof value !== "bigint") throw new DecodeError("a fork's input lacks '" + key + "'");
+    return value;
+  };
+  const turn = number(FORK_TURN);
+  const discarded = number(FORK_DISCARDED);
+  if (typeof input[FORK_ORIGIN] !== "string") throw new DecodeError("a fork's input lacks '" + FORK_ORIGIN + "'");
+  if (typeof input[FORK_STATE] !== "string") throw new DecodeError("a fork's input lacks '" + FORK_STATE + "'");
+  return [
+    { kind: "host", key: FORKED_HOST_KEY, value: object([[FORK_DISCARDED, discarded], [FORK_ORIGIN, input[FORK_ORIGIN]], [FORK_TURN, turn]]) },
+    { kind: "checkpoint", revision: ENTRY_REVISION, state: PROGRAM.name, payload: input[FORK_STATE] },
+  ];
+}
+
+async function forkEntry(setup, records, at, origin) {
+  const session = fold(records);
+  const selected = forkSelect(session, at);
+  if (selected.missing !== undefined) return { refused: forkMissing(selected.missing) };
+  const payload = await forkPayload(setup, session, selected, origin);
+  return { records: forkRecords(forkInput(selected, origin, payload)) };
 }
 
 function sideNamed(name) {

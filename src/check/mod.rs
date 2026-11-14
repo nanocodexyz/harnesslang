@@ -96,6 +96,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
         notice: None,
         blobs: None,
         idle: None,
+        forked: None,
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -114,6 +115,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     settings(source, &mut program, &globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
     spawns(source, &mut program, &mut globals, &mut values, load)?;
+    forks(source, &mut program, &mut globals, &mut values)?;
     codes(source, &mut program, &mut globals, &mut values)?;
     listings(source, &mut program, &mut globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
@@ -125,6 +127,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     let expanded = idle(&expanded, &mut program, &globals)?.unwrap_or(expanded);
     invariants(&expanded, &mut program, &globals)?;
     handlers(&expanded, &mut program, &globals)?;
+    forked(&expanded, &mut program, &globals)?;
     program.cuts = program.find_cuts();
     ir::validate::program(&program);
     Ok(program)
@@ -957,6 +960,7 @@ fn tools(
             interrupts: ir::Interrupts::default(),
             jobs,
             spawn: None,
+            fork: None,
             finds: None,
         });
     }
@@ -1018,6 +1022,10 @@ fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
         let (names, owner) = match item {
             Item::Tool(tool) => (&tool.interrupts, Some(tool.name.text.as_str())),
             Item::Model(model) => (&model.interrupts, None),
+            Item::Code(code) => {
+                code_interrupts(code, program)?;
+                continue;
+            }
             _ => continue,
         };
         let mut interrupts = ir::Interrupts::default();
@@ -1067,6 +1075,41 @@ fn interrupts(source: &ast::Program, program: &mut ir::Program) -> Checked<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn code_interrupts(code: &ast::Code, program: &mut ir::Program) -> Checked<()> {
+    let mut interrupts = ir::Interrupts::default();
+    for name in &code.interrupts {
+        if name.text != EVENT_CANCEL {
+            return error(
+                name.at,
+                format!(
+                    "code '{}' is interruptible by '{EVENT_CANCEL}' only: a cancel stops its cell, which nothing else does",
+                    code.name.text
+                ),
+            );
+        }
+        if !program.events.cancel {
+            return error(
+                name.at,
+                format!(
+                    "'interruptible by {EVENT_CANCEL}' needs 'on {EVENT_CANCEL}' on the harness"
+                ),
+            );
+        }
+        if interrupts.cancel {
+            return error(
+                name.at,
+                format!("'{EVENT_CANCEL}' interrupts the effect twice"),
+            );
+        }
+        interrupts.cancel = true;
+    }
+    let (id, _) = program
+        .code(&code.name.text)
+        .expect("codes are checked before interrupts");
+    program.codes[id].interrupts = interrupts;
     Ok(())
 }
 
@@ -1137,6 +1180,7 @@ fn spawns(
             interrupts: ir::Interrupts::default(),
             jobs: None,
             finds: None,
+            fork: None,
             spawn: Some(ir::Spawn {
                 file: spawn.file.text.clone(),
                 handler: spawn.handler.text.clone(),
@@ -1252,6 +1296,7 @@ fn hooks(
             HookKind::PromptSubmit => None,
             HookKind::SubagentStart => Some(vec![Type::Text]),
             HookKind::SubagentStop => Some(vec![Type::Text, Type::Text]),
+            HookKind::Forked => Some(vec![Type::Text, Type::U64]),
         };
         let mut found = Vec::with_capacity(hook.params.len());
         for param in &hook.params {
@@ -1263,6 +1308,7 @@ fn hooks(
             HookKind::PromptSubmit => "(p: T), naming a parameter of the handlers it runs in",
             HookKind::SubagentStart => "(agent: text)",
             HookKind::SubagentStop => "(agent: text, result: text)",
+            HookKind::Forked => "(origin: text, discarded: u64)",
             HookKind::SessionStart
             | HookKind::PreCompact
             | HookKind::PostCompact
@@ -1506,10 +1552,51 @@ fn codes(
         }
         globals.codes.insert(code.name.text.clone(), id);
     }
+    let mut waits: BTreeMap<String, Position> = BTreeMap::new();
     for code in declared {
         let checked = code_tool(program, globals, code)?;
+        if let Some(name) = code
+            .fields
+            .iter()
+            .find(|field| field.key.text == WAITS_FIELD)
+        {
+            wait_tool(globals, values, &mut waits, &name.value)?;
+        }
         program.codes.push(checked);
     }
+    Ok(())
+}
+
+pub const WAITS_FIELD: &str = "waits";
+
+fn wait_tool(
+    globals: &Globals,
+    values: &mut BTreeMap<String, Position>,
+    waits: &mut BTreeMap<String, Position>,
+    name: &ast::Name,
+) -> Checked<()> {
+    if let Some(previous) = waits.get(&name.text) {
+        return error(
+            name.at,
+            format!(
+                "wait tool '{}' is already declared at {previous}",
+                name.text
+            ),
+        );
+    }
+    if globals.effect(&name.text) {
+        return error(
+            name.at,
+            format!(
+                "wait tool '{}' has the name of another tool, code tool, listing or model",
+                name.text
+            ),
+        );
+    }
+    if name.text != ir::WAIT_TOOL {
+        claim(values, name, "wait tool")?;
+    }
+    waits.insert(name.text.clone(), name.at);
     Ok(())
 }
 
@@ -1535,12 +1622,23 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         );
     }
     let mut limits: BTreeMap<&str, Bound> = BTreeMap::new();
+    let mut waits = None;
     for field in &code.fields {
+        if field.key.text == WAITS_FIELD {
+            if waits.is_some() {
+                return error(
+                    field.key.at,
+                    format!("code '{name}' gives '{WAITS_FIELD}' twice"),
+                );
+            }
+            waits = Some(ir::Waits::new(field.value.text.clone()));
+            continue;
+        }
         let Some(key) = CODE_FIELDS.iter().find(|key| **key == field.key.text) else {
             return error(
                 field.key.at,
                 format!(
-                    "code '{name}' has no field '{}'; its fields are tools, {}",
+                    "code '{name}' has no field '{}'; its fields are tools, {}, {WAITS_FIELD}",
                     field.key.text,
                     CODE_FIELDS.join(", ")
                 ),
@@ -1567,6 +1665,8 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         timer_ms: take(CODE_FIELDS[3])?,
         journal_bytes: take(CODE_FIELDS[4])?,
         yield_ms: take(CODE_FIELDS[5])?,
+        waits,
+        interrupts: ir::Interrupts::default(),
     };
     code_bounds(code, &checked)?;
     Ok(checked)
@@ -2109,7 +2209,7 @@ fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
     if let Some(hook) = globals
         .hooks
         .values()
-        .find(|hook| !used.contains(&hook.kind))
+        .find(|hook| hook.kind != ast::HookKind::Forked && !used.contains(&hook.kind))
     {
         let reason = match hook.kind {
             ast::HookKind::BeforeTool | ast::HookKind::AfterTool => {
@@ -2127,6 +2227,9 @@ fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
             ast::HookKind::SubagentStart => "no handler matches on a spawn's result".to_owned(),
             ast::HookKind::SubagentStop => "no handler joins a spawned session".to_owned(),
             ast::HookKind::SessionStart | ast::HookKind::Stop => "no handler runs it".to_owned(),
+            ast::HookKind::Forked => {
+                unreachable!("on forked runs at every fork, never in a handler")
+            }
         };
         return error(
             hook.at,
@@ -2139,5 +2242,84 @@ fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
             format!("harness '{}' has no handler", source.name.text),
         );
     }
+    Ok(())
+}
+
+fn forks(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &mut Globals,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    let variants = variant_names(program);
+    for item in &source.items {
+        let Item::Fork(fork) = item else { continue };
+        claim(values, &fork.name, "fork tool")?;
+        if variants.contains(&fork.name.text) {
+            return error(
+                fork.name.at,
+                format!("fork tool '{}' has the name of a variant", fork.name.text),
+            );
+        }
+        let at = match fork.at.text.as_str() {
+            "latest" => ir::ForkAt::Latest,
+            "turn" => ir::ForkAt::Turn,
+            _ => {
+                return error(
+                    fork.at.at,
+                    format!(
+                        "fork tool '{}' starts at 'latest' or at 'turn', not '{}'",
+                        fork.name.text, fork.at.text
+                    ),
+                );
+            }
+        };
+        if program.blobs.is_some() {
+            return error(
+                fork.name.at,
+                format!(
+                    "fork tool '{}': a fork starts from a checkpoint, which holds no blob's bytes, so a harness with blobs cannot fork",
+                    fork.name.text
+                ),
+            );
+        }
+        let params = match at {
+            ir::ForkAt::Latest => Vec::new(),
+            ir::ForkAt::Turn => vec![ir::Field {
+                name: ir::FORK_TURN.to_owned(),
+                ty: Type::U64,
+            }],
+        };
+        globals
+            .tools
+            .insert(fork.name.text.clone(), program.tools.len());
+        program.tools.push(ir::Tool {
+            name: fork.name.text.clone(),
+            defaults: vec![None; params.len()],
+            params,
+            returns: Type::Text,
+            attaches: None,
+            effect: crate::effect::EffectClass::External,
+            recoverable: false,
+            interrupts: ir::Interrupts::default(),
+            jobs: None,
+            spawn: None,
+            fork: Some(at),
+            finds: None,
+        });
+    }
+    Ok(())
+}
+
+fn forked(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let found = source.items.iter().find_map(|item| match item {
+        Item::Hook(hook) if hook.kind == ast::HookKind::Forked => Some(hook),
+        _ => None,
+    });
+    let Some(hook) = found else {
+        return Ok(());
+    };
+    let checked = handler::forked(program, globals, hook)?;
+    program.forked = Some(checked);
     Ok(())
 }

@@ -181,11 +181,12 @@ pub fn batch_json(records: &[Record], head: u64, last_turn: u64) -> String {
     let mut turn = last_turn;
     for (index, record) in records.iter().enumerate() {
         turn = record.turn().unwrap_or(turn);
-        assert!(turn > 0, "a cell row follows its site's call row");
+        let entry = matches!(record, Record::Host { .. } | Record::Checkpoint { revision: ENTRY_REVISION, .. });
+        assert!(turn > 0 || entry, "a cell row follows its site's call row");
         let text = record_json(record).encode();
         assert_eq!(decode_line(&text, false).as_ref(), Ok(record), "a row's record decodes back");
         rows.push(Json::object(vec![
-            ("kind", Json::text(record.tag())),
+            ("kind", Json::text(if entry { "checkpoint" } else { record.tag() })),
             ("record", Json::String(text)),
             ("seq", Json::Number(head + 1 + index as u64)),
             ("turn", Json::Number(turn)),

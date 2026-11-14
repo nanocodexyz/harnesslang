@@ -683,6 +683,10 @@ pub enum Record {
         at: u64,
         delivery: Delivery,
     },
+    Host {
+        key: String,
+        value: Json,
+    },
 }
 
 impl Record {
@@ -697,6 +701,7 @@ impl Record {
             Self::Status { .. } => "status",
             Self::Checkpoint { .. } => "checkpoint",
             Self::Event { .. } => "event",
+            Self::Host { .. } => "host",
         }
     }
 
@@ -712,6 +717,7 @@ impl Record {
             | Self::Status { turn, .. }
             | Self::Event { turn, .. } => Some(*turn),
             Self::Checkpoint { revision, .. } => Some(*revision),
+            Self::Host { .. } => Some(ENTRY_REVISION),
             Self::Cell { .. } => None,
         }
     }
@@ -916,6 +922,7 @@ fn record_body(record: &Record) -> Json {
             ("seq", Json::Number(*seq)),
             ("turn", turn_text(*turn)),
         ]),
+        Record::Host { key, value } => Json::object(vec![("key", Json::text(key)), ("value", value.clone())]),
     }
 }
 
@@ -1074,6 +1081,13 @@ pub fn record_from(json: &Json) -> Result<Record, String> {
                 revision: fields.number("revision")?,
                 state: fields.text("state")?.to_owned(),
                 payload,
+            })
+        }
+        "host" => {
+            fields.exact(&["key", "value"])?;
+            Ok(Record::Host {
+                key: fields.text("key")?.to_owned(),
+                value: fields.get("value")?.clone(),
             })
         }
         other => Err(format!("unknown record '{other}'")),
@@ -1414,6 +1428,7 @@ pub struct Session {
     pub cell_origins: BTreeMap<u64, (u64, u64)>,
     pub last_event: u64,
     pub jobs: BTreeMap<String, String>,
+    pub forked: Option<Json>,
 }
 
 impl Session {
@@ -1481,6 +1496,9 @@ pub fn fold_from(start: Start, records: &[Record]) -> Result<Session, String> {
 }
 
 fn admit(session: &mut Session, turn: u64, handler: &str, arguments: &Json) -> Result<(), String> {
+    if session.forked.is_some() && !session.checkpoints.contains_key(&ENTRY_REVISION) {
+        return Err(format!("turn {turn} is admitted before the forked session's entry checkpoint"));
+    }
     if let Start::Checkpoint { revision, .. } = session.start
         && session.turns.is_empty()
         && turn != revision + 1
@@ -1505,7 +1523,9 @@ fn admit(session: &mut Session, turn: u64, handler: &str, arguments: &Json) -> R
 
 fn nested_call(log: &mut TurnLog, turn: u64, id: (u64, u64), call: Call) -> Result<(), String> {
     let (seq, nested) = id;
-    if !matches!(log.sites.get(&seq), Some(SiteLog::Open(_))) {
+    let continued = log.cells.get(&seq).is_some_and(|cell| !cell.finished)
+        && matches!(log.sites.last_key_value(), Some((_, SiteLog::Open(_))));
+    if !continued && !matches!(log.sites.get(&seq), Some(SiteLog::Open(_))) {
         return Err(format!(
             "nested call {seq}/{nested} of turn {turn} comes from a site that is not running"
         ));
@@ -1801,12 +1821,24 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
                 .turns
                 .get(revision)
                 .is_some_and(|log| log.finished.is_some());
-            if !finished {
+            let entry = *revision == ENTRY_REVISION && session.turns.is_empty() && session.start == Start::Beginning;
+            if !finished && !entry {
                 return Err(format!(
                     "checkpoint at revision {revision}, which is not a finished turn"
                 ));
             }
             session.checkpoints.insert(*revision, payload.clone());
+        }
+        Record::Host { key, value } => {
+            let first = session.turns.is_empty()
+                && session.checkpoints.is_empty()
+                && session.forked.is_none()
+                && session.cell_origins.is_empty()
+                && session.start == Start::Beginning;
+            if key != FORKED_HOST_KEY || !first {
+                return Err(format!("host record '{key}' where only a leading '{FORKED_HOST_KEY}' record is taken"));
+            }
+            session.forked = Some(value.clone());
         }
     }
     Ok(())

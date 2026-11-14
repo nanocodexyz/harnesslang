@@ -3,6 +3,7 @@ pub mod cell;
 pub mod cell_journal;
 pub mod crc;
 pub mod engine;
+pub mod fork;
 pub mod journal;
 pub mod json;
 pub mod mutation;

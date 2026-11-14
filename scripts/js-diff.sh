@@ -36,6 +36,9 @@ plant_expression() {
     interrupt_ignored) echo 's/const interrupted = !ran.preempted\[0\] \&\& /const interrupted = false \&\& /' ;;
     recover_reply_ignored) echo 's/if (recovered.kind !== "reply") return recovered;/return { kind: "unknown" };/' ;;
     job_unopened) echo 's/if (jobStarted(record.output) !== null) session.jobs.set/if (false) session.jobs.set/' ;;
+    fork_hook_skipped) echo 's/const state = await runForked({ target: setup.target, mutation: "none" }, before, origin, selected.discarded);/const state = before;/' ;;
+    cell_leaks) echo 's/^    if (!cellsYield()) return;$/    return;/' ;;
+    cell_cancel_ignored) echo 's/^    if (!PROGRAM.codes\[code\].cancel) return false;$/    return false;/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

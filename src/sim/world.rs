@@ -148,6 +148,7 @@ pub struct Stats {
     pub events: Option<u64>,
     pub entry_states: u64,
     pub children: u64,
+    pub forks: u64,
     pub joined: u64,
     pub child_crashes: u64,
     pub side_questions: u64,
@@ -158,6 +159,7 @@ pub struct Stats {
     pub jobs_died: u64,
     pub idle_turns: u64,
     pub idle_refused: u64,
+    pub yields: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +240,7 @@ pub struct SimWorld<'a> {
     listing_changes: u64,
     pub(crate) sides: crate::sim::side::Sides,
     pub jobs: crate::sim::jobs::Jobs,
+    yielded: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,6 +312,7 @@ impl<'a> SimWorld<'a> {
             listing_changes: 0,
             sides: crate::sim::side::Sides::default(),
             jobs: crate::sim::jobs::Jobs::default(),
+            yielded: BTreeSet::new(),
         };
         world.change_listings(LISTED_PRESENT_PPM);
         world
@@ -410,6 +414,7 @@ impl<'a> SimWorld<'a> {
             ]
         });
         self.current = Some(request.clone());
+        self.yielded.clear();
         self.parking.pending = None;
         self.parking.suspensions = 0;
         self.parking.unmatched = 0;
@@ -440,6 +445,9 @@ impl<'a> SimWorld<'a> {
         self.run_effects = 0;
         self.run_outbound = 0;
         self.parking.run_waited_ms = 0;
+        if let Medium::Rows(rows) = &mut self.medium {
+            rows.pending_deadlines.clear();
+        }
         if self.faults_left == 0 {
             self.armed = false;
         }
@@ -937,6 +945,9 @@ impl World for SimWorld<'_> {
         }
         self.count_effect(true);
         self.change_listings(LISTING_CHANGE_PPM);
+        if let Some(think_ms) = crate::sim::cell::think_ms_max(self.program) {
+            self.clock += self.rng.range(1, think_ms);
+        }
         let response = self.reply(request);
         self.model_modes
             .entry((request.turn, request.seq))
@@ -1064,6 +1075,7 @@ impl World for SimWorld<'_> {
             (&mut self.medium, self.target.recovery)
         {
             rows.waited.insert((wait.cell, wait.timer));
+            rows.keep_deadlines();
         }
         let clock = self.clock;
         self.record("wait", || {
@@ -1075,6 +1087,23 @@ impl World for SimWorld<'_> {
             ]
         });
         Ok(())
+    }
+
+    fn cell_deadline(&mut self, turn: u64, site: u64, cell: u64) -> u64 {
+        let key = (turn, site, cell);
+        if let Medium::Rows(rows) = &self.medium
+            && let Some(clock) = rows
+                .deadlines
+                .get(&key)
+                .or(rows.pending_deadlines.get(&key))
+        {
+            return *clock;
+        }
+        let clock = self.now();
+        if let Medium::Rows(rows) = &mut self.medium {
+            rows.pending_deadlines.insert(key, clock);
+        }
+        clock
     }
 
     fn waited(&mut self, wait: &Wait) -> bool {
@@ -1107,7 +1136,13 @@ impl World for SimWorld<'_> {
                 }
                 self.diverged.insert((owner, *cell));
             }
-            CellEvent::Finished { .. } => {}
+            CellEvent::Finished { cell, .. } => {
+                self.yielded.remove(cell);
+            }
+            CellEvent::Yielded { cell } => {
+                self.stats.yields += 1;
+                self.yielded.insert(*cell);
+            }
         }
         self.record("cell", || {
             vec![("observed", crate::run::cell::event_json(event))]
@@ -1253,6 +1288,7 @@ impl SimWorld<'_> {
                 return Err(Stop::Fenced);
             }
             rows.commit(records);
+            rows.keep_deadlines();
             return Ok(());
         }
         let torn = self.fault(self.profile.torn_ppm);
@@ -1368,6 +1404,7 @@ impl SimWorld<'_> {
             ))
         };
         let output = self.spawn_child(request, output);
+        let output = self.fork_child(request, output);
         let output = self.job_started(request, &mut rng, output);
         self.dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
@@ -1642,8 +1679,16 @@ impl SimWorld<'_> {
         };
         let mut calls = Vec::new();
         for index in 0..count {
-            let cell = !self.program.codes.is_empty() && rng.chance(CELL_CALL_PPM);
-            let (tool, input) = if cell {
+            let waited = if index == 0 {
+                crate::sim::cell::wait_call(self.program, &self.yielded, rng)
+            } else {
+                None
+            };
+            let cell =
+                waited.is_none() && !self.program.codes.is_empty() && rng.chance(CELL_CALL_PPM);
+            let (tool, input) = if let Some(waited) = waited {
+                waited
+            } else if cell {
                 let code = &self.program.codes[rng.pick(self.program.codes.len())];
                 let plan = Plan {
                     program: self.program,
@@ -1654,7 +1699,10 @@ impl SimWorld<'_> {
             } else {
                 let tool = self.drawn_tool(rng);
                 let input = match self.program.input_params(&tool) {
-                    Some(params) => self.drawn_input(rng, &tool, params),
+                    Some(params) => {
+                        let input = self.drawn_input(rng, &tool, params);
+                        self.fork_turn_input(rng, &tool, request.turn, input)
+                    }
                     None => Self::generated_text(rng),
                 };
                 (tool, input)
