@@ -77,6 +77,31 @@ pub enum Recovery {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellPlacement {
+    HostProcess,
+    LeaseHolder,
+    WorkerIsolate,
+    WorkflowFunction,
+    Unsupported { reason: &'static str },
+}
+
+impl CellPlacement {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::HostProcess => "the host's engine in the harness process",
+            Self::LeaseHolder => "the host's engine in the process holding the session's lease",
+            Self::WorkerIsolate => {
+                "a dynamic Worker isolate without network whose steps are RPC calls into the object (Worker Loader, unverified)"
+            }
+            Self::WorkflowFunction => {
+                "the re-executed workflow function, every nested call a step (script compilation in the workflow sandbox unverified)"
+            }
+            Self::Unsupported { reason } => reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limit {
     pub value: u64,
     pub unit: &'static str,
@@ -101,6 +126,13 @@ pub struct Model {
     pub recovery: Recovery,
     pub gate_before_outbound: bool,
     pub limits: Limits,
+    pub cells: CellPlacement,
+}
+
+impl Model {
+    pub const fn wait_flushes(&self) -> bool {
+        self.gate_before_outbound
+    }
 }
 
 const NO_LIMITS: Limits = Limits {
@@ -145,6 +177,7 @@ pub const fn model(target: Target) -> Model {
             recovery: Recovery::AtLoad,
             gate_before_outbound: false,
             limits: NO_LIMITS,
+            cells: CellPlacement::HostProcess,
         },
         Target::NativeSqlite => Model {
             target,
@@ -156,6 +189,7 @@ pub const fn model(target: Target) -> Model {
             recovery: Recovery::AtLoad,
             gate_before_outbound: false,
             limits: NO_LIMITS,
+            cells: CellPlacement::HostProcess,
         },
         Target::ServerPostgres => Model {
             target,
@@ -167,6 +201,7 @@ pub const fn model(target: Target) -> Model {
             recovery: Recovery::AtLoad,
             gate_before_outbound: false,
             limits: NO_LIMITS,
+            cells: CellPlacement::LeaseHolder,
         },
         Target::Cloudflare => Model {
             target,
@@ -178,6 +213,7 @@ pub const fn model(target: Target) -> Model {
             recovery: Recovery::AtLoad,
             gate_before_outbound: true,
             limits: CLOUDFLARE_LIMITS,
+            cells: CellPlacement::WorkerIsolate,
         },
         Target::Vercel => Model {
             target,
@@ -191,6 +227,7 @@ pub const fn model(target: Target) -> Model {
             },
             gate_before_outbound: false,
             limits: VERCEL_LIMITS,
+            cells: CellPlacement::WorkflowFunction,
         },
     }
 }
@@ -217,6 +254,23 @@ pub fn check_limits(program: &Program, model: &Model) -> Vec<String> {
     errors
 }
 
+pub fn check_cells(program: &Program, model: &Model) -> Vec<String> {
+    let CellPlacement::Unsupported { reason } = model.cells else {
+        return Vec::new();
+    };
+    program
+        .codes
+        .iter()
+        .map(|code| {
+            format!(
+                "code '{}': cells: unsupported on {}: {reason}",
+                code.name,
+                model.target.name()
+            )
+        })
+        .collect()
+}
+
 pub fn describe(model: &Model) -> String {
     let mut lines = vec![format!(
         "target {}: runs in {}; journal: {}; flush: {:?}; atomic unit: {:?}; who else may run: {:?}",
@@ -227,6 +281,7 @@ pub fn describe(model: &Model) -> String {
         model.atomic,
         model.others
     )];
+    lines.push(format!("  cells run in: {}", model.cells.describe()));
     let limits = [
         ("memory", model.limits.memory),
         (

@@ -177,7 +177,8 @@ fn check_command(args: &[String]) -> ExitCode {
             limit.value, limit.unit
         );
     }
-    let errors = target::check_limits(&program, &model);
+    let mut errors = target::check_cells(&program, &model);
+    errors.extend(target::check_limits(&program, &model));
     if errors.is_empty() && proved {
         println!("{file}: ok for {}", target.name());
         return ExitCode::SUCCESS;
@@ -285,6 +286,13 @@ fn sim_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
+    let refused = target::check_cells(&program, &target::model(target));
+    if !refused.is_empty() {
+        for error in refused {
+            eprintln!("{file}: error: {error}");
+        }
+        return ExitCode::from(FAILURE_EXIT);
+    }
     if let Err(error) = sim::supported(&program) {
         eprintln!("{file}: error: {error}");
         return ExitCode::from(FAILURE_EXIT);
