@@ -1,0 +1,15 @@
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+model think calls calls_max modes text_only
+
+state {
+  context: list<entry, context_max>
+}
+
+on ping() -> u64 {
+  let reply = think(context) mode summary
+  return 1
+}

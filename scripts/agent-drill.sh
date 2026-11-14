@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+mode="${AGENT_DRILL_MODE:-mock}"
+kills_max="${AGENT_DRILL_KILLS:-12}"
+kill_ms_max="${AGENT_DRILL_KILL_MS_MAX:-1500}"
+steps="${AGENT_DRILL_STEPS:-6}"
+mock_delay_ms="${AGENT_DRILL_MOCK_DELAY_MS:-300}"
+tool_sleep="${AGENT_DRILL_TOOL_SLEEP:-0.3}"
+model="${AGENT_DRILL_MODEL:-claude-haiku-4-5}"
+plant="${AGENT_DRILL_PLANT:-none}"
+seed="${AGENT_DRILL_SEED:-1}"
+out=output/agent-drill-$mode
+[ "$plant" = none ] || out="$out-$plant"
+target=agent/target
+[ "$plant" = none ] || target=output/agent-target-$plant
+agent=$target/release/hl-agent
+mock=$target/release/mock-messages
+killed_status=137
+
+finished=0
+mock_pid=
+report() {
+  local status=$?
+  [ -z "$mock_pid" ] || kill "$mock_pid" 2> /dev/null || true
+  if [ "$finished" -ne 1 ]; then
+    echo "agent-drill: FAILED (exit $status)"
+    [ "$status" -ne 0 ] || status=1
+  fi
+  exit "$status"
+}
+trap report EXIT
+
+case "$plant" in
+  none) plant_text= ;;
+  batch_flush_after_dispatch) plant_text='if external { ==> if false && external {' ;;
+  *)
+    echo "agent-drill: unknown AGENT_DRILL_PLANT $plant (none, batch_flush_after_dispatch)" >&2
+    exit 2
+    ;;
+esac
+
+cargo build --release --locked -j2 --quiet
+HL_AGENT_PLANT="$plant_text" CARGO_TARGET_DIR="$(pwd)/$target" HL_BIN="$(pwd)/target/release/hl" cargo build --release --locked -j2 --quiet --manifest-path agent/Cargo.toml
+
+rm -rf "$out"
+mkdir -p "$out/ws"
+workspace=$(cd "$out/ws" && pwd)
+case "$mode" in
+  mock)
+    {
+      printf '['
+      for step in $(seq 1 "$steps"); do
+        printf '{"text":"Step %d.","calls":[{"name":"Bash","input":{"command":"echo step%d >> effects.log && sleep %s","description":"Record step %d"}},{"name":"Read","input":{"file_path":"effects.log"}}]},' "$step" "$step" "$tool_sleep" "$step"
+      done
+      printf '{"calls":[{"name":"Write","input":{"file_path":"done.txt","content":"done\\n"}}]},'
+      printf '{"answer":"All steps ran."}]\n'
+    } > "$out/script.json"
+    "$mock" "$out/port" "$out/script.json" "$mock_delay_ms" 2> "$out/mock.log" &
+    mock_pid=$!
+    for _ in $(seq 1 100); do
+      [ -s "$out/port" ] && break
+      sleep 0.05
+    done
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$(cat "$out/port")"
+    export ANTHROPIC_API_KEY=mock
+    ;;
+  real)
+    : "${ANTHROPIC_API_KEY:?the real drill needs ANTHROPIC_API_KEY}"
+    ;;
+  *)
+    echo "agent-drill: unknown AGENT_DRILL_MODE $mode (mock, real)" >&2
+    exit 2
+    ;;
+esac
+{
+  printf 'Run each of these %d shell commands with the Bash tool, one Bash call per command, one after another, in this order:\n' "$steps"
+  for step in $(seq 1 "$steps"); do
+    printf -- '- echo step%d >> effects.log && sleep %s\n' "$step" "$tool_sleep"
+  done
+  printf 'If a call reports that its outcome is unknown, do not run that command again: go on with the next one. Then write the file done.txt containing the single line done. Do not change anything else.\n'
+} > "$out/instruction.md"
+
+run_agent() {
+  "$agent" run --instruction "$out/instruction.md" --cwd "$workspace" --model "$model" --journal "$out/journal" >> "$out/agent.out" 2>> "$out/agent.err"
+}
+
+RANDOM=$seed
+kills=0
+kills_model=0
+kills_tool=0
+status=
+for attempt in $(seq 1 "$kills_max"); do
+  run_agent &
+  pid=$!
+  delay_ms=$(( RANDOM % kill_ms_max ))
+  sleep "$(printf '%d.%03d' $((delay_ms / 1000)) $((delay_ms % 1000)))"
+  if kill -0 "$pid" 2> /dev/null; then
+    last=$(tail -n 1 "$out/agent.err" 2> /dev/null || true)
+    pkill -KILL -P "$pid" 2> /dev/null || true
+    kill -KILL "$pid" 2> /dev/null || true
+    set +e
+    wait "$pid" 2> /dev/null
+    status=$?
+    set -e
+    if [ "$status" -eq "$killed_status" ]; then
+      kills=$((kills + 1))
+      case "$last" in
+        *" model "*) kills_model=$((kills_model + 1)) ;;
+        *) kills_tool=$((kills_tool + 1)) ;;
+      esac
+      echo "agent-drill: kill $kills after ${delay_ms} ms, during: ${last:-start}" >> "$out/kills.log"
+      continue
+    fi
+  else
+    set +e
+    wait "$pid" 2> /dev/null
+    status=$?
+    set -e
+  fi
+  break
+done
+if [ "$status" != 0 ]; then
+  set +e
+  run_agent
+  status=$?
+  set -e
+fi
+if [ "$status" -ne 0 ]; then
+  echo "agent-drill: hl-agent exited $status after $kills kills" >&2
+  tail -n 20 "$out/agent.err" >&2
+  exit 1
+fi
+
+set +e
+run_agent
+rerun=$?
+set -e
+if [ "$rerun" -ne 0 ]; then
+  echo "agent-drill: rerunning a finished journal exited $rerun" >&2
+  exit 1
+fi
+
+python3 - "$out" "$mode" "$steps" <<'EOF'
+import collections, json, os, sys
+out, mode, steps = sys.argv[1], sys.argv[2], int(sys.argv[3])
+external = {"Bash", "Edit", "Write"}
+dispatches = collections.Counter()
+for line in open(f"{out}/journal/usage.jsonl"):
+    record = json.loads(line)
+    if record.get("kind") == "tool" and record["tool"] in external:
+        dispatches[record["call"]] += 1
+repeated = {call: count for call, count in dispatches.items() if count > 1}
+if repeated:
+    sys.exit(f"agent-drill: external calls dispatched more than once: {repeated}")
+usage = json.load(open(f"{out}/journal/usage.json"))
+if usage["finish"] != "completed":
+    sys.exit(f"agent-drill: the harness finished {usage['finish']}")
+log = f"{out}/ws/effects.log"
+effects = collections.Counter(open(log).read().split()) if os.path.exists(log) else collections.Counter()
+twice = {step: count for step, count in effects.items() if count > 1}
+if mode == "mock" and twice:
+    sys.exit(f"agent-drill: effects ran more than once: {twice}")
+if set(effects) - {f"step{index}" for index in range(1, steps + 1)}:
+    sys.exit(f"agent-drill: unexpected effects {sorted(effects)}")
+if open(f"{out}/ws/done.txt").read().strip() != "done":
+    sys.exit("agent-drill: done.txt is wrong")
+unknown = 0
+replies = set()
+for line in open(f"{out}/journal/journal.jsonl"):
+    record = json.loads(line)["record"]
+    if "recovery" in record:
+        unknown += len(record["recovery"].get("unknown", []))
+    if "model" in record:
+        replies.add(record["model"]["call_id"])
+discarded = [json.loads(line) for line in open(f"{out}/journal/usage.jsonl")]
+discarded = [record["call"] for record in discarded if record.get("kind") == "stream_discarded"]
+unanswered = sorted(set(discarded) - replies)
+if unanswered:
+    sys.exit(f"agent-drill: streams cut by a kill were not requested again to a journaled reply: {unanswered}")
+leftover = [name for name in os.listdir(f"{out}/journal/state") if name.endswith(".sse")]
+if leftover:
+    sys.exit(f"agent-drill: partial streams left after the turn finished: {leftover}")
+print(f"agent-drill: external_dispatches={sum(dispatches.values())} distinct={len(dispatches)} effects={sum(effects.values())} unknown_recovered={unknown} streams_cut={len(discarded)} requests={usage['requests']} tool_calls={usage['tool_calls']} input_tokens={usage['input_tokens']} output_tokens={usage['output_tokens']} cache_read_tokens={usage['cache_read_tokens']} wall_ms={usage['wall_ms']}")
+EOF
+finished=1
+echo "agent-drill: ok mode=$mode model=$model plant=$plant kills=$kills (model $kills_model, tool $kills_tool)"

@@ -7,6 +7,7 @@ const compact_kept: u64 = 32
 const agents_max: u64 = 4096
 const agents_kept: u64 = 3072
 const turns_max: u64 = 1000000
+const wait_agent_ms: u64 = 800
 
 type outcome = completed(text) | failed(text) | exhausted
 type status = "completed" | "failed" | "interrupted"
@@ -59,10 +60,18 @@ fn model_loop() {
               unknown => { push context unknown(call) }
             }
           } else {
-            match dispatch(call) {
-              ok(output) => { push context result(call, output) }
-              failed(error) => { push context error(call, error) }
-              unknown => { push context unknown(call) }
+            if call.tool == "wait_agent" {
+              let woke = wait(wait_agent_ms)
+              match wait_agent(call.input) {
+                ok(snapshot) => { push context result(call, snapshot) }
+                failed(error) => { push context error(call, error) }
+              }
+            } else {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
             }
           }
         }

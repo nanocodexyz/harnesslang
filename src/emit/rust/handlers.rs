@@ -259,9 +259,13 @@ impl<'a, 'p> Body<'a, 'p> {
             Durability::Cell => panic!("only a cell site has cell durability"),
         };
         let maybe = matches!(site.result, Type::Maybe(_));
+        let mode = match site.mode {
+            Some(mode) => format!("Some({:?})", self.program.mode_name(mode)),
+            None => "None".to_owned(),
+        };
         let (kind, run, decode) = self.site_call(site.kind, &site.result, args);
         self.line(&format!(
-            "let site = Site {{ kind: Kind::{kind}, durability: {durability}, maybe: {maybe} }};"
+            "let site = Site {{ kind: Kind::{kind}, durability: {durability}, maybe: {maybe}, mode: {mode} }};"
         ));
         self.line(&format!("let answer = engine.effect(site, call, {run})?;"));
         self.line(&decode);
@@ -367,6 +371,33 @@ impl<'a, 'p> Body<'a, 'p> {
                 ("Model", run, decode)
             }
             SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
+            SiteKind::Wait(constant_id) => {
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number({}))]) }};",
+                    ir::WAIT_TOOL,
+                    EffectClass::None,
+                    crate::run::engine::WAIT_MS,
+                    constant(&self.program.constants[constant_id].name)
+                ));
+                (
+                    "Wait",
+                    "Run::Wait".to_owned(),
+                    "scalar(engine, answer)?".to_owned(),
+                )
+            }
+            SiteKind::Suspend => {
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::String(argument0))]) }};",
+                    ir::SUSPEND_TOOL,
+                    EffectClass::None,
+                    crate::run::engine::SUSPEND_KEY
+                ));
+                (
+                    "Suspend",
+                    "Run::Suspend".to_owned(),
+                    "answer_text(engine, answer)?".to_owned(),
+                )
+            }
             SiteKind::Now | SiteKind::Random => {
                 let (name, variant) = if kind == SiteKind::Now {
                     ("now", "Now")
@@ -394,6 +425,7 @@ impl<'a, 'p> Body<'a, 'p> {
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
             Expr::Construct { ty, .. } => ty.clone(),
+            Expr::TextBuiltin { op, .. } => op.result(),
             Expr::Binary { op, .. } => match op {
                 BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => Type::U64,
                 BinaryOp::Concat => Type::Text,
@@ -445,6 +477,10 @@ impl<'a, 'p> Body<'a, 'p> {
             } => self.binary(*op, left, right),
             Expr::Not(operand) => format!("(!{})", self.expr(operand)),
             Expr::Len(operand) => format!("({}.len() as u64)", self.expr(operand)),
+            Expr::TextBuiltin { op, args } => {
+                let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
+                format!("text_{}({})", op.name(), args.join(", "))
+            }
             Expr::Cancelled => "engine.cancelled()".to_owned(),
         }
     }

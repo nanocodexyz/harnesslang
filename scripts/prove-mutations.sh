@@ -6,6 +6,7 @@ hl=target/release/hl
 scratch=output/prove-mutations
 files="examples/agent.hl examples/reviewer.hl examples/code_agent.hl"
 cell_files="examples/code_agent.hl"
+park_files="examples/hooks.hl"
 plain_files="examples/agent.hl examples/reviewer.hl"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 usage_exit=2
@@ -34,6 +35,8 @@ property_of() {
     cell_limit_unchecked) echo cell_bounds ;;
     cell_gate_releases_early) echo output_gate ;;
     nested_idempotent_reported_unknown) echo nested_known ;;
+    suspend_before_flush) echo suspend_durable ;;
+    resume_replays_suspend) echo seq_unique ;;
     *) return 1 ;;
   esac
 }
@@ -63,6 +66,13 @@ is_cell_mutation() {
   esac
 }
 
+is_park_mutation() {
+  case $1 in
+    suspend_before_flush | resume_replays_suspend) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 check_untouched() {
   local mutation=$1 file target status
   for file in $plain_files; do
@@ -78,13 +88,17 @@ check_untouched() {
       fi
     done
   done
-  echo "cell mutation $mutation leaves $plain_files proved"
+  echo "mutation $mutation leaves $plain_files proved"
 }
 
 check_mutation() {
   local mutation=$1 property=$2 file target status applied mutated=$files
   if is_cell_mutation "$mutation"; then
     mutated=$cell_files
+    check_untouched "$mutation" || return 1
+  fi
+  if is_park_mutation "$mutation"; then
+    mutated=$park_files
     check_untouched "$mutation" || return 1
   fi
   for file in $mutated; do
@@ -173,6 +187,15 @@ expect_error examples/invalid/cell_push_unbounded.hl "handler 'run': push_bound:
 for target in native-jsonl native-sqlite server-postgres vercel; do
   if ! "$hl" prove --target "$target" examples/invalid/cell_over_cloudflare.hl > /dev/null 2> "$scratch/stderr"; then
     echo "examples/invalid/cell_over_cloudflare.hl must prove on $target:" >&2
+    cat "$scratch/stderr" >&2
+    exit 1
+  fi
+done
+expect_error examples/invalid/over_wait.hl "handler 'watch' on cloudflare: worst_case: worst case 2400000 milliseconds of waits per run exceeds cloudflare's limit of 900000 milliseconds of waits per run; path: poll below polls_max (4)"
+expect_error examples/invalid/long_wait.hl "handler 'nap' on vercel: worst_case: worst case 3600000 milliseconds in its longest wait exceeds vercel's limit of 800000 milliseconds per wait; path: no loops"
+for target in native-jsonl native-sqlite server-postgres vercel; do
+  if ! "$hl" prove --target "$target" examples/invalid/over_wait.hl > /dev/null 2> "$scratch/stderr"; then
+    echo "examples/invalid/over_wait.hl must prove on $target:" >&2
     cat "$scratch/stderr" >&2
     exit 1
   fi

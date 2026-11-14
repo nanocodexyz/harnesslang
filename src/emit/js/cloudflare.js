@@ -9,7 +9,9 @@ const ALARM_RESUME_DELAY_MS = 1000;
 const HARNESS_BINDING = "HARNESS";
 const TURN_PATH = "/turn";
 const EVENT_PATH = "/event";
-const SESSION_PATH = /^\/sessions\/([^/]+)\/(turn|event)$/;
+const RESUME_PATH = "/resume";
+const SESSION_PATH = /^\/sessions\/([^/]+)\/(turn|event|resume)$/;
+const SESSION_PATHS = { turn: TURN_PATH, event: EVENT_PATH, resume: RESUME_PATH };
 const RAN_HEADER = "hl-ran";
 const HTTP_BAD_REQUEST = 400;
 const HTTP_NOT_FOUND = 404;
@@ -117,6 +119,27 @@ class CloudflareWorld {
     return this.object.arrived(turn);
   }
 
+  clock() {
+    return this.object.host.clock();
+  }
+
+  sleep(turn, seq, untilMs) {
+    return this.object.host.sleep(turn, seq, untilMs);
+  }
+
+  async resume(suspension) {
+    if (this.object.simulation.resume !== undefined) return this.object.simulation.resume(suspension);
+    return this.object.pendingResume(suspension);
+  }
+
+  async resumed(suspension, resume, matched) {
+    if (this.object.simulation.resumed !== undefined) {
+      await this.object.simulation.resumed(suspension, resume, matched);
+      return;
+    }
+    this.object.answerResume(suspension, matched);
+  }
+
   async answer(turn, position, answers) {
     if (this.object.simulation.answer !== undefined) {
       await this.object.simulation.answer(turn, position, answers);
@@ -150,6 +173,38 @@ class HarnessObject {
     this.storageWrites = [];
     this.runningTurn = null;
     this.waiting = [];
+    this.resumes = [];
+  }
+
+  pendingResume(suspension) {
+    const entry = this.resumes.find((waiting) => waiting.turn === suspension.turn);
+    return entry === undefined ? null : entry.resume;
+  }
+
+  answerResume(suspension, matched) {
+    const index = this.resumes.findIndex((waiting) => waiting.turn === suspension.turn);
+    if (index >= 0) this.resumes.splice(index, 1)[0].resolve(matched ? "recorded" : "unmatched");
+  }
+
+  async deliverResume(request) {
+    let turn;
+    let resume;
+    try {
+      const body = decodeJson(await request.text());
+      turn = smallNumber(body.turn, "a resume's turn");
+      resume = resumeFrom(body);
+    } catch (error) {
+      if (error instanceof DecodeError) return new Response(error.message, { status: HTTP_BAD_REQUEST });
+      throw error;
+    }
+    if (this.resumes.length > 0) return new Response("a resume is already being delivered", { status: HTTP_SERVICE_UNAVAILABLE });
+    const answered = new Promise((resolve) => this.resumes.push({ turn, resume, resolve }));
+    const driven = await this.serialized(() => this.resume());
+    const index = this.resumes.findIndex((waiting) => waiting.resume === resume);
+    if (index >= 0) this.resumes.splice(index, 1)[0].resolve(driven === null ? "busy" : "not_waiting");
+    const answer = await answered;
+    const status = answer === "recorded" ? 200 : HTTP_SERVICE_UNAVAILABLE;
+    return new Response(encodeJson(object([["answer", answer]])), { status, headers: { "content-type": "application/json" } });
   }
 
   arrived(turn) {
@@ -244,6 +299,11 @@ class HarnessObject {
       const records = this.load();
       const world = new CloudflareWorld(this);
       const ran = await runTurn({ target: CLOUDFLARE_TARGET, mutation: this.mutation }, world, CLOUDFLARE_EPOCH, records, request);
+      if (ran.ran === "suspended") {
+        this.disarm();
+        await this.settle();
+        return { ran: ran.ran, suspension: ran.suspension };
+      }
       if (ran.ran === "already_finished") await world.acknowledge(ran.finish);
       await this.settle();
       assert(world.finish !== null, "a driven turn is acknowledged");
@@ -262,6 +322,7 @@ class HarnessObject {
   async fetch(request) {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === EVENT_PATH) return this.deliver(request);
+    if (request.method === "POST" && url.pathname === RESUME_PATH) return this.deliverResume(request);
     if (request.method !== "POST" || url.pathname !== TURN_PATH) return new Response("not found", { status: HTTP_NOT_FOUND });
     let turn;
     try {
@@ -273,7 +334,8 @@ class HarnessObject {
     try {
       const driven = await this.serialized(() => this.drive(turn));
       if (driven === null) return new Response(`REQUESTS_QUEUED_MAX (${REQUESTS_QUEUED_MAX}) requests already wait for this object`, { status: HTTP_SERVICE_UNAVAILABLE });
-      return new Response(encodeJson(finishJson(driven.finish)), { headers: { "content-type": "application/json", [RAN_HEADER]: driven.ran } });
+      const body = driven.ran === "suspended" ? suspensionJson(driven.suspension) : finishJson(driven.finish);
+      return new Response(encodeJson(body), { headers: { "content-type": "application/json", [RAN_HEADER]: driven.ran } });
     } catch (error) {
       if (error instanceof Corrupt) return new Response(error.message, { status: HTTP_INTERNAL_ERROR });
       throw error;
@@ -390,7 +452,7 @@ const worker = {
     if (request.method !== "POST" || match === null) return new Response("not found", { status: HTTP_NOT_FOUND });
     const namespace = env[HARNESS_BINDING];
     const stub = namespace.get(namespace.idFromName(decodeURIComponent(match[1])));
-    const path = match[2] === "event" ? EVENT_PATH : TURN_PATH;
+    const path = SESSION_PATHS[match[2]];
     return stub.fetch(new URL(path, url.origin), { method: "POST", body: await request.text(), headers: { "content-type": "application/json" } });
   },
 };
@@ -403,6 +465,7 @@ const harness = {
   ranHeader: RAN_HEADER,
   turnPath: TURN_PATH,
   eventPath: EVENT_PATH,
+  resumePath: RESUME_PATH,
 };
 
 export { HarnessObject, harness };

@@ -201,13 +201,22 @@ invalid_fail() {
   expect_error examples/invalid/fn_recursion.hl any "fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask"
   expect_error examples/invalid/fn_arity.hl any "fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1"
   expect_error examples/invalid/fn_hidden_name.hl any "fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input'"
-  expect_error examples/invalid/event_unknown.hl any "event_unknown.hl:3:4: error: unknown event 'pause': a harness takes 'cancel' and 'steer'"
+  expect_error examples/invalid/event_unknown.hl any "event_unknown.hl:3:4: error: unknown event 'pause': a harness takes 'cancel', 'steer' and 'resume'"
   expect_error examples/invalid/event_take_undeclared.hl any "event_take_undeclared.hl:6:16: error: 'take steers' needs 'on steer(message: text) bound N' on the harness"
   expect_error examples/invalid/listing_tool_name.hl any "listing_tool_name.hl:5:6: error: tool 'docs__search' is named like a tool of listing 'docs'"
   expect_error examples/invalid/listing_unknown.hl any "listing_unknown.hl:11:5: error: 'unknown' is not a variant of known<u64>"
+  expect_error examples/invalid/suspend_undeclared.hl any "suspend_undeclared.hl:6:16: error: 'suspend' needs 'on resume' on the harness"
+  expect_error examples/invalid/wait_literal.hl any "wait_literal.hl:6:19: error: the duration of 'wait' must be a named constant in milliseconds"
+  expect_error examples/invalid/over_wait.hl cloudflare "handler 'watch': worst case 2400000 milliseconds of waits exceeds cloudflare's limit of 900000 milliseconds of waits per run; loops: poll below polls_max (4)"
+  expect_error examples/invalid/long_wait.hl cloudflare "handler 'nap': worst case 3600000 milliseconds of waits exceeds cloudflare's limit of 900000 milliseconds of waits per run; loops: no loops"
+  expect_error examples/invalid/long_wait.hl vercel "handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds vercel's limit of 800000 milliseconds per wait"
   local target
   for target in native-jsonl native-sqlite server-postgres vercel; do
     "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
+    "$hl" check --target "$target" examples/invalid/over_wait.hl > /dev/null
+  done
+  for target in native-jsonl native-sqlite server-postgres; do
+    "$hl" check --target "$target" examples/invalid/long_wait.hl > /dev/null
   done
   echo "check: every invalid example fails with its expected error"
 }
@@ -322,6 +331,25 @@ drill() {
   echo "drill: flush_after_dispatch and no_fence are caught in the real SQLite and Postgres databases"
 }
 
+agent() {
+  if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' agent/src agent/build.rs; then
+    echo "agent/ has comments or test functions" >&2
+    exit 1
+  fi
+  rustfmt --edition 2024 --check agent/build.rs agent/src/*.rs agent/src/bin/*.rs
+  AGENT_DRILL_SEED=1 scripts/agent-drill.sh
+  if AGENT_DRILL_SEED=1 AGENT_DRILL_PLANT=batch_flush_after_dispatch scripts/agent-drill.sh > "$scratch/agent-drill-plant.log" 2>&1; then
+    echo "agent: batch_flush_after_dispatch survived the hl-agent kill -9 drill" >&2
+    exit 1
+  fi
+  if ! grep -q 'external calls dispatched more than once' "$scratch/agent-drill-plant.log"; then
+    echo "agent: the planted drill failed for another reason:" >&2
+    cat "$scratch/agent-drill-plant.log" >&2
+    exit 1
+  fi
+  echo "agent: hl-agent survives kill -9 against the local mock without repeating an external call, and batch_flush_after_dispatch is caught"
+}
+
 stage build build
 stage census scripts/mutations.sh --census
 queue rules rules
@@ -357,6 +385,7 @@ done
 queue exhaustive scripts/exhaustive.sh
 queue js-mutations scripts/js-mutations.sh
 queue prove scripts/prove-mutations.sh
+queue agent agent
 run_queued
 stage census-examples census_examples
 if [ "${HL_ORACLE:-0}" = 1 ]; then

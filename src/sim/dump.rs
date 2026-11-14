@@ -248,7 +248,7 @@ fn cell_json(session: &Session, cell: u64) -> Json {
 fn site_call(site: &SiteLog) -> Option<&Call> {
     match site {
         SiteLog::Open(call) | SiteLog::Done(call, _) | SiteLog::Unknown(call) => Some(call),
-        SiteLog::Reply(_) => None,
+        SiteLog::Reply(..) => None,
     }
 }
 
@@ -288,7 +288,7 @@ fn turn_json(turn: u64, log: &TurnLog) -> Json {
     let replies = log
         .sites
         .values()
-        .filter(|site| matches!(site, SiteLog::Reply(_)))
+        .filter(|site| matches!(site, SiteLog::Reply(..)))
         .count() as u64;
     let (phase, outcome, last, result) = match &log.finished {
         Some(finished) => (

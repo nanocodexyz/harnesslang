@@ -106,6 +106,7 @@ fn reads_local(value: &Expr) -> bool {
         Expr::Construct { fields, .. } => fields.iter().any(reads_local),
         Expr::Binary { left, right, .. } => reads_local(left) || reads_local(right),
         Expr::Not(operand) | Expr::Len(operand) => reads_local(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_local),
         Expr::Cancelled => false,
     }
 }
@@ -123,6 +124,7 @@ fn reads_events(value: &Expr) -> bool {
         Expr::Construct { fields, .. } => fields.iter().any(reads_events),
         Expr::Binary { left, right, .. } => reads_events(left) || reads_events(right),
         Expr::Not(operand) | Expr::Len(operand) => reads_events(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_events),
     }
 }
 
@@ -131,9 +133,38 @@ fn handler(program: &Program, handler: &Handler) {
     for site in &handler.sites {
         assert_eq!(
             site.durability,
-            Durability::of(site.class),
-            "a site's durability follows from its class"
+            Durability::of_site(site.kind, site.class),
+            "a site's durability follows from its kind and class"
         );
+        if site.kind.parks() {
+            assert_eq!(
+                site.class,
+                SiteClass::Fixed(EffectClass::None),
+                "a wait or suspend is a none effect"
+            );
+            assert!(
+                program.events.resume || site.kind != SiteKind::Suspend,
+                "a suspend needs the resume event"
+            );
+        }
+        if let SiteKind::Wait(constant) = site.kind {
+            assert!(
+                constant < program.constants.len(),
+                "a wait names a constant"
+            );
+            assert_eq!(
+                site.result,
+                Type::U64,
+                "a wait yields the clock at its wake"
+            );
+        }
+        if site.kind == SiteKind::Suspend {
+            assert_eq!(
+                site.result,
+                Type::Text,
+                "a suspend yields the resume's answer"
+            );
+        }
         if let SiteKind::Tool(tool) = site.kind {
             assert_eq!(
                 site.class,
@@ -336,5 +367,9 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
             expr(program, handler, right);
         }
         Expr::Not(operand) | Expr::Len(operand) => expr(program, handler, operand),
+        Expr::TextBuiltin { op, args } => {
+            assert_eq!(args.len(), op.arity(), "a text builtin takes its arity");
+            args.iter().for_each(|arg| expr(program, handler, arg));
+        }
     }
 }

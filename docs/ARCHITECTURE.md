@@ -102,7 +102,8 @@ on prompt(input: text) -> outcome
 
 ### Values and types
 
-- `u64`, `bool`, `text`. Arithmetic on `u64` traps on overflow and underflow;
+- `u64`, `bool`, `text`. Text has `++` and four pure builtins that never index
+  characters (`contains`, `before`, `after`, `trim`). Arithmetic on `u64` traps on overflow and underflow;
   the trap is a typed failure of the handler, never a wrapped value.
 - Sum types: `type name = variant(type, ...) | ...`. Variants carry only what
   that case has.
@@ -129,12 +130,13 @@ on prompt(input: text) -> outcome
 ### Effects
 
 An effect is anything whose result the program cannot recompute: a tool, the
-model, `now()` and `random()`. Each effect site is journaled. Spawning child
+model, `now()`, `random()`, `wait(c)` and `suspend(key)`. Each effect site is
+journaled. Spawning child
 sessions and waiting on them are not in the language yet (see Next).
 
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
-| `none` | `effect none`, `now()`, `random()` | `known<T>` (`now` and `random` return `u64`) | run again |
+| `none` | `effect none`, `now()`, `random()`, `wait(c)`, `suspend(key)` | `known<T>` (`now`, `random` and `wait` return `u64`, `suspend` returns `text`) | run again; a wait sleeps only until its recorded deadline, and an open suspend waits again without a second `call` |
 | `idempotent` | `effect idempotent`, the model | `known<T>` (the model returns `reply`, or `known<R>` for a declared reply type `R`, whose `failed` is a provider failure or a reply that does not fit) | run again with the same idempotency key |
 | `external` | `effect external`, `dispatch` of a tool the program does not declare | `maybe<T>` | never run again: the result is `unknown` |
 
@@ -144,7 +146,11 @@ the call's tool up among the declared tools at run time and always has type
 `maybe<text>`; a declared none or idempotent tool reached through it never
 yields `unknown`.
 
-A tool's parameters are its input type. `dispatch` checks the call's input
+A tool's parameters are its input type; a parameter may declare a default
+(`timeout: u64 = timeout_ms`), which `dispatch` fills into input that leaves it
+out before the check, so the journal holds the filled object. A model may
+declare call modes (`model m calls N modes text_only`), and `m(context) mode
+text_only` passes the mode to the host and journals it with the reply. `dispatch` checks the call's input
 text against them before the tool runs: a JSON object holding exactly the
 parameters, each of its type, is journaled as that object and sent; anything
 else is journaled as the text and recorded as the call's failure without
@@ -221,7 +227,7 @@ journal and a nanocode journal fold the same way:
 | `admitted` | a handler starts | turn, handler, arguments |
 | `call` | before an effect runs | sequence, tool, effect class, input |
 | `result` | after it returns | sequence, `ok` or `failed` and the value |
-| `model` | after the model returns | sequence, the reply, or `{"failed": error}` for a failed call to a model with a declared reply type |
+| `model` | after the model returns | sequence, the reply, or `{"failed": error}` for a failed call to a model with a declared reply type, and the call's `mode` when it has one |
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
@@ -236,7 +242,12 @@ places:
    including its `call` record. A crash after the flush and before the result
    leaves an open `call`, which recovery turns into `unknown`.
 2. Before a turn's outcome is acknowledged, its `status` record is durable.
-3. Nothing else forces a flush. Results of `none` and `idempotent` effects and
+3. Before a `wait` sleeps and before a `suspend` ends the run, every buffered
+   record is durable, including the wait's or suspend's `call` record, so a
+   host evicted during a wait, or a turn that waits for hours on a person,
+   loses nothing before it. A resume's `result` is durable before its
+   sender is answered and before the turn goes on.
+4. Nothing else forces a flush. Results of `none` and `idempotent` effects and
    model replies ride the next flush; losing them in a crash only repeats work
    that is safe to repeat.
 
@@ -269,9 +280,10 @@ lowering hoists every effect out of the expression it appears in into an
 `Effect` statement that binds a temporary local, so a statement's effects run
 first, left to right, then its expression. `and` and `or` evaluate both sides.
 
-Each effect site has a kind (a tool, `dispatch`, the model, `now`, `random`),
+Each effect site has a kind (a tool, `dispatch`, the model, `now`, `random`,
+`wait` with its constant, `suspend`),
 a class (fixed, or resolved at run time for `dispatch`), a result type and a
-durability: `RidesNextFlush`, `FlushBeforeRun` (external), or
+durability: `RidesNextFlush`, `FlushBeforeRun` (external, and every wait and suspend), or
 `FlushBeforeRunWhenExternal` (dispatch). An effect runs as: take the next
 sequence number; return the journaled result if there is one; otherwise append
 its `call` record (the model writes none), flush if its durability says so,
@@ -281,13 +293,22 @@ trap ends the turn the same way with outcome `failed`. A target may flush
 more often than the IR asks (the output gate before every outbound request, a
 step boundary after every external step) but never less.
 
+A suspend site ends the run instead of running: after its flush the handler
+returns `Suspended { turn, seq, key }` to the host and appends no `status`; the
+turn's waiting status is that open `call`. The host runs the turn again with a
+resume, `{key, answer}`; the run replays to the suspend, which records the
+answer as its `result` when the key matches and waits again when it does not.
+A wait reads the clock, appends `{"ms":c,"until":T}`, flushes and sleeps until
+`T`; its `result` is the clock at its wake. [LANGUAGE.md](LANGUAGE.md) has both.
+
 Code mode adds a code site: `SiteKind::Cell` with class `Cell` and durability `Cell`: its
 own `call` record is `none`, and its nested calls follow points 1 to 3 plus
 C1 (header durable before a nested external) and C2 (header durable before a
 timer wait); see [CODE_MODE.md](CODE_MODE.md).
 
-Each handler also carries its worst case: effects, journal records and
-outbound requests, each with the chain of loops that multiplies into it. A
+Each handler also carries its worst case: effects, journal records,
+outbound requests and milliseconds of waits, each with the chain of loops that
+multiplies into it. A
 `Finish` ends its path: a loop whose iteration may return counts the
 iterations before it in full and the last one up to its return, and code after
 a statement every path of which returns adds nothing.
@@ -301,13 +322,14 @@ A target is a durability model and a place.
 | `native-jsonl` | a process | append-only JSONL file, one per session | write and fsync | one record (checksummed; a torn tail is dropped) | nobody | the program's own |
 | `native-sqlite` | a process | SQLite rows through a host `Sql` | one transaction | one transaction | nobody | the program's own |
 | `server-postgres` | a server pool | Postgres rows through a host `Sql` | one transaction fenced by the owner's epoch | one transaction | a second owner after a lease expires; the fence refuses its writes | the program's own |
-| `cloudflare` | a Durable Object | the object's SQLite | `storage.sync()`, which the output gate already waits for before the outbound request or response that follows every flush | one event | nobody else (one object per session), though another event enters it at any await; an alarm restarts it after a reset | outbound requests per invocation (memory is reported, not checked) |
-| `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | none (Function duration is reported, not checked) |
+| `cloudflare` | a Durable Object | the object's SQLite | `storage.sync()`, which the output gate already waits for before the outbound request or response that follows every flush | one event | nobody else (one object per session), though another event enters it at any await; an alarm restarts it after a reset | outbound requests per invocation; the waits of one run, against the 15 minutes of an alarm (memory is reported, not checked) |
+| `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | each wait, against a Function's 800 s (other effects' duration is reported, not checked) |
 
 Vercel documents no limit on the outbound requests of a Function
 (vercel.com/docs/functions/limitations); its limits are duration, memory and
-request and response body size, none of which the checker can bound yet, since
-effect durations and text sizes are not modelled. Workflow's per-run limits on
+request and response body size. Duration enters the check through waits, the
+one effect whose duration the program states; the others' durations and text
+sizes are not modelled. Workflow's per-run limits on
 steps and events (vercel.com/docs/workflows/pricing) span every turn of a
 session, so they are not a per-handler bound either.
 
@@ -396,6 +418,8 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | `invariant_initial`, `invariant_preserved` | invariants hold in the zero state, at every `return`, and where a model reply fails to decode: the one trap left once `no_overflow` and `push_bound` hold |
 | `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target; outbound requests per invocation, counted on the plan with every nested call of a cell as one, are within the target's limit |
 | `header_before_wait` | a cell waits on a timer only after its header is durable (C2) |
+| `durable_before_wait` | a top-level `wait` sleeps only when nothing is buffered and its own `call` record, with its deadline, is flushed |
+| `suspend_durable` | a `suspend` ends the run only when nothing is buffered and its `call` is durable, and never after the turn's `status`; a suspend replayed from its recorded answer appends nothing (`seq_unique`) |
 | `cell_finish_once` | every path through a code site, divergence and the journal limit included, appends one `finished` update and one site `result`, and a cell whose result is recorded never starts its engine again |
 | `cell_replay_equal` | nothing is dispatched after a replayed cell diverges from its journal |
 | `unknown_nested_reported`, `nested_known` | a reopened nested external call reaches the script as the unknown outcome after a `recovery` record lists it, and the cell runs on; a reopened none or idempotent nested call runs again |
@@ -475,7 +499,8 @@ or the turn exits as corrupt without finishing.
 
 What is not proved: the generated Rust and JavaScript themselves; properties
 across turns other than the invariants' induction; recovery from a torn
-checkpoint; Cloudflare's alarm; memory, wall time and text sizes; conditions
+checkpoint; Cloudflare's alarm; memory, wall time beyond the waits a program
+states, and text sizes; conditions
 outside linear `u64` comparisons joined by `and`, `or` and `not` (an
 invariant over `bool` or `text` fails rather than being assumed, and a
 condition the prover cannot read adds no fact to its branch).
@@ -486,7 +511,9 @@ simulator's lowering mutations and five of its own (`drop_flush`,
 `scripts/prove-mutations.sh` requires each to fail proving `agent.hl`,
 `reviewer.hl` and `code_agent.hl` on every target it applies to, naming the
 property it breaks; a cell mutation must fail `code_agent.hl` and leave the
-programs without a `code` tool proved.
+programs without a `code` tool proved, and `suspend_before_flush` and
+`resume_replays_suspend` must fail `hooks.hl` and leave the programs without a
+suspend proved.
 The same script requires every example to prove and the prover's invalid
 examples under `examples/invalid/` to fail with their message: overflow in a
 loop, across a branch join and of a product, underflow, a push that can fill
@@ -511,7 +538,10 @@ dispatches per call, and the target's fault model:
 - for Cloudflare, a crash is an object reset, and the next run is the
   restart its alarm would make;
 - for Vercel, a crash is a step that ran and is retried with the next
-  attempt number.
+  attempt number;
+- a seeded clock that a wait advances to its deadline, crashes in the middle of
+  a wait, and resumes that arrive up to eight hours after a turn reported
+  waiting, one in five with another key.
 
 Invariants, named as nanocode-sim names them:
 
@@ -533,7 +563,9 @@ Invariants, named as nanocode-sim names them:
 | `checkpoint_compacted` | every checkpoint holds the state that replaying the journal reaches at its turn, so a list `clear` or `keep` shrank is short in it (`retire_skipped` writes the dropped entries back), and a turn that dropped entries flushes its checkpoint with its status, so the next load never replays the dropped prefix (`seal_skipped` leaves it out) |
 | `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed that sends no events the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
+| `mode_sent` | every journaled model reply answered a request sent in the mode its `model` record names (`mode_dropped` sends the request without its mode) |
 | `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
+| `suspend_durable`, `resume_matched`, `wait_until`, `wall_limit` | waits and suspends, defined in [LANGUAGE.md](LANGUAGE.md#suspend-and-resume) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded`, `nested_enum_valid` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
@@ -602,8 +634,11 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
-- Subagent trees as sessions spawned by a `spawn` effect and joined by `wait`,
-  simulated at 100K children.
+- Subagent trees as sessions spawned by a `spawn` effect and joined by a
+  suspend that a child's completion resumes, simulated at 100K children.
+- Waits as durable sleeps outside the run: on Vercel a workflow `sleep()`
+  between steps and on Cloudflare the object's alarm, so a wait spends no
+  Function or alarm time.
 - Cloudflare continuations: split a handler whose worst case exceeds the
   per-invocation request limit at a loop boundary into continuations driven
   by the alarm, instead of refusing it.

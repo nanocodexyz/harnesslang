@@ -5,8 +5,8 @@ use crate::ir::{self, Program, Type};
 use crate::run::cell::{CellEngine, CellEvent, Input, Step, Wait};
 use crate::run::cell_journal::Entry;
 use crate::run::engine::{
-    Answer, Finish, ListingRequest, ModelRequest, Point, Read, Stop, ToolRequest, World,
-    batch_width, run_batch,
+    Answer, Finish, ListingRequest, ModelRequest, Point, Read, Resume, Stop, Suspension,
+    ToolRequest, World, batch_width, run_batch,
 };
 use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
@@ -38,6 +38,7 @@ pub const UNLISTED_TOOL_PPM: u64 = 250_000;
 pub const LISTED_PRESENT_PPM: u64 = 500_000;
 pub const LISTING_CHANGE_PPM: u64 = 100_000;
 pub const INPUT_INVALID_PPM: u64 = 100_000;
+pub const DEFAULT_OMITTED_PPM: u64 = 500_000;
 pub const INVALID_INPUT_KINDS: u64 = 3;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const WORDS: [&str; 8] = [
@@ -100,6 +101,8 @@ pub struct Stats {
     pub nested: u64,
     pub divergences: u64,
     pub waits: u64,
+    pub sleeps: u64,
+    pub suspensions: u64,
     pub events: Option<u64>,
     pub entry_states: u64,
 }
@@ -138,6 +141,7 @@ pub struct SimWorld<'a> {
     cell_timers: BTreeMap<u64, BTreeSet<u64>>,
     cell_codes: BTreeMap<u64, usize>,
     pub inbox: Inbox,
+    pub parking: crate::sim::park::Parking,
     pub edges: Option<Edges>,
     pub greedy: bool,
     pub worst_faults: Vec<String>,
@@ -148,11 +152,12 @@ pub struct SimWorld<'a> {
     rng: Rng,
     faults_left: u64,
     armed: bool,
-    nested: bool,
+    pub(crate) nested: bool,
     lease_spent: bool,
     current: Option<TurnRequest>,
-    clock: u64,
+    pub(crate) clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
+    pub model_modes: BTreeMap<(u64, u64), Vec<(Option<String>, Json)>>,
     run_epoch: u64,
     batch_calls: BTreeMap<(u64, u64), u64>,
     listing_reads: BTreeMap<(u64, u64), u64>,
@@ -199,6 +204,7 @@ impl<'a> SimWorld<'a> {
             cell_timers: BTreeMap::new(),
             cell_codes: BTreeMap::new(),
             inbox: Inbox::default(),
+            parking: crate::sim::park::Parking::default(),
             edges: None,
             greedy: false,
             worst_faults: Vec::new(),
@@ -212,6 +218,7 @@ impl<'a> SimWorld<'a> {
             current: None,
             clock: 0,
             model_calls: BTreeMap::new(),
+            model_modes: BTreeMap::new(),
             run_epoch: 0,
             batch_calls: BTreeMap::new(),
             listings: vec![BTreeMap::new(); program.listings.len()],
@@ -272,7 +279,7 @@ impl<'a> SimWorld<'a> {
             Medium::Jsonl(_) => None,
         };
         format!(
-            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?}",
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?} {}",
             self.nested_dispatched,
             self.cell_faults,
             self.injected,
@@ -282,7 +289,8 @@ impl<'a> SimWorld<'a> {
             self.cell_timers,
             self.cell_codes,
             self.clock,
-            waited
+            waited,
+            self.parking.key()
         )
     }
 
@@ -318,6 +326,8 @@ impl<'a> SimWorld<'a> {
             ]
         });
         self.current = Some(request.clone());
+        self.parking.pending = None;
+        self.parking.suspensions = 0;
         self.inbox.schedule(program, self.seed, request.turn);
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
@@ -341,6 +351,7 @@ impl<'a> SimWorld<'a> {
         self.stats.runs += 1;
         self.run_effects = 0;
         self.run_outbound = 0;
+        self.parking.run_waited_ms = 0;
         if self.faults_left == 0 {
             self.armed = false;
         }
@@ -444,17 +455,19 @@ impl<'a> SimWorld<'a> {
         };
         let counted = (self.run_effects, self.run_outbound);
         (self.run_effects, self.run_outbound) = (0, 0);
+        let waited = std::mem::take(&mut self.parking.run_waited_ms);
         self.inbox.load(&records, true);
         self.nested = true;
         let ran = run_turn(program, &model, mutation, self, epoch, &records, &request);
         self.nested = false;
         self.inbox.unload();
         (self.run_effects, self.run_outbound) = counted;
+        self.parking.run_waited_ms = waited;
         if let Some(trace) = &mut self.trace {
             trace.exit(&ran);
         }
         match ran {
-            Ok(Ran::Finished(_)) => {}
+            Ok(Ran::Finished(_) | Ran::Suspended(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => self.acknowledge(&finish),
             Err(exit) => self
                 .owner_faults
@@ -537,6 +550,50 @@ impl<'a> SimWorld<'a> {
                 request.turn, request.handler
             ));
         }
+    }
+
+    pub(crate) fn rng_step(&mut self) -> u64 {
+        self.rng.range(1, CLOCK_STEP_MAX)
+    }
+
+    pub(crate) fn count_wait(&mut self) {
+        self.stats.sleeps += 1;
+        self.count_effect(false);
+    }
+
+    pub(crate) fn crash_mid_wait(&mut self, until: u64) -> Option<Stop> {
+        if !self.fault(self.profile.crash_ppm) {
+            return None;
+        }
+        if until > self.clock {
+            self.clock += self.rng.below(until - self.clock);
+        }
+        Some(self.crash())
+    }
+
+    pub(crate) fn handler_worst(&self) -> &ir::worst::WorstCase {
+        let request = self
+            .current
+            .as_ref()
+            .expect("a wait or suspend runs within a turn");
+        &self
+            .program
+            .handler(&request.handler)
+            .expect("a turn request names a handler of the program")
+            .worst
+    }
+
+    pub(crate) fn handler_wait_ms(&self) -> u64 {
+        self.handler_worst().wait_ms.total
+    }
+
+    pub fn enter_turn(&mut self, request: &TurnRequest) {
+        if self.current.as_ref().map(|current| current.turn) == Some(request.turn) {
+            return;
+        }
+        self.current = Some(request.clone());
+        self.parking.pending = None;
+        self.parking.suspensions = 0;
     }
 
     fn durable_status(&self, turn: u64) -> Option<Record> {
@@ -684,6 +741,10 @@ impl World for SimWorld<'_> {
         self.count_effect(true);
         self.change_listings(LISTING_CHANGE_PPM);
         let response = self.reply(request);
+        self.model_modes
+            .entry((request.turn, request.seq))
+            .or_default()
+            .push((request.mode.map(str::to_owned), response.clone()));
         let program = self.program;
         self.record("model", || {
             let context = Json::Array(
@@ -694,7 +755,7 @@ impl World for SimWorld<'_> {
                     .map(|entry| value::to_json(program, &Type::Sum(ir::ENTRY), entry))
                     .collect(),
             );
-            vec![
+            let mut fields = vec![
                 ("turn", Json::Number(request.turn)),
                 ("seq", Json::Number(request.seq)),
                 ("calls_max", Json::Number(request.calls_max)),
@@ -705,7 +766,11 @@ impl World for SimWorld<'_> {
                     ))),
                 ),
                 ("response", response.clone()),
-            ]
+            ];
+            if let Some(mode) = request.mode {
+                fields.push((crate::run::journal::MODEL_MODE, Json::text(mode)));
+            }
+            fields
         });
         response
     }
@@ -854,6 +919,22 @@ impl World for SimWorld<'_> {
             ]
         });
         self.check_acknowledge(finish);
+    }
+
+    fn clock(&mut self) -> u64 {
+        self.wait_clock()
+    }
+
+    fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        self.sleep_until(turn, seq, until_ms)
+    }
+
+    fn resume(&mut self, suspension: &Suspension) -> Option<Resume> {
+        self.deliver_resume(suspension)
+    }
+
+    fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {
+        self.answer_resume(suspension, resume, matched);
     }
 
     fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
@@ -1115,7 +1196,7 @@ impl SimWorld<'_> {
             } else {
                 let tool = self.drawn_tool(rng);
                 let input = match self.program.input_params(&tool) {
-                    Some(params) => self.drawn_input(rng, params),
+                    Some(params) => self.drawn_input(rng, &tool, params),
                     None => Self::generated_text(rng),
                 };
                 (tool, input)
@@ -1386,11 +1467,20 @@ impl SimWorld<'_> {
             .clone()
     }
 
-    fn drawn_input(&self, rng: &mut Rng, params: &[ir::Field]) -> String {
+    fn drawn_input(&self, rng: &mut Rng, tool: &str, params: &[ir::Field]) -> String {
         let mut fields: BTreeMap<String, Json> = params
             .iter()
             .map(|param| (param.name.clone(), self.param_value(rng, &param.ty)))
             .collect();
+        let defaults = self
+            .program
+            .input_defaults(tool)
+            .expect("a tool with declared parameters has default slots");
+        for (param, default) in params.iter().zip(defaults) {
+            if default.is_some() && rng.chance(DEFAULT_OMITTED_PPM) {
+                fields.remove(&param.name);
+            }
+        }
         if self.greedy || !rng.chance(INPUT_INVALID_PPM) {
             return Json::Object(fields).encode();
         }

@@ -621,7 +621,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             Some(SiteLog::Done(_, output)) => self.set_output(id, encode_output(&output)),
             Some(SiteLog::Unknown(_)) => self.set_output(id, (unknown_outcome().encode(), false)),
             Some(SiteLog::Open(_)) => panic!("recovery turns every open nested external call unknown before the cell runs again"),
-            Some(SiteLog::Reply(_)) => panic!("a nested call never holds a model reply"),
+            Some(SiteLog::Reply(..)) => panic!("a nested call never holds a model reply"),
             None if tool.effect == EffectClass::External => self.dispatch(id, true)?,
             None => {}
         }

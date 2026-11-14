@@ -5,7 +5,7 @@ const calls_per_round_max: u64 = 8
 const context_entries_max: u64 = 1024
 const turns_max: u64 = 1000000
 
-type mode = "default" | "plan"
+type mode = "default" | "plan" | "ask"
 type decision = "continue" | "block" | "stop"
 type outcome = completed(text) | stopped(text) | exhausted
 
@@ -15,6 +15,8 @@ tool stop_hook(last_assistant_message: text) -> decision effect idempotent
 
 model messages calls calls_per_round_max
 
+on resume
+
 state {
   context: list<entry, context_entries_max>
   permission: mode
@@ -23,6 +25,14 @@ state {
 
 invariant turns_bounded: turns <= turns_max
 invariant context_bounded: len(context) <= context_entries_max
+
+fn run_call(call: call) {
+  match dispatch(call) {
+    ok(output) => { push context result(call, output) }
+    failed(error) => { push context error(call, error) }
+    unknown => { push context unknown(call) }
+  }
+}
 
 on set_mode(next: mode) -> mode {
   permission = next
@@ -44,8 +54,14 @@ on prompt(input: text) -> outcome
           ok(verdict) => {
             match verdict {
               "continue" => { return completed(words) }
-              "block" => { push context user("A stop hook blocked the stop. Continue the task.") }
-              "stop" => { return stopped(words) }
+              "block" => {
+                let reason = suspend("stop_hook block")
+                push context user("A stop hook blocked the stop: " ++ reason)
+              }
+              "stop" => {
+                let reason = suspend("stop_hook stop")
+                return stopped(reason)
+              }
             }
           }
           failed(error) => { return stopped(error) }
@@ -54,22 +70,24 @@ on prompt(input: text) -> outcome
       calls(requested) => {
         for call in requested {
           match permission {
-            "default" => {
-              match dispatch(call) {
-                ok(output) => { push context result(call, output) }
-                failed(error) => { push context error(call, error) }
-                unknown => { push context unknown(call) }
-              }
-            }
+            "default" => { run_call(call) }
             "plan" => {
               if call.tool == "Read" {
-                match dispatch(call) {
-                  ok(output) => { push context result(call, output) }
-                  failed(error) => { push context error(call, error) }
-                  unknown => { push context unknown(call) }
-                }
+                run_call(call)
               } else {
                 push context error(call, "Plan mode runs only Read.")
+              }
+            }
+            "ask" => {
+              if call.tool == "Read" {
+                run_call(call)
+              } else {
+                let verdict = suspend(call.id)
+                if verdict == "allow" {
+                  run_call(call)
+                } else {
+                  push context error(call, "Denied: " ++ verdict)
+                }
               }
             }
           }

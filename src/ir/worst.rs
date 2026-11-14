@@ -30,6 +30,7 @@ pub struct WorstCase {
     pub effects: Cost,
     pub records: Cost,
     pub requests: Cost,
+    pub wait_ms: Cost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,9 +39,14 @@ pub struct Overflow {
     pub loops: Vec<Factor>,
 }
 
-pub const MEASURES: [&str; 3] = ["effects", "journal records", "outbound requests"];
+pub const MEASURES: [&str; 4] = [
+    "effects",
+    "journal records",
+    "outbound requests",
+    "milliseconds of waits",
+];
 
-type Costs = [Cost; 3];
+type Costs = [Cost; 4];
 
 #[derive(Clone, Debug)]
 struct Paths {
@@ -102,7 +108,12 @@ impl Cost {
 }
 
 fn zero() -> Costs {
-    [Cost::default(), Cost::default(), Cost::default()]
+    [
+        Cost::default(),
+        Cost::default(),
+        Cost::default(),
+        Cost::default(),
+    ]
 }
 
 fn combine(left: Costs, right: Costs) -> Result<Costs, Overflow> {
@@ -132,9 +143,9 @@ fn repeated(costs: Costs, factor: &Factor, count: u64) -> Result<Costs, Overflow
 }
 
 fn widest(left: Costs, right: Costs) -> Costs {
-    let [a, b, c] = left;
-    let [x, y, z] = right;
-    [a.or(x), b.or(y), c.or(z)]
+    let [a, b, c, d] = left;
+    let [w, x, y, z] = right;
+    [a.or(w), b.or(x), c.or(y), d.or(z)]
 }
 
 fn either(left: Option<Costs>, right: Option<Costs>) -> Option<Costs> {
@@ -230,7 +241,12 @@ fn cell_cost(program: &Program, code: &Code) -> Result<Costs, Overflow> {
             nested.checked_add(EFFECT_RECORDS + CELL_HEADER_RECORDS + CELL_FINISH_RECORDS)
         })
         .ok_or_else(|| overflow(1))?;
-    Ok([Cost::of(effects), Cost::of(records), Cost::of(calls)])
+    Ok([
+        Cost::of(effects),
+        Cost::of(records),
+        Cost::of(calls),
+        Cost::of(0),
+    ])
 }
 
 fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
@@ -239,6 +255,7 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
             Cost::of(1),
             Cost::of(records),
             Cost::of(u64::from(kind.outbound())),
+            Cost::of(0),
         ]
     };
     match kind {
@@ -251,8 +268,19 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
             }
             Ok(widest_cost)
         }
-        SiteKind::Tool(_) | SiteKind::Listing(_) | SiteKind::Now | SiteKind::Random => {
-            Ok(plain(EFFECT_RECORDS))
+        SiteKind::Tool(_)
+        | SiteKind::Listing(_)
+        | SiteKind::Now
+        | SiteKind::Random
+        | SiteKind::Suspend => Ok(plain(EFFECT_RECORDS)),
+        SiteKind::Wait(constant) => {
+            let [effects, records, requests, _] = plain(EFFECT_RECORDS);
+            Ok([
+                effects,
+                records,
+                requests,
+                Cost::of(program.constants[constant].value),
+            ])
         }
     }
 }
@@ -280,7 +308,12 @@ fn statement_cost(
         Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {
             through: None,
-            ended: Some([Cost::of(0), Cost::of(FINISH_RECORDS), Cost::of(0)]),
+            ended: Some([
+                Cost::of(0),
+                Cost::of(FINISH_RECORDS),
+                Cost::of(0),
+                Cost::of(0),
+            ]),
         }),
         Stmt::If {
             then, otherwise, ..
@@ -322,11 +355,17 @@ pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overfl
     let body = block(program, handler, &handler.body)?;
     let longest =
         either(body.through, body.ended).expect("a block keeps a path through it or ending in it");
-    let admission = [Cost::of(0), Cost::of(ADMISSION_RECORDS), Cost::of(0)];
-    let [effects, records, requests] = combine(admission, longest)?;
+    let admission = [
+        Cost::of(0),
+        Cost::of(ADMISSION_RECORDS),
+        Cost::of(0),
+        Cost::of(0),
+    ];
+    let [effects, records, requests, wait_ms] = combine(admission, longest)?;
     Ok(WorstCase {
         effects,
         records,
         requests,
+        wait_ms,
     })
 }

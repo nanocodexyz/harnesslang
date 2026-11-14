@@ -1,0 +1,8 @@
+harness suspend_undeclared
+
+type outcome = approved(text)
+
+on ask(question: text) -> outcome {
+  let answer = suspend(question)
+  return approved(answer)
+}
