@@ -52,6 +52,22 @@ fn check_directory(
     Ok(())
 }
 
+fn kinds(disagreements: &[compare::Disagreement]) -> std::collections::BTreeMap<String, usize> {
+    let mut kinds = std::collections::BTreeMap::new();
+    for disagreement in disagreements {
+        let mut kind = String::with_capacity(disagreement.what.len());
+        for character in disagreement.what.chars() {
+            if !character.is_ascii_digit() {
+                kind.push(character);
+            } else if !kind.ends_with('N') {
+                kind.push('N');
+            }
+        }
+        *kinds.entry(kind).or_insert(0) += 1;
+    }
+    kinds
+}
+
 fn write_golden(directory: &str) -> ExitCode {
     match golden::write(Path::new(directory)) {
         Ok(count) => {
@@ -108,6 +124,9 @@ fn main() -> ExitCode {
             "... {} more disagreements",
             disagreements.len() - DISAGREEMENTS_SHOWN_MAX
         );
+    }
+    for (kind, count) in kinds(&disagreements) {
+        println!("KIND {count} {kind}");
     }
     let verdict = if disagreements.is_empty() {
         "ok"

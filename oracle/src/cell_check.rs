@@ -8,7 +8,7 @@ use serde_json::value::RawValue;
 
 use crate::cells;
 use crate::djs::{self, Script, Terminal};
-use crate::golden::Follow;
+use crate::golden::{self, Follow};
 use crate::summary::CellSummary;
 
 const NESTED_ID_INFIX: &str = "/code-";
@@ -231,6 +231,7 @@ pub fn open_running(journal: &CellJournal) -> BTreeSet<u64> {
 pub enum SiteOutput {
     Ok(String),
     Failed,
+    Unknown,
 }
 
 fn tool_names(journal: &CellJournal) -> Result<Vec<String>, String> {
@@ -269,8 +270,15 @@ pub fn differential(journal: &CellJournal, output: &SiteOutput) -> Result<(), St
         ));
     }
     match (&run.terminal, output) {
-        (Terminal::Done, SiteOutput::Ok(text)) if *text == run.text => Ok(()),
-        (Terminal::Threw(_), SiteOutput::Failed) => Ok(()),
+        (Terminal::Diverged(reason), _) => Err(format!(
+            "djs diverges replaying cell {}: {reason}",
+            journal.cell_id
+        )),
+        (_, SiteOutput::Unknown) => Ok(()),
+        (Terminal::Done, SiteOutput::Ok(text)) if *text == run.text => {
+            golden::resumes(&script, entries, &run)
+        }
+        (Terminal::Threw(_), SiteOutput::Failed) => golden::resumes(&script, entries, &run),
         (terminal, SiteOutput::Ok(text)) => Err(format!(
             "djs replaying cell {} ends {terminal:?} with text {:?}; the site's result is ok({text:?})",
             journal.cell_id, run.text

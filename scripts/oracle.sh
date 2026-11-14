@@ -22,7 +22,7 @@ mkdir -p "$journals"
 pids=()
 for target in $targets; do
   (
-    for file in examples/*.hl oracle/cells.hl; do
+    for file in examples/*.hl; do
       "$hl" sim --target "$target" --seeds "$seeds" --dump-journal "$journals" "$file"
     done
   ) > "$scratch/dump-$target.log" 2>&1 &
@@ -49,7 +49,7 @@ for journal in "$cells"/synthetic/*/*.jsonl; do
   stem=$(basename "$journal" .jsonl)
   for target in $targets; do
     case "$stem" in
-      *-"$target"-[0-9]*) "$hl" sim --target "$target" --summarize "$journal" oracle/cells.hl > "${journal%.jsonl}.summary.jsonl" ;;
+      *-"$target"-[0-9]*) "$hl" sim --target "$target" --summarize "$journal" examples/code_agent.hl > "${journal%.jsonl}.summary.jsonl" ;;
     esac
   done
 done

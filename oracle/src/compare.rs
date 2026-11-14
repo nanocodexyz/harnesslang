@@ -9,6 +9,7 @@ use crate::journal::{self, Lines};
 use crate::summary::{self, CellSummary, CheckpointSummary, Header, Line, Recovery, TurnSummary};
 
 const BUILTIN_NONE_TOOLS: [&str; 2] = ["now", "random"];
+const UNKNOWN_KEY: &str = "unknown";
 
 #[derive(Debug)]
 pub struct Disagreement {
@@ -592,6 +593,12 @@ impl<'a> Check<'a> {
         let site = match raw(output) {
             Value::Object(map) => match (map.get("ok"), map.get("failed")) {
                 (Some(Value::String(text)), None) => SiteOutput::Ok(text.clone()),
+                (Some(Value::Object(unknown)), None)
+                    if unknown.len() == 1
+                        && unknown.get(UNKNOWN_KEY).is_some_and(Value::is_string) =>
+                {
+                    SiteOutput::Unknown
+                }
                 (None, Some(_)) => SiteOutput::Failed,
                 _ => {
                     return self.disagree(
