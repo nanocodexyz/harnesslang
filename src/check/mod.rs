@@ -1378,6 +1378,7 @@ fn invariants(source: &ast::Program, program: &mut ir::Program, globals: &Global
 }
 
 fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let mut used = BTreeSet::new();
     let mut names: BTreeMap<String, Position> = BTreeMap::new();
     for item in &source.items {
         let Item::Handler(definition) = item else {
@@ -1392,8 +1393,36 @@ fn handlers(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
                 ),
             );
         }
-        let checked = handler::check(program, globals, definition)?;
+        let (checked, ran) = handler::check(program, globals, definition)?;
+        used.extend(ran);
         program.handlers.push(checked);
+    }
+    if let Some(hook) = globals
+        .hooks
+        .values()
+        .find(|hook| !used.contains(&hook.kind))
+    {
+        let reason = match hook.kind {
+            ast::HookKind::BeforeTool | ast::HookKind::AfterTool => {
+                "no handler dispatches a call".to_owned()
+            }
+            ast::HookKind::PromptSubmit => format!(
+                "no handler takes '{}'",
+                hook.params
+                    .first()
+                    .map_or("", |param| param.name.text.as_str())
+            ),
+            ast::HookKind::PreCompact | ast::HookKind::PostCompact => {
+                "no handler keeps or clears a list of entries".to_owned()
+            }
+            ast::HookKind::SubagentStart => "no handler matches on a spawn's result".to_owned(),
+            ast::HookKind::SubagentStop => "no handler joins a spawned session".to_owned(),
+            ast::HookKind::SessionStart | ast::HookKind::Stop => "no handler runs it".to_owned(),
+        };
+        return error(
+            hook.at,
+            format!("'{}' runs nowhere: {reason}", hook.kind.describe()),
+        );
     }
     if program.handlers.is_empty() {
         return error(

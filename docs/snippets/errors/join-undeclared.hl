@@ -1,0 +1,8 @@
+harness notes
+
+on resume
+
+on ping(agent: text) -> text {
+  let result = join(agent)
+  return result
+}

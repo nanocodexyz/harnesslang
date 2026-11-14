@@ -132,6 +132,7 @@ impl Checker<'_> {
         at: Position,
         out: &mut Vec<Stmt>,
     ) -> Checked<()> {
+        self.used.insert(hook.kind);
         if self.hook_inline(hook, args, out)? {
             return error(
                 at,
@@ -413,6 +414,7 @@ impl Checker<'_> {
         at: Position,
         out: &mut Vec<Stmt>,
     ) -> Checked<()> {
+        self.used.insert(kind);
         let flags = self.flags();
         for field in [flags.decided, flags.denied] {
             out.push(Stmt::Assign {

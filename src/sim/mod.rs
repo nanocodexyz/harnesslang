@@ -402,6 +402,7 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.entry_states += more.entry_states;
     total.children += more.children;
     total.joined += more.joined;
+    total.child_crashes += more.child_crashes;
 }
 
 pub fn run_child(
@@ -598,7 +599,10 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                     String::new()
                 },
                 if stats.children > 0 {
-                    format!(" children={} joined={}", stats.children, stats.joined)
+                    format!(
+                        " children={} joined={} child_crashes={}",
+                        stats.children, stats.joined, stats.child_crashes
+                    )
                 } else {
                     String::new()
                 }

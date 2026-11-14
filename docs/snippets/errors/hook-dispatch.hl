@@ -1,0 +1,23 @@
+harness notes
+
+const calls_max: u64 = 4
+
+tool read(path: text) -> text effect none
+
+model infer calls calls_max
+
+state {
+  context: list<entry, calls_max>
+}
+
+on stop {
+  match dispatch(call("audit", "read", "{}")) {
+    ok(_) => {}
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on ping(path: text) -> u64 {
+  return 1
+}

@@ -21,13 +21,14 @@ struct Checker<'a> {
     reads_events: bool,
     in_hook: bool,
     spawn_subject: bool,
+    used: std::collections::BTreeSet<ast::HookKind>,
 }
 
 pub fn check(
     program: &ir::Program,
     globals: &Globals,
     definition: &ast::Handler,
-) -> Checked<ir::Handler> {
+) -> Checked<(ir::Handler, std::collections::BTreeSet<ast::HookKind>)> {
     let returns = resolve(program, globals, &definition.returns)?;
     let mut checker = Checker {
         program,
@@ -39,6 +40,7 @@ pub fn check(
         reads_events: false,
         in_hook: false,
         spawn_subject: false,
+        used: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::new();
     for param in &definition.params {
@@ -70,8 +72,8 @@ pub fn check(
         params,
         returns,
         requires,
-        locals: checker.locals,
-        sites: checker.sites,
+        locals: std::mem::take(&mut checker.locals),
+        sites: std::mem::take(&mut checker.sites),
         body,
         worst: ir::worst::WorstCase::default(),
     };
@@ -90,7 +92,7 @@ pub fn check(
             ),
         )
     })?;
-    Ok(handler)
+    Ok((handler, checker.used))
 }
 
 pub fn invariant(
@@ -108,6 +110,7 @@ pub fn invariant(
         reads_events: false,
         in_hook: false,
         spawn_subject: false,
+        used: std::collections::BTreeSet::new(),
     };
     let condition = checker.condition(
         &definition.condition,

@@ -1,0 +1,14 @@
+harness notes
+
+tool read(path: text) -> text effect none
+
+before tool(c: call) {
+  if c.tool != "read" {
+    deny("read only")
+  }
+}
+
+on ping(c: call) -> u64 {
+  let outcome = dispatch(c)
+  return 1
+}

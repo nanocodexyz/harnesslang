@@ -18,6 +18,7 @@ pub struct Parking {
     pub sent: Vec<(u64, u64, String, String)>,
     pub faults: Vec<Violation>,
     pub suspensions: u64,
+    pub unmatched: u64,
     pub run_waited_ms: u64,
 }
 
@@ -28,8 +29,8 @@ fn fault(invariant: Invariant, detail: String) -> Violation {
 impl Parking {
     pub fn key(&self) -> String {
         format!(
-            "{:?} {:?} {} {}",
-            self.pending, self.sent, self.suspensions, self.run_waited_ms
+            "{:?} {:?} {} {} {}",
+            self.pending, self.sent, self.suspensions, self.unmatched, self.run_waited_ms
         )
     }
 }
@@ -70,12 +71,13 @@ impl SimWorld<'_> {
         }
         self.parking.suspensions += 1;
         self.stats.suspensions += 1;
-        let suspensions_max = self.handler_worst().effects.total;
-        if self.parking.suspensions > suspensions_max {
+        let effects = self.handler_worst().effects.total;
+        let unmatched = self.parking.unmatched;
+        if self.parking.suspensions > effects + unmatched {
             return Err(fault(
                 Invariant::Liveness,
                 format!(
-                    "turn {} suspended {} times, more than its {suspensions_max} worst-case effects",
+                    "turn {} suspended {} times, more than its {effects} worst-case effects and {unmatched} unmatched resume(s)",
                     suspension.turn, self.parking.suspensions
                 ),
             ));
@@ -97,7 +99,9 @@ impl SimWorld<'_> {
         };
         let answer = match self.children.get(&suspension.key) {
             Some(crate::sim::world::Child { result: Ok(result) }) => {
-                self.stats.joined += 1;
+                if key == suspension.key {
+                    self.stats.joined += 1;
+                }
                 result.clone()
             }
             _ => answer,
@@ -152,6 +156,9 @@ impl SimWorld<'_> {
                     resume.key
                 ),
             ));
+        }
+        if !matched {
+            self.parking.unmatched += 1;
         }
         self.parking.pending = None;
     }

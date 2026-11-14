@@ -108,6 +108,7 @@ pub struct Stats {
     pub entry_states: u64,
     pub children: u64,
     pub joined: u64,
+    pub child_crashes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +343,7 @@ impl<'a> SimWorld<'a> {
         self.current = Some(request.clone());
         self.parking.pending = None;
         self.parking.suspensions = 0;
+        self.parking.unmatched = 0;
         self.inbox.schedule(program, self.seed, request.turn);
         self.change_listings(LISTING_CHANGE_PPM);
         self.faults_left = if faults { RESTARTS_PER_TURN_MAX } else { 0 };
@@ -1135,6 +1137,7 @@ impl SimWorld<'_> {
                 request.input,
             );
             crate::sim::add(&mut self.stats, &stats);
+            self.stats.child_crashes += stats.crashes;
             self.stats.children += 1;
             self.children.insert(key.clone(), Child { result });
         }

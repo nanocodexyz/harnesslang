@@ -419,11 +419,12 @@ impl<'a> Parser<'a> {
     fn tool_hook(&mut self) -> Parsed<Hook> {
         let at = self.at();
         let kind = if self.is_word("before") {
+            self.word("before")?;
             HookKind::BeforeTool
         } else {
+            self.word("after")?;
             HookKind::AfterTool
         };
-        self.advance();
         self.word("tool")?;
         let params = self.params()?;
         let body = self.block()?;
@@ -446,8 +447,8 @@ impl<'a> Parser<'a> {
             _ => return Ok(None),
         };
         if first == "session" && second.as_deref() == Some("end") {
-            self.advance();
-            self.advance();
+            self.word("session")?;
+            self.word("end")?;
             let name = Name {
                 text: SESSION_END_HANDLER.to_owned(),
                 at,
@@ -463,9 +464,37 @@ impl<'a> Parser<'a> {
         }) else {
             return Ok(None);
         };
-        self.advance();
-        if second.is_some() {
-            self.advance();
+        match kind {
+            HookKind::SessionStart => {
+                self.word("session")?;
+                self.word("start")?;
+            }
+            HookKind::PromptSubmit => {
+                self.word("prompt")?;
+                self.word("submit")?;
+            }
+            HookKind::PreCompact => {
+                self.word("pre")?;
+                self.word("compact")?;
+            }
+            HookKind::PostCompact => {
+                self.word("post")?;
+                self.word("compact")?;
+            }
+            HookKind::Stop => {
+                self.word("stop")?;
+            }
+            HookKind::SubagentStart => {
+                self.word("subagent")?;
+                self.word("start")?;
+            }
+            HookKind::SubagentStop => {
+                self.word("subagent")?;
+                self.word("stop")?;
+            }
+            HookKind::BeforeTool | HookKind::AfterTool => {
+                panic!("a tool hook starts with before or after, not on")
+            }
         }
         let params = if self.is_symbol(Symbol::LeftParen) {
             self.params()?
