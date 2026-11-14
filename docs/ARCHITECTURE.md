@@ -251,10 +251,120 @@ What the compiler does differently per target:
 - Names and types resolve; `match` is exhaustive; `maybe<T>` results are
   matched before use.
 - Every loop is `below` a constant and every list has a constant capacity.
+- Every handler proves (below): durability, finishing once, no overflow,
+  pushes within capacity, invariants and the worst case.
 - Worst case per handler: effects, journal records and outbound requests,
   compared with the target's limits. The message names the handler, the bound
   and the loops that multiply into it.
 - No ambient time, randomness or I/O: the language has none outside effects.
+
+### Proofs
+
+`hl prove [--target T] FILE` proves properties of every path through each
+handler, per target, and `hl check` runs the same proofs and fails when one
+fails. A failure names the handler, the target, the property, the path (the
+branches, loop iterations, crash and recovery choices that reach it) and,
+for arithmetic, a counterexample.
+
+A program states what the arithmetic proofs may assume and must keep:
+
+    invariant turns_bounded: turns <= turns_max
+
+    on prompt(input: text) -> outcome
+      requires turns < turns_max
+        and len(context) + 1 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+    { ... }
+
+An `invariant` must hold in the zero state and wherever a turn can end. A
+handler's `requires` is checked when the turn is admitted; when it is false
+the turn finishes `failed` before its body runs, so state is unchanged.
+
+| Property | Proved |
+| --- | --- |
+| `finish_once` | every path of the body ends in exactly one `return`; on every target, every path of the lowered plan, traps included, appends one `status`, flushes it, then acknowledges, never twice |
+| `durable_before_external` | an external effect runs only when nothing is buffered and its own `call` record is flushed, on first runs and on every rerun after a crash |
+| `external_once` | an external call whose `call` record a crash left open is never run again: at-load recovery reports it `unknown`, Vercel's in-step recovery runs it only on attempt 1; Postgres flushes are fenced |
+| `unknown_reported`, `idempotent_known` | a reopened external call yields `unknown`, a reopened none or idempotent call runs again |
+| `seq_unique` | no path appends a second `call` record for a sequence number already in the journal |
+| `output_gate` | on Cloudflare, nothing leaves the object while a record is uncommitted |
+| `liveness`, `replay_equal` | the lowering checksums JSONL lines and writes checkpoints in sorted order (checks of the lowering, not of paths) |
+| `no_overflow` | every `+`, `-` and `*` on `u64`, in `requires` too, stays in range |
+| `push_bound` | every `push` finds its list below capacity |
+| `invariant_initial`, `invariant_preserved` | invariants hold in the zero state, at every `return`, and where a model reply fails to decode: the one trap left once `no_overflow` and `push_bound` hold |
+| `worst_case` | outbound requests per invocation, counted on the lowered plan, are within the target's limit |
+
+With `no_overflow` and `push_bound` proved, a turn of a proving program
+finishes `failed` only when its `requires` is false or a model reply does not
+decode: never by a trap in its own code. A push that may
+find its list full is an error, not a warning: `requires` bounds the room a
+turn needs, as `examples/minimal.hl` does.
+
+How:
+
+- **Durability** is a reachability proof over a model of the lowering. For
+  each target the prover lowers a handler to a plan: the records each
+  statement appends, the flushes the target performs (the IR's durability
+  points, Cloudflare's output gate before every outbound request, Vercel's
+  step commit), each effect's run, and the acknowledgement. The handler's
+  start is a choice between a first run and a rerun after a crash; every
+  effect is a choice between running, replaying its recorded result on a
+  rerun, and, where the target can leave its `call` durable without its
+  result, being reopened by recovery; `dispatch` is a choice of every class
+  a tool can have; every possible trap is a choice that finishes the turn.
+  The prover walks every path with the set of abstract states it can reach
+  (buffered records, open and durable calls, the finish phase, the step
+  attempt), iterating each loop to a fixpoint within its bound, and checks
+  each operation against each state.
+- **Arithmetic** is abstract interpretation over linear integer constraints.
+  Every `u64` field, list length and local is a variable in `[0, max]`;
+  assignments add equalities, linear comparisons in conditions add facts, and
+  `requires` and the invariants are assumed at entry. An obligation holds
+  when its negation and the facts have no solution, decided by Fourier-Motzkin
+  elimination with integer tightening. A loop's body is first run once with
+  the quantities it changes left free, which bounds each one's change per
+  iteration; iteration `k` then starts from the entry value plus `k` times
+  that change, and the loop exits after its exact count (`loop` runs its
+  bound, `for` the list's length at entry, which the interpreter snapshots).
+  At a branch join the prover keeps the facts both sides imply and the hull
+  of each changed quantity. A product of two variables is bounded by the
+  product of their upper bounds. Every approximation drops facts and never
+  adds one, so a failure can be spurious but a proof is not.
+  `PROOF_STEPS_PER_HANDLER_MAX` bounds the elimination steps per handler and
+  `PROOF_CONSTRAINTS_MAX` the constraints per step; reaching either fails
+  the obligation and says so.
+- **Worst case** is the longest path of outbound runs in the plan, loops
+  multiplied by their bounds, and it must not exceed the IR's own count,
+  which `hl check` reports: two computations of one bound, paired.
+- **Counterexamples** are a solution of the prover's facts at the failing
+  point, not a replay. After a join or a loop summary they can name values
+  no run reaches.
+
+What is assumed: the target models in `src/target/` (what a flush makes
+durable, the atomic unit, who else may run, how recovery reports open calls)
+are true of the platform; the plan is what the interpreter and the generated
+code do, which the simulator, the oracle and the differential runs check,
+not the prover; the runner reruns only unfinished turns, and a fenced owner's
+writes are refused; tools and the model return values of their declared types,
+or the turn exits as corrupt without finishing.
+
+What is not proved: the generated Rust and JavaScript themselves; properties
+across turns other than the invariants' induction; recovery from a torn
+checkpoint; Cloudflare's alarm; memory, wall time and text sizes; conditions
+outside linear `u64` comparisons joined by `and`, `or` and `not` (an
+invariant over `bool` or `text` fails rather than being assumed, and a
+condition the prover cannot read adds no fact to its branch).
+
+Every property comes with a planted bug: `hl prove --mutation M` takes the
+simulator's lowering mutations and four of its own (`drop_flush`,
+`drop_finish`, `drop_requires`, `repeat_assign`), and
+`scripts/prove-mutations.sh` requires each to fail proving `agent.hl` and
+`reviewer.hl` on every target it applies to, naming the property it breaks.
+The same script requires every example to prove and the prover's invalid
+examples under `examples/invalid/` to fail with their message: overflow in a
+loop, across a branch join and of a product, underflow, a push that can fill
+its list on an `unknown` arm, in a `for` over the list itself or after an
+early return, and invariants broken at a return, at a trap or in the zero
+state.
 
 ### Deterministic simulation
 
@@ -318,11 +428,13 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
   - `ir/`: the lowered program: effect sites, durability points, loop bounds
   - `run/`: the interpreter and the journal
   - `target/`: the target models
+  - `prove/`: `hl prove`: the plan per target, the durability, finishing and
+    arithmetic proofs, and the linear constraint solver
   - `emit/`: Rust, JavaScript and SQL generation
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
 - `oracle/`: the nanocode oracle, its own workspace
-- `scripts/`: the check, mutation and differential scripts
+- `scripts/`: the check, mutation, prover mutation and differential scripts
 
 ## Next
 
