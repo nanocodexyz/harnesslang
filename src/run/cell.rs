@@ -262,6 +262,7 @@ pub trait CellHost {
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output;
     fn attempt(&mut self, seq: u64, nested: u64, first: bool) -> Result<u64, Stop>;
     fn recovered(&mut self, seq: u64, nested: u64) -> Result<(), Stop>;
+    fn abandoned(&mut self, seq: u64, nested: u64) -> Result<(), Stop>;
     fn clock(&mut self) -> u64;
     fn deadline(&mut self, site: u64, cell: u64) -> u64;
     fn random(&mut self) -> u64;
@@ -953,8 +954,7 @@ impl<'a, 'h> Runner<'a, 'h> {
         }
         let output = self.run_tool(id)?;
         if required && self.host.cancelled(self.site.code, true)? {
-            self.host.recovered(self.site.seq, self.record_id(id))?;
-            self.header_unsaved = false;
+            self.host.abandoned(self.site.seq, self.record_id(id))?;
             return Err(Interrupt::Stopped(true));
         }
         if required {

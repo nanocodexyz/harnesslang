@@ -4637,7 +4637,8 @@ Replay needs nothing new: the result records already hold the outcome, and the
 event records hold when each event arrived. On Vercel, whose events enter at
 step boundaries, an interruptible effect runs in a step of its own: it flushes
 before it runs and takes the events that arrived while it ran before its
-result is recorded. A cell's nested calls are not interruptible.
+result is recorded. A cell's nested calls are not interruptible one by one, but a
+cancel can stop the whole cell: [Stopping a cell](#stopping-a-cell).
 
 #### Jobs
 
@@ -5277,4 +5278,153 @@ FAIL invariant=cell_settled_at_turn_end seed=29 target=native-jsonl profile=asyn
 replay: hl sim --target native-jsonl --seeds 29..30 --mutation cell_leaks docs/snippets/code_wait.hl
 $ hl prove --target native-jsonl --mutation cell_leaks docs/snippets/code_wait.hl 2>&1 | grep -m 1 -o 'cell_settled_at_turn_end: [^;]*'
 cell_settled_at_turn_end: dispatch(call): the turn's status is appended while its cell is still running
+```
+
+#### Stopping a cell
+
+`interruptible by cancel` in a `code` declaration (the harness declares
+`on cancel`) lets a cancel stop a running cell, as nanocode's stop does:
+
+```hl docs/snippets/code_stop.hl
+harness worker
+
+const steps_max: u64 = 6
+const calls_max: u64 = 3
+const entries_max: u64 = 256
+const cell_calls_max: u64 = 4
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 60000
+const cell_journal_bytes_max: u64 = 1048576
+const cell_yield_ms: u64 = 10000
+
+type outcome = done(text) | stopped | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+code exec {
+  tools read, bash
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+  waits wait
+  interruptible by cancel
+}
+
+model infer calls calls_max
+
+on cancel
+
+state {
+  context: list<entry, entries_max>
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+        if cancelled { return stopped }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+- The runtime takes the turn's events after each nested call returns and after
+  each timer wait of a cell, at the site's sequence number, as it does after
+  an interruptible effect. A cancel recorded there stops the cell: no nested
+  call starts after it, the cell gets its finished update, and the site's
+  result is `ok` with nanocode's `StartedToolCall::STOPPED` text ("Tool
+  execution stopped by the user. The cell was terminated and no nested tool
+  call was left running.").
+- When the cancel arrived during an external nested call, that call's result
+  is not recorded: a `recovery` record reports it unknown, as for an
+  abandoned external tool, and the site's text is `STOPPED_UNKNOWN` ("...
+  terminated while a nested tool call was still running; that call's outcome
+  is unknown. Do not assume it did not run or automatically repeat it.").
+- An exec or wait site that would start while a cancel is recorded runs
+  nothing and returns the `STOPPED` text; a wait site still finishes the
+  cell it names. A site rerun after a crash goes on with its cell, which stops
+  before it starts anything new. On Vercel, whose events enter at step
+  boundaries, a cancel taken at the flush before an external nested call
+  stops the cell when that call returns, which is then reported unknown.
+
+Only a cancel stops a cell:
+
+```console
+$ hl check docs/snippets/errors/code-interrupt-steer.hl
+docs/snippets/errors/code-interrupt-steer.hl:22:28: error: code 'exec' is interruptible by 'cancel' only: a cancel stops its cell, which nothing else does
+```
+
+```hl docs/snippets/errors/code-interrupt-steer.hl
+harness worker
+
+const calls_max: u64 = 2
+const cell_calls_max: u64 = 4
+const cell_parallel_max: u64 = 2
+const cell_timers_max: u64 = 2
+const cell_timer_ms_max: u64 = 60000
+const cell_journal_bytes_max: u64 = 1048576
+const cell_yield_ms: u64 = 10000
+const steers_max: u64 = 2
+
+tool read(path: text) -> text effect none
+
+code exec {
+  tools read
+  calls cell_calls_max
+  parallel cell_parallel_max
+  timers cell_timers_max
+  timer_ms cell_timer_ms_max
+  journal_bytes cell_journal_bytes_max
+  yield_ms cell_yield_ms
+  interruptible by cancel, steer
+}
+
+model infer calls calls_max
+
+on cancel
+on steer(message: text) bound steers_max
+
+on run(script: text) -> text {
+  match exec(script) {
+    ok(output) => { return output }
+    failed(error) => { return error }
+    unknown => { return "lost" }
+  }
+}
+```
+
+`interrupt_honored` counts a stopped site as interrupted, so a site that
+records any other result after a cancel fails it, and the prover's plan gives
+every interruptible cell site a stop arm (a recovery record when its tools
+are external, then the finished update). The planted bug `cell_cancel_ignored`
+lets cells run on after a cancel:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/code_stop.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1980 crashes=1476 power_losses=100 torn_writes=140 takeovers=0 fenced=0 dispatches=1481 unknown=334 cells=359 nested=402 divergences=5 waits=63 events=44 interrupted=18 yields=23
+$ hl sim --target native-jsonl --seeds 0..200 --mutation cell_cancel_ignored docs/snippets/code_stop.hl
+FAIL invariant=interrupt_honored seed=12 target=native-jsonl profile=async mutation=cell_cancel_ignored: 2/4 is interruptible by cancel and an event that interrupts it was recorded before its outcome, yet it records a finished outcome
+replay: hl sim --target native-jsonl --seeds 12..13 --mutation cell_cancel_ignored docs/snippets/code_stop.hl
 ```

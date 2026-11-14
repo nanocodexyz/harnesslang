@@ -2962,6 +2962,22 @@ impl CellHost for Engine<'_> {
         self.world().nested_attempt(turn, seq, nested, first)
     }
 
+    fn abandoned(&mut self, seq: u64, nested: u64) -> Result<(), Stop> {
+        let attempt = self.next_attempt();
+        self.append(Record::Recovery {
+            turn: self.turn,
+            attempt,
+            unknown: Vec::new(),
+            nested: vec![(seq, nested)],
+            replied: Vec::new(),
+            undispatched: Vec::new(),
+        });
+        if let Some(SiteLog::Open(call)) = self.nested.get(&(seq, nested)).cloned() {
+            self.nested.insert((seq, nested), SiteLog::Unknown(call));
+        }
+        Ok(())
+    }
+
     fn recovered(&mut self, seq: u64, nested: u64) -> Result<(), Stop> {
         let attempt = self.next_attempt();
         self.append(Record::Recovery {
