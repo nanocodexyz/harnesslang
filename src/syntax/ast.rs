@@ -98,6 +98,7 @@ pub struct Spawn {
     pub name: Name,
     pub handler: Name,
     pub file: Name,
+    pub sessions: Option<Name>,
 }
 
 #[derive(Clone, Debug)]

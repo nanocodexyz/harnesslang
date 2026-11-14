@@ -40,18 +40,48 @@ fn print_report(report: &str) -> std::io::Result<()> {
 }
 
 fn load(file: &str) -> Result<Program, String> {
+    load_within(file, &mut Vec::new())
+}
+
+fn load_within(
+    file: &str,
+    spawning: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<Program, String> {
     let source = std::fs::read_to_string(file)
         .map_err(|error| format!("{file}: error: cannot read: {error}"))?;
+    let identity = std::fs::canonicalize(file)
+        .map_err(|error| format!("{file}: error: cannot resolve: {error}"))?;
+    if let Some(start) = spawning.iter().position(|(path, _)| *path == identity) {
+        let chain: Vec<&str> = spawning[start..]
+            .iter()
+            .map(|(_, shown)| shown.as_str())
+            .chain([file])
+            .collect();
+        return Err(format!(
+            "{file}: error: the spawn tree returns to a harness it is inside, so its sessions have no bound: {}",
+            chain.join(" spawns ")
+        ));
+    }
+    let depth = u64::try_from(spawning.len()).expect("a spawn chain's length fits u64");
+    if depth > ir::SPAWN_DEPTH_MAX {
+        return Err(format!(
+            "{file}: error: the spawn tree is deeper than spawn_depth_max ({}) levels",
+            ir::SPAWN_DEPTH_MAX
+        ));
+    }
     let parsed = syntax::parse(&source).map_err(|diagnostic| diagnostic.render(file))?;
     let directory = std::path::Path::new(file)
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
-    check::check_with(&parsed, &mut |child: &str| {
+    spawning.push((identity, file.to_owned()));
+    let checked = check::check_with(&parsed, &mut |child: &str| {
         let path = directory.join(child);
-        load(&path.to_string_lossy())
+        load_within(&path.to_string_lossy(), spawning)
     })
-    .map_err(|diagnostic| diagnostic.render(file))
+    .map_err(|diagnostic| diagnostic.render(file));
+    spawning.pop();
+    checked
 }
 
 fn parse_seeds(value: &str) -> Option<std::ops::Range<u64>> {
@@ -189,21 +219,34 @@ fn worst_lines(program: &ir::Program, handler: &ir::Handler) -> String {
             worst.spawns.describe_loops()
         ));
         for (tool, spawn) in program.spawns() {
-            let child = &spawn.child().worst;
+            let tree = spawn.tree();
+            let descendants = match &spawn.sessions {
+                Some(limit) if tree.sessions > 1 => format!(
+                    ", {} sessions with its descendants (sessions at most {} ({}))",
+                    tree.sessions, limit.name, limit.value
+                ),
+                _ => String::new(),
+            };
             lines.push(format!(
-                "      {} runs {}.{}: worst case {} effects, {} journal records, {} outbound requests each",
+                "      {} runs {}.{}: worst case {} effects, {} journal records, {} outbound requests each{descendants}",
                 tool.name,
                 spawn.harness(),
                 spawn.handler,
-                child.effects.total,
-                child.records.total,
-                child.requests.total
+                tree.measures[0],
+                tree.measures[1],
+                tree.measures[2]
             ));
         }
         lines.push(format!(
             "    with its child sessions: {} effects, {} journal records, {} outbound requests",
             family.total[0], family.total[1], family.total[2]
         ));
+        if family.depth > 1 {
+            lines.push(format!(
+                "    sessions in its tree: {}, {} levels below it",
+                family.sessions, family.depth
+            ));
+        }
     }
     lines.push("    plus one recovery record per restart".to_owned());
     let events = &program.events;

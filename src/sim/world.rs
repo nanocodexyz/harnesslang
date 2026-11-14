@@ -142,6 +142,9 @@ pub struct Stats {
 #[derive(Clone, Debug)]
 pub struct Child {
     pub result: Result<String, Violation>,
+    pub turn: u64,
+    pub tool: String,
+    pub sessions: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,6 +183,8 @@ pub struct SimWorld<'a> {
     pub inbox: Inbox,
     pub parking: crate::sim::park::Parking,
     pub children: BTreeMap<String, Child>,
+    pub scope: String,
+    pub family_left: usize,
     pub denied_ran: Vec<String>,
     denying: bool,
     pub edges: Option<Edges>,
@@ -246,6 +251,8 @@ impl<'a> SimWorld<'a> {
             inbox: Inbox::default(),
             parking: crate::sim::park::Parking::default(),
             children: BTreeMap::new(),
+            scope: String::new(),
+            family_left: CHILD_SESSIONS_PER_SEED_MAX,
             denied_ran: Vec::new(),
             denying: false,
             edges: None,
@@ -717,6 +724,10 @@ impl<'a> SimWorld<'a> {
 }
 
 impl World for SimWorld<'_> {
+    fn scope(&self) -> String {
+        self.scope.clone()
+    }
+
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
         self.inbox.hook();
         match point {
@@ -1231,8 +1242,8 @@ impl SimWorld<'_> {
         if !matches!(output, Output::Ok(_)) {
             return output;
         }
-        let key = crate::ir::spawn_key(request.turn, request.seq);
-        if !self.children.contains_key(&key) && self.children.len() >= CHILD_SESSIONS_PER_SEED_MAX {
+        let key = crate::ir::scoped_spawn_key(&self.scope, request.turn, request.seq);
+        if !self.children.contains_key(&key) && self.family_left == 0 {
             return Output::Failed(format!(
                 "{} refused: the host holds child_sessions_per_seed_max ({CHILD_SESSIONS_PER_SEED_MAX}) child sessions",
                 request.tool
@@ -1240,18 +1251,39 @@ impl SimWorld<'_> {
         }
         if !self.children.contains_key(&key) {
             let seed = Rng::derive_keyed(self.seed, "child", &[request.turn, request.seq]).draw();
+            self.family_left -= 1;
             let (result, stats) = crate::sim::run_child(
                 &spawn.program,
-                self.target.target,
-                self.mutation,
-                seed,
+                &crate::sim::Placement {
+                    target: self.target.target,
+                    mutation: self.mutation,
+                    seed,
+                    scope: &key,
+                    family_left: self.family_left,
+                },
                 &spawn.handler,
                 request.input,
             );
+            let descendants = usize::try_from(stats.children)
+                .expect("a family's sessions fit usize, bounded by child_sessions_per_seed_max");
+            assert!(
+                descendants <= self.family_left,
+                "a child starts no more sessions than the family has left"
+            );
+            self.family_left -= descendants;
+            let child_crashes = self.stats.child_crashes + stats.crashes;
             crate::sim::add(&mut self.stats, &stats);
-            self.stats.child_crashes += stats.crashes;
+            self.stats.child_crashes = child_crashes;
             self.stats.children += 1;
-            self.children.insert(key.clone(), Child { result });
+            self.children.insert(
+                key.clone(),
+                Child {
+                    result,
+                    turn: request.turn,
+                    tool: request.tool.to_owned(),
+                    sessions: stats.children + 1,
+                },
+            );
         }
         Output::Ok(Json::String(key))
     }

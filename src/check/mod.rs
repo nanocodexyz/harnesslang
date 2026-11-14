@@ -897,15 +897,6 @@ fn spawns(
                 ),
             )
         })?;
-        if let Some((grandchild, _)) = child.spawns().next() {
-            return error(
-                spawn.file.at,
-                format!(
-                    "harness '{}' declares spawn tool '{}': a spawned harness spawns no child of its own, so a parent's worst case holds every session it can start",
-                    child.name, grandchild.name
-                ),
-            );
-        }
         let Some(handler) = child.handler(&spawn.handler.text) else {
             return error(
                 spawn.handler.at,
@@ -932,6 +923,7 @@ fn spawns(
             }
             params.push(field.clone());
         }
+        let sessions = spawn_sessions(program, globals, spawn, &child)?;
         globals
             .tools
             .insert(spawn.name.text.clone(), program.tools.len());
@@ -947,10 +939,84 @@ fn spawns(
                 file: spawn.file.text.clone(),
                 handler: spawn.handler.text.clone(),
                 program: Box::new(child),
+                sessions,
             }),
         });
     }
     Ok(())
+}
+
+fn spawn_sessions(
+    program: &ir::Program,
+    globals: &Globals,
+    spawn: &ast::Spawn,
+    child: &ir::Program,
+) -> Checked<Option<Bound>> {
+    let sessions = match &spawn.sessions {
+        Some(name) => Some(bound(
+            program,
+            globals,
+            name,
+            "the most sessions one spawn starts",
+        )?),
+        None => None,
+    };
+    let Some(handler) = child.handler(&spawn.handler.text) else {
+        return Ok(sessions);
+    };
+    let Some(family) = &handler.worst.family else {
+        return Ok(sessions);
+    };
+    let Some(limit) = &sessions else {
+        return error(
+            spawn.file.at,
+            format!(
+                "handler '{}' of harness '{}' starts child sessions of its own: declare how many sessions one call of '{}' starts, the child's and its descendants', as spawn {} runs {} from \"{}\" sessions at most constant",
+                spawn.handler.text,
+                child.name,
+                spawn.name.text,
+                spawn.name.text,
+                spawn.handler.text,
+                spawn.file.text
+            ),
+        );
+    };
+    let depth = family.depth + 1;
+    if depth > ir::SPAWN_DEPTH_MAX {
+        return error(
+            spawn.file.at,
+            format!(
+                "spawn tool '{}' starts a tree {depth} levels deep, over spawn_depth_max ({}) levels",
+                spawn.name.text,
+                ir::SPAWN_DEPTH_MAX
+            ),
+        );
+    }
+    let Some(tree) = family.sessions.checked_add(1) else {
+        return error(
+            spawn.file.at,
+            format!(
+                "spawn tool '{}' starts more sessions per call than u64 counts",
+                spawn.name.text
+            ),
+        );
+    };
+    if tree > limit.value {
+        return error(
+            spawn.file.at,
+            format!(
+                "spawn tool '{}' starts up to {tree} sessions per call ({}.{} and {} descendant sessions, {}), over sessions at most {} ({})",
+                spawn.name.text,
+                child.name,
+                spawn.handler.text,
+                family.sessions,
+                handler.worst.spawns.describe_loops(),
+                limit.name,
+                limit.value
+            ),
+        );
+    }
+    Ok(sessions)
 }
 
 fn hooks(

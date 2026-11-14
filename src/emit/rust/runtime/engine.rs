@@ -111,11 +111,17 @@ pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
     ])
 }
 
-pub fn spawn_output(turn: u64, seq: u64, tool: &str, output: Output) -> Output {
+pub const SPAWN_SCOPE_SEPARATOR: &str = "/";
+
+pub fn spawn_output(scope: &str, turn: u64, seq: u64, tool: &str, output: Output) -> Output {
     if !matches!(output, Output::Ok(_)) || !program::spawns(tool) {
         return output;
     }
-    Output::Ok(Json::String(format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")))
+    let key = format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}");
+    if scope.is_empty() {
+        return Output::Ok(Json::String(key));
+    }
+    Output::Ok(Json::String(format!("{scope}{SPAWN_SCOPE_SEPARATOR}{key}")))
 }
 
 pub fn wait_until(input: &Json) -> Option<u64> {
@@ -432,6 +438,9 @@ pub trait World {
     fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop>;
     fn resume(&mut self, suspension: &Suspension) -> Option<Resume>;
     fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool);
+    fn scope(&self) -> String {
+        String::new()
+    }
 }
 
 pub trait Host {
@@ -468,6 +477,9 @@ pub trait Host {
         None
     }
     fn resumed(&mut self, _suspension: &Suspension, _resume: &Resume, _matched: bool) {}
+    fn scope(&self) -> String {
+        String::new()
+    }
 }
 
 pub struct Sent {
@@ -1334,7 +1346,7 @@ impl<'a> Engine<'a> {
                         admitted: admitted.as_deref(),
                         nested: None,
                     });
-                    spawn_output(turn, seq, &call.tool, {
+                    spawn_output(&world.scope(), turn, seq, &call.tool, {
                         checked_output(&call.tool, returns, output)
                     })
                 }
@@ -1523,10 +1535,14 @@ impl<'a> Engine<'a> {
             }
         }
         completed.sort_by_key(|(position, _)| *position);
+        let scope = match &self.mode {
+            Mode::Live { world, .. } => world.scope(),
+            Mode::Replay => String::new(),
+        };
         for (position, output) in completed {
             let (index, seq) = group[position];
             let output = checked_output(&calls[index].tool, returns(&calls[index].tool), output);
-            let output = spawn_output(turn, seq, &calls[index].tool, self.settled(&calls[index].tool, output));
+            let output = spawn_output(&scope, turn, seq, &calls[index].tool, self.settled(&calls[index].tool, output));
             self.append(Record::Result {
                 turn,
                 seq,

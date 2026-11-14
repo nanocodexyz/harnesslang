@@ -1,0 +1,20 @@
+harness lead
+
+const tree_sessions_max: u64 = 3
+
+type outcome = planned(text) | lost(text)
+
+spawn planner runs plan_change from "tree_planner.hl" sessions at most tree_sessions_max
+
+on resume
+
+on review(change: text) -> outcome {
+  match planner(change) {
+    ok(agent) => {
+      let verdict = join(agent)
+      return planned(verdict)
+    }
+    failed(error) => { return lost(error) }
+    unknown => { return lost("the spawn's outcome is unknown") }
+  }
+}

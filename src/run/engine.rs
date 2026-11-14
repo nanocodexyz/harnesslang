@@ -188,6 +188,9 @@ pub trait World {
     fn inbox(&mut self, turn: u64) -> Vec<Delivery>;
     fn answer(&mut self, turn: u64, position: u64, answers: &[(String, Answer)]);
     fn read(&mut self, read: &Read);
+    fn scope(&self) -> String {
+        String::new()
+    }
 }
 
 pub fn close_inbox(world: &mut dyn World, turn: u64, position: u64, events: &[Recorded]) {
@@ -1066,6 +1069,7 @@ impl<'a> Engine<'a> {
         let Mode::Live { world, .. } = &mut self.mode else {
             unreachable!("replay never runs an effect");
         };
+        let scope = world.scope();
         let mut completed = if requests.is_empty() {
             Vec::new()
         } else {
@@ -1095,7 +1099,15 @@ impl<'a> Engine<'a> {
                 let output = self.checked(tool, &returned[position], output);
                 (
                     position,
-                    spawn_output(self.program, self.mutation, self.turn, seq, tool, output),
+                    spawn_output(
+                        self.program,
+                        self.mutation,
+                        &scope,
+                        self.turn,
+                        seq,
+                        tool,
+                        output,
+                    ),
                 )
             })
             .collect();
@@ -1876,6 +1888,7 @@ impl<'a> Engine<'a> {
                 match gate {
                     Err(refused) => Output::Failed(refused),
                     Ok(admitted) => {
+                        let scope = world.scope();
                         let output = world.tool(&ToolRequest {
                             turn: self.turn,
                             seq,
@@ -1890,6 +1903,7 @@ impl<'a> Engine<'a> {
                         spawn_output(
                             self.program,
                             self.mutation,
+                            &scope,
                             self.turn,
                             seq,
                             &call.tool,
@@ -2249,6 +2263,7 @@ pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
 pub fn spawn_output(
     program: &Program,
     mutation: Mutation,
+    scope: &str,
     turn: u64,
     seq: u64,
     tool: &str,
@@ -2257,10 +2272,10 @@ pub fn spawn_output(
     if !matches!(output, Output::Ok(_)) || program.spawn_of(tool).is_none() {
         return output;
     }
-    let key = if mutation == Mutation::SpawnKeyUnscoped {
-        seq.to_string()
-    } else {
-        ir::spawn_key(turn, seq)
+    let key = match mutation {
+        Mutation::SpawnKeyUnscoped => seq.to_string(),
+        Mutation::GrandchildUnscoped => ir::spawn_key(turn, seq),
+        _ => ir::scoped_spawn_key(scope, turn, seq),
     };
     Output::Ok(Json::String(key))
 }

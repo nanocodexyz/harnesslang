@@ -431,10 +431,19 @@ impl<'a> Parser<'a> {
         let handler = self.name("the handler the child session runs")?;
         self.word("from")?;
         let file = self.text_value("the child harness's file, as text")?;
+        let sessions = if self.is_word("sessions") {
+            self.advance();
+            self.word("at")?;
+            self.word("most")?;
+            Some(self.bound("the most sessions one spawn starts")?)
+        } else {
+            None
+        };
         Ok(Spawn {
             name,
             handler,
             file,
+            sessions,
         })
     }
 

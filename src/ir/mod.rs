@@ -391,6 +391,7 @@ pub struct Spawn {
     pub file: String,
     pub handler: String,
     pub program: Box<Program>,
+    pub sessions: Option<Bound>,
 }
 
 impl Spawn {
@@ -403,13 +404,44 @@ impl Spawn {
     pub fn harness(&self) -> &str {
         &self.program.name
     }
+
+    pub fn tree(&self) -> worst::Tree {
+        let worst = &self.child().worst;
+        match &worst.family {
+            Some(family) => worst::Tree {
+                measures: family.total,
+                sessions: family.sessions.checked_add(1).expect(
+                    "the checker refuses a family whose sessions and the spawn's own pass u64",
+                ),
+                depth: family.depth,
+            },
+            None => worst::Tree {
+                measures: [
+                    worst.effects.total,
+                    worst.records.total,
+                    worst.requests.total,
+                ],
+                sessions: 1,
+                depth: 0,
+            },
+        }
+    }
 }
 
 pub fn spawn_key(turn: u64, seq: u64) -> String {
     format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}")
 }
 
+pub fn scoped_spawn_key(scope: &str, turn: u64, seq: u64) -> String {
+    if scope.is_empty() {
+        return spawn_key(turn, seq);
+    }
+    format!("{scope}{SPAWN_SCOPE_SEPARATOR}{}", spawn_key(turn, seq))
+}
+
 pub const SPAWN_KEY_SEPARATOR: &str = ".";
+pub const SPAWN_SCOPE_SEPARATOR: &str = "/";
+pub const SPAWN_DEPTH_MAX: u64 = 16;
 
 #[derive(Clone, Debug)]
 pub struct Listing {

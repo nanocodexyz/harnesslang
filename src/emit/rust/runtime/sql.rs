@@ -283,6 +283,10 @@ impl<H: Host> World for SqlWorld<'_, H> {
     fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {
         self.host.resumed(suspension, resume, matched)
     }
+
+    fn scope(&self) -> String {
+        self.host.scope()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

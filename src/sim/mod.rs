@@ -407,11 +407,17 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.child_crashes += more.child_crashes;
 }
 
+pub struct Placement<'a> {
+    pub target: Target,
+    pub mutation: Mutation,
+    pub seed: u64,
+    pub scope: &'a str,
+    pub family_left: usize,
+}
+
 pub fn run_child(
     program: &Program,
-    target: Target,
-    mutation: Mutation,
-    seed: u64,
+    placement: &Placement<'_>,
     handler: &str,
     input: &Json,
 ) -> (Result<String, Violation>, Stats) {
@@ -430,7 +436,15 @@ pub fn run_child(
             );
         }
     };
-    let mut world = SimWorld::new(program, target, mutation, seed, true);
+    let mut world = SimWorld::new(
+        program,
+        placement.target,
+        placement.mutation,
+        placement.seed,
+        true,
+    );
+    world.scope = placement.scope.to_owned();
+    world.family_left = placement.family_left;
     let faulty = world.profile.crash_ppm > 0 || world.profile.lease_ppm > 0;
     let request = TurnRequest {
         turn: 1,

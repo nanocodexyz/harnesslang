@@ -5,11 +5,14 @@ const SUSPEND_TOOL = "suspend";
 const SUSPEND_KEY = "key";
 const DENY_TOOL = "deny";
 const SPAWN_KEY_SEPARATOR = ".";
+const SPAWN_SCOPE_SEPARATOR = "/";
+const ROOT_SCOPE = "";
 
-function spawnOutput(tool, turn, seq, output) {
+function spawnOutput(tool, scope, turn, seq, output) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
   if (output.tag !== "ok" || declared === undefined || !declared.spawn) return output;
-  return { tag: "ok", value: String(turn) + SPAWN_KEY_SEPARATOR + String(seq) };
+  const key = String(turn) + SPAWN_KEY_SEPARATOR + String(seq);
+  return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };
 }
 
 class Suspended {
@@ -549,7 +552,7 @@ class Engine {
     const ordered = this.mutation === "results_in_completion_order" ? completed : [...completed].sort((left, right) => left[0] - right[0]);
     for (const [position, raw] of ordered) {
       const waiting = group[position];
-      const output = spawnOutput(waiting.call.tool, this.turn, waiting.seq, this.checked(waiting.call.tool, returned[position], raw));
+      const output = spawnOutput(waiting.call.tool, this.mode.scope, this.turn, waiting.seq, this.checked(waiting.call.tool, returned[position], raw));
       this.append({ kind: "result", turn: this.turn, seq: waiting.seq, output });
       this.sites.set(waiting.seq, { kind: "done", call: waiting.call, output });
       values[waiting.index] = this.settle(site, waiting.call, output);
@@ -592,7 +595,7 @@ class Engine {
         output = { tag: "failed", error: gate.refused };
       } else {
         const request = { turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: gate.admitted };
-        output = spawnOutput(call.tool, this.turn, seq, this.checked(call.tool, returns, await world.tool(request)));
+        output = spawnOutput(call.tool, this.mode.scope, this.turn, seq, this.checked(call.tool, returns, await world.tool(request)));
       }
     }
     await this.hook(runPoint("after_run", site.kind, call.effect));
@@ -931,7 +934,9 @@ async function runTurn(setup, world, epoch, records, request) {
     log = newTurnLog(request.handler, null);
   }
   const assumed = setup.mutation === "cell_recovery_reports_failed" ? assumeNestedFailed(log, unknown.nested.splice(0)) : [];
-  const engine = new Engine(setup, handler, { live: true, world, epoch }, request.turn, state, log);
+  const scope = request.scope === undefined ? ROOT_SCOPE : request.scope;
+  assert(typeof scope === "string", "a turn request's scope is text");
+  const engine = new Engine(setup, handler, { live: true, world, epoch, scope }, request.turn, state, log);
   engine.nextCell = nextCell(session);
   engine.blobs = blobs;
   for (const record of pending) engine.append(record);
@@ -952,7 +957,9 @@ function turnRequestFromJson(json) {
   if (typeof json.handler !== "string") throw new DecodeError("a turn request names its handler");
   const handler = handlerNamed(json.handler);
   if (handler === null) throw new DecodeError(`no handler '${json.handler}'`);
-  return { turn, handler: json.handler, arguments: argumentsFromJson(handler, json.arguments) };
+  if (json.scope !== undefined && typeof json.scope !== "string") throw new DecodeError("a turn request's scope is text, the key its session was spawned under");
+  const scope = json.scope === undefined ? ROOT_SCOPE : json.scope;
+  return { turn, handler: json.handler, arguments: argumentsFromJson(handler, json.arguments), scope };
 }
 
 function finishJson(finish) {

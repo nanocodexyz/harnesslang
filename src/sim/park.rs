@@ -98,7 +98,9 @@ impl SimWorld<'_> {
             SimWorld::generated_text(&mut rng)
         };
         let answer = match self.children.get(&suspension.key) {
-            Some(crate::sim::world::Child { result: Ok(result) }) => {
+            Some(crate::sim::world::Child {
+                result: Ok(result), ..
+            }) => {
                 if key == suspension.key {
                     self.stats.joined += 1;
                 }

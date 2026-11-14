@@ -51,10 +51,11 @@ pub enum Invariant {
     SearchListed,
     DeniedUnrun,
     ChildScoped,
+    FamilyBounded,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -91,6 +92,7 @@ impl Invariant {
         Self::SearchListed,
         Self::DeniedUnrun,
         Self::ChildScoped,
+        Self::FamilyBounded,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -131,6 +133,7 @@ impl Invariant {
             Self::SearchListed => "search_listed",
             Self::DeniedUnrun => "denied_unrun",
             Self::ChildScoped => "child_scoped",
+            Self::FamilyBounded => "family_bounded",
         }
     }
 }
@@ -524,7 +527,7 @@ fn sessions_and_denials(world: &SimWorld<'_>, records: &[Record]) -> Result<(), 
                 seq,
                 output: Output::Ok(Json::String(key)),
             } if spawned.contains_key(&(*turn, *seq)) => {
-                let scoped = crate::ir::spawn_key(*turn, *seq);
+                let scoped = crate::ir::scoped_spawn_key(&world.scope, *turn, *seq);
                 if *key != scoped || !world.children.contains_key(key) {
                     return violation(
                         Invariant::ChildScoped,
@@ -541,8 +544,73 @@ fn sessions_and_denials(world: &SimWorld<'_>, records: &[Record]) -> Result<(), 
     Ok(())
 }
 
+fn family_bounded(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    if world.children.is_empty() {
+        return Ok(());
+    }
+    let program = world.program;
+    let mut started: BTreeMap<u64, u64> = BTreeMap::new();
+    for (key, child) in &world.children {
+        let declared = program
+            .spawn_of(&child.tool)
+            .and_then(|spawn| spawn.sessions.as_ref());
+        if let Some(limit) = declared
+            && child.sessions > limit.value
+        {
+            return violation(
+                Invariant::FamilyBounded,
+                format!(
+                    "spawn {} started child session {key:?} and {} more below it, over sessions at most {} ({})",
+                    child.tool,
+                    child.sessions - 1,
+                    limit.name,
+                    limit.value
+                ),
+            );
+        }
+        let count = started.entry(child.turn).or_insert(0);
+        *count = count
+            .checked_add(child.sessions)
+            .expect("a family's sessions fit u64, bounded by child_sessions_per_seed_max");
+    }
+    for (turn, count) in started {
+        let Some(handler) = records.iter().find_map(|record| match record {
+            Record::Admitted {
+                turn: admitted,
+                handler,
+                ..
+            } if *admitted == turn => program.handler(handler),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let worst = &handler.worst;
+        let levels = if world.mutation == crate::run::mutation::Mutation::FamilyOneLevel {
+            crate::ir::worst::Levels::One
+        } else {
+            crate::ir::worst::Levels::Tree
+        };
+        let bound = crate::ir::worst::family_with(program, [0; 3], &worst.spawns, levels)
+            .expect("hl check counted the family in u64")
+            .map_or(0, |family| family.sessions);
+        if count > bound {
+            return violation(
+                Invariant::FamilyBounded,
+                format!(
+                    "turn {turn} ({}) started {count} sessions in its tree, over its worst case of {bound} ({} child sessions, {})",
+                    handler.name,
+                    worst.spawns.total,
+                    worst.spawns.describe_loops()
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violation> {
     sessions_and_denials(world, records)?;
+    family_bounded(world, records)?;
     for (id, dispatched) in &world.dispatched {
         if dispatched.external > 1 {
             return violation(
