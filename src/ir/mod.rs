@@ -188,7 +188,36 @@ pub struct Tool {
 pub struct Model {
     pub name: String,
     pub calls: Bound,
+    pub reply: Reply,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    Builtin,
+    Declared { calls: VariantId, field: usize },
+}
+
+impl Model {
+    pub const fn calls_at(&self) -> (VariantId, usize) {
+        match self.reply {
+            Reply::Builtin => (CALLS, 0),
+            Reply::Declared { calls, field } => (calls, field),
+        }
+    }
+
+    pub fn result(&self) -> Type {
+        match self.reply {
+            Reply::Builtin => Type::Sum(REPLY),
+            Reply::Declared { .. } => Type::Known(Box::new(Type::Sum(REPLY))),
+        }
+    }
+
+    pub const fn declared(&self) -> bool {
+        matches!(self.reply, Reply::Declared { .. })
+    }
+}
+
+pub const MODEL_FAILED: &str = "failed";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
@@ -214,6 +243,12 @@ pub struct Site {
     pub class: SiteClass,
     pub result: Type,
     pub durability: Durability,
+}
+
+impl Site {
+    pub fn traps_on_decode(&self) -> bool {
+        self.kind == SiteKind::Model && !matches!(self.result, Type::Known(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -217,6 +217,7 @@ class Engine {
   }
 
   reply(response) {
+    if (PROGRAM.model.declared) return modelOutcome(response);
     try {
       return fromJson({ sum: SUM_REPLY }, response);
     } catch (error) {

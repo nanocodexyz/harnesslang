@@ -680,10 +680,16 @@ impl Checker<'_> {
                     ),
                 );
             }
+            let result = self
+                .program
+                .model
+                .as_ref()
+                .expect("a model name is bound only with a model")
+                .result();
             return Ok(self.site(
                 SiteKind::Model,
                 SiteClass::Fixed(EffectClass::Idempotent),
-                Type::Sum(ir::REPLY),
+                result,
                 vec![value],
                 out,
             ));

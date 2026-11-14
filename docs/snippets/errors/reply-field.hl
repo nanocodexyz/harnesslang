@@ -1,0 +1,10 @@
+harness notes
+
+const calls_max: u64 = 4
+const notes_max: u64 = 8
+
+type turn_reply = answer(text) | calls(list<call, calls_max>) | notes(list<text, notes_max>)
+
+model think calls calls_max reply turn_reply
+
+on ping() -> u64 { return 1 }

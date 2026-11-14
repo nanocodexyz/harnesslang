@@ -267,6 +267,17 @@ impl Prover<'_> {
         state
     }
 
+    pub(super) fn implied(&mut self, state: &State, condition: &Expr) -> bool {
+        let Some(alternatives) = self.goals(state, condition, true) else {
+            return false;
+        };
+        alternatives.iter().any(|alternative| {
+            alternative
+                .iter()
+                .all(|goal| self.proves(&state.facts, goal))
+        })
+    }
+
     pub(super) fn holds(&mut self, state: &State, condition: &Expr) -> Result<(), Option<String>> {
         let Some(alternatives) = self.goals(state, condition, true) else {
             return Err(Some(

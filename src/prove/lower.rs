@@ -337,7 +337,7 @@ impl Lowering<'_> {
             Stmt::Effect { site, args, .. } => {
                 args.iter().for_each(|arg| self.arithmetic_trap(arg, ops));
                 ops.extend(self.effect(*site, args));
-                if self.handler.sites[*site].kind == SiteKind::Model {
+                if self.handler.sites[*site].traps_on_decode() {
                     ops.push(self.trap(format!(
                         "decoding the reply of {}",
                         self.names.site(*site, args)

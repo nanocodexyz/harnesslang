@@ -1,0 +1,9 @@
+harness notes
+
+const calls_max: u64 = 4
+
+type turn_reply = answer(text) | calls(list<call, calls_max>) | failed(text)
+
+model think calls calls_max reply turn_reply
+
+on ping() -> u64 { return 1 }

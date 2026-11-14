@@ -1,0 +1,12 @@
+harness reply_no_call_list
+
+const calls_max: u64 = 4
+
+type outcome = done(text) | stopped(text)
+type text_reply = answer(text) | refused(text)
+
+model think calls calls_max reply text_reply
+
+on ask(question: text) -> outcome {
+  return done(question)
+}
