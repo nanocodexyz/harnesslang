@@ -30,10 +30,11 @@ pub enum Mutation {
     PostgresCellUnfenced,
     NestedIdempotentReportedUnknown,
     EnumUnchecked,
+    NestedEnumUnchecked,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -62,6 +63,7 @@ impl Mutation {
         Self::PostgresCellUnfenced,
         Self::NestedIdempotentReportedUnknown,
         Self::EnumUnchecked,
+        Self::NestedEnumUnchecked,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -94,6 +96,7 @@ impl Mutation {
             Self::PostgresCellUnfenced => "postgres_cell_unfenced",
             Self::NestedIdempotentReportedUnknown => "nested_idempotent_reported_unknown",
             Self::EnumUnchecked => "enum_unchecked",
+            Self::NestedEnumUnchecked => "nested_enum_unchecked",
         }
     }
 
@@ -182,7 +185,7 @@ impl Mutation {
             Self::VercelNestedRetryRedispatches => vec![Target::Vercel],
             Self::CellGateReleasesEarly => vec![Target::Cloudflare],
             Self::PostgresCellUnfenced => vec![Target::ServerPostgres],
-            Self::NestedIdempotentReportedUnknown => all,
+            Self::NestedIdempotentReportedUnknown | Self::NestedEnumUnchecked => all,
         }
     }
 }

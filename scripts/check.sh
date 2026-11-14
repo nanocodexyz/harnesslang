@@ -92,6 +92,7 @@ same_program() {
 }
 same_program examples/subagents.hl examples/inlined/subagents.hl
 same_program docs/snippets/fn.hl docs/snippets/fn_inline.hl
+same_program examples/code_tasks.hl examples/inlined/code_tasks.hl
 sed '/push agents spawned/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' examples/inlined/subagents.hl > "$scratch/planted.hl"
 "$hl" check "$scratch/planted.hl" > /dev/null
 if same_program examples/subagents.hl "$scratch/planted.hl" 2> /dev/null; then
@@ -209,6 +210,17 @@ if [ "${HL_RUST_DIFF:-0}" = 1 ]; then
     fi
     echo "rust-diff: plant $plant is caught by the differential"
   done
+  plant=nested_enum_unchecked
+  if RUST_DIFF_SEEDS=0..300 RUST_DIFF_OPT=0 RUST_DIFF_FILES=examples/code_tasks.hl RUST_DIFF_PLANT=$plant scripts/rust-diff.sh > "$scratch/rust-diff-$plant.log" 2>&1; then
+    echo "rust-diff: plant $plant matched the interpreter" >&2
+    exit 1
+  fi
+  if ! grep -q 'FAIL invariant=backend_equal' "$scratch/rust-diff-$plant.log"; then
+    echo "rust-diff: plant $plant failed for another reason:" >&2
+    cat "$scratch/rust-diff-$plant.log" >&2
+    exit 1
+  fi
+  echo "rust-diff: plant $plant is caught by the differential"
 fi
 if [ "${HL_CLOUDFLARE:-0}" = 1 ]; then
   scripts/cloudflare-drill.sh

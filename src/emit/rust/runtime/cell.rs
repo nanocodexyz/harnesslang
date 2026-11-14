@@ -678,7 +678,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             }),
         });
         self.host.hook(CellPoint::AfterNested(tool.effect))?;
-        Ok(output)
+        Ok(checked_output(tool.name, tool.returns, output))
     }
 
     fn timeout(&mut self, id: u64, delay_ms: u64) -> Driven<Input> {

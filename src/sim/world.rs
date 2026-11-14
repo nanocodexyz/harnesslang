@@ -50,6 +50,24 @@ pub struct Returned {
     pub expected: Output,
 }
 
+impl Dispatched {
+    pub fn returned(&mut self, program: &Program, request: &ToolRequest<'_>, output: &Output) {
+        let expected =
+            value::checked_output(program, request.tool, request.returns, output.clone());
+        if request.effect == EffectClass::External {
+            self.outputs.push(expected.clone());
+        }
+        if program.text_enum(request.returns).is_some() {
+            self.values.push(Returned {
+                tool: request.tool.to_owned(),
+                input: request.input.clone(),
+                output: output.clone(),
+                expected,
+            });
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub turns: u64,
@@ -164,6 +182,26 @@ impl<'a> SimWorld<'a> {
         }
     }
 
+    pub fn cell_key(&self) -> String {
+        let waited = match &self.medium {
+            Medium::Rows(rows) => Some(&rows.waited),
+            Medium::Jsonl(_) => None,
+        };
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {} {:?}",
+            self.nested_dispatched,
+            self.cell_faults,
+            self.injected,
+            self.diverged,
+            self.running,
+            self.cell_calls,
+            self.cell_timers,
+            self.cell_codes,
+            self.clock,
+            waited
+        )
+    }
+
     pub fn record(&mut self, name: &str, fields: impl FnOnce() -> Vec<(&'static str, Json)>) {
         if let Some(trace) = &mut self.trace {
             trace.event(name, fields());
@@ -237,13 +275,22 @@ impl<'a> SimWorld<'a> {
             Medium::Jsonl(_) => 0,
         };
         self.opened("run", epoch, bytes);
+        self.run_opened(epoch, &records);
+        Ok((records, epoch))
+    }
+
+    pub fn run_opened(&mut self, epoch: u64, records: &[Record]) {
         self.run_epoch = epoch;
         if let (Medium::Rows(rows), Recovery::InStep { .. }) =
             (&mut self.medium, self.target.recovery)
         {
-            rows.step_reexecuted(&records);
+            rows.step_reexecuted(records);
         }
-        Ok((records, epoch))
+    }
+
+    pub fn second_owner_runs(&mut self, second: bool) {
+        assert_ne!(self.nested, second, "owners alternate");
+        self.nested = second;
     }
 
     fn crash(&mut self) -> Stop {
@@ -333,7 +380,12 @@ impl<'a> SimWorld<'a> {
         )
     }
 
-    fn tool_value(program: &Program, rng: &mut Rng, returns: &Type, edges: Option<&Edges>) -> Json {
+    pub fn tool_value(
+        program: &Program,
+        rng: &mut Rng,
+        returns: &Type,
+        edges: Option<&Edges>,
+    ) -> Json {
         match returns {
             Type::U64 => Json::Number(match edges {
                 Some(edges) => edges.draw(rng),
@@ -665,14 +717,16 @@ impl World for SimWorld<'_> {
 }
 
 impl SimWorld<'_> {
-    fn flush_medium(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
-        let cell_unfenced = self.mutation == Mutation::PostgresCellUnfenced
+    pub fn fences(mutation: Mutation, target: Target, records: &[Record]) -> bool {
+        let cell_unfenced = mutation == Mutation::PostgresCellUnfenced
             && records
                 .iter()
                 .any(|record| matches!(record, Record::NestedCall { .. }));
-        let fence = self.mutation != Mutation::PostgresNoFence
-            && self.target.target == Target::ServerPostgres
-            && !cell_unfenced;
+        mutation != Mutation::PostgresNoFence && target == Target::ServerPostgres && !cell_unfenced
+    }
+
+    fn flush_medium(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
+        let fence = Self::fences(self.mutation, self.target.target, records);
         if let Medium::Rows(rows) = &mut self.medium {
             if fence && rows.fenced(epoch) {
                 self.stats.fenced += 1;
@@ -734,24 +788,10 @@ impl SimWorld<'_> {
                 self.edges.as_ref(),
             ))
         };
-        let expected =
-            value::checked_output(self.program, request.tool, request.returns, output.clone());
-        let checked = self.program.text_enum(request.returns).is_some();
-        let entry = self
-            .dispatched
+        self.dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
-            .expect("inserted above");
-        if request.effect == EffectClass::External {
-            entry.outputs.push(expected.clone());
-        }
-        if checked {
-            entry.values.push(Returned {
-                tool: request.tool.to_owned(),
-                input: request.input.clone(),
-                output: output.clone(),
-                expected,
-            });
-        }
+            .expect("inserted above")
+            .returned(self.program, request, &output);
         output
     }
 
@@ -1025,13 +1065,10 @@ impl SimWorld<'_> {
                 self.edges.as_ref(),
             ))
         };
-        if request.effect == EffectClass::External {
-            self.nested_dispatched
-                .get_mut(&id)
-                .expect("inserted above")
-                .outputs
-                .push(output.clone());
-        }
+        self.nested_dispatched
+            .get_mut(&id)
+            .expect("inserted above")
+            .returned(self.program, request, &output);
         output
     }
 

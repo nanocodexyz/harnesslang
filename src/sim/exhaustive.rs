@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use crate::effect::EffectClass;
-use crate::ir::{Program, Type};
+use crate::ir::Program;
 use crate::run::cell::{CellEvent, Input, Step, Wait};
 use crate::run::engine::{Exit, Finish, ModelRequest, Point, Stop, ToolRequest, World};
 use crate::run::journal::{self, Output, Record};
@@ -250,6 +250,7 @@ impl Run<'_, '_> {
         let model = self.state.sim.target;
         assert!(!self.nested, "a second owner runs no third owner");
         self.nested = true;
+        self.state.sim.second_owner_runs(true);
         let ran = run_turn(
             session.program,
             &model,
@@ -259,6 +260,7 @@ impl Run<'_, '_> {
             &records,
             &request,
         );
+        self.state.sim.second_owner_runs(false);
         self.nested = false;
         match ran {
             Ok(Ran::Finished(_)) => {}
@@ -346,8 +348,7 @@ impl Run<'_, '_> {
     }
 
     fn flush_rows(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
-        let fence = self.session.mutation != Mutation::PostgresNoFence
-            && self.session.target == Target::ServerPostgres;
+        let fence = SimWorld::fences(self.session.mutation, self.session.target, records);
         let Medium::Rows(rows) = &mut self.state.sim.medium else {
             panic!("flush_rows commits rows");
         };
@@ -422,15 +423,6 @@ fn line_cuts(bytes: &[u8], cuts: &mut BTreeSet<usize>) {
     cuts.insert(bytes.len());
 }
 
-fn tool_value(rng: &mut Rng, returns: &Type) -> Json {
-    match returns {
-        Type::U64 => Json::Number(rng.draw() >> 32),
-        Type::Bool => Json::Bool(rng.draw() & 1 == 1),
-        Type::Text => Json::String(SimWorld::generated_text(rng)),
-        other => panic!("the checker admits only scalar tool results, found {other:?}"),
-    }
-}
-
 impl World for Run<'_, '_> {
     fn hook(&mut self, point: Point) -> Result<(), Stop> {
         if self.nested || self.state.faults_left == 0 {
@@ -474,7 +466,7 @@ impl World for Run<'_, '_> {
         }
         let id = journal::call_id(request.turn, request.seq);
         let flipped = self.outcome_flipped(request, &id);
-        let entry = self.state.sim.dispatched.entry(id).or_default();
+        let entry = self.state.sim.dispatched.entry(id.clone()).or_default();
         entry.tool = request.tool.to_owned();
         if request.effect == EffectClass::External {
             entry.external += 1;
@@ -492,11 +484,20 @@ impl World for Run<'_, '_> {
                 SimWorld::generated_text(&mut rng)
             ))
         } else {
-            Output::Ok(tool_value(&mut rng, request.returns))
+            Output::Ok(SimWorld::tool_value(
+                self.session.program,
+                &mut rng,
+                request.returns,
+                None,
+            ))
         };
-        if request.effect == EffectClass::External {
-            entry.outputs.push(output.clone());
-        }
+        let program = self.session.program;
+        self.state
+            .sim
+            .dispatched
+            .get_mut(&id)
+            .expect("inserted above")
+            .returned(program, request, &output);
         output
     }
 
@@ -570,6 +571,7 @@ fn key(state: &State<'_>) -> Vec<u8> {
     put(format_args!("{:?}", state.sim.acks));
     put(format_args!("{:?}", state.sim.ack_faults));
     put(format_args!("{:?}", state.sim.owner_faults));
+    put(format_args!("{}", state.sim.cell_key()));
     if let Medium::Rows(rows) = &state.sim.medium {
         put(format_args!("{} {:?}", rows.epoch, rows.attempts));
     }
@@ -618,6 +620,8 @@ fn begin_run(state: &mut State<'_>, target: Target) -> Result<(), Violation> {
         Medium::Rows(rows) => rows.epoch,
         Medium::Jsonl(_) => 0,
     };
+    state.sim.stats.runs += 1;
+    state.sim.run_opened(state.epoch, &records);
     state.records = records;
     Ok(())
 }
@@ -890,6 +894,12 @@ fn add(total: &mut Stats, more: &Stats) {
 }
 
 pub fn validate(options: &Options) -> Result<(), String> {
+    if options.mutation == Mutation::DivergenceDispatches {
+        return Err(format!(
+            "--exhaustive enumerates crash points and injects no engine divergence, so {} cannot fail there; run it without --exhaustive",
+            options.mutation.name()
+        ));
+    }
     if options.faults_per_session > RESTARTS_PER_TURN_MAX {
         return Err(format!(
             "--depth {} exceeds restarts_per_turn_max ({RESTARTS_PER_TURN_MAX})",

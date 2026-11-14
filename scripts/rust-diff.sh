@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 
 seeds="${RUST_DIFF_SEEDS:-0..2000}"
 targets="${RUST_DIFF_TARGETS:-native-jsonl native-sqlite server-postgres}"
-files="${RUST_DIFF_FILES:-examples/agent.hl examples/minimal.hl examples/reviewer.hl examples/code_agent.hl}"
+files="${RUST_DIFF_FILES:-examples/agent.hl examples/minimal.hl examples/reviewer.hl examples/code_agent.hl examples/code_tasks.hl}"
 opt="${RUST_DIFF_OPT:-2}"
 plant="${RUST_DIFF_PLANT:-none}"
 hl=target/release/hl
@@ -24,6 +24,7 @@ plant_expression() {
     nested_flush_after_dispatch) echo 's/if tool.effect.may_be_unknown() {/if false \&\& tool.effect.may_be_unknown() {/' ;;
     timeout_rides) echo 's/if self.header_unsaved {/if false \&\& self.header_unsaved {/' ;;
     enum_unchecked) echo 's/checked_output(&call.tool, returns, output)$/output/' ;;
+    nested_enum_unchecked) echo 's/Ok(checked_output(tool.name, tool.returns, output))$/Ok(output)/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

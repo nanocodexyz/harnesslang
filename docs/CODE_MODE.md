@@ -251,17 +251,24 @@ Worker Loader binding exists and needs workerd's `--experimental` flag, an
 object stub in the loaded Worker's `env` carries nested calls into the
 object, `globalOutbound: null` makes `fetch()` and `connect()` throw, and
 every nested call's outbound request left the object only after its call row
-committed. Still unverified, to be recorded in `src/target/mod.rs` when
-cells land: production availability (an open beta on Workers Paid, per a
+committed. These facts, and the vendor statements below them, are written in
+`src/target/mod.rs` as each target's cell facts (`About::Cells`), with their
+sources, and `hl check --target T` prints them under the cell placement for a
+program with a `code` tool; `scripts/cloudflare-drill.sh` fails when a
+`loader.mjs` fact it cites was not printed by that run. Still unverified:
+production availability (an open beta on Workers Paid, per a
 search summary of the vendor docs) and how subrequests are counted, which
 local workerd does not enforce at all. The vendor's limits page counts
 Durable Object RPC as subrequests to internal services, under the same
 per-invocation limit as outbound requests, so the model counts a cell's
 nested calls as `calls` internal subrequests of the loaded Worker's
 invocation and each nested call's outbound request against the RPC event
-that makes it, not none as first assumed. Unverified for Vercel: whether
-the workflow sandbox lets the engine compile a script (`node:vm` or an
-equivalent) and the longest workflow sleep. Where a fact turns out false the target says
+that makes it, not none as first assumed. On Vercel the generated code runs
+the engine inside a step, which the vendor documents as having the full
+Node.js runtime (so `node:vm` is there), and replays the cell from the run's
+journal in each step; a timer is a durable `sleep()`. Unverified for Vercel:
+those vendor statements on a real deployment (read from a search summary) and
+the longest workflow sleep. Where a fact turns out false the target says
 `cells: unsupported` and `hl check` refuses `code` there; at-most-once is
 never weakened to make a target fit.
 
@@ -298,10 +305,22 @@ Invariants, beside the existing ones (each counts per nested call id):
 | `cell_replay_equal` | a replay without the divergence fault matches its journal step for step; under the fault the cell finishes `unknown` and nothing after the divergence is dispatched |
 | `header_before_wait` | whenever a cell waits on a timer, its header is durable |
 | `cell_bounded` | nested calls, running calls, timers and journal bytes stay within the declaration's bounds; reaching one is the typed refusal the script sees, never a dropped call |
+| `nested_enum_valid` | every nested result a cell journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not; the script sees the same failure, in the interpreter, the generated Rust and the generated JavaScript alike |
 
 `seq_unique` extends to nested ids, and `external_once`,
-`unknown_reported` and `idempotent_known` keep counting top-level calls
-only, so a failure names the level it happened at.
+`unknown_reported`, `idempotent_known` and `enum_valid` keep counting
+top-level calls only, so a failure names the level it happened at.
+
+`hl sim --exhaustive` explores cell sites too: every cell hook is a crash
+point it enumerates, nested calls draw their results from the seed, and the
+simulator's cell bookkeeping (nested dispatches, running calls, timers) is
+part of the state it deduplicates. It enumerates crashes, torn writes and
+lease expiries but injects no engine divergence, so it refuses
+`--mutation divergence_dispatches` (exit 2); scripts over a cell's limits are a
+0.5% draw (policy) its small workloads rarely reach, so `cell_limit_unchecked`
+is left to the seeded sweep. `scripts/exhaustive.sh` explores
+`examples/code_tasks.hl` at depth 1 on every target and requires every other
+cell mutation to fail there with its invariant.
 
 ## Proofs
 
@@ -348,6 +367,7 @@ them with the property each must fail with.
 | `cell_rerun_after_finish` | all | `cell_finishes_once` |
 | `timeout_rides` (C2 removed) | jsonl, sqlite, postgres (Cloudflare's event and Vercel's sleep flush before every wait) | `header_before_wait` |
 | `nested_idempotent_reported_unknown` | all | `nested_known` |
+| `nested_enum_unchecked` (a nested result outside its text enum taken as the enum's last value) | all | `nested_enum_valid` |
 | `divergence_dispatches` (dispatch the divergent call) | all | `cell_replay_equal` |
 | `nested_ids_restart` (ids from 1 on every run) | all | `seq_unique` |
 | `cell_limit_unchecked` | all | `cell_bounded` |

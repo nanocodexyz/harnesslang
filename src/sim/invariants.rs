@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::effect::EffectClass;
 use crate::ir::Program;
-use crate::run::cell::CellOutcome;
+use crate::run::cell::{CellOutcome, encode_output};
 use crate::run::cell_journal::{Entry, unknown_outcome};
 use crate::run::journal::{Output, Record, call_id, nested_id};
 use crate::run::json::Json;
@@ -30,13 +30,14 @@ pub enum Invariant {
     HeaderBeforeWait,
     CellBounded,
     EnumValid,
+    NestedEnumValid,
     NoTrap,
     InvariantKept,
     WorstCase,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -53,6 +54,7 @@ impl Invariant {
         Self::HeaderBeforeWait,
         Self::CellBounded,
         Self::EnumValid,
+        Self::NestedEnumValid,
         Self::NoTrap,
         Self::InvariantKept,
         Self::WorstCase,
@@ -76,6 +78,7 @@ impl Invariant {
             Self::HeaderBeforeWait => "header_before_wait",
             Self::CellBounded => "cell_bounded",
             Self::EnumValid => "enum_valid",
+            Self::NestedEnumValid => "nested_enum_valid",
             Self::NoTrap => "no_trap",
             Self::InvariantKept => "invariant_kept",
             Self::WorstCase => "worst_case",
@@ -396,6 +399,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     let calls = seq_unique(records)?;
     nested_reported(world, &calls)?;
     enum_valid(world, records)?;
+    nested_enum_valid(world, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()
@@ -590,6 +594,77 @@ fn liveness_and_replay(
                 resumed.encode()
             ),
         );
+    }
+    Ok(())
+}
+
+fn nested_enum_valid(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    if world
+        .nested_dispatched
+        .values()
+        .all(|dispatched| dispatched.values.is_empty())
+    {
+        return Ok(());
+    }
+    let Ok(folded) = session::fold(records) else {
+        return Ok(());
+    };
+    for (turn, log) in &folded.turns {
+        for (seq, cell) in &log.cells {
+            nested_results_valid(world, *turn, *seq, &cell.entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn nested_results_valid(
+    world: &SimWorld<'_>,
+    turn: u64,
+    seq: u64,
+    entries: &[Entry],
+) -> Result<(), Violation> {
+    let unknown = unknown_outcome().encode();
+    let mut calls: BTreeMap<u64, (&str, &Json)> = BTreeMap::new();
+    for entry in entries {
+        match entry {
+            Entry::Call { id, name, input } => {
+                calls.insert(*id, (name, input));
+            }
+            Entry::Result {
+                id,
+                encoded,
+                success,
+            } => {
+                let nested = nested_id(turn, seq, *id);
+                let (Some(dispatched), Some(&(tool, input))) =
+                    (world.nested_dispatched.get(&nested), calls.get(id))
+                else {
+                    continue;
+                };
+                let returned: Vec<_> = dispatched
+                    .values
+                    .iter()
+                    .filter(|returned| returned.tool == tool && &returned.input == input)
+                    .collect();
+                let recorded = (encoded.clone(), *success);
+                if *encoded == unknown
+                    || returned.is_empty()
+                    || returned
+                        .iter()
+                        .any(|returned| encode_output(&returned.expected) == recorded)
+                {
+                    continue;
+                }
+                let outputs: Vec<_> = returned.iter().map(|returned| &returned.output).collect();
+                return violation(
+                    Invariant::NestedEnumValid,
+                    format!(
+                        "nested call {nested} ({tool}) records {encoded}, but the tool returned {outputs:?}: a result outside its text enum must be recorded as failed"
+                    ),
+                );
+            }
+            _ => {}
+        }
     }
     Ok(())
 }

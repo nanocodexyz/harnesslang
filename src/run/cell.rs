@@ -11,6 +11,7 @@ use crate::run::journal::{Output, Record, call_id};
 use crate::run::json::Json;
 use crate::run::mutation::Mutation;
 use crate::run::session::SiteLog;
+use crate::run::value;
 use crate::target::{self, Recovery};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -928,7 +929,12 @@ impl<'a, 'h> Runner<'a, 'h> {
             }),
         });
         self.host.hook(CellPoint::AfterNested(class))?;
-        Ok(output)
+        let program = self.site.program;
+        Ok(if self.site.mutation == Mutation::NestedEnumUnchecked {
+            value::fallback_output(program, &returns, output)
+        } else {
+            value::checked_output(program, &call.name, &returns, output)
+        })
     }
 
     fn timeout(&mut self, id: u64, delay_ms: u64) -> Ran<Input> {

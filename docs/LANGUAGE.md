@@ -1685,7 +1685,7 @@ and the kill -9 drill of generated code.
 | `hl check [--target T] FILE` | parse, type-check, report each handler's worst case and prove it; with a target, also check the target's limits |
 | `hl prove [--target T] [--mutation M] FILE` | the proofs alone; a mutation plants a lowering bug the proofs must catch |
 | `hl sim --target T --seeds A..B [--twice] [--strict [--any-state]] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs; `--strict` also checks what the proofs promise (no trap but requires and model replies, invariants after every turn, the worst case within the target's limit), and `--any-state` starts each session from a drawn state that satisfies the invariants |
-| `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal` |
+| `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session, cell hooks included; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal`, and refuses `--mutation divergence_dispatches`, since it injects no engine divergence |
 | `hl run FILE --handler NAME [--arg VALUE]... [--seed S]` | run one turn in the interpreter and print the journal |
 | `hl emit --target T FILE` | print the generated program |
 
@@ -1705,3 +1705,17 @@ are not code tools, `parallel` at least 1 and at most `calls`. Calling the tool
 journaled and flushed with the cell's header before it runs and is never
 dispatched twice. `examples/code_agent.hl` is a complete harness, and
 [CODE_MODE.md](CODE_MODE.md) the whole design.
+
+A nested tool returning a text enum is checked where the cell receives its
+result, as a direct call is: a value outside the enum reaches the script as
+the call's failure and is journaled so. `examples/code_tasks.hl` lists
+`lookup(ticket: text) -> status` among its cell's tools, and shares its model
+loop between two handlers through a fn, so each handler keeps its own cell
+site. The planted bug `nested_enum_unchecked` takes the unlisted value as the
+enum's last one instead:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation nested_enum_unchecked examples/code_tasks.hl
+FAIL invariant=nested_enum_valid seed=10 target=native-jsonl profile=async mutation=nested_enum_unchecked: nested call 1/6/code-2 (lookup) records "blocked", but the tool returned [Ok(String("beta-44"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 10..11 --mutation nested_enum_unchecked examples/code_tasks.hl
+```

@@ -473,7 +473,7 @@ class CellRunner {
       nested: { id, record: this.recordId(id), cell: this.cell, code: this.site.code },
     });
     await this.host.hook(nestedPoint("cell_after_nested", effect));
-    return output;
+    return checkedOutput(call.name, tool.returns, output);
   }
 
   async timeout(id, delayMs) {
