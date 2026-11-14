@@ -37,6 +37,13 @@ fn pure(program: &Program, state: &[Value], expr: &Expr) -> Option<Value> {
         Expr::Cancelled => return None,
         Expr::Not(operand) => Value::Bool(!pure(program, state, operand)?.as_bool()),
         Expr::Len(operand) => Value::U64(pure(program, state, operand)?.as_list().len() as u64),
+        Expr::TextBuiltin { op, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(pure(program, state, arg)?.as_text().to_owned());
+            }
+            text_value(*op, &values)
+        }
         Expr::Binary {
             op, left, right, ..
         } => {
@@ -153,4 +160,12 @@ pub fn check_program(
         }
     }
     Ok(())
+}
+
+fn text_value(op: crate::ir::TextOp, args: &[String]) -> Value {
+    let subject = args.first().expect("a text builtin reads its subject");
+    match crate::ir::text_op(op, subject, args.get(1).map(String::as_str)) {
+        crate::ir::TextValue::Bool(flag) => Value::Bool(flag),
+        crate::ir::TextValue::Text(text) => Value::Text(text),
+    }
 }

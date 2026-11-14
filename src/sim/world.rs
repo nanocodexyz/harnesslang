@@ -38,6 +38,7 @@ pub const UNLISTED_TOOL_PPM: u64 = 250_000;
 pub const LISTED_PRESENT_PPM: u64 = 500_000;
 pub const LISTING_CHANGE_PPM: u64 = 100_000;
 pub const INPUT_INVALID_PPM: u64 = 100_000;
+pub const DEFAULT_OMITTED_PPM: u64 = 500_000;
 pub const INVALID_INPUT_KINDS: u64 = 3;
 pub const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 pub const WORDS: [&str; 8] = [
@@ -153,6 +154,7 @@ pub struct SimWorld<'a> {
     current: Option<TurnRequest>,
     clock: u64,
     model_calls: BTreeMap<(u64, u64), u64>,
+    pub model_modes: BTreeMap<(u64, u64), Vec<(Option<String>, Json)>>,
     run_epoch: u64,
     batch_calls: BTreeMap<(u64, u64), u64>,
     listing_reads: BTreeMap<(u64, u64), u64>,
@@ -212,6 +214,7 @@ impl<'a> SimWorld<'a> {
             current: None,
             clock: 0,
             model_calls: BTreeMap::new(),
+            model_modes: BTreeMap::new(),
             run_epoch: 0,
             batch_calls: BTreeMap::new(),
             listings: vec![BTreeMap::new(); program.listings.len()],
@@ -684,6 +687,10 @@ impl World for SimWorld<'_> {
         self.count_effect(true);
         self.change_listings(LISTING_CHANGE_PPM);
         let response = self.reply(request);
+        self.model_modes
+            .entry((request.turn, request.seq))
+            .or_default()
+            .push((request.mode.map(str::to_owned), response.clone()));
         let program = self.program;
         self.record("model", || {
             let context = Json::Array(
@@ -694,7 +701,7 @@ impl World for SimWorld<'_> {
                     .map(|entry| value::to_json(program, &Type::Sum(ir::ENTRY), entry))
                     .collect(),
             );
-            vec![
+            let mut fields = vec![
                 ("turn", Json::Number(request.turn)),
                 ("seq", Json::Number(request.seq)),
                 ("calls_max", Json::Number(request.calls_max)),
@@ -705,7 +712,11 @@ impl World for SimWorld<'_> {
                     ))),
                 ),
                 ("response", response.clone()),
-            ]
+            ];
+            if let Some(mode) = request.mode {
+                fields.push((crate::run::journal::MODEL_MODE, Json::text(mode)));
+            }
+            fields
         });
         response
     }
@@ -1115,7 +1126,7 @@ impl SimWorld<'_> {
             } else {
                 let tool = self.drawn_tool(rng);
                 let input = match self.program.input_params(&tool) {
-                    Some(params) => self.drawn_input(rng, params),
+                    Some(params) => self.drawn_input(rng, &tool, params),
                     None => Self::generated_text(rng),
                 };
                 (tool, input)
@@ -1386,11 +1397,20 @@ impl SimWorld<'_> {
             .clone()
     }
 
-    fn drawn_input(&self, rng: &mut Rng, params: &[ir::Field]) -> String {
+    fn drawn_input(&self, rng: &mut Rng, tool: &str, params: &[ir::Field]) -> String {
         let mut fields: BTreeMap<String, Json> = params
             .iter()
             .map(|param| (param.name.clone(), self.param_value(rng, &param.ty)))
             .collect();
+        let defaults = self
+            .program
+            .input_defaults(tool)
+            .expect("a tool with declared parameters has default slots");
+        for (param, default) in params.iter().zip(defaults) {
+            if default.is_some() && rng.chance(DEFAULT_OMITTED_PPM) {
+                fields.remove(&param.name);
+            }
+        }
         if self.greedy || !rng.chance(INPUT_INVALID_PPM) {
             return Json::Object(fields).encode();
         }

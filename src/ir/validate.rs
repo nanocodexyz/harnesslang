@@ -106,6 +106,7 @@ fn reads_local(value: &Expr) -> bool {
         Expr::Construct { fields, .. } => fields.iter().any(reads_local),
         Expr::Binary { left, right, .. } => reads_local(left) || reads_local(right),
         Expr::Not(operand) | Expr::Len(operand) => reads_local(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_local),
         Expr::Cancelled => false,
     }
 }
@@ -123,6 +124,7 @@ fn reads_events(value: &Expr) -> bool {
         Expr::Construct { fields, .. } => fields.iter().any(reads_events),
         Expr::Binary { left, right, .. } => reads_events(left) || reads_events(right),
         Expr::Not(operand) | Expr::Len(operand) => reads_events(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_events),
     }
 }
 
@@ -336,5 +338,9 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
             expr(program, handler, right);
         }
         Expr::Not(operand) | Expr::Len(operand) => expr(program, handler, operand),
+        Expr::TextBuiltin { op, args } => {
+            assert_eq!(args.len(), op.arity(), "a text builtin takes its arity");
+            args.iter().for_each(|arg| expr(program, handler, arg));
+        }
     }
 }

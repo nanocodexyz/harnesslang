@@ -493,11 +493,11 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `parallel` `reply` `take` `tools`
+Contextual words: `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `parallel` `reply` `take` `tools`
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `dispatch` `len` `now` `random`
+Builtins: `after` `before` `contains` `dispatch` `len` `now` `random` `trim`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -543,11 +543,13 @@ item       = const | type | tool | listing | code | model | state | invariant | 
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
-tool       = "tool" name params "->" type_expr "effect" effect_class ;
+tool       = "tool" name tool_params "->" type_expr "effect" effect_class ;
+tool_params = "(" [ tool_param { "," tool_param } ] ")" ;
+tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
-listing    = "tools" "from" "listing" "(" name "," bound ")" params "effect" effect_class ;
+listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound [ "reply" name ] ;
+model      = "model" name "calls" bound [ "reply" name ] [ "modes" name { "," name } ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -582,7 +584,7 @@ product    = postfix { "*" postfix } ;
 postfix    = primary { "." name } ;
 primary    = number | text | "true" | "false" | "(" expr ")"
            | "take" name
-           | name [ "(" [ expr { "," expr } ] ")" ] ;
+           | name [ "(" [ expr { "," expr } ] ")" [ "mode" name ] ] ;
 ```
 
 Notes the grammar leaves out:
@@ -681,6 +683,75 @@ JSON object holding exactly the parameters, each of its type. Then the
 recorded as failed with what was wrong (`input of read: missing 'path'`),
 never run with a guess. A tool the program does not declare has no input
 type and receives the text.
+
+A parameter may declare a default, `name: type = value`, where the value is a
+literal of the parameter's type or, for `u64`, a named constant. `dispatch`
+fills each default the input leaves out before it checks the input, so the
+`call` record, the host and every replay see the filled object, never what
+the model left out; a parameter without a default is still required, and a
+call the program makes passes every argument. Parameters of `tools from
+listing` take defaults the same way. The simulator draws inputs that leave
+each defaulted parameter out, and `default_unfilled` runs such a call without
+filling it, which `tool_admitted` catches:
+
+```hl docs/snippets/defaults.hl
+harness shell
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const timeout_default_ms: u64 = 120000
+
+type outcome = done(text) | exhausted
+
+tool bash(command: text, timeout_ms: u64 = timeout_default_ms, background: bool = false) -> text effect external
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+```console
+$ hl run docs/snippets/defaults.hl --handler ask --arg hi --seed 0 | grep -o '"input":{[^}]*}' | head -n 1
+"input":{"background":false,"command":"alpha-14","timeout_ms":120000}
+$ hl check docs/snippets/errors/default-type.hl
+docs/snippets/errors/default-type.hl:3:45: error: the default of parameter 'background' must be a literal of bool or, for u64, a named constant
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation default_unfilled docs/snippets/defaults.hl | head -n 1
+FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=default_unfilled: call 1/8 (bash) ran with input {"background":false,"command":"beta-6"}, which does not fit its declared input: missing 'timeout_ms'
+```
+
+```hl docs/snippets/errors/default-type.hl
+harness notes
+
+tool bash(command: text, background: bool = "no") -> text effect external
+
+on ping() -> u64 { return 1 }
+```
 
 ```console
 $ hl check docs/snippets/errors/tool-returns.hl
@@ -885,6 +956,87 @@ docs/snippets/errors/needs-model.hl:3:15: error: type 'entry' needs a model decl
 harness notes
 
 on ping(said: entry) -> u64 { return 1 }
+```
+
+`modes name, ...` after the model declares a finite set of call modes, and
+`name(context) mode m` calls the model in mode `m`, which must be one of
+them. A mode is a name the host interprets, such as Claude's `tool_choice`
+of `none` for `text_only`: the program decides when to use it, the host how.
+The host receives the mode with the request, the `model` record carries it
+as `"mode"` (a call without a mode writes none), and a replay whose site asks
+for a different mode than the journal records is a divergence, as a
+different tool would be. A mode is one more model call site, so the worst
+case counts it like any other. The simulator records the mode of every
+request; `mode_sent` requires that each journaled reply answered a request
+sent in the mode its record names, and `mode_dropped` sends the request
+without its mode:
+
+```hl docs/snippets/modes.hl
+harness summarizer
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+
+type outcome = summary(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+model think calls calls_max reply turn_reply modes text_only
+
+state {
+  context: list<entry, context_max>
+}
+
+on summarize(conversation: text) -> outcome
+  requires len(context) + 1 <= context_max
+{
+  push context user(conversation)
+  match think(context) {
+    failed(error) => { return stopped(error) }
+    ok(reply) => {
+      match reply {
+        answer(words) => { return summary(words) }
+        calls(_) => {
+          match think(context) mode text_only {
+            failed(error) => { return stopped(error) }
+            ok(forced) => {
+              match forced {
+                answer(words) => { return summary(words) }
+                calls(_) => { return stopped("the summary called a tool") }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```console
+$ hl run docs/snippets/modes.hl --handler summarize --arg hi --seed 0 | grep -o '"model":{"call_id":"1/2","mode":"text_only"'
+"model":{"call_id":"1/2","mode":"text_only"
+$ hl check docs/snippets/errors/undeclared-mode.hl
+docs/snippets/errors/undeclared-mode.hl:13:35: error: model 'think' declares no mode 'summary'
+$ hl sim --target vercel --seeds 0..200 --twice --mutation mode_dropped docs/snippets/modes.hl | head -n 1
+FAIL invariant=mode_sent seed=0 target=vercel profile=errors mutation=mode_dropped: model call 1/2 is journaled with mode text_only but its reply answered a request sent with no mode
+```
+
+```hl docs/snippets/errors/undeclared-mode.hl
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+model think calls calls_max modes text_only
+
+state {
+  context: list<entry, context_max>
+}
+
+on ping() -> u64 {
+  let reply = think(context) mode summary
+  return 1
+}
 ```
 
 ### state
@@ -1381,7 +1533,7 @@ on ping() -> u64 { return count }
 | --- | --- | --- |
 | `u64` | 0 to 18446744073709551615 | `+ - *` (trap on overflow and underflow), `< <= > >=`, `== !=` |
 | `bool` | `true`, `false` | `and`, `or`, `not`, `== !=` |
-| `text` | UTF-8 text | `++` (concatenate), `== !=` |
+| `text` | UTF-8 text | `++` (concatenate), `== !=`, [`contains`, `before`, `after`, `trim`](#text) |
 | a declared sum | its variants | construct, `match` |
 | a text enum | its listed texts | a text literal where it is expected, `match` |
 | `list<T, N>` | up to `N` values of `T` | `push` (state fields only), `for`, `len(list)` |
@@ -1569,6 +1721,72 @@ harness notes
 on echo(input: text) -> text {
   return inpt
 }
+```
+
+### Text
+
+Four builtins read text without an effect, so they replay like any
+expression, and every backend implements them identically:
+
+- `contains(t, s)` is whether `s` occurs in `t`.
+- `before(t, s)` is `t` up to the first `s`, or all of `t` when `s` does not
+  occur.
+- `after(t, s)` is what follows the first `s`, or the empty text when `s` does
+  not occur.
+- `trim(t)` is `t` without leading and trailing ASCII whitespace (space, tab,
+  newline, form feed, carriage return).
+
+None of them counts or indexes characters, so nothing depends on how a
+platform measures text (bytes in Rust, UTF-16 units in JavaScript), and none
+can fail. `examples/claude_code.hl` strips a compaction summary's `<analysis>`
+block and rewrites its `<summary>` tag with them, as nanocode's
+`compact_summary` does.
+
+```hl docs/snippets/text.hl
+harness pages
+
+const turns_max: u64 = 1000000
+
+type outcome = summary(text) | parts(text, text) | missing(text)
+
+tool fetch(key: text) -> text effect none
+
+state {
+  turns: u64
+}
+
+invariant turns_bounded: turns <= turns_max
+
+on summarize(key: text) -> outcome
+  requires turns < turns_max
+{
+  turns = turns + 1
+  match fetch(key) {
+    failed(error) => { return missing(trim("  " ++ error ++ "\n")) }
+    ok(page) => {
+      if contains(page, "eta") {
+        return parts(before(page, "eta"), after(page, "eta"))
+      }
+      let tagged = "<analysis>draft</analysis>\n<summary> " ++ page ++ " </summary>"
+      return summary(trim(before(after(tagged, "<summary>"), "</summary>")) ++ after(page, "a-"))
+    }
+  }
+}
+```
+
+```console
+$ hl run docs/snippets/text.hl --handler summarize --arg notes --seed 3 | grep -o '"result":{"parts[^}]*}'
+"result":{"parts":["b","-4"]}
+$ hl run docs/snippets/text.hl --handler summarize --arg notes --seed 10 | grep -o '"result":{"summary[^}]*}'
+"result":{"summary":"alpha-2424"}
+$ hl check docs/snippets/errors/text-argument.hl
+docs/snippets/errors/text-argument.hl:3:65: error: expected text, found u64
+```
+
+```hl docs/snippets/errors/text-argument.hl
+harness notes
+
+on ping(page: text, count: u64) -> bool { return contains(page, count) }
 ```
 
 ### Text enums

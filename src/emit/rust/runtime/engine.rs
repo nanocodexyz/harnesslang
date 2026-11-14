@@ -43,6 +43,7 @@ pub struct Site {
     pub kind: Kind,
     pub durability: Durability,
     pub maybe: bool,
+    pub mode: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,14 +144,20 @@ pub fn listed(tool: &str) -> Option<(usize, &str)> {
     Some((id, name))
 }
 
-pub fn typed_input(tool: &str, raw: &str, check: fn(&Json) -> Result<(), String>) -> ToolInput {
-    let input = match Json::decode(raw) {
+pub fn typed_input(tool: &str, raw: &str, check: fn(&mut Json) -> Result<(), String>) -> ToolInput {
+    let mut input = match Json::decode(raw) {
         Ok(input @ Json::Object(_)) => input,
         _ => return ToolInput::Invalid(format!("input of {tool}: not a JSON object")),
     };
-    match check(&input) {
+    match check(&mut input) {
         Ok(()) => ToolInput::Typed(input),
         Err(error) => ToolInput::Invalid(format!("input of {tool}: {error}")),
+    }
+}
+
+pub fn input_default(input: &mut Json, name: &str, value: Json) {
+    if let Json::Object(fields) = input {
+        fields.entry(name.to_owned()).or_insert(value);
     }
 }
 
@@ -238,6 +245,7 @@ pub struct ModelRequest<'a> {
     pub turn: u64,
     pub seq: u64,
     pub calls_max: u64,
+    pub mode: Option<&'a str>,
     pub context: &'a dyn Fn() -> Json,
 }
 
@@ -761,7 +769,7 @@ impl<'a> Engine<'a> {
                 self.same(seq, &recorded, &call)?;
                 return Ok(Answer::Unknown);
             }
-            Some(SiteLog::Reply(_)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Reply(..)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
             Some(SiteLog::Open(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 self.require_live(seq)?;
@@ -856,9 +864,16 @@ impl<'a> Engine<'a> {
                 }
                 Ok(Answer::Output(output))
             }
-            Some(SiteLog::Reply(response)) => {
+            Some(SiteLog::Reply(response, recorded)) => {
                 if site.kind != Kind::Model {
                     return Err(self.diverged(seq, "a model reply", &call.tool));
+                }
+                if recorded.as_deref() != site.mode {
+                    return Err(self.diverged(
+                        seq,
+                        &format!("a model reply in {}", mode_text(recorded.as_deref())),
+                        &format!("{} in {}", call.tool, mode_text(site.mode)),
+                    ));
                 }
                 Ok(Answer::Reply(response))
             }
@@ -933,16 +948,19 @@ impl<'a> Engine<'a> {
                     turn,
                     seq,
                     calls_max,
+                    mode: site.mode,
                     context,
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
                 self.drain()?;
+                let mode = site.mode.map(str::to_owned);
                 self.append(Record::Model {
                     turn,
                     seq,
                     response: response.clone(),
+                    mode: mode.clone(),
                 });
-                self.sites.insert(seq, SiteLog::Reply(response.clone()));
+                self.sites.insert(seq, SiteLog::Reply(response.clone(), mode));
                 return Ok(Answer::Reply(response));
             }
             Run::Now => Output::Ok(Json::Number(world.now())),
@@ -1025,7 +1043,7 @@ impl<'a> Engine<'a> {
                     self.same(seq, &recorded, call)?;
                     answers[index] = Some(Answer::Output(output));
                 }
-                Some(SiteLog::Reply(_)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+                Some(SiteLog::Reply(..)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
                 Some(SiteLog::Unknown(recorded)) => {
                     self.same(seq, &recorded, call)?;
                     answers[index] = Some(Answer::Unknown);
@@ -1277,6 +1295,36 @@ pub fn subtract(left: u64, right: u64) -> Result<u64, Halt> {
 pub fn multiply(left: u64, right: u64) -> Result<u64, Halt> {
     left.checked_mul(right)
         .ok_or_else(|| Halt::Trap("u64 overflow in '*'".to_owned()))
+}
+
+pub fn text_contains(subject: String, separator: String) -> bool {
+    subject.contains(separator.as_str())
+}
+
+pub fn text_before(subject: String, separator: String) -> String {
+    match subject.split_once(separator.as_str()) {
+        Some((before, _)) => before.to_owned(),
+        None => subject,
+    }
+}
+
+pub fn text_after(subject: String, separator: String) -> String {
+    match subject.split_once(separator.as_str()) {
+        Some((_, after)) => after.to_owned(),
+        None => String::new(),
+    }
+}
+
+pub fn text_trim(subject: String) -> String {
+    const WHITESPACE: [char; 5] = [' ', '\t', '\n', '\x0c', '\r'];
+    subject.trim_matches(WHITESPACE.as_slice()).to_owned()
+}
+
+pub fn mode_text(mode: Option<&str>) -> String {
+    match mode {
+        Some(mode) => format!("mode {mode}"),
+        None => "no mode".to_owned(),
+    }
 }
 
 pub fn concat(left: String, right: String) -> String {

@@ -337,6 +337,8 @@ impl World for Driver {
         expect(&event, "turn", &Json::Number(request.turn));
         expect(&event, "seq", &Json::Number(request.seq));
         expect(&event, "calls_max", &Json::Number(request.calls_max));
+        let traced = event.get("mode").map(|mode| mode.as_str().expect("a traced mode is text"));
+        assert_eq!(traced, request.mode, "model mode at {}/{}", request.turn, request.seq);
         let context = (request.context)().encode();
         expect(&event, "context_crc", &Json::Number(u64::from(harness::crc32(context.as_bytes()))));
         field(&event, "response").clone()

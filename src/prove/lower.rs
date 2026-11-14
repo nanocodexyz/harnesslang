@@ -240,7 +240,9 @@ fn arithmetic(value: &Expr) -> bool {
         }
         Expr::Not(operand) | Expr::Len(operand) => arithmetic(operand),
         Expr::Member { base, .. } => arithmetic(base),
-        Expr::Construct { fields, .. } => fields.iter().any(arithmetic),
+        Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
+            fields.iter().any(arithmetic)
+        }
         Expr::U64(_)
         | Expr::Bool(_)
         | Expr::Text(_)

@@ -17,7 +17,7 @@ pub enum SiteLog {
     Open(Call),
     Done(Call, Output),
     Unknown(Call),
-    Reply(Json),
+    Reply(Json, Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -332,9 +332,15 @@ pub fn apply(session: &mut Session, record: &Record) -> Result<(), String> {
             turn,
             seq,
             response,
+            mode,
         } => {
             let log = running(session, *turn, "a model reply")?;
-            next_site(log, *turn, *seq, SiteLog::Reply(response.clone()))?;
+            next_site(
+                log,
+                *turn,
+                *seq,
+                SiteLog::Reply(response.clone(), mode.clone()),
+            )?;
         }
         Record::NestedCall {
             turn,

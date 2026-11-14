@@ -102,7 +102,8 @@ on prompt(input: text) -> outcome
 
 ### Values and types
 
-- `u64`, `bool`, `text`. Arithmetic on `u64` traps on overflow and underflow;
+- `u64`, `bool`, `text`. Text has `++` and four pure builtins that never index
+  characters (`contains`, `before`, `after`, `trim`). Arithmetic on `u64` traps on overflow and underflow;
   the trap is a typed failure of the handler, never a wrapped value.
 - Sum types: `type name = variant(type, ...) | ...`. Variants carry only what
   that case has.
@@ -144,7 +145,11 @@ the call's tool up among the declared tools at run time and always has type
 `maybe<text>`; a declared none or idempotent tool reached through it never
 yields `unknown`.
 
-A tool's parameters are its input type. `dispatch` checks the call's input
+A tool's parameters are its input type; a parameter may declare a default
+(`timeout: u64 = timeout_ms`), which `dispatch` fills into input that leaves it
+out before the check, so the journal holds the filled object. A model may
+declare call modes (`model m calls N modes text_only`), and `m(context) mode
+text_only` passes the mode to the host and journals it with the reply. `dispatch` checks the call's input
 text against them before the tool runs: a JSON object holding exactly the
 parameters, each of its type, is journaled as that object and sent; anything
 else is journaled as the text and recorded as the call's failure without
@@ -221,7 +226,7 @@ journal and a nanocode journal fold the same way:
 | `admitted` | a handler starts | turn, handler, arguments |
 | `call` | before an effect runs | sequence, tool, effect class, input |
 | `result` | after it returns | sequence, `ok` or `failed` and the value |
-| `model` | after the model returns | sequence, the reply, or `{"failed": error}` for a failed call to a model with a declared reply type |
+| `model` | after the model returns | sequence, the reply, or `{"failed": error}` for a failed call to a model with a declared reply type, and the call's `mode` when it has one |
 | `recovery` | a recovery finds open external calls | turn, attempt, the unknown sequences |
 | `status` | the turn finishes | turn, outcome |
 | `checkpoint` | after a finish, by policy | revision, state |
@@ -533,6 +538,7 @@ Invariants, named as nanocode-sim names them:
 | `checkpoint_compacted` | every checkpoint holds the state that replaying the journal reaches at its turn, so a list `clear` or `keep` shrank is short in it (`retire_skipped` writes the dropped entries back), and a turn that dropped entries flushes its checkpoint with its status, so the next load never replays the dropped prefix (`seal_skipped` leaves it out) |
 | `sequential_equal` | a parallel for's results are recorded in list order in every journal, and on a clean seed that sends no events the journal, read per sequence number, and the acknowledgements equal those of the same seed with every parallel for run one call at a time |
 | `enum_valid` | every result the journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not (the simulator returns unlisted values on purpose; `enum_unchecked` falls back to the last value instead) |
+| `mode_sent` | every journaled model reply answered a request sent in the mode its `model` record names (`mode_dropped` sends the request without its mode) |
 | `tool_admitted` | every listed tool that ran had the fingerprint its turn's latest listing read admitted, and every tool with a declared input ran only with input that fits it (the simulator changes listings between turns, at crashes and at model calls, and draws unlisted names and input that does not fit; `listing_unchecked` and `input_unchecked` skip the checks, and `listed_class_dropped` journals an external listed tool as `none`, which `external_once` catches) |
 | `nested_external_once`, `unknown_nested_reported`, `nested_known`, `cell_finishes_once`, `cell_replay_equal`, `header_before_wait`, `cell_bounded`, `nested_enum_valid` | code cells, defined in [CODE_MODE.md](CODE_MODE.md) |
 

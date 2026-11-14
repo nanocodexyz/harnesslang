@@ -7,6 +7,9 @@ const context_tokens_compact: u64 = 167000
 const turns_max: u64 = 1000000
 const continuations_max: u64 = 3
 const throttled_attempts_max: u64 = 10
+const bash_timeout_ms: u64 = 120000
+const read_offset_first: u64 = 1
+const read_limit_whole: u64 = 0
 
 type outcome = completed(text) | failed(text) | exhausted
 type claude_reply = answer(text, text, u64)
@@ -17,12 +20,12 @@ type claude_reply = answer(text, text, u64)
   | refused(text)
   | rejected(text)
 
-tool Bash(command: text, timeout: u64, description: text, run_in_background: bool, dangerouslyDisableSandbox: bool) -> text effect external
-tool Read(file_path: text, offset: u64, limit: u64, pages: text, allow_large: bool) -> text effect none
-tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool) -> text effect external
+tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
+tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text effect none
+tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool = false) -> text effect external
 tool Write(file_path: text, content: text) -> text effect external
 
-model messages calls calls_per_round_max reply claude_reply
+model messages calls calls_per_round_max reply claude_reply modes text_only
 
 state {
   context: list<entry, context_entries_max>
@@ -58,11 +61,24 @@ fn compact() {
     failed(error) => { return failed("compaction failed: " ++ error) }
     ok(summary) => {
       match summary {
-        answer(words, _, _) => {
-          clear context
-          context_tokens = 0
-          push context user("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" ++ words ++ "\n" ++ "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.")
-        }
+        answer(words, _, _) => { summarized(words) }
+        calls(_, _, _) => { forced_summary() }
+        truncated(_) => { return failed("compaction summary did not end normally") }
+        paused => { return failed("compaction summary did not end normally") }
+        context_full => { return failed("compaction exhausted the context window") }
+        refused(reason) => { return failed("provider refused compaction: " ++ reason) }
+        rejected(reason) => { return failed("provider rejected compaction: " ++ reason) }
+      }
+    }
+  }
+}
+
+fn forced_summary() {
+  match messages(context) mode text_only {
+    failed(error) => { return failed("compaction failed: " ++ error) }
+    ok(summary) => {
+      match summary {
+        answer(words, _, _) => { summarized(words) }
         calls(_, _, _) => { return failed("compaction returned a tool block") }
         truncated(_) => { return failed("compaction summary did not end normally") }
         paused => { return failed("compaction summary did not end normally") }
@@ -72,6 +88,28 @@ fn compact() {
       }
     }
   }
+}
+
+fn summarized(words: text) {
+  if contains(words, "<analysis>") and contains(after(words, "<analysis>"), "</analysis>") {
+    summary_tagged(before(words, "<analysis>") ++ after(after(words, "<analysis>"), "</analysis>"))
+  } else {
+    summary_tagged(words)
+  }
+}
+
+fn summary_tagged(stripped: text) {
+  if contains(stripped, "<summary>") and contains(after(stripped, "<summary>"), "</summary>") {
+    continued(trim(before(stripped, "<summary>") ++ "Summary:\n" ++ trim(before(after(stripped, "<summary>"), "</summary>")) ++ after(after(stripped, "<summary>"), "</summary>")))
+  } else {
+    continued(trim(stripped))
+  }
+}
+
+fn continued(summary: text) {
+  clear context
+  context_tokens = 0
+  push context user("This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" ++ summary ++ "\n" ++ "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.")
 }
 
 on prompt(input: text, rounds: u64) -> outcome
@@ -85,9 +123,10 @@ on prompt(input: text, rounds: u64) -> outcome
   loop round below rounds_max {
     if len(context) + 1 + (1 + calls_per_round_max) > context_entries_max {
       compact()
-    }
-    if context_tokens >= context_tokens_compact {
-      compact()
+    } else {
+      if context_tokens >= context_tokens_compact {
+        compact()
+      }
     }
     if round >= rounds { return exhausted }
     match messages(context) {

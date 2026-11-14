@@ -1,0 +1,29 @@
+harness pages
+
+const turns_max: u64 = 1000000
+
+type outcome = summary(text) | parts(text, text) | missing(text)
+
+tool fetch(key: text) -> text effect none
+
+state {
+  turns: u64
+}
+
+invariant turns_bounded: turns <= turns_max
+
+on summarize(key: text) -> outcome
+  requires turns < turns_max
+{
+  turns = turns + 1
+  match fetch(key) {
+    failed(error) => { return missing(trim("  " ++ error ++ "\n")) }
+    ok(page) => {
+      if contains(page, "eta") {
+        return parts(before(page, "eta"), after(page, "eta"))
+      }
+      let tagged = "<analysis>draft</analysis>\n<summary> " ++ page ++ " </summary>"
+      return summary(trim(before(after(tagged, "<summary>"), "</summary>")) ++ after(page, "a-"))
+    }
+  }
+}

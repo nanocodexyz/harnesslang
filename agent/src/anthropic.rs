@@ -1,14 +1,17 @@
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::json::Value;
+use crate::stream::{self, Streamed};
 use crate::tools;
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const BASE_URL_DEFAULT: &str = "https://api.anthropic.com";
-pub const REQUEST_SECONDS_MAX: u64 = 600;
+pub const STREAM_IDLE_SECONDS_MAX: u64 = 600;
+pub const STREAM_IDLE_BYTES_PER_SECOND: u64 = 1;
 pub const CURL_TIMED_OUT: i32 = 28;
+pub const MODE_TEXT_ONLY: &str = "text_only";
 pub const HTTP_OK: u16 = 200;
 pub const HTTP_REQUEST_TIMEOUT: u16 = 408;
 pub const HTTP_CONFLICT: u16 = 409;
@@ -231,7 +234,7 @@ pub fn messages(context: &Value) -> Result<Vec<Value>, String> {
 }
 
 impl Client {
-    pub fn body(&self, context: &Value) -> Result<Value, String> {
+    pub fn body(&self, context: &Value, mode: Option<&str>) -> Result<Value, String> {
         let mut tools = self.tools.clone();
         if let Value::Array(items) = &mut tools
             && let Some(last) = items.last_mut()
@@ -244,7 +247,22 @@ impl Client {
             ("system", self.system.clone()),
             ("tools", tools),
             ("messages", Value::Array(messages(context)?)),
+            ("stream", Value::Bool(true)),
         ]);
+        match mode {
+            None => {}
+            Some(MODE_TEXT_ONLY) => {
+                body.insert(
+                    "tool_choice",
+                    Value::object([("type", Value::text("none"))]),
+                );
+            }
+            Some(other) => {
+                return Err(format!(
+                    "the harness asked for mode {other}, which this host does not know"
+                ));
+            }
+        }
         if adaptive_thinking(&self.model) {
             body.insert(
                 "thinking",
@@ -266,19 +284,18 @@ impl Client {
         Ok(body)
     }
 
-    pub fn send(&self, body: &Value) -> Result<(u16, String), String> {
+    pub fn send(&self, body: &Value, partial: &Path) -> Result<(u16, String), String> {
         if let Some(rest) = self.base_url.strip_prefix("http://") {
             let request = self.scratch.join("request.json");
             let encoded = body.encode();
             std::fs::write(&request, &encoded)
                 .map_err(|error| format!("write request: {error}"))?;
-            return plain::post(rest, &self.key, &encoded);
+            return plain::post(rest, &self.key, &encoded, partial);
         }
         let request = self.scratch.join("request.json");
-        let response = self.scratch.join("response.json");
+        let response = partial;
         std::fs::write(&request, body.encode())
             .map_err(|error| format!("write request: {error}"))?;
-        let _ = std::fs::remove_file(&response);
         let config = format!(
             "url = \"{}/v1/messages\"\nheader = \"x-api-key: {}\"\nheader = \"anthropic-version: {ANTHROPIC_VERSION}\"\nheader = \"content-type: application/json\"\ndata-binary = \"@{}\"\noutput = \"{}\"\n",
             self.base_url.trim_end_matches('/'),
@@ -289,8 +306,10 @@ impl Client {
         let mut child = Command::new("curl")
             .args([
                 "-sS",
-                "--max-time",
-                &REQUEST_SECONDS_MAX.to_string(),
+                "--speed-limit",
+                &STREAM_IDLE_BYTES_PER_SECOND.to_string(),
+                "--speed-time",
+                &STREAM_IDLE_SECONDS_MAX.to_string(),
                 "-w",
                 "%{http_code}",
                 "-K",
@@ -313,7 +332,9 @@ impl Client {
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
             let reason = if code == CURL_TIMED_OUT {
-                format!(" (no answer within REQUEST_SECONDS_MAX, {REQUEST_SECONDS_MAX} s)")
+                format!(
+                    " (the stream stalled for STREAM_IDLE_SECONDS_MAX, {STREAM_IDLE_SECONDS_MAX} s)"
+                )
             } else {
                 String::new()
             };
@@ -326,8 +347,17 @@ impl Client {
             .trim()
             .parse()
             .map_err(|_| "curl printed no HTTP status".to_owned())?;
-        let text = std::fs::read_to_string(&response)
-            .map_err(|error| format!("read response: {error}"))?;
+        let size = std::fs::metadata(response)
+            .map_err(|error| format!("read response: {error}"))?
+            .len();
+        if size > plain::RESPONSE_BYTES_MAX as u64 {
+            return Err(format!(
+                "response exceeds RESPONSE_BYTES_MAX ({} bytes)",
+                plain::RESPONSE_BYTES_MAX
+            ));
+        }
+        let text =
+            std::fs::read_to_string(response).map_err(|error| format!("read response: {error}"))?;
         Ok((status, text))
     }
 }
@@ -368,26 +398,42 @@ fn error_text(status: u16, body: &str) -> (String, String) {
     }
 }
 
+fn error_answer(status: Option<u16>, kind: &str, text: String) -> Answer {
+    if status == Some(HTTP_TOO_LARGE) || text.contains(PROMPT_TOO_LONG) {
+        return Answer::Reply(Value::text("context_full"), Usage::default());
+    }
+    let retryable = status.is_some_and(|status| {
+        matches!(status, HTTP_REQUEST_TIMEOUT | HTTP_CONFLICT | HTTP_TOO_MANY)
+            || status >= HTTP_SERVER_ERROR_MIN
+    }) || matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error");
+    if retryable {
+        Answer::Retry(text)
+    } else {
+        Answer::Reply(
+            Value::object([("rejected", Value::text(&text))]),
+            Usage::default(),
+        )
+    }
+}
+
+pub fn interpret_stream(status: u16, body: &str) -> Answer {
+    if status != HTTP_OK {
+        return interpret(status, body);
+    }
+    match stream::assemble(body) {
+        Ok(Streamed::Message(message)) => interpret(status, &message.encode()),
+        Ok(Streamed::Error { kind, message }) => {
+            let text = format!("stream error {kind}: {message}");
+            error_answer(None, &kind, text)
+        }
+        Err(error) => Answer::Retry(error),
+    }
+}
+
 pub fn interpret(status: u16, body: &str) -> Answer {
     if status != HTTP_OK {
         let (kind, text) = error_text(status, body);
-        if status == HTTP_TOO_LARGE || text.contains(PROMPT_TOO_LONG) {
-            return Answer::Reply(Value::text("context_full"), Usage::default());
-        }
-        let retryable = matches!(status, HTTP_REQUEST_TIMEOUT | HTTP_CONFLICT | HTTP_TOO_MANY)
-            || status >= HTTP_SERVER_ERROR_MIN
-            || matches!(
-                kind.as_str(),
-                "overloaded_error" | "api_error" | "rate_limit_error"
-            );
-        return if retryable {
-            Answer::Retry(text)
-        } else {
-            Answer::Reply(
-                Value::object([("rejected", Value::text(&text))]),
-                Usage::default(),
-            )
-        };
+        return error_answer(Some(status), &kind, text);
     }
     let value = match Value::decode(body) {
         Ok(value) => value,
@@ -404,8 +450,7 @@ pub fn interpret(status: u16, body: &str) -> Answer {
             Some("text") => text.push_str(block.get("text").and_then(Value::as_str).unwrap_or("")),
             Some("tool_use") => {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                let input =
-                    tools::with_defaults(name, block.get("input").cloned().unwrap_or(Value::Null));
+                let input = block.get("input").cloned().unwrap_or(Value::Null);
                 calls.push(Value::object([
                     ("id", block.get("id").cloned().unwrap_or(Value::text(""))),
                     ("tool", Value::text(name)),
@@ -449,13 +494,20 @@ pub fn interpret(status: u16, body: &str) -> Answer {
 mod plain {
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
+    use std::path::Path;
     use std::time::Duration;
 
     pub const RESPONSE_BYTES_MAX: usize = 32 * 1024 * 1024;
     pub const HTTP_PORT: u16 = 80;
+    pub const READ_CHUNK_BYTES: usize = 8192;
     const HEADER_END: &[u8] = b"\r\n\r\n";
 
-    pub fn post(rest: &str, key: &str, body: &str) -> Result<(u16, String), String> {
+    pub fn post(
+        rest: &str,
+        key: &str,
+        body: &str,
+        partial: &Path,
+    ) -> Result<(u16, String), String> {
         let (authority, prefix) = rest
             .split_once('/')
             .map_or((rest, ""), |(authority, path)| (authority, path));
@@ -467,7 +519,7 @@ mod plain {
         };
         let mut stream =
             TcpStream::connect(&address).map_err(|error| format!("connect {address}: {error}"))?;
-        let timeout = Some(Duration::from_secs(super::REQUEST_SECONDS_MAX));
+        let timeout = Some(Duration::from_secs(super::STREAM_IDLE_SECONDS_MAX));
         stream
             .set_read_timeout(timeout)
             .map_err(|error| error.to_string())?;
@@ -485,15 +537,27 @@ mod plain {
         stream
             .write_all(body.as_bytes())
             .map_err(|error| format!("send: {error}"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(partial)
+            .map_err(|error| format!("{}: {error}", partial.display()))?;
         let mut response = Vec::new();
-        let read = stream
-            .take(RESPONSE_BYTES_MAX as u64 + 1)
-            .read_to_end(&mut response)
-            .map_err(|error| format!("receive: {error}"))?;
-        if read > RESPONSE_BYTES_MAX {
-            return Err(format!(
-                "response exceeds RESPONSE_BYTES_MAX ({RESPONSE_BYTES_MAX} bytes)"
-            ));
+        let mut chunk = [0_u8; READ_CHUNK_BYTES];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .map_err(|error| format!("receive: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            if response.len() + read > RESPONSE_BYTES_MAX {
+                return Err(format!(
+                    "response exceeds RESPONSE_BYTES_MAX ({RESPONSE_BYTES_MAX} bytes)"
+                ));
+            }
+            response.extend_from_slice(&chunk[..read]);
+            file.write_all(&chunk[..read])
+                .map_err(|error| format!("{}: {error}", partial.display()))?;
         }
         parse(&response)
     }

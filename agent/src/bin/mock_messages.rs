@@ -40,10 +40,116 @@ fn main() {
     }
 }
 
+fn streamed(body: &str) -> bool {
+    Value::decode(body)
+        .ok()
+        .and_then(|body| body.get("stream").cloned())
+        .is_some_and(|stream| matches!(stream, Value::Bool(true)))
+}
+
+fn sse(kind: &str, data: Value) -> String {
+    let mut data = data;
+    data.insert("type", Value::text(kind));
+    format!("event: {kind}\ndata: {}\n\n", data.encode())
+}
+
+fn halves(text: &str) -> (String, String) {
+    let mut middle = text.len() / 2;
+    while !text.is_char_boundary(middle) {
+        middle += 1;
+    }
+    (text[..middle].to_owned(), text[middle..].to_owned())
+}
+
+fn events(message: &Value) -> Vec<String> {
+    let mut head = message.clone();
+    head.insert("content", Value::Array(Vec::new()));
+    head.insert("stop_reason", Value::Null);
+    let mut out = vec![sse("message_start", Value::object([("message", head)]))];
+    let blocks = message
+        .get("content")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
+    for (index, block) in blocks.iter().enumerate() {
+        let at = Value::number(index as u64);
+        let (start, delta_kind, key, text) = match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                let mut start = block.clone();
+                start.insert("input", Value::object([]));
+                let input = block.get("input").map(Value::encode).unwrap_or_default();
+                (start, "input_json_delta", "partial_json", input)
+            }
+            _ => {
+                let mut start = block.clone();
+                start.insert("text", Value::text(""));
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                (start, "text_delta", "text", text)
+            }
+        };
+        out.push(sse(
+            "content_block_start",
+            Value::object([("index", at.clone()), ("content_block", start)]),
+        ));
+        let (first, second) = halves(&text);
+        for part in [first, second] {
+            out.push(sse(
+                "content_block_delta",
+                Value::object([
+                    ("index", at.clone()),
+                    (
+                        "delta",
+                        Value::object([
+                            ("type", Value::text(delta_kind)),
+                            (key, Value::String(part)),
+                        ]),
+                    ),
+                ]),
+            ));
+        }
+        out.push(sse("content_block_stop", Value::object([("index", at)])));
+    }
+    let stop = message.get("stop_reason").cloned().unwrap_or(Value::Null);
+    let usage = message.get("usage").cloned().unwrap_or(Value::object([]));
+    out.push(sse(
+        "message_delta",
+        Value::object([
+            ("delta", Value::object([("stop_reason", stop)])),
+            ("usage", usage),
+        ]),
+    ));
+    out.push(sse("message_stop", Value::object([])));
+    out
+}
+
+fn serve_stream(mut stream: TcpStream, message: &Value, delay: Duration) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let events = events(message);
+    let pause = delay / u32::try_from(events.len()).expect("a scripted message has few events");
+    for event in events {
+        std::thread::sleep(pause);
+        if stream.write_all(event.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
 fn serve(mut stream: TcpStream, steps: &[Value], delay: Duration) {
     let Some((headers, body)) = read_request(&stream) else {
         return;
     };
+    if streamed(&body)
+        && let Ok(message) = answer(&headers, &body, steps)
+    {
+        serve_stream(stream, &message, delay);
+        return;
+    }
     let (status, reply) = match answer(&headers, &body, steps) {
         Ok(reply) => (200, reply),
         Err(error) => {

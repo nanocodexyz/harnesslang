@@ -190,6 +190,9 @@ class Engine {
         return this.decode(site, logged.output);
       case "reply":
         if (site.kind !== "model") throw this.diverged(seq, "a model reply", call.tool);
+        if (logged.mode !== site.mode) {
+          throw this.diverged(seq, `a model reply in ${modeText(logged.mode)}`, `${call.tool} in ${modeText(site.mode)}`);
+        }
         return this.reply(logged.response);
       case "unknown":
         this.same(seq, logged.call, call);
@@ -417,11 +420,11 @@ class Engine {
     await this.hook(runPoint("before_run", site.kind, call.effect));
     if (site.kind === "model") {
       const callsMax = PROGRAM.model === null ? 0n : PROGRAM.model.calls;
-      const response = await world.model({ turn: this.turn, seq, callsMax, context: args[0] });
+      const response = await world.model({ turn: this.turn, seq, callsMax, mode: site.mode, context: args[0] });
       await this.hook(runPoint("after_run", site.kind, call.effect));
       await this.drain();
-      this.append({ kind: "model", turn: this.turn, seq, response });
-      this.sites.set(seq, { kind: "reply", response });
+      this.append({ kind: "model", turn: this.turn, seq, response, mode: site.mode });
+      this.sites.set(seq, { kind: "reply", response, mode: site.mode });
       return this.reply(response);
     }
     let output;
@@ -778,12 +781,18 @@ function listingRequestJson(request) {
 }
 
 function modelRequestJson(request) {
-  return object([
+  const entries = [
     ["calls_max", request.callsMax],
     ["context", toJson(CONTEXT_TYPE, request.context)],
     ["seq", BigInt(request.seq)],
     ["turn", BigInt(request.turn)],
-  ]);
+  ];
+  if (request.mode !== null) entries.push([MODEL_MODE, request.mode]);
+  return object(entries);
+}
+
+function modeText(mode) {
+  return mode === null ? "no mode" : `mode ${mode}`;
 }
 
 class HostError extends Error {}

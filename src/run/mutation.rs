@@ -46,10 +46,12 @@ pub enum Mutation {
     ResultsInCompletionOrder,
     BatchPushesReversed,
     LoopPastBound,
+    DefaultUnfilled,
+    ModeDropped,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 46] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -94,6 +96,8 @@ impl Mutation {
         Self::ResultsInCompletionOrder,
         Self::BatchPushesReversed,
         Self::LoopPastBound,
+        Self::DefaultUnfilled,
+        Self::ModeDropped,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -142,6 +146,8 @@ impl Mutation {
             Self::ResultsInCompletionOrder => "results_in_completion_order",
             Self::BatchPushesReversed => "batch_pushes_reversed",
             Self::LoopPastBound => "loop_past_bound",
+            Self::DefaultUnfilled => "default_unfilled",
+            Self::ModeDropped => "mode_dropped",
         }
     }
 
@@ -200,7 +206,9 @@ impl Mutation {
             | Self::ListingUnchecked
             | Self::ListedClassDropped
             | Self::InputUnchecked
-            | Self::LoopPastBound => all,
+            | Self::LoopPastBound
+            | Self::DefaultUnfilled
+            | Self::ModeDropped => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,
