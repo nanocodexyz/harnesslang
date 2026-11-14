@@ -67,6 +67,24 @@ pub struct CellSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellLine {
+    cell: CellSummary,
+    record: usize,
+}
+
+const CELL_KEY: &str = "cell";
+
+fn parse_line(row: &str) -> Result<Line, serde_json::Error> {
+    let value: Value = serde_json::from_str(row)?;
+    if value.get(CELL_KEY).is_none() {
+        return serde_json::from_value(value);
+    }
+    let CellLine { cell, record } = serde_json::from_value(value)?;
+    Ok(Line::Cell { cell, record })
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Line {
     Turn {
@@ -78,6 +96,7 @@ pub enum Line {
         checkpoint: CheckpointSummary,
         record: usize,
     },
+    #[serde(skip)]
     Cell {
         cell: CellSummary,
         record: usize,
@@ -103,8 +122,8 @@ pub fn parse(text: &str) -> Result<Summary, String> {
         serde_json::from_str(first).map_err(|error| format!("summary header: {error}"))?;
     let mut lines = Vec::new();
     for (index, row) in rows.enumerate() {
-        let line: Line = serde_json::from_str(row)
-            .map_err(|error| format!("summary line {}: {error}", index + 2))?;
+        let line =
+            parse_line(row).map_err(|error| format!("summary line {}: {error}", index + 2))?;
         lines.push(line);
     }
     Ok(Summary { header, lines })

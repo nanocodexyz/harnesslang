@@ -10,7 +10,7 @@ use crate::djs::{self, Inputs, Next, Run, Script, Terminal, View};
 const SESSION: &str = "golden";
 const ORIGIN: &str = "1/1";
 const YIELD_MS: u64 = 10_000;
-const NESTED_TOOLS: [(&str, &str); 3] = [
+pub const NESTED_TOOLS: [(&str, &str); 3] = [
     ("read", "none"),
     ("edit", "idempotent"),
     ("bash", "external"),
@@ -293,10 +293,40 @@ fn replay_matches(cell: &Script, entries: &[JournalEntry], live: &Run) -> Result
     Ok(())
 }
 
-fn golden(case: &Case, index: usize) -> Result<Value, String> {
+pub struct Lived {
+    pub name: &'static str,
+    pub cell: Script,
+    pub entries: Vec<JournalEntry>,
+    pub run: Run,
+}
+
+fn live(case: &Case, index: usize) -> Result<Lived, String> {
     let cell = script(case, index);
-    let live = djs::run(&cell, None, &mut Respond { case })?;
-    let entries = normalized(&live.entries);
+    let run = djs::run(&cell, None, &mut Respond { case })?;
+    let entries = normalized(&run.entries);
+    Ok(Lived {
+        name: case.name,
+        cell,
+        entries,
+        run,
+    })
+}
+
+pub fn lived() -> Result<Vec<Lived>, String> {
+    CASES
+        .iter()
+        .enumerate()
+        .map(|(index, case)| live(case, index).map_err(|error| format!("{}: {error}", case.name)))
+        .collect()
+}
+
+fn golden(case: &Case, index: usize) -> Result<Value, String> {
+    let Lived {
+        cell,
+        entries,
+        run: live,
+        ..
+    } = live(case, index)?;
     replay_matches(&cell, &entries, &live)?;
     resumes(&cell, &entries, &live)?;
     let divergence = divergence(&cell, &entries)?;

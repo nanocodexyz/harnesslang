@@ -5,6 +5,7 @@ mod djs;
 mod golden;
 mod journal;
 mod summary;
+mod synthetic;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,6 +18,7 @@ const JOURNAL_SUFFIX: &str = ".jsonl";
 const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
 const GOLDEN_FLAG: &str = "--golden";
+const SYNTHETIC_FLAG: &str = "--synthetic";
 
 fn pairs(directory: &Path) -> Result<Vec<(String, PathBuf, PathBuf)>, String> {
     let entries = std::fs::read_dir(directory)
@@ -63,15 +65,31 @@ fn write_golden(directory: &str) -> ExitCode {
     }
 }
 
+fn write_synthetic(directory: &str) -> ExitCode {
+    match synthetic::generate(Path::new(directory)) {
+        Ok(count) => {
+            println!("ok synthetic journals={count} directory={directory}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("hl-oracle: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let directories: Vec<String> = std::env::args().skip(1).collect();
-    if let [flag, directory] = directories.as_slice()
-        && flag == GOLDEN_FLAG
-    {
-        return write_golden(directory);
+    if let [flag, directory] = directories.as_slice() {
+        if flag == GOLDEN_FLAG {
+            return write_golden(directory);
+        }
+        if flag == SYNTHETIC_FLAG {
+            return write_synthetic(directory);
+        }
     }
     if directories.is_empty() {
-        eprintln!("usage: hl-oracle DIR... | hl-oracle --golden DIR");
+        eprintln!("usage: hl-oracle DIR... | hl-oracle --golden DIR | hl-oracle --synthetic DIR");
         return ExitCode::from(USAGE_EXIT);
     }
     let mut tally = Tally::default();
