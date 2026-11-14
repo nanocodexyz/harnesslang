@@ -214,7 +214,7 @@ impl Agent {
         input: &Value,
         room: bool,
     ) -> tools::Ran {
-        let receipted = tool == "Bash" && self.children.is_some();
+        let receipted = matches!(tool, "Bash" | "Write") && self.children.is_some();
         if receipted && let Err(error) = self.workspace.dispatching(turn, seq) {
             return tools::Ran::Failed(format!(
                 "<tool_use_error>receipt: {error}</tool_use_error>"
