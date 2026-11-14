@@ -274,19 +274,31 @@ pub fn digest_of(json: &Json) -> Result<&str, String> {
 }
 
 pub fn returned_bound<'p>(program: &'p Program, tool: &str) -> Option<&'p Bound> {
-    match &program.tool(tool)?.1.returns {
+    let declared = program.tool(tool)?.1;
+    match &declared.returns {
         Type::Blob(bytes) => Some(bytes),
+        _ => declared.attaches.as_ref(),
+    }
+}
+
+pub fn host_data(json: &Json) -> Option<&str> {
+    match json {
+        Json::Object(map) if map.len() == 1 => map.get(DATA_KEY).and_then(Json::as_str),
         _ => None,
     }
+}
+
+pub fn host_blob(data: &str) -> Json {
+    Json::object([(DATA_KEY, Json::text(data))])
 }
 
 pub fn checked(tool: &str, bytes: &Bound, output: Output) -> Output {
     let Output::Ok(json) = &output else {
         return output;
     };
-    let Some(text) = json.as_str() else {
+    let Some(text) = host_data(json) else {
         return Output::Failed(format!(
-            "{tool} returned {}, which is not a blob: blobs are base64 text",
+            "{tool} returned {}, which is not a blob: a host returns a blob as {{\"data\": base64}}",
             json.encode()
         ));
     };
@@ -378,7 +390,7 @@ impl Blobs {
         }
         for (turn, log) in &session.turns {
             for (seq, site) in &log.sites {
-                let SiteLog::Done(call, Output::Ok(json)) = site else {
+                let SiteLog::Done(call, Output::Ok(json @ Json::Object(_))) = site else {
                     continue;
                 };
                 if returned_bound(program, &call.tool).is_none() {
@@ -483,9 +495,10 @@ pub fn digested(output: Output) -> Output {
     }
 }
 
-pub fn expected(returns: &Type, output: Output) -> Output {
-    match (returns, &output) {
-        (Type::Blob(_), Output::Ok(Json::String(data))) => {
+pub fn expected(output: Output) -> Output {
+    match &output {
+        Output::Ok(json) if host_data(json).is_some() => {
+            let data = host_data(json).expect("matched above");
             let bytes = base64_decode(data).expect("a checked blob is base64");
             Output::Ok(value_json(&sha256_hex(&bytes)))
         }

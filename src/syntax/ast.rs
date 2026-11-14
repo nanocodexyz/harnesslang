@@ -72,6 +72,7 @@ pub struct Tool {
     pub params: Vec<Param>,
     pub defaults: Vec<Option<Expr>>,
     pub returns: TypeExpr,
+    pub attaches: Option<TypeExpr>,
     pub effect: EffectClass,
     pub finds: Option<Name>,
 }

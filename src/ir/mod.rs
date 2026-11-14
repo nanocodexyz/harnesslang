@@ -369,6 +369,7 @@ pub struct Tool {
     pub params: Vec<Field>,
     pub defaults: Vec<Option<Literal>>,
     pub returns: Type,
+    pub attaches: Option<Bound>,
     pub effect: EffectClass,
     pub finds: Option<ListingId>,
 }

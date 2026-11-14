@@ -348,7 +348,12 @@ fn blob_bound(source: &ast::Program) -> Checked<Option<&ast::Name>> {
     let mut found: Option<&ast::Name> = None;
     for item in &source.items {
         let Item::Tool(tool) = item else { continue };
-        let TypeExpr::Blob { bytes, .. } = &tool.returns else {
+        let returned = [Some(&tool.returns), tool.attaches.as_ref()];
+        let Some(TypeExpr::Blob { bytes, .. }) = returned
+            .into_iter()
+            .flatten()
+            .find(|ty| matches!(ty, TypeExpr::Blob { .. }))
+        else {
             continue;
         };
         match found {
@@ -816,6 +821,18 @@ fn tools(
                 "a tool returns u64, bool, text, a text enum or a blob",
             );
         }
+        let attaches = match &tool.attaches {
+            None => None,
+            Some(ty) => match (&returns, resolve(program, globals, ty)?) {
+                (Type::Text, Type::Blob(bytes)) => Some(bytes),
+                _ => {
+                    return error(
+                        ty.at(),
+                        "a tool returns 'text or blob<N>': text, or a blob the model sees as an attachment",
+                    );
+                }
+            },
+        };
         globals
             .tools
             .insert(tool.name.text.clone(), program.tools.len());
@@ -824,6 +841,7 @@ fn tools(
             params,
             defaults,
             returns,
+            attaches,
             effect: tool.effect,
             finds: None,
         });
@@ -1062,11 +1080,10 @@ fn code_tool(program: &ir::Program, globals: &Globals, code: &ast::Code) -> Chec
         );
     }
     let tools = nested_tools(globals, code)?;
-    if let Some((tool, at)) = tools
-        .iter()
-        .zip(&code.tools)
-        .find(|(tool, _)| matches!(program.tools[**tool].returns, Type::Blob(_)))
-    {
+    if let Some((tool, at)) = tools.iter().zip(&code.tools).find(|(tool, _)| {
+        matches!(program.tools[**tool].returns, Type::Blob(_))
+            || program.tools[**tool].attaches.is_some()
+    }) {
         return error(
             at.at,
             format!(

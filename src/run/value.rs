@@ -287,7 +287,9 @@ pub fn returned(program: &Program, returns: &Type) -> String {
 }
 
 pub fn checked_output(program: &Program, tool: &str, returns: &Type, output: Output) -> Output {
-    if let Type::Blob(bytes) = returns {
+    if let Some(bytes) = crate::run::blob::returned_bound(program, tool)
+        && (matches!(returns, Type::Blob(_)) || matches!(&output, Output::Ok(Json::Object(_))))
+    {
         return crate::run::blob::checked(tool, bytes, output);
     }
     let Output::Ok(json) = &output else {

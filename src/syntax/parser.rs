@@ -268,6 +268,12 @@ impl<'a> Parser<'a> {
         let (params, defaults) = self.tool_params()?;
         self.symbol(Symbol::Arrow)?;
         let returns = self.type_expr()?;
+        let attaches = if self.is_word("or") {
+            self.advance();
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
         let effect = self.effect_class()?;
         let finds = if self.is_word("finds") {
             self.advance();
@@ -280,6 +286,7 @@ impl<'a> Parser<'a> {
             params,
             defaults,
             returns,
+            attaches,
             effect,
             finds,
         })

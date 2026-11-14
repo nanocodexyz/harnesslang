@@ -1869,8 +1869,12 @@ impl<'a> Engine<'a> {
     }
 
     fn dispatched_returns(&self, tool: &str) -> Type {
-        match crate::run::blob::returned_bound(self.program, tool) {
-            Some(bytes) if self.program.blobs.is_some() => Type::Blob(bytes.clone()),
+        match self
+            .program
+            .tool(tool)
+            .map(|(_, declared)| &declared.returns)
+        {
+            Some(Type::Blob(bytes)) if self.program.blobs.is_some() => Type::Blob(bytes.clone()),
             _ => Type::Text,
         }
     }
@@ -1891,12 +1895,17 @@ impl<'a> Engine<'a> {
             ),
             _ => output,
         };
-        match (returns, output) {
-            (Type::Blob(_), Output::Ok(Json::String(data))) => {
+        let _ = returns;
+        match output {
+            Output::Ok(json)
+                if crate::run::blob::returned_bound(self.program, tool).is_some()
+                    && crate::run::blob::host_data(&json).is_some() =>
+            {
+                let data = crate::run::blob::host_data(&json).expect("matched above");
                 let with_data = self.mutation != Mutation::BlobUnjournaled;
-                Output::Ok(self.blobs.journaled(&data, with_data))
+                Output::Ok(self.blobs.journaled(data, with_data))
             }
-            (_, output) => output,
+            output => output,
         }
     }
 
@@ -2021,7 +2030,7 @@ impl<'a> Engine<'a> {
                 Output::Failed(error) => {
                     Ok(Value::Variant(ir::FAILED, vec![Value::Text(error.clone())]))
                 }
-                Output::Ok(json)
+                Output::Ok(json @ Json::Object(_))
                     if crate::run::blob::returned_bound(self.program, &call.tool).is_some() =>
                 {
                     let digest = crate::run::blob::digest_of(json).map_err(corrupt)?;

@@ -1111,6 +1111,15 @@ impl Checker<'_> {
         }
         if let Some(&tool_id) = self.globals.tools.get(&callee.text) {
             let tool = &self.program.tools[tool_id];
+            if tool.attaches.is_some() {
+                return error(
+                    at,
+                    format!(
+                        "tool '{}' returns text or a blob: call it through dispatch, whose blob arm takes the blob",
+                        callee.text
+                    ),
+                );
+            }
             let wanted: Vec<Type> = tool.params.iter().map(|param| param.ty.clone()).collect();
             let args = self.args(at, &format!("tool '{}'", callee.text), args, &wanted, out)?;
             let inner = Box::new(tool.returns.clone());
