@@ -267,6 +267,7 @@ struct Runner<'a, 'h> {
     entries: u64,
     fresh_entries: Vec<Entry>,
     changed: BTreeMap<u64, JournaledCall>,
+    journaled: BTreeMap<u64, CallState>,
     next_seq: u64,
     header: Option<Header>,
     header_unsaved: bool,
@@ -315,6 +316,10 @@ impl<'a, 'h> Runner<'a, 'h> {
             entries,
             fresh_entries: Vec::new(),
             changed: BTreeMap::new(),
+            journaled: match site.cell {
+                CellStart::Existing(log) => log.calls.iter().map(|(id, call)| (*id, call.state.clone())).collect(),
+                CellStart::Fresh(_) => BTreeMap::new(),
+            },
             next_seq,
             header_unsaved: false,
             header,
@@ -467,6 +472,9 @@ impl<'a, 'h> Runner<'a, 'h> {
         }
         let entries = std::mem::take(&mut self.fresh_entries);
         let calls: Vec<JournaledCall> = std::mem::take(&mut self.changed).into_values().collect();
+        for call in &calls {
+            self.journaled.insert(call.id, call.state.clone());
+        }
         let entries_from = self.entries - entries.len() as u64;
         let fresh = header.is_some();
         assert_eq!(fresh, self.next_seq == 0, "the header rides the first update only");
@@ -511,6 +519,10 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn changed(&mut self, id: u64) {
         if self.live {
             let journaled = self.journaled(id);
+            if self.journaled.get(&id) == Some(&journaled.state) {
+                self.changed.remove(&id);
+                return;
+            }
             self.changed.insert(id, journaled);
         }
     }
@@ -535,6 +547,11 @@ impl<'a, 'h> Runner<'a, 'h> {
         } else {
             None
         };
+        let recorded = self.record(Entry::Call {
+            id,
+            name: name.clone(),
+            input: input.clone(),
+        });
         self.calls.insert(
             id,
             Nested {
@@ -546,6 +563,7 @@ impl<'a, 'h> Runner<'a, 'h> {
                 refused,
             },
         );
+        recorded?;
         if self.running() < self.code.parallel.value {
             return self.start_call(id);
         }
@@ -555,13 +573,7 @@ impl<'a, 'h> Runner<'a, 'h> {
     }
 
     fn start_call(&mut self, id: u64) -> Driven<()> {
-        let call = self.calls[&id].clone();
-        self.record(Entry::Call {
-            id,
-            name: call.name.clone(),
-            input: call.input.clone(),
-        })?;
-        self.calls.get_mut(&id).expect("inserted").phase = Phase::Running;
+        self.calls.get_mut(&id).expect("a started call was issued").phase = Phase::Running;
         self.changed(id);
         if self.live {
             self.settle(id)?;
@@ -620,6 +632,7 @@ impl<'a, 'h> Runner<'a, 'h> {
         let call = self.calls[&id].clone();
         let tool = call.tool.expect("a dispatched call names a nested tool");
         let required = tool.effect == EffectClass::External;
+        self.emit(false);
         if fresh && required {
             self.host.append(Record::NestedCall {
                 turn: self.site.turn,
