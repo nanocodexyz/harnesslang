@@ -34,16 +34,6 @@ like any other). Compaction is then a handler branch:
 `seal_skipped` mutations then have a counterpart: the simulator checks that
 a checkpoint after `clear` no longer replays the cleared prefix.
 
-## 6. Typed tool input and dynamic tool lists
-
-A model call's input is one `text`, and `dispatch` finds the tool by name
-with classes fixed at compile time. nanocode validates JSON input against
-each tool's schema, discovers deferred tools (`ToolSearch`), reads MCP
-listings (`McpToolListing`) and refuses a dynamic tool that changed since
-admission. Smallest addition: `tools from listing(name) effect C`, a family
-of tools named at run time whose class is fixed by the declaration, so the
-effect rule stays a compile-time fact.
-
 ## 7. Permission prompts and lifecycle hooks
 
 nanocode's hooks (`hooks.rs`: `UserPromptSubmit`, `Stop`, `PreCompact`,

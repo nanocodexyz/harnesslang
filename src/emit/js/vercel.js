@@ -31,6 +31,10 @@ class StepWorld {
     return this.context.host.tool(request);
   }
 
+  listing(request) {
+    return this.context.host.listing(request);
+  }
+
   async tools(requests, limit) {
     const simulated = this.context.tools;
     if (simulated !== undefined) return simulated(this, requests, limit);
@@ -159,6 +163,7 @@ const WORKFLOW_BINDING = [
   "  return harness.runtime.defaultHost({",
   "    fetch: (url, init) => fetch(url, init),",
   "    toolsUrl: process.env.HL_TOOLS_URL,",
+  "    listingsUrl: process.env.HL_LISTINGS_URL,",
   "    modelUrl: process.env.HL_MODEL_URL,",
   "    now: () => Date.now(),",
   "    random: harness.platformRandom,",

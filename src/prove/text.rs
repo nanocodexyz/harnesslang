@@ -28,6 +28,7 @@ impl<'a> Names<'a> {
         let handler = self.handler.expect("a site belongs to a handler");
         let name = match handler.sites[site].kind {
             SiteKind::Tool(tool) => self.program.tools[tool].name.clone(),
+            SiteKind::Listing(listing) => self.program.listings[listing].name.clone(),
             SiteKind::Model => self
                 .program
                 .model

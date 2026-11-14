@@ -189,6 +189,7 @@ fn declared(
     names.extend(globals.fields.keys().cloned());
     names.extend(globals.constants.keys().cloned());
     names.extend(globals.tools.keys().cloned());
+    names.extend(globals.listings.keys().cloned());
     names.extend(globals.model.iter().cloned());
     names.extend(BUILTIN_FUNCTIONS.iter().map(|name| (*name).to_owned()));
     names

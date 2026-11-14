@@ -5,16 +5,19 @@ const calls_per_round_max: u64 = 16
 const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
 const turns_max: u64 = 1000000
+const mcp_tools_max: u64 = 64
 
 type outcome = completed(text) | failed(text) | exhausted
+type turn_result = message(text, bool) | calls(list<call, calls_per_round_max>)
 
 tool shell(command: text) -> text effect external
 tool apply_patch(patch: text) -> text effect external
 tool update_plan(plan: text) -> text effect none
 tool view_image(path: text) -> text effect none
 tool web_search(query: text) -> text effect none
+tools from listing(mcp, mcp_tools_max) (arguments: text) effect external
 
-model responses calls calls_per_round_max
+model responses calls calls_per_round_max reply turn_result
 
 on steer(message: text) bound steers_per_turn_max
 
@@ -33,22 +36,32 @@ on prompt(input: text) -> outcome
   push context user(input)
   turns = turns + 1
   loop round below rounds_max {
-    let reply = responses(context)
-    push context assistant(reply)
-    match reply {
-      answer(words) => {
-        let steers = take steers
-        if len(steers) == 0 { return completed(words) }
-        for steer in steers {
-          push context user(steer)
-        }
-      }
-      calls(requested) => {
-        for call in requested {
-          match dispatch(call) {
-            ok(output) => { push context result(call, output) }
-            failed(error) => { push context error(call, error) }
-            unknown => { push context unknown(call) }
+    match mcp() {
+      ok(_) => {}
+      failed(_) => {}
+    }
+    match responses(context) {
+      failed(error) => { return failed("model call failed: " ++ error) }
+      ok(reply) => {
+        push context assistant(reply)
+        match reply {
+          message(words, end_turn) => {
+            if end_turn {
+              let steers = take steers
+              if len(steers) == 0 { return completed(words) }
+              for steer in steers {
+                push context user(steer)
+              }
+            }
+          }
+          calls(requested) => {
+            for call in requested parallel {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
           }
         }
       }

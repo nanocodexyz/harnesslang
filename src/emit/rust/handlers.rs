@@ -158,10 +158,11 @@ impl<'a, 'p> Body<'a, 'p> {
             "let calls: Vec<Call> = {items}.iter().map(|item| {{"
         ));
         self.line(&format!(
-            "    let {call}::Call(_, tool, input) = item.clone();"
+            "    let {call}::Call(_, tool, raw) = item.clone();"
         ));
         self.line("    let effect = dispatch_class(&tool);");
-        self.line("    Call { tool, effect, input: Json::String(input) }");
+        self.line("    let input = match tool_input(&tool, &raw) { Input::Typed(input) => input, Input::Untyped | Input::Invalid(_) => Json::String(raw) };");
+        self.line("    Call { tool, effect, input }");
         self.line("}).collect();");
         self.line(&format!(
             "let {answers} = engine.parallel(calls, {returns}, CONCURRENT_REQUESTS_MAX)?;"
@@ -282,11 +283,24 @@ impl<'a, 'p> Body<'a, 'p> {
             }
             SiteKind::Dispatch => {
                 let call = super::types::sum_name(self.program, ir::CALL);
-                self.line(&format!("let {call}::Call(_, tool, input) = argument0;"));
+                self.line(&format!("let {call}::Call(_, tool, raw) = argument0;"));
                 self.line("let effect = dispatch_class(&tool);");
-                self.line("let call = Call { tool, effect, input: Json::String(input) };");
+                self.line("let input = match tool_input(&tool, &raw) { Input::Typed(input) => input, Input::Untyped | Input::Invalid(_) => Json::String(raw) };");
+                self.line("let call = Call { tool, effect, input };");
                 let run = format!("Run::Tool({})", returns(self.types, result));
                 ("Dispatch", run, decode(self.types))
+            }
+            SiteKind::Listing(listing) => {
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::Null }};",
+                    self.program.listings[listing].name,
+                    EffectClass::None
+                ));
+                (
+                    "Listing",
+                    format!("Run::Listing({listing})"),
+                    "known(engine, answer, listing_count)?".to_owned(),
+                )
             }
             SiteKind::Model => {
                 let model = self

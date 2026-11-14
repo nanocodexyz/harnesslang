@@ -1,3 +1,4 @@
+use crate::effect::EffectClass;
 use crate::ir::{
     self, Durability, Expr, Handler, Program, SiteClass, SiteKind, Stmt, SumKind, Type,
 };
@@ -18,8 +19,34 @@ pub fn program(program: &Program) {
         );
     }
     reply(program);
+    listings(program);
     for handler in &program.handlers {
         self::handler(program, handler);
+    }
+}
+
+fn listings(program: &Program) {
+    for (id, listing) in program.listings.iter().enumerate() {
+        assert!(
+            !listing.name.contains(ir::LISTED_TOOL_SEPARATOR),
+            "a listing's name holds no separator, so a listed tool names one listing"
+        );
+        let probe = format!("{}{}tool", listing.name, ir::LISTED_TOOL_SEPARATOR);
+        assert_eq!(
+            program.listed(&probe).map(|(found, _)| found),
+            Some(id),
+            "a listing's tools are named by its prefix"
+        );
+        assert!(
+            program.tool(&listing.name).is_none(),
+            "a listing's name is not a tool's"
+        );
+    }
+    for tool in &program.tools {
+        assert!(
+            program.listed(&tool.name).is_none(),
+            "a declared tool is not named like a listed one"
+        );
     }
 }
 
@@ -102,6 +129,22 @@ fn handler(program: &Program, handler: &Handler) {
                 site.class,
                 SiteClass::Fixed(program.tools[tool].effect),
                 "a tool site has its tool's class"
+            );
+        }
+        if let SiteKind::Listing(listing) = site.kind {
+            assert!(
+                listing < program.listings.len(),
+                "a listing site reads a declared listing"
+            );
+            assert_eq!(
+                site.class,
+                SiteClass::Fixed(EffectClass::None),
+                "reading a listing is a none effect"
+            );
+            assert_eq!(
+                site.result,
+                Type::Known(Box::new(Type::U64)),
+                "a listing site yields known<u64>, the tools it admitted"
             );
         }
         if site.kind == SiteKind::Model {

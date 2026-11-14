@@ -36,6 +36,10 @@ impl ConcurrentTools for Bench {
 }
 
 impl Host for Bench {
+    fn listing(&mut self, _request: &harness::ListingRequest<'_>) -> Output {
+        panic!("the bench program reads no listing")
+    }
+
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
         self.run_tool(request)
     }
@@ -51,7 +55,7 @@ impl Host for Bench {
                 Json::object(vec![
                     ("id", Json::String(format!("c{}-{}-{index}", request.turn, request.seq))),
                     ("tool", Json::text(BATCH_TOOL)),
-                    ("input", Json::String(format!("src/file_{index}.rs"))),
+                    ("input", Json::String(format!("{{\"path\":\"src/file_{index}.rs\"}}"))),
                 ])
             })
             .collect();

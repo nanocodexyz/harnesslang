@@ -151,6 +151,7 @@ fn generate(program: &Program, target: Target) -> String {
     state(&mut out, program, &mut types);
     arguments(&mut out, program, &mut types);
     dispatch(&mut out, program);
+    inputs(&mut out, program, &mut types);
     for handler in &program.handlers {
         handler_function(&mut out, program, handler, &mut types);
     }
@@ -323,10 +324,77 @@ fn dispatch(out: &mut String, program: &Program) {
         )
         .expect("writing to a string succeeds");
     }
+    let mut listed = String::new();
+    let mut listings = Vec::new();
+    for (id, listing) in program.listings.iter().enumerate() {
+        writeln!(
+            listed,
+            "            Some(({id}, _)) => EffectClass::{:?},",
+            listing.effect
+        )
+        .expect("writing to a string succeeds");
+        listings.push(format!(
+            "({:?}, {:?}, {})",
+            listing.name,
+            listing.bound.name,
+            constant(&listing.bound.name)
+        ));
+    }
     writeln!(
         out,
-        "pub fn dispatch_class(tool: &str) -> EffectClass {{\n    match tool {{\n{arms}        _ => EffectClass::{:?},\n    }}\n}}\n",
+        "pub const LISTINGS: &[(&str, &str, u64)] = &[{}];\n",
+        listings.join(", ")
+    )
+    .expect("writing to a string succeeds");
+    writeln!(
+        out,
+        "pub fn dispatch_class(tool: &str) -> EffectClass {{\n    match tool {{\n{arms}        _ => match listed(tool) {{\n{listed}            _ => EffectClass::{:?},\n        }},\n    }}\n}}\n",
         EffectClass::undeclared()
+    )
+    .expect("writing to a string succeeds");
+}
+
+fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
+    let mut arms = String::new();
+    let mut listed = String::new();
+    let declared = program
+        .tools
+        .iter()
+        .map(|tool| (tool.name.as_str(), &tool.params));
+    let families = program
+        .listings
+        .iter()
+        .map(|listing| (listing.name.as_str(), &listing.params));
+    for (index, (name, params)) in declared.chain(families).enumerate() {
+        let names: Vec<String> = params
+            .iter()
+            .map(|param| format!("{:?}", param.name))
+            .collect();
+        let mut checks = String::new();
+        for param in params {
+            writeln!(
+                checks,
+                "    input_param(fields, {:?}, {})?;",
+                param.name,
+                types.from_json(&param.ty)
+            )
+            .expect("writing to a string succeeds");
+        }
+        writeln!(
+            out,
+            "fn input_{index}(input: &Json) -> Result<(), String> {{\n    let fields = input_fields(input)?;\n{checks}    input_extra(fields, &[{}])\n}}\n",
+            names.join(", ")
+        )
+        .expect("writing to a string succeeds");
+        match index.checked_sub(program.tools.len()) {
+            None => writeln!(arms, "        {name:?} => input_{index},"),
+            Some(listing) => writeln!(listed, "            Some(({listing}, _)) => input_{index},"),
+        }
+        .expect("writing to a string succeeds");
+    }
+    writeln!(
+        out,
+        "pub fn tool_input(tool: &str, raw: &str) -> Input {{\n    let check: fn(&Json) -> Result<(), String> = match tool {{\n{arms}        _ => match listed(tool) {{\n{listed}            _ => return Input::Untyped,\n        }},\n    }};\n    typed_input(tool, raw, check)\n}}\n"
     )
     .expect("writing to a string succeeds");
 }
