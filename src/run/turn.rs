@@ -116,6 +116,7 @@ fn check_events(program: &Program, turn: u64, log: &TurnLog) -> Result<(), Exit>
         let taken = match &event.delivery.inbound {
             Inbound::Cancel => declared.cancel,
             Inbound::Steer(_) => declared.steers.is_some(),
+            Inbound::Job(_) => declared.jobs.is_some(),
         };
         if !taken {
             return Err(corrupt(format!(
@@ -123,6 +124,15 @@ fn check_events(program: &Program, turn: u64, log: &TurnLog) -> Result<(), Exit>
                 event.delivery.inbound.name()
             )));
         }
+    }
+    let jobs = crate::run::engine::job_count(&log.events);
+    if let Some(bound) = &declared.jobs
+        && jobs > bound.value
+    {
+        return Err(corrupt(format!(
+            "turn {turn} records {jobs} job notices, more than {} ({})",
+            bound.name, bound.value
+        )));
     }
     let steers = steer_count(&log.events);
     if let Some(bound) = &declared.steers
@@ -307,6 +317,11 @@ fn ask_recover(
         job: false,
     });
     match recovered {
+        Recovered::Reply(output)
+            if job_started(&output).is_some() && program.jobs_of(&call.tool).is_some() =>
+        {
+            Recovered::Reply(output)
+        }
         Recovered::Reply(output) => {
             Recovered::Reply(value::checked_output(program, &call.tool, &returns, output))
         }

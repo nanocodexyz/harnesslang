@@ -152,6 +152,18 @@ impl<H: SideHost + ?Sized> World for Scratch<'_, H> {
         Vec::new()
     }
 
+    fn recover(&mut self, _request: &ToolRequest<'_>) -> crate::run::engine::Recovered {
+        panic!("{REFUSED}: a side question runs no external call")
+    }
+
+    fn jobs(&mut self, _turn: u64, _open: &[String]) -> Vec<String> {
+        panic!("{REFUSED}: a side question starts no turn")
+    }
+
+    fn hold(&mut self, _turn: u64, _seq: u64, _until_ms: u64) -> Result<u64, Stop> {
+        panic!("{REFUSED}: hold")
+    }
+
     fn answer(
         &mut self,
         _turn: u64,

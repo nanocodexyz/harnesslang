@@ -79,6 +79,8 @@ pub struct Dispatched {
     pub other: u64,
     pub outputs: Vec<Output>,
     pub values: Vec<Returned>,
+    pub first: Option<Output>,
+    pub recovered: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,12 +93,19 @@ pub struct Returned {
 
 impl Dispatched {
     pub fn returned(&mut self, program: &Program, request: &ToolRequest<'_>, output: &Output) {
-        let expected = crate::run::blob::expected(value::checked_output(
-            program,
-            request.tool,
-            request.returns,
-            output.clone(),
-        ));
+        if self.first.is_none() {
+            self.first = Some(output.clone());
+        }
+        let expected = if journal::job_started(output).is_some() {
+            output.clone()
+        } else {
+            crate::run::blob::expected(value::checked_output(
+                program,
+                request.tool,
+                request.returns,
+                output.clone(),
+            ))
+        };
         if program.dispatch_class(request.tool) == EffectClass::External {
             self.outputs.push(expected.clone());
         }
@@ -140,6 +149,11 @@ pub struct Stats {
     pub joined: u64,
     pub child_crashes: u64,
     pub side_questions: u64,
+    pub interrupted: u64,
+    pub recovered: [u64; 3],
+    pub jobs: u64,
+    pub job_notices: u64,
+    pub jobs_died: u64,
     pub idle_turns: u64,
     pub idle_refused: u64,
 }
@@ -214,6 +228,7 @@ pub struct SimWorld<'a> {
     listing_reads: BTreeMap<(u64, u64), u64>,
     listing_changes: u64,
     pub(crate) sides: crate::sim::side::Sides,
+    pub jobs: crate::sim::jobs::Jobs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,6 +299,7 @@ impl<'a> SimWorld<'a> {
             listing_reads: BTreeMap::new(),
             listing_changes: 0,
             sides: crate::sim::side::Sides::default(),
+            jobs: crate::sim::jobs::Jobs::default(),
         };
         world.change_listings(LISTED_PRESENT_PPM);
         world
@@ -461,6 +477,9 @@ impl<'a> SimWorld<'a> {
         );
         self.faults_left -= 1;
         self.stats.crashes += 1;
+        if !self.jobs.is_empty() {
+            self.jobs.crash(self.seed, self.stats.crashes);
+        }
         self.change_listings(LISTING_CHANGE_PPM);
         let power_loss = self.profile.power_loss;
         let Medium::Jsonl(file) = &mut self.medium else {
@@ -776,6 +795,13 @@ impl World for SimWorld<'_> {
 
     fn flush(&mut self, epoch: u64, records: &[Record]) -> Result<(), Stop> {
         for record in records {
+            if let Record::Event {
+                turn, at, delivery, ..
+            } = record
+                && matches!(delivery.inbound, journal::Inbound::Job(_))
+            {
+                self.inbox.noted(*turn, &delivery.id, *at);
+            }
             if let Record::Status { turn, .. } = record {
                 let checkpointed = records.iter().any(|other| {
                     matches!(other, Record::Checkpoint { revision, .. } if revision == turn)
@@ -1093,8 +1119,57 @@ impl World for SimWorld<'_> {
         self.answer_resume(suspension, resume, matched);
     }
 
+    fn recover(&mut self, request: &ToolRequest<'_>) -> crate::run::engine::Recovered {
+        let answer = self.recovered(request);
+        self.record("recover", || {
+            vec![
+                ("turn", Json::Number(request.turn)),
+                ("seq", Json::Number(request.seq)),
+                ("tool", Json::text(request.tool)),
+                ("input", request.input.clone()),
+                ("answer", trace::recovered_json(&answer)),
+            ]
+        });
+        answer
+    }
+
+    fn jobs(&mut self, turn: u64, open: &[String]) -> Vec<String> {
+        let lost = self.jobs.lost(open, self.stats.runs);
+        self.record("jobs", || {
+            vec![
+                ("turn", Json::Number(turn)),
+                (
+                    "open",
+                    Json::Array(open.iter().map(|key| Json::text(key)).collect()),
+                ),
+                (
+                    "answer",
+                    Json::Array(lost.iter().map(|key| Json::text(key)).collect()),
+                ),
+            ]
+        });
+        lost
+    }
+
+    fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        let pending = !self.inbox.arrived(turn).is_empty()
+            || !self.jobs.arrived(self.clock).is_empty();
+        let wake = if pending {
+            self.clock
+        } else {
+            self.jobs
+                .next_due()
+                .map_or(until_ms, |due| due.min(until_ms))
+        };
+        self.sleep_to(turn, seq, until_ms, wake, "hold")
+    }
+
     fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
-        let arrived = self.inbox.arrived(turn);
+        let mut arrived = self.inbox.arrived(turn);
+        if self.program.events.jobs.is_some() {
+            arrived.extend(self.jobs.arrived(self.clock));
+            self.jobs.drained(self.stats.runs);
+        }
         self.record("inbox", || {
             vec![
                 ("turn", Json::Number(turn)),
@@ -1112,7 +1187,14 @@ impl World for SimWorld<'_> {
                 ("answers", events::answers_json(answers)),
             ]
         });
-        self.inbox.answer(turn, position, answers);
+        let (jobs, others): (Vec<(String, Answer)>, Vec<(String, Answer)>) = answers
+            .iter()
+            .cloned()
+            .partition(|(id, _)| crate::sim::jobs::Jobs::owns(id));
+        for (id, answer) in jobs {
+            self.jobs.answer(&id, answer);
+        }
+        self.inbox.answer(turn, position, &others);
     }
 
     fn side(&mut self, turn: u64, seq: u64, buffered: &[Record]) -> Option<SideRequest> {
@@ -1258,11 +1340,54 @@ impl SimWorld<'_> {
             ))
         };
         let output = self.spawn_child(request, output);
+        let output = self.job_started(request, &mut rng, output);
         self.dispatched
             .get_mut(&journal::call_id(request.turn, request.seq))
             .expect("inserted above")
             .returned(self.program, request, &output);
         output
+    }
+
+    fn job_started(&mut self, request: &ToolRequest<'_>, rng: &mut Rng, output: Output) -> Output {
+        let starts = request.job
+            && matches!(output, Output::Ok(_))
+            && self.program.jobs_of(request.tool).is_some()
+            && rng.chance(crate::sim::jobs::JOB_START_PPM);
+        if !starts {
+            return output;
+        }
+        let key = ir::spawn_key(request.turn, request.seq);
+        self.stats.jobs += 1;
+        Output::Ok(self.jobs.start(rng, &key, request.turn, self.clock))
+    }
+
+    fn recovered(&mut self, request: &ToolRequest<'_>) -> crate::run::engine::Recovered {
+        use crate::run::engine::Recovered;
+        let id = journal::call_id(request.turn, request.seq);
+        let entry = self.dispatched.entry(id).or_default();
+        entry.recovered += 1;
+        let mut rng = Rng::derive_keyed(
+            self.seed,
+            "recover",
+            &[request.turn, request.seq, entry.recovered],
+        );
+        let answer = if rng.chance(crate::sim::jobs::RECOVER_UNKNOWN_PPM) {
+            Recovered::Unknown
+        } else if entry.external == 0 {
+            Recovered::NotDispatched
+        } else {
+            entry
+                .first
+                .clone()
+                .map_or(Recovered::Unknown, Recovered::Reply)
+        };
+        let index = match &answer {
+            Recovered::Reply(_) => 0,
+            Recovered::NotDispatched => 1,
+            Recovered::Unknown => 2,
+        };
+        self.stats.recovered[index] += 1;
+        answer
     }
 
     fn spawn_child(&mut self, request: &ToolRequest<'_>, output: Output) -> Output {

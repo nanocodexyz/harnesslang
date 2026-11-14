@@ -173,11 +173,23 @@ impl SimWorld<'_> {
     }
 
     pub fn sleep_until(&mut self, turn: u64, seq: u64, until: u64) -> Result<u64, Stop> {
+        self.sleep_to(turn, seq, until, until, "sleep")
+    }
+
+    pub fn sleep_to(
+        &mut self,
+        turn: u64,
+        seq: u64,
+        until: u64,
+        wake: u64,
+        kind: &str,
+    ) -> Result<u64, Stop> {
+        assert!(wake <= until, "a hold wakes by its deadline");
         self.count_wait();
         let before = self.clock;
-        if let Some(stop) = self.crash_mid_wait(until) {
+        if let Some(stop) = self.crash_mid_wait(wake) {
             let clock = self.clock;
-            self.record("sleep", || {
+            self.record(kind, || {
                 vec![
                     ("turn", Json::Number(turn)),
                     ("seq", Json::Number(seq)),
@@ -188,11 +200,11 @@ impl SimWorld<'_> {
             });
             return Err(stop);
         }
-        self.clock = self.clock.max(until);
+        self.clock = self.clock.max(wake);
         let slept = self.clock - before;
         self.check_sleep(turn, seq, until, slept);
         let clock = self.clock;
-        self.record("sleep", || {
+        self.record(kind, || {
             vec![
                 ("turn", Json::Number(turn)),
                 ("seq", Json::Number(seq)),

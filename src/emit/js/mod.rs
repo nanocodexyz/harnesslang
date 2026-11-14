@@ -159,12 +159,13 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Now
         | SiteKind::Random
         | SiteKind::Wait(_)
+        | SiteKind::Hold(_)
         | SiteKind::Suspend
         | SiteKind::Deny
         | SiteKind::Cell(_) => "null".to_owned(),
     };
     let (ms, cap) = match site.kind {
-        SiteKind::Wait(constant) => (
+        SiteKind::Wait(constant) | SiteKind::Hold(constant) => (
             format!("{}n", program.constants[constant].value),
             js_string(&program.constants[constant].name),
         ),
@@ -571,7 +572,9 @@ impl Writer<'_> {
                     args.join(", ")
                 ));
             }
-            Stmt::Take { result } => self.line(&format!("local_{result} = rt.take();")),
+            Stmt::Take { result, taken } => {
+                self.line(&format!("local_{result} = rt.take(\"{}\");", taken.name()));
+            }
             Stmt::Finish { value } => self.line(&format!("return {};", expr(program, value))),
         }
     }

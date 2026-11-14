@@ -70,6 +70,10 @@ impl Inbox {
         }
     }
 
+    pub fn noted(&mut self, turn: u64, id: &str, at: u64) {
+        self.recorded_at.insert((turn, id.to_owned()), at);
+    }
+
     pub fn hook(&mut self) {
         self.hooks += 1;
     }
@@ -243,7 +247,9 @@ impl Inbox {
         let journal: BTreeMap<(u64, &str), &Delivery> = records
             .iter()
             .filter_map(|record| match record {
-                Record::Event { turn, delivery, .. } => {
+                Record::Event { turn, delivery, .. }
+                    if !matches!(delivery.inbound, journal::Inbound::Job(_)) =>
+                {
                     Some(((*turn, delivery.id.as_str()), delivery))
                 }
                 _ => None,

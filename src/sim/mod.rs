@@ -5,6 +5,7 @@ pub mod exhaustive;
 pub mod faults;
 pub mod idle;
 pub mod invariants;
+pub mod jobs;
 pub mod park;
 pub mod rng;
 pub mod side;
@@ -320,6 +321,7 @@ fn run_seed_unguarded(
         && profile == "clean"
         && program.has_parallel()
         && world.inbox.scheduled.is_empty()
+        && world.jobs.is_empty()
         && let Ok(records) = &records
     {
         result = sequential_twin(
@@ -334,8 +336,15 @@ fn run_seed_unguarded(
         );
     }
     let mut stats = world.stats.clone();
-    stats.unknown = records.map_or(0, |records| unknown_count(&records));
+    stats.unknown = records
+        .as_ref()
+        .map_or(0, |records| unknown_count(records));
     stats.events = program.events.any().then_some(world.inbox.recorded);
+    stats.interrupted = records
+        .as_ref()
+        .map_or(0, |records| invariants::interrupted_count(program, records));
+    stats.job_notices = world.jobs.notices;
+    stats.jobs_died = world.jobs.died;
     let journal = world.medium.bytes();
     let acks = world.acks.len() as u64;
     let outcome = match &result {
@@ -417,6 +426,26 @@ fn sequential_twin(
     invariants::sequential_equal(records, acks, &sequential.records, &run.acks)
 }
 
+fn in_flight_stats(stats: &Stats) -> String {
+    let mut out = String::new();
+    if stats.interrupted > 0 {
+        out += &format!(" interrupted={}", stats.interrupted);
+    }
+    if stats.recovered.iter().any(|count| *count > 0) {
+        let [replied, undispatched, unknown] = stats.recovered;
+        out += &format!(
+            " recovered={replied} not_dispatched={undispatched} recover_unknown={unknown}"
+        );
+    }
+    if stats.jobs > 0 {
+        out += &format!(
+            " jobs={} job_notices={} jobs_died={}",
+            stats.jobs, stats.job_notices, stats.jobs_died
+        );
+    }
+    out
+}
+
 fn unknown_count(records: &[Record]) -> u64 {
     records
         .iter()
@@ -468,6 +497,13 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.joined += more.joined;
     total.child_crashes += more.child_crashes;
     total.side_questions += more.side_questions;
+    total.interrupted += more.interrupted;
+    for (sum, part) in total.recovered.iter_mut().zip(more.recovered) {
+        *sum += part;
+    }
+    total.jobs += more.jobs;
+    total.job_notices += more.job_notices;
+    total.jobs_died += more.jobs_died;
     total.idle_turns += more.idle_turns;
     total.idle_refused += more.idle_refused;
 }
@@ -701,7 +737,7 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                 format!(" side_questions={}", stats.side_questions)
             } else {
                 String::new()
-            },
+            } + &in_flight_stats(&stats),
         ),
     }
 }
