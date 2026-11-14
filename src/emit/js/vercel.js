@@ -14,19 +14,19 @@ class StepWait {
 }
 
 function waitJson(wait) {
-  return object([["cell", BigInt(wait.cell)], ["delay_ms", wait.delayMs], ["timer", BigInt(wait.timer)], ["until_ms", wait.untilMs]]);
+  return object([["cell", BigInt(wait.cell)], ["code", BigInt(wait.code)], ["delay_ms", wait.delayMs], ["timer", BigInt(wait.timer)], ["until_ms", wait.untilMs]]);
 }
 
 function waitFrom(json) {
   if (!isObject(json)) throw new DecodeError("a wait is an object");
   const fields = new Fields("wait", json);
-  fields.exact(["cell", "delay_ms", "timer", "until_ms"]);
+  fields.exact(["cell", "code", "delay_ms", "timer", "until_ms"]);
   const big = (key) => {
     const value = fields.get(key);
     if (typeof value !== "bigint") throw new DecodeError(`a wait's '${key}' is not a number`);
     return value;
   };
-  return { cell: fields.number("cell"), timer: fields.number("timer"), delayMs: big("delay_ms"), untilMs: big("until_ms") };
+  return { cell: fields.number("cell"), code: fields.number("code"), timer: fields.number("timer"), delayMs: big("delay_ms"), untilMs: big("until_ms") };
 }
 
 class StepWorld {

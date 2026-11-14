@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { DurableCells, TracedCells, engineDifferential } from "./js-sim-cell.mjs";
+import { CellChecks, DurableCells, TracedCells, engineDifferential } from "./js-sim-cell.mjs";
 
 const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
@@ -108,12 +108,14 @@ class Seed {
     this.nestedDispatched = new Map();
     this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0 };
     this.durableLines = () => [];
+    this.checks = new CellChecks(rt, (invariant, detail) => new Failure(invariant, detail));
     this.cells = new TracedCells(this, {
       rt,
       cursor: this.cursor,
       same,
       failure: (invariant, detail) => new Failure(invariant, detail),
       durable: () => new DurableCells(rt, this.durableLines()),
+      checks: this.checks,
     });
   }
 
@@ -170,7 +172,6 @@ class Seed {
 
   tool(request, durable) {
     if (request.nested === null) return this.topTool(request, durable);
-    this.nestedTool(request);
     if (durable !== null && durable.alarmed !== undefined) durable.alarmed(`${request.turn}/${request.seq}/code-${request.nested.id}`, request.effect);
     const event = this.cursor.next("tool", short(rt.encodeJson({ ...request, nested: BigInt(request.nested.id) })));
     same("tool call turn", event.turn, request.turn);
@@ -179,6 +180,7 @@ class Seed {
     same("tool call name", event.tool, request.tool);
     same("tool call class", event.effect, request.effect);
     same("tool call input", event.input, request.input);
+    this.checks.dispatched(this.stats.runs, request.nested, request, event.output);
     return event.output;
   }
 
@@ -203,6 +205,7 @@ class Seed {
   }
 
   wait(wait) {
+    this.checks.waited(wait, wait.code);
     if (!this.durableCells().header(wait.cell)) throw new Failure("header_before_wait", `cell ${wait.cell} waits on timer ${wait.timer} before its header is durable`);
     const event = this.cursor.next("wait", `cell ${wait.cell} timer ${wait.timer}`);
     same("wait cell", event.cell, BigInt(wait.cell));
@@ -241,6 +244,7 @@ class Seed {
   }
 
   ended(medium) {
+    this.checks.ended(this.durableLines());
     const event = this.cursor.next("end", "end of seed");
     same("journal bytes", event.journal_bytes, BigInt(Buffer.byteLength(medium)));
     same("journal crc", event.journal_crc, BigInt(rt.crc32(medium)));
@@ -253,7 +257,8 @@ class Seed {
     const fakeFetch = async (url, init) => {
       const body = rt.decodeJson(init.body);
       if (url === TOOLS_URL) {
-        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell } };
+        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
+        if (request.nested !== null) seed.nestedTool(request);
         fetchCheck(request);
         const output = seed.tool(request, fetchCheck.durable === undefined ? null : fetchCheck);
         return new Response(rt.encodeJson(output), { status: HTTP_OK });
@@ -271,6 +276,7 @@ class Seed {
       ...host,
       async tool(request) {
         seed.nestedCell = request.nested?.cell ?? null;
+        seed.nestedCode = request.nested?.code ?? null;
         return tool(request);
       },
       async wait(wait) {
@@ -380,6 +386,7 @@ async function cloudflareSeed(seed) {
       if (rt.encodeLines(records, false) !== bytes) throw differ("rows inserted before the gate", rt.encodeLines(records, false), bytes);
       seed.flushed(bytes);
       storage.commit();
+      seed.checks.flushed(storage.lines());
     },
   };
   fetchCheck.alarmed = (callId, effect) => {
@@ -482,6 +489,7 @@ class SimWorkflow {
     const output = await harness.runStep(input, context);
     if (input.kind === "run" && output.wait === undefined) {
       this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
+      this.seed.checks.flushed([...this.state.lines(), ...output.lines]);
       const request = rt.decodeJson(input.request);
       if (output.lines.some((line) => {
         const record = rt.decodeLine(line, false);

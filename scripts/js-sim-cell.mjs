@@ -271,6 +271,7 @@ export class DurableCells {
   constructor(rt, lines) {
     this.cells = new Map();
     this.nested = new Set();
+    this.entries = new Map();
     for (const line of lines) {
       const record = rt.decodeLine(line, false);
       if (record.kind === "cell") {
@@ -278,6 +279,7 @@ export class DurableCells {
         cell.header ||= record.fresh;
         cell.finished ||= record.update.finished;
         this.cells.set(record.cell, cell);
+        this.entries.set(record.cell, [...(this.entries.get(record.cell) ?? []), ...record.update.entries]);
       }
       if (record.kind === "nested_call") this.nested.add(`${record.turn}/${record.seq}/code-${record.nested}`);
     }
@@ -329,11 +331,14 @@ export class TracedCells {
     const key = this.key(cell);
     if (this.memory.has(key)) this.replaying.set(key, 0);
     return this.exchange(cell, "start", rt.object([["script", script]]), () => {
+      this.check.checks.started(this.seed.stats.runs, cell, this.check.durable().entries.get(cell) ?? []);
       const event = cursor.next("cell_start", `cell ${cell}`);
       same("cell start cell", event.cell, BigInt(cell));
       same("cell start script", event.script, script);
       this.seed.stats.cells += 1;
-      return stepFromJson(rt, event.step);
+      const step = stepFromJson(rt, event.step);
+      this.check.checks.stepped(this.seed.stats.runs, cell, step);
+      return step;
     }, null);
   }
 
@@ -344,7 +349,9 @@ export class TracedCells {
       const event = cursor.next("cell_resume", `cell ${cell} ${rt.encodeJson(json)}`);
       same("cell resume cell", event.cell, BigInt(cell));
       same("cell resume input", event.input, json);
-      return stepFromJson(rt, event.step);
+      const step = stepFromJson(rt, event.step);
+      this.check.checks.stepped(this.seed.stats.runs, cell, step);
+      return step;
     }, input);
   }
 
@@ -355,6 +362,7 @@ export class TracedCells {
       const traced = cursor.next("cell", rt.encodeJson(json));
       same("cell event", traced.observed, json);
       if (event.kind === "diverged") this.seed.stats.divergences += 1;
+      if (event.kind === "delivered") this.check.checks.delivered(this.seed.stats.runs, event.cell, event.id);
       return null;
     }, event);
   }
@@ -420,5 +428,127 @@ export async function engineDifferential(rt, cells, totals) {
       step = await engine.resume(next.raw);
     }
     totals.cells += 1;
+  }
+}
+
+const OUTPUT_STEP_KINDS = ["call", "timeout", "clock", "monotonic", "random", "bytes"];
+
+function stepMatchesEntry(rt, step, entry) {
+  if (step.kind !== entry.kind) return false;
+  if (step.kind === "bytes") return BigInt(entry.data.length) === step.length;
+  return rt.sameStep(entry, { atMs: 0n, ...step });
+}
+
+export class CellChecks {
+  constructor(rt, failure) {
+    this.rt = rt;
+    this.failure = failure;
+    this.outputs = new Map();
+    this.divergedCells = new Set();
+    this.running = new Map();
+    this.issued = new Map();
+    this.armed = new Map();
+    this.dispatchedOutputs = new Map();
+  }
+
+  started(run, cell, durableEntries) {
+    this.outputs.set(`${run}/${cell}`, { journal: durableEntries.filter((entry) => !this.rt.entryIsInput(entry)), taken: 0 });
+    this.divergedCells.delete(`${run}/${cell}`);
+  }
+
+  stepped(run, cell, step) {
+    const key = `${run}/${cell}`;
+    const outputs = this.outputs.get(key);
+    if (outputs === undefined || !OUTPUT_STEP_KINDS.includes(step.kind)) return;
+    const index = outputs.taken;
+    outputs.taken += 1;
+    if (index < outputs.journal.length && !stepMatchesEntry(this.rt, step, outputs.journal[index])) this.divergedCells.add(key);
+  }
+
+  delivered(run, cell, id) {
+    this.running.get(`${run}/${cell}`)?.delete(id);
+  }
+
+  dispatched(run, nested, request, output) {
+    const { cell, id, code } = nested;
+    const key = `${run}/${cell}`;
+    const callId = `${request.turn}/${request.seq}/code-${id}`;
+    if (this.divergedCells.has(key)) throw this.failure("cell_replay_equal", `nested call ${callId} was dispatched after cell ${cell} diverged from its journal`);
+    const bounds = this.rt.PROGRAM.codes[code];
+    const issued = this.issued.get(cell) ?? new Set();
+    issued.add(id);
+    this.issued.set(cell, issued);
+    if (BigInt(issued.size) > bounds.calls.value) {
+      throw this.failure("cell_bounded", `cell ${cell} dispatched ${issued.size} nested calls, past calls (${bounds.calls.name} = ${bounds.calls.value})`);
+    }
+    const running = this.running.get(key) ?? new Set();
+    running.add(id);
+    this.running.set(key, running);
+    if (BigInt(running.size) > bounds.parallel.value) {
+      throw this.failure("cell_bounded", `cell ${cell} runs ${running.size} nested calls at once, past parallel (${bounds.parallel.name} = ${bounds.parallel.value})`);
+    }
+    const outputs = this.dispatchedOutputs.get(callId) ?? [];
+    outputs.push(output);
+    this.dispatchedOutputs.set(callId, outputs);
+  }
+
+  waited(wait, code) {
+    const bounds = this.rt.PROGRAM.codes[code];
+    const armed = this.armed.get(wait.cell) ?? new Set();
+    armed.add(wait.timer);
+    this.armed.set(wait.cell, armed);
+    if (BigInt(armed.size) > bounds.timers.value) {
+      throw this.failure("cell_bounded", `cell ${wait.cell} waits on ${armed.size} timers, past timers (${bounds.timers.name} = ${bounds.timers.value})`);
+    }
+    if (wait.delayMs > bounds.timerMs.value) {
+      throw this.failure("cell_bounded", `cell ${wait.cell} waits ${wait.delayMs} ms, past timer_ms (${bounds.timerMs.name} = ${bounds.timerMs.value})`);
+    }
+  }
+
+  flushed(lines) {
+    const seen = new Set();
+    for (const line of lines) {
+      const record = this.rt.decodeLine(line, false);
+      if (record.kind !== "nested_call") continue;
+      const callId = `${record.turn}/${record.seq}/code-${record.nested}`;
+      if (seen.has(callId)) throw this.failure("seq_unique", `nested call ${callId} has two call records`);
+      seen.add(callId);
+    }
+  }
+
+  ended(lines) {
+    const rt = this.rt;
+    const reported = new Set();
+    const tools = new Map();
+    for (const line of lines) {
+      const record = rt.decodeLine(line, false);
+      if (record.kind === "recovery") for (const [seq, nested] of record.nested) reported.add(`${record.turn}/${seq}/code-${nested}`);
+      if (record.kind === "nested_result") {
+        const callId = `${record.turn}/${record.seq}/code-${record.nested}`;
+        const outputs = this.dispatchedOutputs.get(callId) ?? [];
+        const recorded = rt.encodeJson(record.output.tag === "ok" ? rt.object([["ok", record.output.value]]) : rt.object([["failed", record.output.error]]));
+        if (!outputs.some((output) => rt.encodeJson(output) === recorded)) {
+          throw this.failure("unknown_nested_reported", `nested call ${callId} has result ${recorded}, which its tool never returned`);
+        }
+      }
+      if (record.kind === "cell") this.cellEnded(record, reported, tools);
+    }
+  }
+
+  cellEnded(record, reported, tools) {
+    const rt = this.rt;
+    const origin = record.update.header?.originCallId;
+    if (origin !== undefined) tools.set(record.cell, { origin, names: new Map() });
+    const cell = tools.get(record.cell);
+    for (const entry of record.update.entries) {
+      if (entry.kind === "call") cell.names.set(entry.id, entry.name);
+      if (entry.kind !== "result" || entry.success) continue;
+      const json = rt.decodeJson(entry.encoded);
+      if (!(rt.isObject(json) && json.outcome === "unknown")) continue;
+      const callId = `${cell.origin}/code-${entry.id}`;
+      const tool = rt.PROGRAM.tools.find((candidate) => candidate.name === cell.names.get(entry.id));
+      if (tool !== undefined && tool.effect !== "external") throw this.failure("nested_known", `${tool.effect} nested call ${callId} ended with the unknown outcome`);
+      if (!reported.has(callId)) throw this.failure("unknown_nested_reported", `nested call ${callId} was given the unknown outcome without a recovery record listing it`);
+    }
   }
 }

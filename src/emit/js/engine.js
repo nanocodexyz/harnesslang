@@ -607,5 +607,5 @@ const runtime = {
   Panic, Trap, Corrupt, DecodeError, HostError,
   encodeJson, decodeJson, crc32, encodeLine, decodeLine, encodeLines, decodeLines,
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
-  Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS,
+  Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
 };
