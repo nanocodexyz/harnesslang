@@ -105,15 +105,6 @@ function rustDebugByte(byte, quote) {
   return unprintable ? `\\u{${byte.toString(16)}}` : String.fromCharCode(byte);
 }
 
-function rustDebugText(text) {
-  let out = "\"";
-  for (const character of text) {
-    const code = character.codePointAt(0);
-    out += code < BYTE_VALUES ? rustDebugByte(code, 0x22) : character;
-  }
-  return out + "\"";
-}
-
 function base64Decode(text) {
   const bytes = textEncoder.encode(text);
   if (bytes.length % BASE64_GROUP_CHARS !== 0) return { error: `${bytes.length} characters, not a multiple of ${BASE64_GROUP_CHARS}` };
@@ -310,7 +301,7 @@ function notDiscovered(tool, listing) {
 }
 
 function notFound(tool, found, listing) {
-  return `${tool} found ${rustDebugText(found)}, which listing ${listing} did not list in this turn`;
+  return `${tool} found ${found}, which listing ${listing} did not list in this turn`;
 }
 
 function checkedSearch(tool, listing, admitted, output) {
