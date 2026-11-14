@@ -621,7 +621,17 @@ fn recover(log: &mut TurnLog) -> Vec<u64> {
 }
 
 pub fn run_turn(world: &mut dyn World, epoch: u64, records: &[Record], request: &TurnRequest) -> Result<Ran, Exit> {
-    let session = fold(records).map_err(corrupt)?;
+    run_turn_from(world, epoch, Start::Beginning, records, request)
+}
+
+pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &[Record], request: &TurnRequest) -> Result<Ran, Exit> {
+    if let Start::Checkpoint(revision) = start {
+        assert!(
+            request.turn > revision,
+            "a turn runs over a journal read from after it finished"
+        );
+    }
+    let session = fold_from(start, records).map_err(corrupt)?;
     let handler = program::handler_name(&request.arguments);
     let arguments = program::arguments_json(&request.arguments);
     if let Some(log) = session.turns.get(&request.turn)
@@ -649,7 +659,10 @@ pub fn run_turn(world: &mut dyn World, epoch: u64, records: &[Record], request: 
             log
         }
         None => {
-            let next = session.turns.last_key_value().map_or(1, |(last, _)| last + 1);
+            let next = session
+                .turns
+                .last_key_value()
+                .map_or(session.start.first_turn(), |(last, _)| last + 1);
             if request.turn != next {
                 return Err(corrupt(format!(
                     "turn {} is requested when turn {next} is next",

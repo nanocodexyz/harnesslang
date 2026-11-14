@@ -80,6 +80,7 @@ fn unhex(text: &str) -> Vec<u8> {
 pub struct Stats {
     pub seeds: u64,
     pub runs: u64,
+    pub tail_opens: u64,
     pub flushes: u64,
     pub records: u64,
     pub syncs: u64,
@@ -113,12 +114,15 @@ impl Driver {
         let bytes = self.opened_bytes(event);
         let epoch = number(event, "epoch");
         let request = self.request.clone().unwrap_or_else(|| fail("a run before any turn"));
-        let (records, opened_epoch) = store::open(self, epoch, &bytes);
+        let (start, records, opened_epoch) = store::open(self, epoch, &bytes, request.turn);
+        if start != harness::Start::Beginning {
+            self.stats.tail_opens += 1;
+        }
         if opened_epoch != epoch {
             fail(&format!("the generated store opened epoch {opened_epoch}, the interpreter {epoch}"));
         }
         self.stats.runs += 1;
-        let ran = harness::run_turn(self, epoch, &records, &request);
+        let ran = harness::run_turn_from(self, epoch, start, &records, &request);
         let result = match &ran {
             Ok(Ran::Finished(_)) => "finished",
             Ok(Ran::AlreadyFinished(_)) => "already_finished",
@@ -279,12 +283,13 @@ fn main() {
     }
     let stats = &driver.stats;
     println!(
-        "ok backend=rust target={} harness={} seeds={} events={} runs={} owners={} flushes={} records={} writes={} syncs={} statements={}",
+        "ok backend=rust target={} harness={} seeds={} events={} runs={} tail_opens={} owners={} flushes={} records={} writes={} syncs={} statements={}",
         program::TARGET,
         program::HARNESS_NAME,
         stats.seeds,
         driver.events.index,
         stats.runs,
+        stats.tail_opens,
         stats.owners,
         stats.flushes,
         stats.records,

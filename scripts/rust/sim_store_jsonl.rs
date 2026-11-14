@@ -1,4 +1,4 @@
-use crate::harness::{self, Disk, Record, Stop};
+use crate::harness::{self, Disk, Record, Start, Stop};
 use crate::{Driver, fail, text};
 
 #[derive(Default)]
@@ -8,12 +8,17 @@ pub struct State {
     opening: bool,
 }
 
-pub fn open(driver: &mut Driver, epoch: u64, bytes: &[u8]) -> (Vec<Record>, u64) {
+pub fn open(driver: &mut Driver, epoch: u64, bytes: &[u8], turn: u64) -> (Start, Vec<Record>, u64) {
+    harness::jsonl_self_check();
     driver.store.contents = bytes.to_vec();
     driver.store.opening = true;
-    let opened = harness::jsonl_open(driver).unwrap_or_else(|error| fail(&error.to_string()));
+    let opened =
+        harness::jsonl_open_for(driver, turn).unwrap_or_else(|error| fail(&error.to_string()));
     driver.store.opening = false;
-    (opened.records, epoch.min(0))
+    if driver.store.contents.len() != bytes.len() - opened.dropped_bytes {
+        fail("the generated store kept other bytes than its records");
+    }
+    (opened.start, opened.records, epoch.min(0))
 }
 
 pub fn flush(driver: &mut Driver, _epoch: u64, records: &[Record]) -> Result<(), Stop> {
@@ -21,13 +26,21 @@ pub fn flush(driver: &mut Driver, _epoch: u64, records: &[Record]) -> Result<(),
 }
 
 impl Disk for Driver {
-    fn contents(&mut self) -> std::io::Result<Vec<u8>> {
+    fn length(&mut self) -> std::io::Result<u64> {
         assert!(self.store.opening, "the store reads the file only at open");
-        Ok(self.store.contents.clone())
+        Ok(self.store.contents.len() as u64)
+    }
+
+    fn read_at(&mut self, offset: u64, length: u64) -> std::io::Result<Vec<u8>> {
+        assert!(self.store.opening, "the store reads the file only at open");
+        Ok(self.store.contents[offset as usize..(offset + length) as usize].to_vec())
     }
 
     fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        assert!(!self.store.opening, "the store appends only when it flushes");
+        assert!(
+            !self.store.opening,
+            "the store appends only when it flushes"
+        );
         if self.store.answer.is_some() {
             fail("the generated store wrote twice in one flush");
         }

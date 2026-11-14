@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 pub const JSON_DEPTH_MAX: u32 = 128;
 pub const FIRST_SEQ: u64 = 1;
+pub const FIRST_TURN: u64 = 1;
 pub const CRC32_POLYNOMIAL_REFLECTED: u32 = 0xedb8_8320;
 pub const CRC32_CHECK_INPUT: &[u8] = b"123456789";
 pub const CRC32_CHECK: u32 = 0xcbf4_3926;
@@ -900,8 +901,25 @@ pub struct TurnLog {
     pub finished: Option<Finished>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Start {
+    #[default]
+    Beginning,
+    Checkpoint(u64),
+}
+
+impl Start {
+    pub const fn first_turn(self) -> u64 {
+        match self {
+            Self::Beginning => FIRST_TURN,
+            Self::Checkpoint(revision) => revision + 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Session {
+    pub start: Start,
     pub turns: BTreeMap<u64, TurnLog>,
     pub checkpoints: BTreeMap<u64, String>,
 }
@@ -928,14 +946,40 @@ fn next_site(log: &mut TurnLog, turn: u64, seq: u64, site: SiteLog) -> Result<()
 }
 
 pub fn fold(records: &[Record]) -> Result<Session, String> {
-    let mut session = Session::default();
-    for record in records {
+    fold_from(Start::Beginning, records)
+}
+
+pub fn fold_from(start: Start, records: &[Record]) -> Result<Session, String> {
+    let mut session = Session {
+        start,
+        ..Session::default()
+    };
+    let rest = match start {
+        Start::Beginning => records,
+        Start::Checkpoint(revision) => {
+            let Some((Record::Checkpoint { revision: first, payload, .. }, rest)) = records.split_first() else {
+                return Err(format!("a journal read from checkpoint {revision} does not start with it"));
+            };
+            if *first != revision {
+                return Err(format!("a journal read from checkpoint {revision} starts with checkpoint {first}"));
+            }
+            session.checkpoints.insert(revision, payload.clone());
+            rest
+        }
+    };
+    for record in rest {
         apply(&mut session, record)?;
     }
     Ok(session)
 }
 
 fn admit(session: &mut Session, turn: u64, handler: &str, arguments: &Json) -> Result<(), String> {
+    if let Start::Checkpoint(revision) = session.start
+        && session.turns.is_empty()
+        && turn != revision + 1
+    {
+        return Err(format!("turn {turn} is admitted after checkpoint {revision}"));
+    }
     if let Some((last, log)) = session.turns.last_key_value() {
         if turn != last + 1 {
             return Err(format!("turn {turn} is admitted after turn {last}"));
