@@ -346,3 +346,17 @@ Measurements (5-core Linux Hand shared with about 7 agents, load average 9 to 12
 - `nice scripts/check.sh`: passed in 117 s before a final refactor that split one function, and in 144 s on the commit (load average 8.6 at its start, after waiting for other agents' check.sh runs to finish).
 
 Commands: `hl emit --target T examples/subagents.hl | cmp - <(hl emit --target T examples/inlined/subagents.hl)`, `hl check examples/invalid/fn_recursion.hl`, `scripts/check.sh` (`same_program`).
+
+## 2026-11-14: --strict and --exhaustive together; scripts/strict.sh
+
+The prover-soundness work (`hl sim --strict [--any-state]`, invariant arithmetic range checks, closed-form loop sums, `examples/sound/`) merged onto the branch that added `hl sim --exhaustive` and list arguments in the simulator.
+
+- `generate` draws list arguments (the exhaustive branch) and takes the strict mode's `Edges` (u64 values at the edges, list lengths included); the exhaustive explorer passes none. The prover-soundness `supported` check, which refused list arguments, is gone with the refusal.
+- `--exhaustive` refuses `--strict` and `--any-state` as it refuses `--twice`, `--trace` and `--dump-journal`: the explorer enumerates crash points of a fixed workload and has no strict model persona or drawn entry state. `--any-state` without `--strict` and either with `--dump-journal` stay usage errors (exit 2). The usage text and docs/LANGUAGE.md list both forms.
+- `scripts/strict.sh`, run by check.sh: the six refused combinations exit 2; every example and every `examples/sound/` example passes `--strict` and `--strict --any-state` on every target (`STRICT_SEEDS`, default 0..6, because the greedy persona drives each session to its worst case: agent.hl at 20 seeds dispatches 19,532 externals under --strict against 769 without); and the prover's rejected examples fail under --strict in seeds 0..50 with the invariant the proof promised: and_overflow, coefficient_overflow and loop_sum_lower with no_trap, invariant_underflow and invariant_return with invariant_kept, in both modes, and invariant_initial with invariant_kept from the zero state (from any state the drawn entry satisfies the invariant by construction, so it is not expected).
+- Prover step counts quoted in docs/LANGUAGE.md move with the soundness checks: 2-requires.hl 14 to 15, agent.hl on cloudflare 4,098 to 4,192.
+
+Measurements (5-core Hand shared by about 6 agents, load average about 11): `hl sim --target native-jsonl --seeds 0..20 --strict examples/agent.hl` gives the same line (turns=137 runs=714 dispatches=19532 unknown=229) from this branch and from the prover-soundness tip; `hl sim --exhaustive --target native-jsonl --seeds 0..2 examples/agent.hl` explores 722 states. `scripts/strict.sh` takes about 60 s; `nice scripts/check.sh` exits 0 (runtime in the commit that lands this).
+
+Commands: `nice scripts/strict.sh`, `nice scripts/docs-check.sh`, `CARGO_BUILD_JOBS=2 nice scripts/check.sh`.
+

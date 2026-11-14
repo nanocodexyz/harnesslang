@@ -1,0 +1,17 @@
+harness invariant_underflow
+
+const gap_max: u64 = 5
+
+invariant close: spent - earned <= gap_max
+
+state {
+  spent: u64
+  earned: u64
+}
+
+on earn(amount: u64) -> u64
+  requires amount <= gap_max and earned <= gap_max
+{
+  earned = earned + amount
+  return earned
+}

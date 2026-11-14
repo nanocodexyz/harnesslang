@@ -1,0 +1,13 @@
+harness coefficient_overflow
+
+const half: u64 = 9223372036854775808
+
+state {
+  total: u64
+}
+
+on double(x: u64, y: u64, z: u64) -> u64
+  requires x == y
+{
+  return (x - y) * half * half + z + ((x - y) * half * half + z)
+}
