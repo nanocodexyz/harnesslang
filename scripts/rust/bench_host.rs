@@ -184,23 +184,23 @@ fn open(path: &std::path::Path, turns: u64) {
     let cpu_started = cpu_ms();
     let started = std::time::Instant::now();
     let opened = store::open(path);
-    let session =
-        harness::fold(&opened.records).unwrap_or_else(|error| panic!("the journal folds: {error}"));
-    let next = session
-        .turns
+    let session = &opened.session;
+    let last_turn = session.turns.last_key_value().map_or(0, |(last, _)| *last);
+    let last_checkpoint = session
+        .checkpoints
         .last_key_value()
-        .map_or(1, |(last, _)| last + 1);
-    let state = harness::state_before(&session, next)
+        .map_or(0, |(last, _)| *last);
+    let next = last_turn.max(last_checkpoint) + 1;
+    let state = harness::state_before(session, next)
         .unwrap_or_else(|exit| panic!("the state before turn {next} builds: {exit:?}"));
     let elapsed = started.elapsed();
     let cpu = cpu_ms() - cpu_started;
     let encoded = program::state_json(&state).encode();
-    for turn in 1..=turns {
-        let finished = session
-            .turns
-            .get(&turn)
-            .is_some_and(|log| log.finished.is_some());
-        assert!(finished, "turn {turn} is finished in the journal");
+    for (turn, log) in &session.turns {
+        assert!(
+            log.finished.is_some(),
+            "turn {turn} is finished in the journal"
+        );
     }
     assert_eq!(
         next,
@@ -208,9 +208,10 @@ fn open(path: &std::path::Path, turns: u64) {
         "the journal holds exactly the bench's turns"
     );
     println!(
-        "open open_ms={:.3} open_cpu_ms={cpu:.3} records={} state_bytes={} {}",
+        "open open_ms={:.3} open_cpu_ms={cpu:.3} records_read={} turns_folded={} state_bytes={} {}",
         milliseconds(elapsed),
-        opened.records.len(),
+        opened.records,
+        session.turns.len(),
         encoded.len(),
         opened.report
     );

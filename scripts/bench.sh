@@ -54,8 +54,12 @@ done
 rm -rf "$out/runs" "$out/input"
 mkdir -p "$out/build" "$out/runs" "$out/input"
 
-if [ ! -x "$hl" ]; then
+head_time=$(git -C "$hl_root" log -1 --format=%ct 2> /dev/null || echo 0)
+if [ ! -x "$hl" ] || [ "$(stat -c %Y "$hl")" -lt "$head_time" ]; then
   (cd "$hl_root" && nice cargo build --release --locked -j1 --quiet)
+fi
+if [ -n "$(git -C "$hl_root" status --porcelain -- src 2> /dev/null)" ]; then
+  echo "bench: note: $hl_root has uncommitted changes under src/, which its hl may or may not include"
 fi
 if [[ " $contenders " == *" nanocode-turnlog "* ]]; then
   (cd oracle && nice cargo build --release --locked -j1 --quiet --bin turnlog_bench)
@@ -73,9 +77,15 @@ build_host() {
   fi
   mv "$dir/harness.rs.new" "$dir/harness.rs"
   cp scripts/rust/bench_host.rs "$dir/bench_host.rs"
+  if [ "$store" = jsonl ] && grep -q '^pub struct JsonlJournal' "$dir/harness.rs"; then
+    store=jsonl_tail
+  fi
   cp "scripts/rust/bench_store_$store.rs" "$dir/store.rs"
+  echo "bench: $target host uses scripts/rust/bench_store_$store.rs"
   local link=()
-  [ "$store" = jsonl ] || link=(-C "link-arg=$sqlite_lib")
+  if [ "$store" = sql ]; then
+    link=(-C "link-arg=$sqlite_lib")
+  fi
   local key
   key=$(cat "$dir/harness.rs" "$dir/bench_host.rs" "$dir/store.rs" | cksum | cut -d' ' -f1)-$opt-$sqlite_lib
   if [ -x "$dir/host" ] && [ "$(cat "$dir/key" 2> /dev/null)" = "$key" ]; then
@@ -182,11 +192,12 @@ check_run() {
   fi
   if [ "$contender" = hl-jsonl ]; then
     cmp -s "$data" "$input/journal.jsonl" || fail "hl-jsonl round $round wrote a journal unlike the reference run's"
-    local flushes model
+    local flushes opens model
     flushes=$(field flushes "$dir/run.out")
-    model=$((flushes + turns + jsonl_directory_syncs))
+    opens=$(field opens "$dir/run.out")
+    model=$((flushes + opens + jsonl_directory_syncs))
     [ "$fsyncs" -eq "$model" ] ||
-      fail "hl-jsonl round $round made $fsyncs fsyncs; native-jsonl's model is one per flush ($flushes), one per open ($turns) and one for the new file's directory ($jsonl_directory_syncs): $model"
+      fail "hl-jsonl round $round made $fsyncs fsyncs; native-jsonl's model is one per flush ($flushes), one per open ($opens) and one for the new file's directory ($jsonl_directory_syncs): $model"
   fi
   local wall cpu open_ms open_cpu flush_ms line
   wall=$(field wall_ms "$dir/run.out")

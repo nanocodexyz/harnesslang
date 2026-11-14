@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::Bench;
-use crate::harness::{self, Disk, FileDisk, Ran, Record, TurnRequest};
+use crate::harness::{self, Disk, FileDisk, Ran, TurnRequest};
 
 const SIDECAR_SUFFIX: &str = "flushes";
 
@@ -50,6 +50,7 @@ impl Disk for Counted {
 pub struct Session {
     disk: Counted,
     directory_syncs: u64,
+    opens: u64,
 }
 
 impl Session {
@@ -65,10 +66,12 @@ impl Session {
                 open_syncs: 0,
             },
             directory_syncs: 1,
+            opens: 0,
         }
     }
 
     pub fn turn(&mut self, bench: &mut Bench, request: &TurnRequest) -> Ran {
+        self.opens += 1;
         harness::run_jsonl(bench, &mut self.disk, request)
             .unwrap_or_else(|error| panic!("turn {}: {error:?}", request.turn))
     }
@@ -86,9 +89,10 @@ impl Session {
             .unwrap_or_else(|error| panic!("{sidecar_path:?}: {error}"));
         let records: u64 = disk.flushes.iter().sum();
         format!(
-            "records={records} flushes={} flush_ms={:.3} open_syncs={} directory_syncs={} syncs_counted={}",
+            "records={records} flushes={} flush_ms={:.3} opens={} open_syncs={} directory_syncs={} syncs_counted={}",
             disk.flushes.len(),
             crate::milliseconds(disk.flush_time),
+            self.opens,
             disk.open_syncs,
             self.directory_syncs,
             disk.file.syncs + self.directory_syncs
@@ -97,7 +101,8 @@ impl Session {
 }
 
 pub struct Opened {
-    pub records: Vec<Record>,
+    pub session: harness::Session,
+    pub records: usize,
     pub report: String,
 }
 
@@ -105,8 +110,11 @@ pub fn open(path: &std::path::Path) -> Opened {
     assert!(path.exists(), "the journal to open exists");
     let mut disk = FileDisk::open(path).unwrap_or_else(|error| panic!("{path:?}: {error}"));
     let opened = harness::jsonl_open(&mut disk).unwrap_or_else(|error| panic!("{error}"));
+    let session =
+        harness::fold(&opened.records).unwrap_or_else(|error| panic!("the journal folds: {error}"));
     Opened {
-        records: opened.records,
+        session,
+        records: opened.records.len(),
         report: format!("dropped_bytes={}", opened.dropped_bytes),
     }
 }

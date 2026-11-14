@@ -3,9 +3,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::time::{Duration, Instant};
 
 use crate::Bench;
-use crate::harness::{
-    self, Ran, Record, Sql, SqlError, SqlJournal, SqlValue, Statement, TurnRequest,
-};
+use crate::harness::{self, Ran, Sql, SqlError, SqlJournal, SqlValue, Statement, TurnRequest};
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
@@ -306,7 +304,8 @@ impl Session {
 }
 
 pub struct Opened {
-    pub records: Vec<Record>,
+    pub session: harness::Session,
+    pub records: usize,
     pub report: String,
 }
 
@@ -317,8 +316,11 @@ pub fn open(path: &std::path::Path) -> Opened {
     let mut journal = journal();
     let opened =
         harness::sql_open(&mut database, &mut journal).unwrap_or_else(|error| panic!("{error}"));
+    let session =
+        harness::fold(&opened.records).unwrap_or_else(|error| panic!("the journal folds: {error}"));
     Opened {
-        records: opened.records,
+        session,
+        records: opened.records.len(),
         report: format!("epoch={}", opened.epoch),
     }
 }
