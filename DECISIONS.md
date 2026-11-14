@@ -166,6 +166,6 @@ What writing it found:
 - ARCHITECTURE.md's targets table lists "outbound requests and wall time per Function" as Vercel's checked limits, but the Vercel model has no request limit and reports its duration without checking it; it also says Cloudflare splits an over-limit handler into continuations, which is not built (`hl check` refuses it), and lists `spawn` and `wait` among effects, which the parser does not have. LANGUAGE.md states what the code does.
 - The language has no comments (the lexer has none), so snippets carry no annotation and the doc's prose explains them.
 
-Measurements (5-core Linux Hand shared with about 14 agents, load average 12 to 18): `scripts/docs-check.sh` MEASURE_FULL; the 46 LANGUAGE.md commands alone take 2.0 s at load 12, of which 1.2 s is the 200-seed `hl sim`.
+Measurements (5-core Linux Hand shared with about 14 agents, load average 12 to 18): `scripts/docs-check.sh` end to end took 45 s at load 18 and 54 s at load 20, most of it the seven planted-bug runs, each of which rereads the source lists and constants and reruns commands up to its failure; `scripts/check.sh` end to end passed in 141 s at load 20; the 46 LANGUAGE.md commands alone take 2.0 s at load 12, of which 1.2 s is the 200-seed `hl sim`.
 
 Commands: `scripts/docs-check.sh`, `DOCS_CHECK_SELF=0 scripts/docs-check.sh` (without the snippet census and the planted bugs, as the planted bugs themselves run it).
