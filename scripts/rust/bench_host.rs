@@ -19,6 +19,31 @@ const WORDS: [&str; 12] = [
 ];
 const NANOS_PER_MILLI: f64 = 1_000_000.0;
 
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_WORDS: usize = 18;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_MILLI: f64 = 1_000.0;
+
+#[repr(C)]
+struct Rusage {
+    words: [i64; RUSAGE_WORDS],
+}
+
+unsafe extern "C" {
+    fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+}
+
+fn cpu_ms() -> f64 {
+    let mut usage = Rusage {
+        words: [0; RUSAGE_WORDS],
+    };
+    let status = unsafe { getrusage(RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage of this process succeeds");
+    let [user_seconds, user_micros, system_seconds, system_micros, ..] = usage.words;
+    let micros = (user_seconds + system_seconds) * MICROS_PER_SECOND + user_micros + system_micros;
+    micros as f64 / MICROS_PER_MILLI
+}
+
 pub struct Rng(u64);
 
 impl Rng {
@@ -133,6 +158,7 @@ fn run(path: &std::path::Path, turns: u64) {
         tools: 0,
     };
     let mut prompts = Rng(BENCH_SEED.wrapping_add(SPLITMIX_GAMMA));
+    let cpu_started = cpu_ms();
     let started = std::time::Instant::now();
     let mut session = store::Session::create(path);
     for turn in 1..=turns {
@@ -144,9 +170,10 @@ fn run(path: &std::path::Path, turns: u64) {
         }
     }
     let wall = started.elapsed();
+    let cpu = cpu_ms() - cpu_started;
     assert_eq!(bench.acknowledged, turns, "every turn is acknowledged once");
     println!(
-        "run turns={turns} wall_ms={:.3} tools={} {}",
+        "run turns={turns} wall_ms={:.3} cpu_ms={cpu:.3} tools={} {}",
         milliseconds(wall),
         bench.tools,
         session.report(path)

@@ -21,6 +21,31 @@ const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
 const NANOS_PER_MILLI: f64 = 1_000_000.0;
 
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_WORDS: usize = 18;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_MILLI: f64 = 1_000.0;
+
+#[repr(C)]
+struct Rusage {
+    words: [i64; RUSAGE_WORDS],
+}
+
+unsafe extern "C" {
+    fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+}
+
+fn cpu_ms() -> f64 {
+    let mut usage = Rusage {
+        words: [0; RUSAGE_WORDS],
+    };
+    let status = unsafe { getrusage(RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage of this process succeeds");
+    let [user_seconds, user_micros, system_seconds, system_micros, ..] = usage.words;
+    let micros = (user_seconds + system_seconds) * MICROS_PER_SECOND + user_micros + system_micros;
+    micros as f64 / MICROS_PER_MILLI
+}
+
 fn ready<T>(future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let mut context = Context::from_waker(Waker::noop());
@@ -262,6 +287,7 @@ fn run(journal_path: &Path, flushes_path: &Path, out: &Path, turns: u64) -> Resu
     if out.exists() {
         return Err(format!("{}: the bench starts from no log", out.display()));
     }
+    let cpu_started = cpu_ms();
     let started = Instant::now();
     let host = Arc::new(FileLog::open(out)?);
     let log = ready(TurnLog::open(host.clone(), SCOPE)).map_err(|error| error.to_string())?;
@@ -278,10 +304,11 @@ fn run(journal_path: &Path, flushes_path: &Path, out: &Path, turns: u64) -> Resu
         ready(lease.commit(point(flush))).map_err(|error| error.to_string())?;
     }
     let wall = started.elapsed();
+    let cpu = cpu_ms() - cpu_started;
     assert!(rest.is_empty(), "the flushes cover every record");
     let stats = ready(log.stats());
     println!(
-        "run turns={turns} wall_ms={:.3} records={} flushes={} flush_ms={:.3} syncs_counted={} appends={} snapshots={} boundaries={} row_bytes={} snapshot_bytes={} plain_bytes={} retired={}",
+        "run turns={turns} wall_ms={:.3} cpu_ms={cpu:.3} records={} flushes={} flush_ms={:.3} syncs_counted={} appends={} snapshots={} boundaries={} row_bytes={} snapshot_bytes={} plain_bytes={} retired={}",
         milliseconds(wall),
         records.len(),
         flushes.len(),

@@ -188,12 +188,13 @@ check_run() {
     [ "$fsyncs" -eq "$model" ] ||
       fail "hl-jsonl round $round made $fsyncs fsyncs; native-jsonl's model is one per flush ($flushes), one per open ($turns) and one for the new file's directory ($jsonl_directory_syncs): $model"
   fi
-  local wall open_ms flush_ms line
+  local wall cpu open_ms flush_ms line
   wall=$(field wall_ms "$dir/run.out")
+  cpu=$(field cpu_ms "$dir/run.out")
   flush_ms=$(field flush_ms "$dir/run.out")
   open_ms=$(field open_ms "$dir/open.out")
-  line=$(awk -v c="$contender" -v r="$round" -v t="$turns" -v w="$wall" -v f="$flush_ms" -v b="$bytes" -v o="$open_ms" -v s="$fsyncs" -v n="$records" 'BEGIN {
-    printf "bench contender=%s round=%d turns=%d wall_ms=%.1f ms_per_turn=%.3f flush_ms=%.1f bytes=%d bytes_per_turn=%.0f open_ms=%.3f fsyncs=%s records=%d", c, r, t, w, w / t, f, b, b / t, o, s, n
+  line=$(awk -v c="$contender" -v r="$round" -v t="$turns" -v w="$wall" -v f="$flush_ms" -v u="$cpu" -v b="$bytes" -v o="$open_ms" -v s="$fsyncs" -v n="$records" 'BEGIN {
+    printf "bench contender=%s round=%d turns=%d wall_ms=%.1f ms_per_turn=%.3f cpu_ms_per_turn=%.3f flush_ms=%.1f bytes=%d bytes_per_turn=%.0f open_ms=%.3f fsyncs=%s records=%d", c, r, t, w, w / t, u / t, f, b, b / t, o, s, n
   }')
   echo "$line"
   echo "$line" >> "$out/results"
@@ -235,15 +236,15 @@ summary() {
       c = value($0, "contender")
       if (!(c in runs)) order[++contenders] = c
       n = ++runs[c]
-      per_turn[c, n] = value($0, "ms_per_turn"); open[c, n] = value($0, "open_ms"); flush[c, n] = value($0, "flush_ms")
+      per_turn[c, n] = value($0, "ms_per_turn"); cpu[c, n] = value($0, "cpu_ms_per_turn"); open[c, n] = value($0, "open_ms"); flush[c, n] = value($0, "flush_ms")
       bytes[c] = value($0, "bytes"); bytes_turn[c] = value($0, "bytes_per_turn"); fsyncs[c] = value($0, "fsyncs")
     }
     END {
-      printf "%-17s %-30s %-28s %-32s %10s %14s %8s\n", "contender", "ms_per_turn median [min..max]", "open_ms median [min..max]", "flush_ms median [min..max]", "bytes", "bytes_per_turn", "fsyncs"
+      printf "%-17s %-30s %-30s %-28s %-32s %10s %14s %8s\n", "contender", "ms_per_turn median [min..max]", "cpu_ms_per_turn median [min..max]", "open_ms median [min..max]", "flush_ms median [min..max]", "bytes", "bytes_per_turn", "fsyncs"
       for (k = 1; k <= contenders; k++) {
         c = order[k]
-        for (i = 1; i <= runs[c]; i++) { a[i] = per_turn[c, i]; o[i] = open[c, i]; f[i] = flush[c, i] }
-        printf "%-17s %-30s %-28s %-32s %10s %14s %8s\n", c, stats(a, runs[c]), stats(o, runs[c]), stats(f, runs[c]), bytes[c], bytes_turn[c], fsyncs[c]
+        for (i = 1; i <= runs[c]; i++) { a[i] = per_turn[c, i]; u[i] = cpu[c, i]; o[i] = open[c, i]; f[i] = flush[c, i] }
+        printf "%-17s %-30s %-30s %-28s %-32s %10s %14s %8s\n", c, stats(a, runs[c]), stats(u, runs[c]), stats(o, runs[c]), stats(f, runs[c]), bytes[c], bytes_turn[c], fsyncs[c]
       }
     }' "$out/results"
 }
