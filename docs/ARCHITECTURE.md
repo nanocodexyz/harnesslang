@@ -125,11 +125,13 @@ on prompt(input: text) -> outcome
     `list<call, M>` the worst case multiplies
   - `entry = user(text) | assistant(reply) | result(call, text) | error(call, text) | unknown(call)`
   - `known<T> = ok(T) | failed(text)` and `maybe<T> = ok(T) | failed(text) | unknown`
+  - with `model name calls M window W`, a model call returns `attempt = ok(reply, stop, u64, u64, u64, u64) | throttled(text, u64) | transient(text, u64) | rejected(text)`: the reply, the text enum `stop` (`end`, `tool_use`, `max_tokens`, `refusal`, `context_exceeded`, `pause`) and the input, output, cache read and cache write tokens, each at most `W`, or a provider error with its `Retry-After` in milliseconds; the context may be `list with e`, one more entry the list never holds
+  - `len(t)` of a text counts UTF-16 code units, and `truncate_middle(t, n)`, `n` a constant, keeps the head and tail of a text over `n` estimated tokens, at most `4n + 39` code units, which the prover knows
 
 ### Effects
 
 An effect is anything whose result the program cannot recompute: a tool, the
-model, `now()`, `random()`, `wait(c)` and `suspend(key)`. Each effect site is
+model, `now()`, `random()`, `wait(c)` (and `wait(e) at most c`) and `suspend(key)`. Each effect site is
 journaled. Spawning child
 sessions and waiting on them are not in the language yet (see Next).
 
@@ -162,9 +164,9 @@ does (`native_call_admitted`); both refusals are recorded failures.
 ### Statements
 
 `let`, assignment to a state field, `push list value`, `clear list`,
-`keep list last n` (drop all but the last `n` entries), `if` / `else`, `match`
+`keep list last n` (drop all but the last `n` entries), `keep list last n after e` (the same, with `e` put first: a summary replacing what it summarizes), `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
-`for call in list parallel` (one `match dispatch(call)` whose arms only push:
+`for call in list parallel` (one `match dispatch(call)` whose arms only push, bind and assign:
 every call record is appended before any dispatch, none and idempotent calls
 run at once, an external call alone after one flush of the batch, results in
 list order),
@@ -317,7 +319,7 @@ A target is a durability model and a place.
 | `native-jsonl` | a process | append-only JSONL file, one per session | write and fsync | one record (checksummed; a torn tail is dropped) | nobody | the program's own |
 | `native-sqlite` | a process | SQLite rows through a host `Sql` | one transaction | one transaction | nobody | the program's own |
 | `server-postgres` | a server pool | Postgres rows through a host `Sql` | one transaction fenced by the owner's epoch | one transaction | a second owner after a lease expires; the fence refuses its writes | the program's own |
-| `cloudflare` | a Durable Object | the object's SQLite | `storage.sync()`, which the output gate already waits for before the outbound request or response that follows every flush | one event | nobody else (one object per session), though another event enters it at any await; an alarm restarts it after a reset | outbound requests per invocation; the waits of one run, against the 15 minutes of an alarm (memory is reported, not checked) |
+| `cloudflare` | a Durable Object | the object's SQLite | `storage.sync()`, which the output gate already waits for before the outbound request or response that follows every flush | one event | nobody else (one object per session), though another event enters it at any await; an alarm restarts it after a reset | outbound requests per invocation; each wait, against the 15 minutes of an alarm (memory is reported, not checked) |
 | `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | each wait, against a Function's 800 s (other effects' duration is reported, not checked) |
 
 Vercel documents no limit on the outbound requests of a Function

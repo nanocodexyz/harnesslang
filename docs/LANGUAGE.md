@@ -402,7 +402,7 @@ target cloudflare: runs in a Durable Object; journal: the object's SQLite; flush
   limit memory: 134217728 bytes per isolate (developers.cloudflare.com/durable-objects/platform/limits)
   limit outbound requests: 10000 outbound requests per invocation (developers.cloudflare.com/workers/platform/limits (Workers Paid default))
   limit concurrent requests: 6 requests waiting for response headers per invocation (developers.cloudflare.com/workers/platform/limits (simultaneous open connections; relaxed to the wait for headers on 2026-04-09); a seventh fetch is queued by the runtime)
-  limit waits: 900000 milliseconds of waits per run, checked on the waits of one run, added up (developers.cloudflare.com/durable-objects/platform/limits (an alarm handler's wall time is 15 minutes; a request's is unlimited while its client stays connected); a turn a reset leaves unfinished resumes in the alarm, so its waits must fit one alarm invocation)
+  limit waits: 900000 milliseconds per wait, checked on each wait on its own, since the run that holds it may be cut and resumed at a wait (developers.cloudflare.com/durable-objects/platform/limits (an alarm handler's wall time is 15 minutes; a request's is unlimited while its client stays connected); a turn a reset leaves unfinished resumes in the alarm, and a run cut at that wall time resumes from the alarm the turn keeps armed, past every wait whose deadline it recorded, so each wait must fit one alarm invocation)
   fact: an outbound fetch or a response leaves only after the event's earlier writes commit (blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three (output gates); oracle/cloudflare/storage.mjs gate_holds_outbound_fetch, consistent with it but not isolating it)
   fact: writes with no await between them commit together, and none commits while the event runs synchronously (developers.cloudflare.com/durable-objects/api/storage-api (write coalescing); oracle/cloudflare/storage.mjs event_commits_after_it_yields)
   fact: a flush is committed once storage.sync() resolves; an awaited microtask commits nothing (developers.cloudflare.com/durable-objects/api/storage-api (sync); oracle/cloudflare/storage.mjs sync_commits, microtask_await_does_not_commit)
@@ -494,11 +494,11 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `parallel` `reply` `take` `tools`
+Contextual words: `after` `at` `below` `bound` `calls` `fn` `from` `in` `known` `last` `listing` `maybe` `most` `parallel` `reply` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `dispatch` `len` `now` `random` `suspend` `wait`
+Builtins: `dispatch` `len` `now` `random` `suspend` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -548,7 +548,7 @@ tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
 listing    = "tools" "from" "listing" "(" name "," bound ")" params "effect" effect_class ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound [ "reply" name ] ;
+model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -564,7 +564,7 @@ block      = "{" { statement } "}" ;
 statement  = "let" name [ ":" type_expr ] "=" expr
            | "push" name expr
            | "clear" name
-           | "keep" name "last" expr
+           | "keep" name "last" expr [ "after" expr ]
            | if
            | "match" expr "{" { arm [ "," ] } "}"
            | "loop" name "below" bound block
@@ -574,7 +574,8 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | name "(" [ expr { "," expr } ] ")" ;
 if         = "if" expr block [ "else" ( if | block ) ] ;
 arm        = ( name [ "(" name { "," name } ")" ] | text ) "=>" block ;
-expr       = and { "or" and } ;
+expr       = or [ "with" or ] ;
+or         = and { "or" and } ;
 and        = not { "and" not } ;
 not        = "not" not | comparison ;
 comparison = sum [ ( "==" | "!=" | "<" | "<=" | ">" | ">=" ) sum ] ;
@@ -583,7 +584,7 @@ product    = postfix { "*" postfix } ;
 postfix    = primary { "." name } ;
 primary    = number | text | "true" | "false" | "(" expr ")"
            | "take" name
-           | name [ "(" [ expr { "," expr } ] ")" ] ;
+           | name [ "(" [ expr { "," expr } ] ")" [ "at" "most" bound ] ] ;
 ```
 
 Notes the grammar leaves out:
@@ -1906,6 +1907,261 @@ model think calls calls_max reply turn_reply
 on show(said: reply) -> u64 { return 1 }
 ```
 
+### Usage, stop reasons and model errors
+
+`model name calls bound window tokens` declares the model's context window,
+and with it every call to the model returns the builtin sum `attempt`:
+
+```text
+attempt = ok(reply, stop, u64, u64, u64, u64)
+        | throttled(text, u64)
+        | transient(text, u64)
+        | rejected(text)
+stop    = "end" | "tool_use" | "max_tokens" | "refusal" | "context_exceeded" | "pause"
+```
+
+`ok` carries the reply (the builtin `reply` or the declared reply type), why
+the provider stopped, and the four usage counts the provider reported: input,
+output, cache read and cache write tokens. A reply that stopped early keeps
+what it said: `max_tokens` and `refusal` come with the partial answer or calls, so
+the harness decides what to keep and whether to continue. `throttled` and
+`transient` carry the provider's error and its `Retry-After` in milliseconds (0 when
+it sent none); `rejected` is an error that asking again does not fix. The whole
+attempt is the `model` record, so a rerun replays the same stop, usage and delay.
+The names `attempt` and `stop` are types a harness can name, and `stop` is matched
+exhaustively like any text enum.
+
+Each usage count is at most the window. A reply that does not decode, a stop
+outside the enum, or a usage count past the window becomes `rejected("model reply: ...")`
+on every backend, so the prover may assume each count in `ok` is at most
+`tokens`: summing the four, as nanocode's compaction threshold does, is proved not to
+overflow.
+
+`docs/snippets/recovery.hl` ports the recoveries of nanocode's Claude loop: it compacts
+when the usage of the last reply plus an estimate of the tool results since
+reaches the window less a reserve, continues after `max_tokens` at most three times,
+asks once more after a refusal, compacts on `context_exceeded`, and backs off on
+`throttled` and `transient` with doubling delays that honour `Retry-After`:
+
+```hl docs/snippets/recovery.hl
+harness recovery
+
+const rounds_max: u64 = 16
+const calls_max: u64 = 4
+const context_max: u64 = 128
+const kept_max: u64 = 8
+const window_tokens: u64 = 200000
+const compact_tokens: u64 = 167000
+const result_tokens_max: u64 = 25000
+const result_units_max: u64 = 100039
+const continuations_max: u64 = 3
+const throttled_max: u64 = 10
+const retry_base_ms: u64 = 500
+const retry_cap_ms: u64 = 32000
+
+type outcome = done(text) | failed(text) | exhausted
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model think calls calls_max window window_tokens
+
+state {
+  context: list<entry, context_max>
+  context_tokens: u64
+  pending_units: u64
+  continuations: u64
+  throttled: u64
+  backoff_ms: u64
+  refused: bool
+}
+
+invariant tokens_bounded: context_tokens <= 4 * window_tokens
+invariant continuations_bounded: continuations <= continuations_max
+invariant throttled_bounded: throttled < throttled_max
+invariant backoff_bounded: backoff_ms <= retry_cap_ms
+invariant pending_bounded: pending_units <= calls_max * result_units_max
+
+fn back_off(error: text, after_ms: u64) {
+  if throttled + 1 >= throttled_max { return failed(error) }
+  if after_ms > retry_cap_ms { return failed("Retry-After past the cap: " ++ error) }
+  throttled = throttled + 1
+  if after_ms > backoff_ms {
+    let woke = wait(after_ms) at most retry_cap_ms
+  } else {
+    let woke = wait(backoff_ms) at most retry_cap_ms
+  }
+  if backoff_ms * 2 > retry_cap_ms { backoff_ms = retry_cap_ms } else { backoff_ms = backoff_ms * 2 }
+}
+
+fn compact() {
+  match think(context with user("Summarize the conversation so far.")) {
+    ok(summary, stop, _, _, _, _) => {
+      match summary {
+        answer(words) => {
+          keep context last kept_max after user("Summary of the earlier conversation:\n" ++ words)
+          context_tokens = 0
+          pending_units = 0
+        }
+        calls(_) => { return failed("the summary asked for tools") }
+      }
+    }
+    throttled(error, _) => { return failed("compaction throttled: " ++ error) }
+    transient(error, _) => { return failed("compaction failed: " ++ error) }
+    rejected(error) => { return failed("compaction rejected: " ++ error) }
+  }
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (2 + calls_max) <= context_max
+{
+  push context user(question)
+  continuations = 0
+  throttled = 0
+  backoff_ms = retry_base_ms
+  refused = false
+  loop round below rounds_max {
+    if context_tokens * 4 + pending_units >= compact_tokens * 4 { compact() }
+    match think(context) {
+      throttled(error, after_ms) => { back_off(error, after_ms) }
+      transient(error, after_ms) => { back_off(error, after_ms) }
+      rejected(error) => { return failed(error) }
+      ok(reply, stop, input_tokens, output_tokens, cache_read, cache_write) => {
+        throttled = 0
+        backoff_ms = retry_base_ms
+        context_tokens = input_tokens + output_tokens + cache_read + cache_write
+        pending_units = 0
+        push context assistant(reply)
+        match reply {
+          answer(words) => {
+            match stop {
+              "end" => { return done(words) }
+              "tool_use" => { return done(words) }
+              "max_tokens" => {
+                if continuations >= continuations_max { return failed("output token limit after every continuation") }
+                continuations = continuations + 1
+                push context user("Output token limit hit. Resume directly.")
+              }
+              "refusal" => {
+                if refused { return failed("refused twice: " ++ words) }
+                refused = true
+                push context user("Continue.")
+              }
+              "context_exceeded" => { compact() }
+              "pause" => {}
+            }
+          }
+          calls(requested) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => {
+                  let cut = truncate_middle(output, result_tokens_max)
+                  pending_units = pending_units + len(cut)
+                  push context result(call, cut)
+                }
+                failed(error) => { push context error(call, truncate_middle(error, result_tokens_max)) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+```console
+$ hl check docs/snippets/recovery.hl | grep -E 'handler ask: worst|milliseconds of waits:|proved for'
+  handler ask: worst case 96 effects, 163 journal records, 96 outbound requests
+    milliseconds of waits: 512000, round below rounds_max (16)
+docs/snippets/recovery.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+$ hl run docs/snippets/recovery.hl --handler ask --arg hi --seed 41 | sed -n 2,3p
+{"crc":3390402489,"record":{"model":{"call_id":"1/1","response":{"throttled":["model failed: gamma-34",0]},"seq":1,"turn":"1"}}}
+{"crc":1242477268,"record":{"call":{"call_id":"1/2","effect":"none","input":{"ms":500,"until":1115},"seq":2,"tool":"wait","turn":"1"}}}
+```
+
+`hl sim` draws, for a model with a window, a throttled attempt in
+`MODEL_THROTTLED_PPM` = 100000 calls per million, a transient one in
+`MODEL_TRANSIENT_PPM` = 50000 and a rejected one in `MODEL_REJECTED_PPM` = 20000, with
+a `Retry-After` absent half the time and otherwise up to `RETRY_AFTER_MS_MAX` = 120000;
+a reply stops early (`max_tokens`, `refusal`, `context_exceeded` or `pause`) in
+`STOP_FAULT_PPM` = 60000, and its usage counts reach the window or pass it by one in
+`USAGE_EDGE_PPM` = 10000 each:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/recovery.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1351 crashes=847 power_losses=80 torn_writes=104 takeovers=0 fenced=0 dispatches=416 unknown=122 sleeps=63 suspensions=0
+```
+
+Two planted bugs show the journal is what makes these replays exact.
+`usage_unchecked` accepts a usage count past the window, and
+`retry_after_unjournaled` journals an attempt without its `Retry-After`, so a rerun
+waits a different time than the run it replays:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation usage_unchecked docs/snippets/recovery.hl | head -n 1
+FAIL invariant=replay_equal seed=3 target=native-jsonl profile=clean mutation=usage_unchecked: replaying the journal failed: Corrupt("replay of turn 1 finished {\"failed\":\"model reply: output usage of 200001 tokens exceeds the window of 200000 tokens\"} where the journal says {\"failed\":\"compaction rejected: model reply: 'eta-26' is not a variant of stop\"}")
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation retry_after_unjournaled docs/snippets/recovery.hl | head -n 1
+FAIL invariant=replay_equal seed=4 target=native-jsonl profile=async mutation=retry_after_unjournaled: replaying the journal failed: Corrupt("replay of turn 1 needs seq 8, which the journal does not record")
+```
+
+`examples/claude_code.hl` holds the same recoveries with nanocode's constants and
+prompts: a 200,000-token window less a 33,000-token reserve, tool results cut
+at 12,000 tokens for `exec` and `wait` and 25,000 for the rest, three continuations,
+one refusal retry, and backoff from 500 ms doubling to 32 s, honouring
+`Retry-After` up to 60 s, with 10 throttled attempts within 180 s and 11 for other
+transient errors.
+
+### Text length and cuts
+
+`len(t)` of a text is its length in UTF-16 code units, the unit JavaScript strings
+count and nanocode's token estimate divides by four. `truncate_middle(t, n)`,
+with `n` a named constant, keeps a text whose estimate (its length divided by four,
+rounded up) is at most `n` tokens, and otherwise keeps its first and last `2n` code
+units, whole characters only, joined by `…K tokens truncated…` where `K` is how many
+tokens it dropped: nanocode's `truncate_middle`, byte for byte on every backend. A cut
+text is at most `4n + 39` code units long (the marker is one ellipsis, at most 20
+digits and ` tokens truncated…`), and the prover knows it: a local bound to a cut,
+and `len` of one, carries that bound, so `recovery.hl` proves its estimate of
+pending tool results fits `calls_max * result_units_max` with `result_units_max` =
+4 × 25000 + 39, and one less is refused:
+
+```console
+$ hl check docs/snippets/errors/cut-bound.hl 2>&1 | grep invariant_preserved
+docs/snippets/errors/cut-bound.hl: error: handler 'ask': invariant_preserved: invariant 'cut_bounded' (cut_units <= cut_units_max) may not hold when the handler returns; path: entry; counterexample: cut_units = 79, len(cut) = 79
+```
+
+```hl docs/snippets/errors/cut-bound.hl
+harness cuts
+
+const tokens_max: u64 = 10
+const cut_units_max: u64 = 78
+
+state {
+  cut_units: u64
+}
+
+invariant cut_bounded: cut_units <= cut_units_max
+
+on ask(said: text) -> u64 {
+  let cut = truncate_middle(said, tokens_max)
+  cut_units = len(cut)
+  return cut_units
+}
+```
+
+The simulator draws tool results long enough to be cut, with characters of
+one, two and four bytes and surrogate pairs, in `LONG_TEXT_PPM` = 20000 results per
+million of a program that cuts. The planted bug `truncate_uncut` leaves a text uncut,
+and the checkpoint it writes no longer matches the journal's replay:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation truncate_uncut docs/snippets/recovery.hl | head -n 1
+FAIL invariant=checkpoint_compacted seed=39 target=native-jsonl profile=errors mutation=truncate_uncut: checkpoint 1 holds 4 entries of context where replaying the journal to turn 1 gives 4 entries of context: a checkpoint must hold the lists as clear and keep left them
+```
+
 ## Statements
 
 | Statement | Meaning |
@@ -1916,6 +2172,7 @@ on show(said: reply) -> u64 { return 1 }
 | `push field e` | append to a state list; a full list traps with `bound(field)` |
 | `clear field` | empty a state list |
 | `keep field last n` | drop all but the last `n` entries of a state list, `n` a `u64`; a list of `n` entries or fewer is unchanged ([clear and keep](#clear-and-keep)) |
+| `keep field last n after e` | keep the last `n` entries and put `e` before them; traps with `bound(field)` when that leaves more than the capacity ([clear and keep](#clear-and-keep)) |
 | `if c { } else if c { } else { }` | `c` is `bool` |
 | `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas; a text enum's arms are its values, `"value" => { }` |
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
@@ -2124,6 +2381,37 @@ on note(line: text) -> u64 {
 exhausted, and `subagents.hl` also keeps the `agents_kept` most recent agents
 of its roster when a child completes.
 
+
+`keep field last n after e` puts `e` before the last `n` entries, so a
+summary replaces what it summarizes instead of following what was kept, and
+`context with e`, as the argument of a model call, sends the context with
+one more entry the list itself never holds. Together they are summarizing
+compaction: the model reads the history and the request to summarize it, and
+its answer becomes the history's first entry, ahead of the entries kept
+verbatim, as nanocode's compaction keeps the messages after its summary.
+`docs/snippets/recovery.hl` compacts so ([Usage, stop reasons and model
+errors](#usage-stop-reasons-and-model-errors)):
+
+```text
+match think(context with user("Summarize the conversation so far.")) {
+  ok(summary, stop, _, _, _, _) => {
+    match summary {
+      answer(words) => {
+        keep context last kept_max after user("Summary of the earlier conversation:\n" ++ words)
+```
+
+The summary is an ordinary model call, with every outcome of one: a
+throttled or refused summary is the harness's to retry or fail. The prover
+treats `keep after` as a `keep` followed by a push, so its length is at most
+`min(len, n) + 1` and the push is a `push_bound` obligation; the runtime
+traps with `bound(field)` where it would not fit. `with` adds no record and
+changes no length, and anywhere but a model call's argument it is an error:
+
+```console
+$ hl check examples/invalid/with_outside_model.hl
+examples/invalid/with_outside_model.hl:13:23: error: 'with' adds an entry to the context a model call reads: it is only a model call's argument
+```
+
 ## Effects
 
 An effect is anything whose result the program cannot recompute: a tool, the
@@ -2240,8 +2528,8 @@ points above, never less.
 
 `for call in requested parallel { ... }` runs a reply's tool calls at once, as
 nanocode runs the calls of a reply that its tools allow in parallel. Its body
-is one `match dispatch(call)` on the item it walks, whose arms only push
-values that run no effect. A turn runs it in three steps:
+is one `match dispatch(call)` on the item it walks, whose arms push, bind
+and assign values that run no effect and read no events. A turn runs it in three steps:
 
 1. In list order, each call takes the next sequence number and appends its
    `call` record (a call the journal already holds is replayed). Nothing is
@@ -2274,8 +2562,8 @@ completes a group's calls in a random order and crashes between them.
 
 Events that arrive while a group runs are recorded at the batch's last
 sequence number, once the group's calls return and before their results,
-so a read after the batch sees them. The body only pushes, so no read falls
-inside a batch: check `cancelled` before and after it. A re-run can find
+so a read after the batch sees them. The body reads no events, so no read
+falls inside a batch: check `cancelled` before and after it. A re-run can find
 a batch whose last call the journal already holds while earlier none calls
 still run again, when recovery reported its external calls `unknown`. Then
 the batch records no events, since reads after it replay, and the next
@@ -2331,7 +2619,7 @@ ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1444
 ```
 
 Anything else in the body is an error: a statement before the match, a match
-on something other than the item's dispatch, an arm that does more than push,
+on something other than the item's dispatch, an arm that does more than push, bind and assign,
 and a parallel for inside another.
 
 ```console
@@ -2340,7 +2628,7 @@ docs/snippets/errors/parallel-statement.hl:11:9: error: the body of a parallel f
 $ hl check docs/snippets/errors/parallel-dispatch.hl
 docs/snippets/errors/parallel-dispatch.hl:13:11: error: a parallel for matches on dispatch(call), the item it walks
 $ hl check docs/snippets/errors/parallel-arm.hl
-docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for only push: found a return
+docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for only push, bind and assign: found a return
 $ hl check docs/snippets/errors/parallel-nested.hl
 docs/snippets/errors/parallel-nested.hl:11:5: error: a parallel for cannot be nested in another parallel for
 ```
@@ -2451,8 +2739,10 @@ compares it with the target's wall-time limit (`src/target/mod.rs`, with
 sources):
 
 - cloudflare: a turn a reset leaves unfinished resumes in the object's alarm,
-  whose wall time is 15 minutes, so the waits of one run, added up, must fit
-  900,000 ms. A wait arms the alarm before it sleeps.
+  whose wall time is 15 minutes. The turn keeps the alarm armed from its
+  first wait or external call to its status, so a run the wall time cuts
+  resumes from the alarm past every wait whose deadline it recorded: each
+  wait on its own must fit 900,000 ms.
 - vercel: a wait's flush ends a Workflow step and the wait runs at the start of
   the next one, so a step holds at most one wait, which must fit a Function's
   800 seconds.
@@ -2461,35 +2751,38 @@ sources):
 
 `examples/subagents.hl` waits `wait_agent_ms` before it reads a child's
 status, as nanocode's `wait_agent` blocks with a timeout (30 s by default
-there). At 64 rounds of 16 calls, Cloudflare's alarm leaves 878 ms per wait,
-so the port waits 800 ms; a wait of 600 s in a loop of four is refused there
-and accepted on Vercel, and an hour-long wait is refused by both:
+there); the port waits 800 ms. A wait of 600 s in a loop of four fits both
+platforms, and an hour-long wait is refused by both:
 
 ```console
-$ hl check --target cloudflare examples/invalid/over_wait.hl > /dev/null
-examples/invalid/over_wait.hl: error: handler 'watch' on cloudflare: worst_case: worst case 2400000 milliseconds of waits per run exceeds cloudflare's limit of 900000 milliseconds of waits per run; path: poll below polls_max (4)
-examples/invalid/over_wait.hl: error: 1 proof obligation(s) failed for cloudflare
-examples/invalid/over_wait.hl: error: handler 'watch': worst case 2400000 milliseconds of waits exceeds cloudflare's limit of 900000 milliseconds of waits per run; loops: poll below polls_max (4)
-$ hl check --target vercel examples/invalid/over_wait.hl | tail -n 1
-examples/invalid/over_wait.hl: ok for vercel
+$ hl check --target cloudflare examples/invalid/over_wait.hl | tail -n 1
+examples/invalid/over_wait.hl: ok for cloudflare
+$ hl check --target cloudflare examples/invalid/long_wait.hl 2>&1 > /dev/null | tail -n 1
+examples/invalid/long_wait.hl: error: handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds cloudflare's limit of 900000 milliseconds per wait
 $ hl check --target vercel examples/invalid/long_wait.hl 2>&1 > /dev/null | tail -n 1
 examples/invalid/long_wait.hl: error: handler 'nap': wait(hour_ms) of 3600000 milliseconds exceeds vercel's limit of 800000 milliseconds per wait
 ```
 
-The duration must be a constant, so the checker can bound it:
+`wait(c)` waits a named constant. `wait(e) at most c` waits a `u64`
+expression bounded by the constant `c`, the delay a harness computes from a
+backoff or a provider's `Retry-After`: the worst case counts `c`, the prover
+must show `e <= c` (`wait_bound`), and a wait that would pass `c` traps with
+`bound(c)` on every backend before its call record is written:
 
 ```console
 $ hl check examples/invalid/wait_literal.hl
-examples/invalid/wait_literal.hl:6:19: error: the duration of 'wait' must be a named constant in milliseconds
+examples/invalid/wait_literal.hl:6:19: error: the duration of 'wait' must be a named constant in milliseconds, or bounded by one: wait(duration) at most constant
+$ hl check examples/invalid/wait_uncapped.hl 2>&1 | grep wait_bound
+examples/invalid/wait_uncapped.hl: error: handler 'poll': wait_bound: wait(after_ms) may sleep past its cap retry_cap_ms and trap with bound(retry_cap_ms); path: match status(job): ok; counterexample: after_ms = 32001
 ```
 
 The simulator runs a program past the checker too, and `wall_limit` catches a
 run whose waits pass the target's limit or the handler's worst case:
 
 ```console
-$ hl sim --target cloudflare --seeds 0..20 examples/invalid/over_wait.hl
-FAIL invariant=wall_limit seed=0 target=cloudflare profile=errors mutation=none: one run of turn 1 waited 1200000 ms by the end of wait 1/6, over cloudflare's limit of 900000 milliseconds of waits per run
-replay: hl sim --target cloudflare --seeds 0..1 examples/invalid/over_wait.hl
+$ hl sim --target cloudflare --seeds 0..20 examples/invalid/long_wait.hl
+FAIL invariant=wall_limit seed=0 target=cloudflare profile=errors mutation=none: wait 1/1 waited 3600000 ms by the end of wait 1/1, over cloudflare's limit of 900000 milliseconds per wait
+replay: hl sim --target cloudflare --seeds 0..1 examples/invalid/long_wait.hl
 ```
 
 ### Suspend and resume
@@ -2590,7 +2883,7 @@ $ hl check --target vercel docs/snippets/park.hl | grep -E 'parks|wait'
     milliseconds of waits: 4000, step below steps_max (2)
   proved handler prompt on vercel: parks: 1 wait site(s) sleep only after their call and every record before it are durable; 1 suspend site(s) end the run only with nothing buffered and are never appended twice
   proved handler prompt on vercel: worst_case: 2000 milliseconds in its longest wait <= 800000 milliseconds per wait (step below steps_max (2))
-  limit waits: 800000 milliseconds per wait, checked on each wait, since a wait's flush ends a step and a step holds at most one wait (vercel.com/docs/functions/limitations (a Function's duration, Pro and Enterprise, fluid compute; a Workflow step runs in one invocation, while a workflow sleep() has no limit, vercel.com/docs/workflows/pricing); a wait runs inside the step after its flush)
+  limit waits: 800000 milliseconds per wait, checked on each wait on its own, since the run that holds it may be cut and resumed at a wait (vercel.com/docs/functions/limitations (a Function's duration, Pro and Enterprise, fluid compute; a Workflow step runs in one invocation, while a workflow sleep() has no limit, vercel.com/docs/workflows/pricing); a wait runs inside the step after its flush)
   not checked: duration (800 seconds per Function invocation) beyond waits, since other effects' durations are not modelled
 $ hl prove --target native-jsonl --mutation suspend_before_flush docs/snippets/park.hl 2>&1 | grep -m 1 suspend_durable
 docs/snippets/park.hl: error: handler 'prompt' on native-jsonl: suspend_durable: suspend(call.id) ends the run waiting while records are not durable: call of suspend(call.id), result of wait(poll_ms), reply of infer(context); path: loop step below steps_max (2) > match reply: calls > for call in requested (at most calls_max = 2) > suspend(call.id) suspends the turn; counterexample: the waiting status is lost with the process, so no resume can find the turn
@@ -2609,7 +2902,7 @@ invariants check it, each with a mutation it catches:
 | `suspend_durable` | a run reports waiting only once its suspend's call record is durable | `suspend_before_flush` |
 | `resume_matched` | a suspend's result is the answer of a resume sent with its key | `resume_unmatched` |
 | `wait_until` | a wait sleeps until the deadline its durable call record holds, and wakes no earlier | `wait_rerun_skips`, `wait_oversleeps` |
-| `wall_limit` | the waits of one run stay within the handler's worst case and the target's limit | `examples/invalid/over_wait.hl` and `long_wait.hl` past the checker |
+| `wall_limit` | the waits of one run stay within the handler's worst case, and each wait within the target's limit | `examples/invalid/long_wait.hl` past the checker on cloudflare and vercel |
 
 A suspend that runs again on resume appends its call twice, and a wait whose
 result is not journaled leaves a finished turn that cannot replay:

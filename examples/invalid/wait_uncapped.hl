@@ -1,0 +1,17 @@
+harness backoff
+
+const retry_cap_ms: u64 = 32000
+
+type outcome = done(u64)
+
+tool status(job: text) -> u64 effect none
+
+on poll(job: text) -> outcome {
+  match status(job) {
+    ok(after_ms) => {
+      let woke = wait(after_ms) at most retry_cap_ms
+      return done(woke)
+    }
+    failed(_) => { return done(0) }
+  }
+}
