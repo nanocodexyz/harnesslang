@@ -11,15 +11,34 @@ seed_base="${DRILL_SEED:-0}"
 mutation="${DRILL_MUTATION:-none}"
 hl=target/release/hl
 out=output/rust-drill
-flush_before_external='if site.durability.flushes(call.effect) {'
+plants=()
 case "$mutation" in
   none) ;;
-  flush_after_dispatch) out="output/rust-drill-$mutation" ;;
+  flush_after_dispatch)
+    plants=('if site.durability.flushes(call.effect) { ==> if false && site.durability.flushes(call.effect) {')
+    ;;
+  nested_flush_after_dispatch)
+    plants=('if tool.effect.may_be_unknown() { ==> if false && tool.effect.may_be_unknown() {')
+    ;;
+  timeout_rides)
+    plants=('if self.header_unsaved { ==> if false && self.header_unsaved {')
+    ;;
+  cell_recovery_reports_failed)
+    plants=('self.set_output(id, (unknown_outcome().encode(), false)), ==> self.set_output(id, (String::from("lost"), false)),')
+    ;;
+  cell_recovery_redispatches_external)
+    plants=(
+      'log.open_nested(|class| class.may_be_unknown()); ==> log.open_nested(|class| false && class.may_be_unknown());'
+      'Some(SiteLog::Open(_)) => panic!("recovery turns every open nested external call unknown before the cell runs again"), ==> Some(SiteLog::Open(_)) => self.dispatch(id, false)?,'
+    )
+    ;;
   *)
-    echo "drill: unknown DRILL_MUTATION $mutation (none or flush_after_dispatch)" >&2
+    echo "drill: unknown DRILL_MUTATION $mutation (none, flush_after_dispatch, nested_flush_after_dispatch, timeout_rides, cell_recovery_reports_failed, cell_recovery_redispatches_external)" >&2
     exit 2
     ;;
 esac
+out="$out-$(basename "$file" .hl)"
+[ "$mutation" = none ] || out="$out-$mutation"
 killed_status=137
 mkdir -p "$out"
 
@@ -37,16 +56,24 @@ trap report EXIT
 cargo build --release --locked -j2 --quiet
 
 "$hl" emit --target native-jsonl "$file" > "$out/harness.rs.new"
-if [ "$mutation" = flush_after_dispatch ]; then
-  if [ "$(grep -cF "$flush_before_external" "$out/harness.rs.new")" -ne 1 ]; then
-    echo "drill: the generated code no longer has one flush before an external effect to mutate" >&2
+for plant in "${plants[@]}"; do
+  from=${plant%% ==> *}
+  to=${plant#* ==> }
+  if [ "$(grep -cF -- "$from" "$out/harness.rs.new")" -ne 1 ]; then
+    echo "drill: $mutation: the generated code no longer has exactly one '$from' to mutate" >&2
     exit 1
   fi
-  sed -i "s/$flush_before_external/if false \&\& site.durability.flushes(call.effect) {/" "$out/harness.rs.new"
-fi
-cp scripts/rust/drill_host.rs "$out/drill_host.rs"
+  pattern=$(printf '%s' "$from" | sed 's/[][\.*^$/]/\\&/g')
+  replacement=$(printf '%s' "$to" | sed 's/[\&/]/\\&/g')
+  sed -i "s/$pattern/$replacement/" "$out/harness.rs.new"
+  if grep -qF -- "$from" "$out/harness.rs.new" || ! grep -qF -- "$to" "$out/harness.rs.new"; then
+    echo "drill: $mutation: '$from' was not replaced by its plant" >&2
+    exit 1
+  fi
+done
+cp scripts/rust/drill_host.rs scripts/rust/drill_cells.rs "$out/"
 mv "$out/harness.rs.new" "$out/harness.rs"
-key=$(cat "$out/harness.rs" "$out/drill_host.rs" | cksum | cut -d' ' -f1)
+key=$(cat "$out/harness.rs" "$out/drill_host.rs" "$out/drill_cells.rs" | cksum | cut -d' ' -f1)
 if [ ! -x "$out/drill_host" ] || [ "$(cat "$out/key" 2>/dev/null)" != "$key" ]; then
   rustc --edition 2024 -O -o "$out/drill_host" "$out/drill_host.rs"
   echo "$key" > "$out/key"
@@ -95,5 +122,5 @@ for session in $(seq 1 "$sessions"); do
   total_kills=$((total_kills + kills))
   total_runs=$((total_runs + runs))
 done
-echo "drill: $sessions sessions of $turns turns (seeds $((seed_base + 1))..$((seed_base + sessions))) survived $total_kills kill -9s over $total_runs runs: external_once, unknown_reported, idempotent_known and finish_once hold on the real files"
+echo "drill: $file: $sessions sessions of $turns turns (seeds $((seed_base + 1))..$((seed_base + sessions))) survived $total_kills kill -9s over $total_runs runs: external_once, unknown_reported, idempotent_known, finish_once, nested_external_once, unknown_nested_reported, nested_known, cell_finishes_once and header_before_wait hold on the real files"
 finished=1

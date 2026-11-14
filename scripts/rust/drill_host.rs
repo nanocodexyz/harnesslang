@@ -1,3 +1,5 @@
+#[path = "drill_cells.rs"]
+mod drill_cells;
 #[path = "harness.rs"]
 mod harness;
 
@@ -6,8 +8,8 @@ use std::io::Write;
 
 use harness::program::{self, Arguments};
 use harness::{
-    Disk, EffectClass, FileDisk, Finish, Host, Json, JsonlJournal, ModelRequest, Output, Ran,
-    Record, Returns, RunError, Start, ToolRequest, TurnRequest, call_id,
+    CellEngine, Disk, EffectClass, FileDisk, Finish, Host, Json, JsonlJournal, ModelRequest, Output,
+    Ran, Record, Returns, RunError, Start, ToolRequest, TurnRequest, call_id, nested_call_id,
 };
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -61,11 +63,20 @@ struct Drill {
     acks: std::fs::File,
     rng: Rng,
     clock: u64,
+    engine: drill_cells::ScriptEngine,
 }
 
 impl Host for Drill {
     fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
-        let id = call_id(request.turn, request.seq);
+        let id = match request.nested {
+            Some(nested) => nested_call_id(&call_id(request.turn, request.seq), nested.id),
+            None => call_id(request.turn, request.seq),
+        };
+        if let Some(nested) = request.nested
+            && request.effect == EffectClass::External
+        {
+            drill_cells::check_c1(&self.engine.journal, request.turn, request.seq, nested.id, request.tool);
+        }
         append_synced(
             &mut self.ledger,
             &format!("{id} {} {}\n", request.tool, request.effect.name()),
@@ -91,6 +102,16 @@ impl Host for Drill {
         let count = 1 + self.rng.below(request.calls_max);
         let mut calls = Vec::new();
         for index in 0..count {
+            if !program::CODES.is_empty() && self.rng.chance(drill_cells::CELL_REPLY_PPM) {
+                let code = self.rng.below(program::CODES.len() as u64) as usize;
+                let script = drill_cells::script(&mut self.rng, code, request.turn, request.seq);
+                calls.push(Json::object(vec![
+                    ("id", Json::String(format!("c{}-{}-{index}", request.turn, request.seq))),
+                    ("tool", Json::text(program::CODES[code].name)),
+                    ("input", Json::String(script)),
+                ]));
+                continue;
+            }
             let tool = if self.rng.chance(UNDECLARED_TOOL_PPM) {
                 UNDECLARED_TOOLS[self.rng.below(UNDECLARED_TOOLS.len() as u64) as usize]
             } else {
@@ -128,6 +149,10 @@ impl Host for Drill {
             ),
         );
     }
+
+    fn cells(&mut self) -> Option<&mut dyn CellEngine> {
+        Some(&mut self.engine)
+    }
 }
 
 fn request(seed: u64, turn: u64) -> TurnRequest {
@@ -147,6 +172,7 @@ fn run(journal: &str, ledger: &str, acks: &str, seed: u64, turns: u64) {
         acks: open_append(acks),
         rng: Rng(seed ^ started),
         clock: 0,
+        engine: drill_cells::ScriptEngine::new(journal),
     };
     append_synced(&mut drill.ledger, &format!("{RUN_MARKER}\n"));
     let first = acknowledged_last(acks) + 1;
@@ -252,6 +278,7 @@ fn calls(records: &[Record]) -> Calls {
 }
 
 struct Dispatch {
+    nested: bool,
     id: String,
     tool: String,
     external: bool,
@@ -275,6 +302,7 @@ fn ledger_runs(ledger: &str) -> Vec<Vec<Dispatch>> {
             .last_mut()
             .unwrap_or_else(|| panic!("ledger line {line:?} comes before any run marker"));
         run.push(Dispatch {
+            nested: id.contains(harness::NESTED_ID_INFIX),
             id: id.to_owned(),
             tool: tool.to_owned(),
             external: effect == EffectClass::External.name(),
@@ -297,7 +325,7 @@ fn check_finished(session: &harness::Session, calls: &Calls, turns: u64) {
 
 fn check_external(calls: &Calls, runs: &[Vec<Dispatch>]) {
     let mut dispatched: BTreeMap<&str, u64> = BTreeMap::new();
-    for dispatch in runs.iter().flatten().filter(|dispatch| dispatch.external) {
+    for dispatch in runs.iter().flatten().filter(|dispatch| dispatch.external && !dispatch.nested) {
         *dispatched.entry(&dispatch.id).or_default() += 1;
         let logged = calls.external.get(&dispatch.id);
         assert!(
@@ -336,7 +364,7 @@ fn check_other(calls: &Calls, runs: &[Vec<Dispatch>]) {
     let (finished_run, killed_runs) = runs
         .split_last()
         .expect("the ledger holds the run that finished");
-    for dispatch in finished_run.iter().filter(|dispatch| !dispatch.external) {
+    for dispatch in finished_run.iter().filter(|dispatch| !dispatch.external && !dispatch.nested) {
         let logged = calls.other.get(&dispatch.id);
         assert!(
             logged.is_some(),
@@ -358,7 +386,7 @@ fn check_other(calls: &Calls, runs: &[Vec<Dispatch>]) {
         .collect();
     for (id, logged) in &calls.other {
         assert!(logged.done, "idempotent_known: {id} ends without a result");
-        if !BUILTIN_EFFECTS.contains(&logged.tool.as_str()) {
+        if !BUILTIN_EFFECTS.contains(&logged.tool.as_str()) && program::code_of(&logged.tool).is_none() {
             assert!(
                 ran.contains(&(id.as_str(), logged.tool.as_str())),
                 "{id} has a result without a dispatch of {}",
@@ -405,12 +433,14 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
     check_other(&calls, &runs);
     let acks_count = check_acks(&calls, acks, turns);
     let tail = check_tail(journal, &session);
+    let cells = drill_cells::check_cells(&session, &opened.records, &runs);
     let dispatches: usize = runs.iter().map(Vec::len).sum();
     let unrecorded = runs
         .iter()
         .flatten()
         .filter(|dispatch| {
             !dispatch.external
+                && !dispatch.nested
                 && !calls
                     .other
                     .get(&dispatch.id)
@@ -418,13 +448,18 @@ fn verify(journal: &str, ledger: &str, acks: &str, turns: u64) {
         })
         .count();
     println!(
-        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={dispatches} other_dispatches_lost_in_a_kill={unrecorded} acks={acks_count} {tail} torn_bytes_dropped={}",
+        "verified turns={turns} runs={} records={} external={} unknown={} other={} dispatches={dispatches} other_dispatches_lost_in_a_kill={unrecorded} acks={acks_count} {tail} torn_bytes_dropped={} cells={} cells_threw={} nested_external={} nested_unknown={} nested_other={}",
         runs.len(),
         opened.records.len(),
         calls.external.len(),
         calls.unknown.len(),
         calls.other.len(),
-        opened.dropped_bytes
+        opened.dropped_bytes,
+        cells.cells,
+        cells.threw,
+        cells.external,
+        cells.unknown,
+        cells.other
     );
 }
 
@@ -542,6 +577,7 @@ fn bench(journal: &str, ledger: &str, acks: &str, turns: u64, mode: &str) {
         acks: open_append(acks),
         rng: Rng(turns),
         clock: 0,
+        engine: drill_cells::ScriptEngine::new(journal),
     };
     let started = std::time::Instant::now();
     let file = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");

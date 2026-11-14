@@ -115,5 +115,24 @@ if [ "${HL_DRILL:-0}" = 1 ]; then
     exit 1
   fi
   echo "drill: flush_after_dispatch is caught on the real files"
+  coder=(DRILL_FILE=examples/code_agent.hl DRILL_TURNS=4 DRILL_DELAY_MS_MAX=40)
+  env "${coder[@]}" DRILL_SESSIONS=4 scripts/rust-crash-drill.sh
+  for expected in \
+    "nested_flush_after_dispatch:nested_external_once: [0-9/]+code-[0-9]+ ran before its (cell's header|call record) was durable" \
+    "timeout_rides:header_before_wait: cell [0-9]+ waits on timer [0-9]+ before its header is durable" \
+    "cell_recovery_reports_failed:unknown_nested_reported: [0-9/]+code-[0-9]+ is delivered unknown exactly when a recovery lists it" \
+    "cell_recovery_redispatches_external:nested_external_once: [0-9/]+code-[0-9]+ dispatched [0-9]+ times"; do
+    mutation=${expected%%:*}
+    if env "${coder[@]}" DRILL_SESSIONS=8 DRILL_MUTATION="$mutation" scripts/rust-crash-drill.sh > "$scratch/drill-$mutation.log" 2>&1; then
+      echo "drill: $mutation survived the crash drill" >&2
+      exit 1
+    fi
+    if ! grep -qE "${expected#*:}" "$scratch/drill-$mutation.log"; then
+      echo "drill: $mutation failed for another reason:" >&2
+      cat "$scratch/drill-$mutation.log" >&2
+      exit 1
+    fi
+    echo "drill: $mutation is caught on the real files"
+  done
 fi
 echo "check.sh: ok"

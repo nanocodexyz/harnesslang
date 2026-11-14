@@ -605,9 +605,7 @@ impl<'a, 'h> Runner<'a, 'h> {
         match logged {
             Some(SiteLog::Done(_, output)) => self.set_output(id, encode_output(&output)),
             Some(SiteLog::Unknown(_)) => self.set_output(id, (unknown_outcome().encode(), false)),
-            Some(SiteLog::Open(_)) => {
-                panic!("recovery turns every open nested external call unknown before the cell runs again")
-            }
+            Some(SiteLog::Open(_)) => panic!("recovery turns every open nested external call unknown before the cell runs again"),
             Some(SiteLog::Reply(_)) => panic!("a nested call never holds a model reply"),
             None if tool.effect == EffectClass::External => self.dispatch(id, true)?,
             None => {}
@@ -630,7 +628,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             });
         }
         self.emit(false);
-        if required {
+        if tool.effect.may_be_unknown() {
             self.host.flush()?;
             self.header_unsaved = false;
         }
