@@ -181,6 +181,15 @@ fn record_line(program: &Program, session: &Session, record: &Record, position: 
     if let Record::Cell { cell, .. } = record {
         return Json::object([("cell", cell_json(session, *cell)), ("record", position)]);
     }
+    if let Record::Host { key, value } = record {
+        return Json::object([
+            (
+                "host",
+                Json::object([("key", Json::text(key)), ("value", value.clone())]),
+            ),
+            ("record", position),
+        ]);
+    }
     let Some(turn) = record.turn() else {
         let (revision, _) = session
             .checkpoints

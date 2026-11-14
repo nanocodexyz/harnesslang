@@ -252,6 +252,13 @@ fn run_seed_unguarded(
             world.stats.entry_states += 1;
         }
     }
+    if strict == strict::Mode::Off
+        && let Some(entry) = fork::forked_entry(program, &world.target, seed)
+    {
+        for record in &entry {
+            world.seed_entry(record);
+        }
+    }
     world.trace = trace;
     let profile_name = world.profile.name;
     world.record("seed", || {

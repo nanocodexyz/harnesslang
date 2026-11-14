@@ -151,7 +151,7 @@ pub fn deny_input(id: &str, tool: &str, input: &str, reason: &str) -> Json {
 pub const SPAWN_SCOPE_SEPARATOR: &str = "/";
 
 pub fn spawn_output(scope: &str, turn: u64, seq: u64, tool: &str, output: Output) -> Output {
-    if !matches!(output, Output::Ok(_)) || !program::spawns(tool) {
+    if !matches!(output, Output::Ok(_)) || (!program::spawns(tool) && program::fork_of(tool).is_none()) {
         return output;
     }
     let key = format!("{turn}{SPAWN_KEY_SEPARATOR}{seq}");
@@ -627,7 +627,7 @@ pub const fn events_taken() -> bool {
 }
 
 pub const fn reads_whole() -> bool {
-    program::HOLDS_BLOBS || program::JOB_EVENT.is_some()
+    program::HOLDS_BLOBS || program::JOB_EVENT.is_some() || program::FORKS
 }
 
 pub fn job_count(events: &[Recorded]) -> u64 {
@@ -855,6 +855,7 @@ pub struct Engine<'a> {
     discovered: BTreeMap<usize, std::collections::BTreeSet<String>>,
     blobs: Blobs,
     snapshot: Option<program::State>,
+    fork_base: Option<Session>,
 }
 
 impl<'a> Engine<'a> {
@@ -882,7 +883,46 @@ impl<'a> Engine<'a> {
             discovered: BTreeMap::new(),
             blobs: Blobs::default(),
             snapshot: None,
+            fork_base: None,
         }
+    }
+
+    pub fn with_fork_base(mut self, session: Session) -> Self {
+        assert!(program::FORKS, "only a program with fork tools keeps the journal a fork reads");
+        self.fork_base = Some(session);
+        self
+    }
+
+    fn fork_call(&mut self, seq: u64, call: Call) -> Result<Call, Halt> {
+        let Some(at) = program::fork_of(&call.tool) else {
+            return Ok(call);
+        };
+        if !matches!(call.input, Json::Object(_)) {
+            return Ok(call);
+        }
+        let base = self.fork_base.as_ref().expect("a live turn of a program with fork tools keeps the journal a fork reads");
+        let Ok((turn, discarded)) = fork_select(base, fork_requested(at, &call.input)) else {
+            return Ok(call);
+        };
+        let Mode::Live { world, .. } = &mut self.mode else {
+            unreachable!("a fork's input is filled only where its call is written");
+        };
+        let key = format!("{}{SPAWN_KEY_SEPARATOR}{seq}", self.turn);
+        let scope = world.scope();
+        let origin = if scope.is_empty() { key } else { format!("{scope}{SPAWN_SCOPE_SEPARATOR}{key}") };
+        let payload = fork_payload(base, turn, discarded, &origin).map_err(Halt::Exit)?;
+        Ok(Call {
+            input: fork_input(turn, discarded, &origin, payload),
+            ..call
+        })
+    }
+
+    fn fork_refused(&self, call: &Call) -> Option<String> {
+        let at = program::fork_of(&call.tool)?;
+        if !matches!(call.input, Json::Object(_)) || call.input.get(FORK_STATE).is_some() {
+            return None;
+        }
+        Some(fork_missing(fork_requested(at, &call.input).unwrap_or(0)))
     }
 
     pub fn with_snapshot(mut self, snapshot: program::State) -> Self {
@@ -1516,17 +1556,18 @@ impl<'a> Engine<'a> {
             Some(SiteLog::Unknown(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 if !site.maybe {
-                    return self.reopen(site, seq, call, run);
+                    return self.reopen(site, seq, recorded, run);
                 }
                 Ok(Answer::Unknown)
             }
             Some(SiteLog::Open(recorded)) => {
                 self.same(seq, &recorded, &call)?;
-                self.reopen(site, seq, call, run)
+                self.reopen(site, seq, recorded, run)
             }
             None => {
                 self.require_live(seq)?;
                 self.side_question(seq)?;
+                let call = self.fork_call(seq, call)?;
                 if site.kind != Kind::Model {
                     self.append(Record::Call {
                         turn: self.turn,
@@ -1723,6 +1764,9 @@ impl<'a> Engine<'a> {
         {
             return Err(error);
         }
+        if let Some(refused) = self.fork_refused(call) {
+            return Err(refused);
+        }
         let Some((listing, name)) = listed(&call.tool) else {
             return Ok(None);
         };
@@ -1914,7 +1958,11 @@ impl<'a> Engine<'a> {
         if recorded.tool != call.tool {
             return Err(self.diverged(seq, &recorded.tool, &call.tool));
         }
-        if recorded.effect != call.effect || recorded.input != call.input {
+        let input = match program::fork_of(&recorded.tool) {
+            Some(at) => fork_request_of(at, &recorded.input),
+            None => recorded.input.clone(),
+        };
+        if recorded.effect != call.effect || input != call.input {
             return Err(Halt::Exit(Exit::Corrupt(format!(
                 "replay of turn {} diverged at seq {seq}: tool '{}' was recorded with another class or input",
                 self.turn, call.tool
@@ -2531,6 +2579,9 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
         .with_attested(attested);
     if let Some(snapshot) = snapshot {
         engine = engine.with_snapshot(snapshot);
+    }
+    if program::FORKS {
+        engine = engine.with_fork_base(session.clone());
     }
     if let Some(record) = pending {
         engine.append(record);

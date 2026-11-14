@@ -13,6 +13,47 @@ use crate::sim::{Placement, generate, request_turn};
 
 pub const FORK_CHILD_TURNS_MAX: u64 = 2;
 pub const FORK_TURN_PAST_PPM: u64 = 250_000;
+pub const FORKED_ENTRY_PPM: u64 = 250_000;
+pub const FORKED_ENTRY_ORIGIN: &str = "host";
+pub const FORKED_ENTRY_DISCARDED_MAX: u64 = 2;
+
+pub fn forked_entry(
+    program: &Program,
+    target: &crate::target::Model,
+    seed: u64,
+) -> Option<[Record; 2]> {
+    if !program.forks() {
+        return None;
+    }
+    let mut rng = Rng::derive(seed, "forked entry");
+    if !rng.chance(FORKED_ENTRY_PPM) {
+        return None;
+    }
+    let selected = fork::Selected {
+        turn: session::ENTRY_REVISION,
+        discarded: rng.below(FORKED_ENTRY_DISCARDED_MAX),
+    };
+    let setup = Setup {
+        program,
+        target,
+        mutation: Mutation::None,
+    };
+    let payload = fork::entry_payload(
+        setup,
+        &session::Session::default(),
+        &selected,
+        FORKED_ENTRY_ORIGIN,
+        None,
+    )
+    .expect("the entry state replays no turn");
+    Some(
+        fork::records_of(
+            program,
+            &fork::input(&selected, FORKED_ENTRY_ORIGIN, payload),
+        )
+        .expect("a fork's input holds its records"),
+    )
+}
 
 fn unequal(detail: String) -> Violation {
     Violation {
