@@ -136,6 +136,36 @@ pub fn run_seed_traced(
     seed: u64,
     trace: Option<trace::Trace>,
 ) -> (SeedRun, Option<trace::Trace>) {
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_seed_unguarded(program, target, mutation, seed, trace)
+    }));
+    ran.unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_owned());
+        let run = SeedRun {
+            journal: Vec::new(),
+            acks: Vec::new(),
+            stats: Stats::default(),
+            profile: faults::Profile::of(seed, target).name,
+            result: Err(Violation {
+                invariant: Invariant::Panic,
+                detail,
+            }),
+        };
+        (run, None)
+    })
+}
+
+fn run_seed_unguarded(
+    program: &Program,
+    target: Target,
+    mutation: Mutation,
+    seed: u64,
+    trace: Option<trace::Trace>,
+) -> (SeedRun, Option<trace::Trace>) {
     let mut workload = Rng::derive(seed, "workload");
     let turns = workload.range(1, TURNS_PER_SESSION_MAX);
     let mut world = SimWorld::new(program, target, mutation, seed, true);

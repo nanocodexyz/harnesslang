@@ -129,7 +129,7 @@ pub fn replay_all(
 
 fn recover(log: &mut TurnLog, mutation: Mutation) -> Vec<u64> {
     let unknown = log.open_seqs(|class| match mutation {
-        Mutation::RecoveryRedispatchesExternal => false,
+        Mutation::RecoveryRedispatchesExternal | Mutation::RecoverySkipped => false,
         Mutation::IdempotentReportedUnknown => true,
         _ => class.may_be_unknown(),
     });

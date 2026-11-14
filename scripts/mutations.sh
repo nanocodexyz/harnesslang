@@ -6,7 +6,7 @@ seeds="${MUTATION_SEEDS:-0..200}"
 hl=target/release/hl
 file=examples/agent.hl
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
-mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early recovery_reports_failed rerun_rewrites_call checkpoint_hash_order"
+mutations="flush_after_dispatch recovery_redispatches_external vercel_retry_redispatches postgres_no_fence jsonl_no_checksum finish_before_flush idempotent_reported_unknown gate_releases_early recovery_reports_failed rerun_rewrites_call checkpoint_hash_order recovery_skipped"
 
 [ -x "$hl" ] || cargo build --release --locked
 
@@ -26,7 +26,7 @@ for mutation in $mutations; do
       echo "$output" >&2
       exit 1
     fi
-    echo "caught $mutation on $target: $(head -1 <<< "$output" | cut -d: -f1)"
+    echo "caught $mutation on $target: $(grep -m1 '^FAIL invariant=' <<< "$output" | cut -d: -f1)"
   done
   if [ "$applied" -eq 0 ]; then
     echo "mutation $mutation applies to no target" >&2
