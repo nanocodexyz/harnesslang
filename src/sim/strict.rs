@@ -206,15 +206,18 @@ fn within_worst(
     Ok(())
 }
 
+pub fn overrun(worst_faults: &[String]) -> Result<(), Violation> {
+    match worst_faults.first() {
+        Some(fault) => violation(Invariant::WorstCase, fault.clone()),
+        None => Ok(()),
+    }
+}
+
 pub fn check(
     program: &Program,
     target: &target::Model,
     records: &[Record],
-    worst_faults: &[String],
 ) -> Result<(), Violation> {
-    if let Some(fault) = worst_faults.first() {
-        return violation(Invariant::WorstCase, fault.clone());
-    }
     let folded = session::fold(records).map_err(|error| Violation {
         invariant: Invariant::Liveness,
         detail: format!("the final journal does not fold: {error}"),

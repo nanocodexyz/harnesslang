@@ -231,13 +231,10 @@ fn run_seed_unguarded(
     let records = world.medium.durable();
     if result.is_ok() {
         result = match &records {
-            Ok(records) => invariants::check(program, &world, turns, records).and_then(|()| {
-                if strict != strict::Mode::Off {
-                    strict::check(program, &world.target, records, &world.worst_faults)
-                } else {
-                    Ok(())
-                }
-            }),
+            Ok(records) if strict != strict::Mode::Off => strict::overrun(&world.worst_faults)
+                .and_then(|()| invariants::check(program, &world, turns, records))
+                .and_then(|()| strict::check(program, &world.target, records)),
+            Ok(records) => invariants::check(program, &world, turns, records),
             Err(error) => Err(liveness(format!(
                 "the final journal cannot be read: {error}"
             ))),

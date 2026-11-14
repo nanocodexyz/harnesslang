@@ -1,32 +1,165 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -m
 cd "$(dirname "$0")/.."
 
 seeds="${SEEDS:-0..2000}"
 twice_seeds="${TWICE_SEEDS:-0..300}"
+rust_diff_seeds="${RUST_DIFF_SEEDS:-0..300}"
+js_diff_seeds="${JS_DIFF_SEEDS:-0..100}"
+if [ "${HL_LONG:-0}" = 1 ]; then
+  rust_diff_seeds="${RUST_DIFF_SEEDS:-0..2000}"
+  js_diff_seeds="${JS_DIFF_SEEDS:-0..2000}"
+fi
+jobs="${CHECK_JOBS:-$(nproc)}"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
+rust_targets="native-jsonl native-sqlite server-postgres"
+js_targets="cloudflare vercel"
+examples=$(echo examples/*.hl)
 hl=target/release/hl
 scratch=output/check
+logs=$scratch/jobs
 mkdir -p "$scratch"
+rm -rf "$logs"
+mkdir -p "$logs"
 
-cargo build --release --locked
-packages=$(grep -c '^name = ' Cargo.lock)
-if [ "$packages" -ne 1 ] || ! grep -q '^name = "harnesslang"' Cargo.lock; then
-  echo "Cargo.lock must list harnesslang alone" >&2
-  exit 1
-fi
-if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' src; then
-  echo "src has comments or test functions" >&2
-  exit 1
-fi
+stage_order=()
+declare -A stage_jobs=() stage_first=() stage_last=() stage_busy=()
+job_stages=()
+job_commands=()
+declare -A running_index=() running_started=()
+check_started=$(date +%s%N)
 
-for file in examples/*.hl; do
-  "$hl" check "$file" > /dev/null
-  for target in $targets; do
-    "$hl" check --target "$target" "$file" > /dev/null
+milliseconds() {
+  echo $(( ($(date +%s%N) - check_started) / 1000000 ))
+}
+
+seconds() {
+  printf '%d.%d' $(( $1 / 1000 )) $(( $1 % 1000 / 100 ))
+}
+
+timings() {
+  local stage
+  echo "check.sh: stage timings (wall: first job start to last job end; busy: the jobs' wall times added up; $jobs jobs at once)"
+  for stage in "${stage_order[@]}"; do
+    [ -n "${stage_last[$stage]:-}" ] || continue
+    printf '  %-16s %3d job(s) %8s s wall %8s s busy\n' "$stage" "${stage_jobs[$stage]}" \
+      "$(seconds $(( stage_last[$stage] - stage_first[$stage] )))" "$(seconds "${stage_busy[$stage]}")"
   done
-done
-echo "check: every example passes on every target"
+  echo "  total $(seconds "$(milliseconds)") s"
+}
+
+stop_running() {
+  local pid
+  for pid in "${!running_index[@]}"; do
+    kill -TERM -- "-$pid" 2> /dev/null || true
+  done
+  for pid in "${!running_index[@]}"; do
+    wait "$pid" 2> /dev/null || true
+  done
+  running_index=()
+}
+trap stop_running EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+queue() {
+  local stage=$1
+  shift
+  if [ -z "${stage_jobs[$stage]:-}" ]; then
+    stage_order+=("$stage")
+    stage_jobs[$stage]=0
+    stage_busy[$stage]=0
+  fi
+  stage_jobs[$stage]=$(( stage_jobs[$stage] + 1 ))
+  job_stages+=("$stage")
+  job_commands+=("$*")
+}
+
+log_of() {
+  echo "$logs/$1-${job_stages[$1]}.log"
+}
+
+start_job() {
+  local index=$1 words stage
+  read -ra words <<< "${job_commands[$index]}"
+  ( set +m; "${words[@]}" ) > "$(log_of "$index")" 2>&1 &
+  running_index[$!]=$index
+  running_started[$!]=$(milliseconds)
+  stage=${job_stages[$index]}
+  [ -n "${stage_first[$stage]:-}" ] || stage_first[$stage]=${running_started[$!]}
+}
+
+finish_job() {
+  local pid=$1 status=$2 index stage started ended
+  index=${running_index[$pid]}
+  stage=${job_stages[$index]}
+  started=${running_started[$pid]}
+  ended=$(milliseconds)
+  unset "running_index[$pid]" "running_started[$pid]"
+  stage_last[$stage]=$ended
+  stage_busy[$stage]=$(( stage_busy[$stage] + ended - started ))
+  if [ "$status" -ne 0 ]; then
+    stop_running
+    cat "$(log_of "$index")" >&2
+    echo "check.sh: FAILED in stage $stage: ${job_commands[$index]} exited $status after $(seconds $(( ended - started ))) s (log: $(log_of "$index"))" >&2
+    timings >&2
+    exit 1
+  fi
+  cat "$(log_of "$index")"
+}
+
+run_queued() {
+  local next=0 pid status
+  while [ "$next" -lt "${#job_commands[@]}" ] || [ "${#running_index[@]}" -gt 0 ]; do
+    while [ "${#running_index[@]}" -lt "$jobs" ] && [ "$next" -lt "${#job_commands[@]}" ]; do
+      start_job "$next"
+      next=$((next + 1))
+    done
+    if wait -n -p pid; then
+      status=0
+    else
+      status=$?
+    fi
+    finish_job "$pid" "$status"
+  done
+  job_stages=()
+  job_commands=()
+}
+
+stage() {
+  queue "$@"
+  run_queued
+}
+
+build() {
+  cargo build --release --locked
+}
+
+rules() {
+  local packages
+  packages=$(grep -c '^name = ' Cargo.lock)
+  if [ "$packages" -ne 1 ] || ! grep -q '^name = "harnesslang"' Cargo.lock; then
+    echo "Cargo.lock must list harnesslang alone" >&2
+    exit 1
+  fi
+  if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' src; then
+    echo "src has comments or test functions" >&2
+    exit 1
+  fi
+  echo "rules: Cargo.lock lists harnesslang alone, and src has no comments or test functions"
+}
+
+examples_pass() {
+  local file target
+  for file in $examples; do
+    "$hl" check "$file" > /dev/null
+    for target in $targets; do
+      "$hl" check --target "$target" "$file" > /dev/null
+    done
+  done
+  echo "check: every example passes on every target"
+}
 
 expect_error() {
   local file=$1 target=$2 expected=$3
@@ -43,25 +176,28 @@ expect_error() {
   fi
 }
 
-expect_error examples/invalid/missing_unknown.hl any "missing_unknown.hl:21:11: error: match on maybe<text> is missing 'unknown'"
-expect_error examples/invalid/unchecked_external.hl any "unchecked_external.hl:10:3: error: match on maybe<text> is missing 'unknown'"
-expect_error examples/invalid/unbounded_list.hl any "unbounded_list.hl:8:22: error: a list needs a capacity"
-expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: error: the bound of loop 'step' must be a named constant, found number 64"
-expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
-expect_error examples/invalid/enum_missing_value.hl any 'enum_missing_value.hl:6:3: error: match on status is missing "interrupted"'
-expect_error examples/invalid/enum_unknown_value.hl any 'enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status'
-expect_error examples/invalid/reply_two_call_lists.hl any "reply_two_call_lists.hl:7:73: error: reply type 'split_reply' carries list<call, calls_max> in 'reads' and 'writes': exactly one variant carries the model's calls"
-expect_error examples/invalid/reply_no_call_list.hl any "reply_no_call_list.hl:6:6: error: reply type 'text_reply' has no variant carrying list<call, calls_max>"
-expect_error examples/invalid/reply_missing_variant.hl any "reply_missing_variant.hl:21:7: error: match on turn_reply is missing 'paused'"
-expect_error examples/invalid/reply_unmatched_failure.hl any "reply_unmatched_failure.hl:20:5: error: 'answer' is not a variant of known<turn_reply>"
-expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': worst case 17408 outbound requests exceeds cloudflare's limit of 10000 outbound requests per invocation; loops: step below turn_steps_max (1024) x call below calls_per_step_max (16)"
-expect_error examples/invalid/fn_recursion.hl any "fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask"
-expect_error examples/invalid/fn_arity.hl any "fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1"
-expect_error examples/invalid/fn_hidden_name.hl any "fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input'"
-for target in native-jsonl native-sqlite server-postgres vercel; do
-  "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
-done
-echo "check: every invalid example fails with its expected error"
+invalid_fail() {
+  expect_error examples/invalid/missing_unknown.hl any "missing_unknown.hl:21:11: error: match on maybe<text> is missing 'unknown'"
+  expect_error examples/invalid/unchecked_external.hl any "unchecked_external.hl:10:3: error: match on maybe<text> is missing 'unknown'"
+  expect_error examples/invalid/unbounded_list.hl any "unbounded_list.hl:8:22: error: a list needs a capacity"
+  expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: error: the bound of loop 'step' must be a named constant, found number 64"
+  expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
+  expect_error examples/invalid/enum_missing_value.hl any 'enum_missing_value.hl:6:3: error: match on status is missing "interrupted"'
+  expect_error examples/invalid/enum_unknown_value.hl any 'enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status'
+  expect_error examples/invalid/reply_two_call_lists.hl any "reply_two_call_lists.hl:7:73: error: reply type 'split_reply' carries list<call, calls_max> in 'reads' and 'writes': exactly one variant carries the model's calls"
+  expect_error examples/invalid/reply_no_call_list.hl any "reply_no_call_list.hl:6:6: error: reply type 'text_reply' has no variant carrying list<call, calls_max>"
+  expect_error examples/invalid/reply_missing_variant.hl any "reply_missing_variant.hl:21:7: error: match on turn_reply is missing 'paused'"
+  expect_error examples/invalid/reply_unmatched_failure.hl any "reply_unmatched_failure.hl:20:5: error: 'answer' is not a variant of known<turn_reply>"
+  expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': worst case 17408 outbound requests exceeds cloudflare's limit of 10000 outbound requests per invocation; loops: step below turn_steps_max (1024) x call below calls_per_step_max (16)"
+  expect_error examples/invalid/fn_recursion.hl any "fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask"
+  expect_error examples/invalid/fn_arity.hl any "fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1"
+  expect_error examples/invalid/fn_hidden_name.hl any "fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input'"
+  local target
+  for target in native-jsonl native-sqlite server-postgres vercel; do
+    "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
+  done
+  echo "check: every invalid example fails with its expected error"
+}
 
 same_program() {
   local with_fn=$1 written_out=$2 target
@@ -78,85 +214,144 @@ same_program() {
     return 1
   fi
 }
-same_program examples/subagents.hl examples/inlined/subagents.hl
-same_program docs/snippets/fn.hl docs/snippets/fn_inline.hl
-sed '/push agents spawned/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' examples/inlined/subagents.hl > "$scratch/planted.hl"
-"$hl" check "$scratch/planted.hl" > /dev/null
-if same_program examples/subagents.hl "$scratch/planted.hl" 2> /dev/null; then
-  echo "fn: a written-out program with two pushes swapped still compares equal" >&2
-  exit 1
-fi
-echo "check: every fn program emits, checks and proves exactly as its written-out copy"
 
-pids=()
-for target in $targets; do
-  (
-    for file in examples/*.hl; do
-      "$hl" sim --target "$target" --seeds "$seeds" "$file"
+fn_equal() {
+  same_program examples/subagents.hl examples/inlined/subagents.hl
+  same_program docs/snippets/fn.hl docs/snippets/fn_inline.hl
+  sed '/push agents spawned/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' examples/inlined/subagents.hl > "$scratch/planted.hl"
+  "$hl" check "$scratch/planted.hl" > /dev/null
+  if same_program examples/subagents.hl "$scratch/planted.hl" 2> /dev/null; then
+    echo "fn: a written-out program with two pushes swapped still compares equal" >&2
+    exit 1
+  fi
+  echo "check: every fn program emits, checks and proves exactly as its written-out copy"
+}
+
+sim_one() {
+  local target=$1 file=$2
+  "$hl" sim --target "$target" --seeds "$seeds" "$file" | sed "s#^#sim file=$file target=$target: #"
+}
+
+sim_twice() {
+  "$hl" sim --target "$1" --seeds "$twice_seeds" --twice examples/agent.hl
+}
+
+rust_diff_one() {
+  RUST_DIFF_SEEDS=$rust_diff_seeds RUST_DIFF_TARGETS=$1 RUST_DIFF_FILES=$2 scripts/rust-diff.sh
+}
+
+js_diff_one() {
+  JS_DIFF_SEEDS=$js_diff_seeds JS_DIFF_TARGETS=$1 JS_DIFF_FILES=$2 scripts/js-diff.sh
+}
+
+mutation_one() {
+  MUTATIONS=$1 scripts/mutations.sh
+}
+
+census_examples() {
+  local file name target missing=0
+  cat "$logs"/*.log > "$scratch/sweeps.log"
+  for file in $examples; do
+    name=$(basename "$file" .hl)
+    for target in $targets; do
+      if ! grep -q "^sim file=$file target=$target: ok target=$target mutation=none seeds=$seeds " "$scratch/sweeps.log"; then
+        echo "census: $file was not swept by hl sim on $target" >&2
+        missing=1
+      fi
     done
-    "$hl" sim --target "$target" --seeds "$twice_seeds" --twice examples/agent.hl
-  ) > "$scratch/sim-$target.log" 2>&1 &
-  pids+=($!)
-done
-failed=0
-for index in "${!pids[@]}"; do
-  if ! wait "${pids[$index]}"; then
-    failed=1
-  fi
-done
-cat "$scratch"/sim-*.log
-if [ "$failed" -ne 0 ]; then
-  echo "sim: a sweep failed" >&2
-  exit 1
-fi
-echo "sim: every example passes seeds $seeds on every target, and agent.hl seeds $twice_seeds twice"
+    for target in $rust_targets; do
+      if ! grep -q "^ok backend=rust target=$target harness=$name seeds=" "$scratch/sweeps.log"; then
+        echo "census: $file had no Rust differential run on $target" >&2
+        missing=1
+      fi
+    done
+    for target in $js_targets; do
+      if ! grep -q "^ok backend=js file=$file target=$target " "$scratch/sweeps.log"; then
+        echo "census: $file had no JavaScript differential run on $target" >&2
+        missing=1
+      fi
+    done
+  done
+  [ "$missing" -eq 0 ] || exit 1
+  echo "census: all $(wc -w <<< "$examples") examples are swept by hl sim on every target and by the differential runs on every Rust and JavaScript target"
+}
 
-scripts/mutations.sh
-scripts/exhaustive.sh
-scripts/strict.sh
-scripts/prove-mutations.sh
-scripts/docs-check.sh
-if [ "${HL_ORACLE:-0}" = 1 ]; then
-  scripts/oracle.sh
-fi
-if [ "${HL_DRILL:-0}" = 1 ]; then
+drill_mutation_caught() {
+  local log=$1 pattern=$2 what=$3
+  shift 3
+  if "$@" > "$log" 2>&1; then
+    echo "drill: $what survived" >&2
+    exit 1
+  fi
+  if ! grep -qE "$pattern" "$log"; then
+    echo "drill: $what failed for another reason:" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+}
+
+drill() {
+  local dispatched='external [0-9]+/[0-9]+ ran (before its call record was durable|as its recorded tool)'
+  local fenced='fence: external [0-9]+/[0-9]+ dispatched by run a\.|taken_over: only a stale owner writes the marker'
+  local target
   DRILL_SESSIONS=4 scripts/rust-crash-drill.sh
-  if DRILL_SESSIONS=8 DRILL_MUTATION=flush_after_dispatch scripts/rust-crash-drill.sh > "$scratch/drill-mutation.log" 2>&1; then
-    echo "drill: flush_after_dispatch survived the crash drill" >&2
-    exit 1
-  fi
-  if ! grep -qE 'external [0-9]+/[0-9]+ ran (before its call record was durable|as its recorded tool)' "$scratch/drill-mutation.log"; then
-    echo "drill: flush_after_dispatch failed for another reason:" >&2
-    cat "$scratch/drill-mutation.log" >&2
-    exit 1
-  fi
+  drill_mutation_caught "$scratch/drill-mutation.log" "$dispatched" "flush_after_dispatch in the crash drill" \
+    env DRILL_SESSIONS=8 DRILL_MUTATION=flush_after_dispatch scripts/rust-crash-drill.sh
   echo "drill: flush_after_dispatch is caught on the real files"
   SQL_DRILL_SESSIONS=2 scripts/rust-sql-drill.sh
   for target in native-sqlite server-postgres; do
-    log="$scratch/sql-drill-flush_after_dispatch-$target.log"
-    if SQL_DRILL_TARGETS=$target SQL_DRILL_MODE=crash SQL_DRILL_MUTATION=flush_after_dispatch scripts/rust-sql-drill.sh > "$log" 2>&1; then
-      echo "drill: flush_after_dispatch survived the SQL crash drill on $target" >&2
-      exit 1
-    fi
-    if ! grep -qE 'external [0-9]+/[0-9]+ ran (before its call record was durable|as its recorded tool)' "$log"; then
-      echo "drill: flush_after_dispatch failed for another reason on $target:" >&2
-      cat "$log" >&2
-      exit 1
-    fi
-    log="$scratch/sql-drill-no_fence-$target.log"
-    if SQL_DRILL_TARGETS=$target SQL_DRILL_MODE=takeover SQL_DRILL_MUTATION=no_fence scripts/rust-sql-drill.sh > "$log" 2>&1; then
-      echo "drill: no_fence survived the takeover drill on $target" >&2
-      exit 1
-    fi
-    if ! grep -qE 'fence: external [0-9]+/[0-9]+ dispatched by run a\.|taken_over: only a stale owner writes the marker' "$log"; then
-      echo "drill: no_fence failed for another reason on $target:" >&2
-      cat "$log" >&2
-      exit 1
-    fi
+    drill_mutation_caught "$scratch/sql-drill-flush_after_dispatch-$target.log" "$dispatched" "flush_after_dispatch in the SQL crash drill on $target" \
+      env SQL_DRILL_TARGETS=$target SQL_DRILL_MODE=crash SQL_DRILL_MUTATION=flush_after_dispatch scripts/rust-sql-drill.sh
+    drill_mutation_caught "$scratch/sql-drill-no_fence-$target.log" "$fenced" "no_fence in the takeover drill on $target" \
+      env SQL_DRILL_TARGETS=$target SQL_DRILL_MODE=takeover SQL_DRILL_MUTATION=no_fence scripts/rust-sql-drill.sh
   done
   echo "drill: flush_after_dispatch and no_fence are caught in the real SQLite and Postgres databases"
+}
+
+stage build build
+stage census scripts/mutations.sh --census
+queue rules rules
+queue examples examples_pass
+queue invalid invalid_fail
+queue fn fn_equal
+queue docs scripts/docs-check.sh
+queue strict scripts/strict.sh
+for file in $examples; do
+  for target in $js_targets; do
+    queue js-diff js_diff_one "$target" "$file"
+  done
+done
+for file in $examples; do
+  for target in $targets; do
+    queue sim sim_one "$target" "$file"
+  done
+done
+for target in $targets; do
+  queue sim-twice sim_twice "$target"
+done
+for file in $examples; do
+  for target in $rust_targets; do
+    queue rust-diff rust_diff_one "$target" "$file"
+  done
+done
+for mutation in $(scripts/mutations.sh --plans); do
+  queue mutations mutation_one "$mutation"
+done
+for plan in $(scripts/mutations.sh --diff-plans); do
+  queue diff-plants scripts/mutations.sh --diff "$plan"
+done
+queue exhaustive scripts/exhaustive.sh
+queue prove scripts/prove-mutations.sh
+run_queued
+stage census-examples census_examples
+if [ "${HL_ORACLE:-0}" = 1 ]; then
+  stage oracle scripts/oracle.sh
+fi
+if [ "${HL_DRILL:-0}" = 1 ]; then
+  stage drill drill
 fi
 if [ "${HL_CLOUDFLARE:-0}" = 1 ]; then
-  scripts/cloudflare-drill.sh
+  stage cloudflare scripts/cloudflare-drill.sh
 fi
+timings
 echo "check.sh: ok"
