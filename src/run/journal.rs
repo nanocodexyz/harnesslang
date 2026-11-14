@@ -126,6 +126,7 @@ pub enum Record {
         seq: u64,
         response: Json,
         mode: Option<String>,
+        settings: Option<Json>,
     },
     NestedCall {
         turn: u64,
@@ -344,6 +345,7 @@ pub fn to_json(record: &Record) -> Json {
             seq,
             response,
             mode,
+            settings,
         } => {
             let mut fields = BTreeMap::from([
                 ("call_id".to_owned(), Json::String(call_id(*turn, *seq))),
@@ -353,6 +355,9 @@ pub fn to_json(record: &Record) -> Json {
             ]);
             if let Some(mode) = mode {
                 fields.insert(MODEL_MODE.to_owned(), Json::text(mode));
+            }
+            if let Some(settings) = settings {
+                fields.insert(MODEL_SETTINGS.to_owned(), settings.clone());
             }
             ("model", Json::Object(fields))
         }
@@ -491,6 +496,7 @@ fn recovery_ids(turn: u64, unknown: &[u64], nested: &[(u64, u64)]) -> Json {
 }
 
 pub const MODEL_MODE: &str = "mode";
+pub const MODEL_SETTINGS: &str = "settings";
 pub const RECOVERY_REPLIED: &str = "replied";
 pub const RECOVERY_UNDISPATCHED: &str = "not_dispatched";
 
@@ -620,11 +626,26 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
         }
         "cell" => cell_from(&fields),
         "model" => {
-            let mode = if fields.map.contains_key(MODEL_MODE) {
-                fields.exact(&["call_id", MODEL_MODE, "response", "seq", "turn"])?;
+            let mut keys = vec!["call_id", "response", "seq", "turn"];
+            let mode = fields.map.contains_key(MODEL_MODE);
+            let settings = fields.map.contains_key(MODEL_SETTINGS);
+            keys.extend(mode.then_some(MODEL_MODE));
+            keys.extend(settings.then_some(MODEL_SETTINGS));
+            fields.exact(&keys)?;
+            let mode = if mode {
                 Some(fields.text(MODEL_MODE)?.to_owned())
             } else {
-                fields.exact(&["call_id", "response", "seq", "turn"])?;
+                None
+            };
+            let settings = if settings {
+                let value = fields.get(MODEL_SETTINGS)?;
+                if !matches!(value, Json::Object(_)) {
+                    return Err(format!(
+                        "a model record's {MODEL_SETTINGS} is not an object"
+                    ));
+                }
+                Some(value.clone())
+            } else {
                 None
             };
             let (turn, seq) = top_level(fields.call()?)?;
@@ -633,6 +654,7 @@ pub fn from_json(json: &Json) -> Result<Record, String> {
                 seq,
                 response: fields.get("response")?.clone(),
                 mode,
+                settings,
             })
         }
         "recovery" => {

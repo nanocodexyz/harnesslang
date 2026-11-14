@@ -333,6 +333,7 @@ fn run_seed_unguarded(
     if result.is_ok()
         && profile == "clean"
         && program.has_parallel()
+        && !program.lanes_run_effects()
         && world.inbox.scheduled.is_empty()
         && world.jobs.is_empty()
         && let Ok(records) = &records

@@ -320,6 +320,7 @@ class Seed {
       const side = this.cursor.next("side_model", `side ${request.seq}`);
       same("side model seq", side.seq, request.seq);
       same("side model mode", side.mode ?? null, request.mode);
+      same("side model settings", rt.encodeJson(side.settings ?? null), rt.encodeJson(request.settings ?? null));
       same("side model context crc", side.context_crc, BigInt(rt.crc32(rt.encodeJson(request.context))));
       return side.response;
     }
@@ -328,6 +329,7 @@ class Seed {
     same("model call seq", event.seq, request.seq);
     same("model calls_max", event.calls_max, request.calls_max);
     same("model mode", event.mode ?? null, request.mode);
+    same("model settings", rt.encodeJson(event.settings ?? null), rt.encodeJson(request.settings ?? null));
     same("model context crc", event.context_crc, BigInt(rt.crc32(rt.encodeJson(request.context))));
     return event.response;
   }
@@ -429,7 +431,7 @@ class Seed {
       }
       if (url === MODEL_URL) {
         if (!side) fetchCheck(null);
-        const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, context: body.context });
+        const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, settings: body.settings ?? null, context: body.context });
         return new Response(rt.encodeJson(response), { status: HTTP_OK });
       }
       throw new Error(`unexpected fetch of ${url}`);

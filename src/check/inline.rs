@@ -417,6 +417,19 @@ impl<'a> Inliner<'a> {
                 self.expr(walk, value)?;
                 Ok(statement.clone())
             }
+            Stmt::Rewrite { list, arms, .. } => {
+                walk.reference(&self.declared, list)?;
+                for arm in arms {
+                    let bindings: &[Name] = match &arm.pattern {
+                        Pattern::Variant { bindings, .. } => bindings,
+                        Pattern::Value(_) => &[],
+                    };
+                    if let Some(entry) = &arm.entry {
+                        walk.scoped(bindings, |walk| self.expr(walk, entry))?;
+                    }
+                }
+                Ok(statement.clone())
+            }
             Stmt::If { .. } | Stmt::Match { .. } | Stmt::Loop { .. } | Stmt::For { .. } => {
                 self.compound(walk, statement)
             }
@@ -564,7 +577,12 @@ impl<'a> Inliner<'a> {
                 Expr::Number(..) | Expr::Text(..) | Expr::Bool(..) => {}
                 Expr::Name(name) => walk.reference(&self.declared, name)?,
                 Expr::Member { base, .. } => pending.push(base),
-                Expr::Call { callee, args, .. } => {
+                Expr::Call {
+                    callee,
+                    args,
+                    settings,
+                    ..
+                } => {
                     if self.functions.contains_key(callee.text.as_str()) {
                         return error(
                             callee.at,
@@ -576,6 +594,9 @@ impl<'a> Inliner<'a> {
                     }
                     walk.reference(&self.declared, callee)?;
                     pending.extend(args.iter().rev());
+                    if let Some(settings) = settings {
+                        pending.extend(settings.fields.iter().rev().map(|(_, value)| value));
+                    }
                 }
                 Expr::Binary { left, right, .. }
                 | Expr::With {

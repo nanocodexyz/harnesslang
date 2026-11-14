@@ -193,7 +193,7 @@ impl Workspace {
     pub fn recover(&self, turn: u64, seq: u64, tool: &str, input: &Value) -> Recovered {
         match tool {
             "Bash" => self.recover_bash(turn, seq),
-            "Write" => self.recover_write(input),
+            "Write" => self.recover_write(turn, seq, input),
             "Edit" => self.recover_edit(input),
             _ => Recovered::Unknown,
         }
@@ -216,7 +216,7 @@ impl Workspace {
         Recovered::NotDispatched
     }
 
-    fn recover_write(&self, input: &Value) -> Recovered {
+    fn recover_write(&self, turn: u64, seq: u64, input: &Value) -> Recovered {
         let (Ok(content), Ok(file_path)) =
             (text_field(input, "content"), text_field(input, "file_path"))
         else {
@@ -230,7 +230,8 @@ impl Workspace {
                 "The file {} has been updated successfully.{FILE_STATE}",
                 path.display()
             ))),
-            _ => Recovered::Unknown,
+            _ if self.receipt(turn, seq, RECEIPT_STARTED).exists() => Recovered::Unknown,
+            _ => Recovered::NotDispatched,
         }
     }
 

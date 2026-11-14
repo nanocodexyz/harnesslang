@@ -1,0 +1,14 @@
+harness notes
+
+const lines_max: u64 = 8
+
+state {
+  lines: list<text, lines_max>
+}
+
+on shorten() -> u64 {
+  rewrite lines {
+    line(words) => drop
+  }
+  return len(lines)
+}

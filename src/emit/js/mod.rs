@@ -287,12 +287,24 @@ fn program_literal(program: &Program) -> String {
                 window.tokens.value, window.attempt
             )
         });
+        let settings: Vec<String> = model
+            .settings
+            .iter()
+            .map(|setting| {
+                format!(
+                    "{{ name: {}, type: {} }}",
+                    js_string(&setting.name),
+                    type_literal(&setting.ty)
+                )
+            })
+            .collect();
         format!(
-            "{{ name: {}, calls: {}n, declared: {}, window: {window}, interrupts: {} }}",
+            "{{ name: {}, calls: {}n, declared: {}, window: {window}, interrupts: {}, settings: [{}] }}",
             js_string(&model.name),
             model.calls.value,
             model.declared(),
-            interrupts_literal(model.interrupts)
+            interrupts_literal(model.interrupts),
+            settings.join(", ")
         )
     });
     let events = &program.events;
@@ -481,6 +493,52 @@ impl Writer<'_> {
         }
     }
 
+    fn rewrite(&mut self, field: usize, arms: &[crate::ir::RewriteArm]) {
+        let program = self.program;
+        let depth = self.depth;
+        self.line("{");
+        self.depth += 1;
+        self.line(&format!("const rewritten_{depth} = [];"));
+        self.line(&format!("for (const item_{depth} of state[{field}]) {{"));
+        self.depth += 1;
+        self.line(&format!("switch (item_{depth}.v) {{"));
+        for (position, arm) in arms.iter().enumerate() {
+            assert_eq!(arm.variant, position, "rewrite arms are in variant order");
+            self.line(&format!("case {position}: {{"));
+            self.depth += 1;
+            match &arm.entry {
+                crate::ir::Rewritten::Kept => {
+                    self.line(&format!("rewritten_{depth}.push(item_{depth});"))
+                }
+                crate::ir::Rewritten::Dropped => {}
+                crate::ir::Rewritten::Into(entry) => {
+                    for (index, binding) in arm.bindings.iter().enumerate() {
+                        if let Some(local) = binding {
+                            self.line(&format!("local_{local} = item_{depth}.f[{index}];"));
+                        }
+                    }
+                    self.line(&format!(
+                        "rewritten_{depth}.push({});",
+                        expr(program, entry)
+                    ));
+                }
+            }
+            self.line("break;");
+            self.depth -= 1;
+            self.line("}");
+        }
+        self.line("default:");
+        self.line(&format!(
+            "{INDENT}throw new Panic(\"a rewrite covers every variant\");"
+        ));
+        self.line("}");
+        self.depth -= 1;
+        self.line("}");
+        self.line(&format!("state[{field}] = rewritten_{depth};"));
+        self.depth -= 1;
+        self.line("}");
+    }
+
     fn statement(&mut self, statement: &Stmt) {
         let program = self.program;
         let depth = self.depth;
@@ -497,6 +555,7 @@ impl Writer<'_> {
             Stmt::Push { field, value } => {
                 self.line(&format!("rt.push({field}, {});", expr(program, value)))
             }
+            Stmt::Rewrite { field, arms } => self.rewrite(*field, arms),
             Stmt::Shrink { field, kept } => match kept {
                 Kept::Nothing => self.line(&format!("rt.keep({field}, 0n);")),
                 Kept::Last(count) => {

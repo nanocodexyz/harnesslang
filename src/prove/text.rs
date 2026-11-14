@@ -151,6 +151,7 @@ fn collect<'a>(
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
             | Stmt::KeepBlobs { .. }
+            | Stmt::Rewrite { .. }
             | Stmt::Finish { .. } => {}
         }
     }

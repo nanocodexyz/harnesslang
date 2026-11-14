@@ -179,6 +179,13 @@ struct DurableCell {
     reported: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sent {
+    pub mode: Option<String>,
+    pub settings: Option<Json>,
+    pub response: Json,
+}
+
 #[derive(Clone)]
 pub struct SimWorld<'a> {
     pub program: &'a Program,
@@ -226,7 +233,7 @@ pub struct SimWorld<'a> {
     pub(crate) clock: u64,
     pub idle_log: Vec<(u64, crate::run::turn::NotDue)>,
     model_calls: BTreeMap<(u64, u64), u64>,
-    pub model_modes: BTreeMap<(u64, u64), Vec<(Option<String>, Json)>>,
+    pub model_modes: BTreeMap<(u64, u64), Vec<Sent>>,
     pub(crate) run_epoch: u64,
     batch_calls: BTreeMap<(u64, u64), u64>,
     listing_reads: BTreeMap<(u64, u64), u64>,
@@ -945,7 +952,11 @@ impl World for SimWorld<'_> {
         self.model_modes
             .entry((request.turn, request.seq))
             .or_default()
-            .push((request.mode.map(str::to_owned), response.clone()));
+            .push(Sent {
+                mode: request.mode.map(str::to_owned),
+                settings: request.settings.cloned(),
+                response: response.clone(),
+            });
         let program = self.program;
         self.record("model", || {
             let context = Json::Array(
@@ -970,6 +981,9 @@ impl World for SimWorld<'_> {
             ];
             if let Some(mode) = request.mode {
                 fields.push((crate::run::journal::MODEL_MODE, Json::text(mode)));
+            }
+            if let Some(settings) = request.settings {
+                fields.push((crate::run::journal::MODEL_SETTINGS, settings.clone()));
             }
             fields
         });

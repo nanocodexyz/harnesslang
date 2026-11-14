@@ -74,6 +74,9 @@ pub enum Mutation {
     RecoverTrustsLost,
     JobLostDropped,
     JobLostAll,
+    SettingsDropped,
+    RewriteLiveOnly,
+    LaneSeqShared,
     ForkLiveState,
     ForkHookSkipped,
     CellLeaks,
@@ -81,7 +84,7 @@ pub enum Mutation {
 }
 
 impl Mutation {
-    pub const ALL: [Self; 76] = [
+    pub const ALL: [Self; 79] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -154,6 +157,9 @@ impl Mutation {
         Self::RecoverTrustsLost,
         Self::JobLostDropped,
         Self::JobLostAll,
+        Self::SettingsDropped,
+        Self::RewriteLiveOnly,
+        Self::LaneSeqShared,
         Self::ForkLiveState,
         Self::ForkHookSkipped,
         Self::CellLeaks,
@@ -234,6 +240,9 @@ impl Mutation {
             Self::RecoverTrustsLost => "recover_trusts_lost",
             Self::JobLostDropped => "job_lost_dropped",
             Self::JobLostAll => "job_lost_all",
+            Self::SettingsDropped => "settings_dropped",
+            Self::RewriteLiveOnly => "rewrite_live_only",
+            Self::LaneSeqShared => "lane_seq_shared",
             Self::ForkLiveState => "fork_live_state",
             Self::ForkHookSkipped => "fork_hook_skipped",
             Self::CellLeaks => "cell_leaks",
@@ -325,6 +334,9 @@ impl Mutation {
             | Self::RecoverTrustsLost
             | Self::JobLostDropped
             | Self::JobLostAll
+            | Self::SettingsDropped
+            | Self::RewriteLiveOnly
+            | Self::LaneSeqShared
             | Self::ForkLiveState
             | Self::ForkHookSkipped
             | Self::CellLeaks

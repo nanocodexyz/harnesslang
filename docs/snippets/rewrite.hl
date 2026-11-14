@@ -1,0 +1,54 @@
+harness repair
+
+const rounds_max: u64 = 3
+const calls_max: u64 = 4
+const context_max: u64 = 64
+const result_tokens_max: u64 = 16
+
+type outcome = answered(text) | stopped(text)
+type turn_reply = answer(text) | calls(list<call, calls_max>)
+
+tool read(path: text) -> text effect none
+tool bash(command: text) -> text effect external
+
+model think calls calls_max reply turn_reply
+
+state {
+  context: list<entry, context_max>
+  repaired: bool
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  repaired = false
+  loop round below rounds_max {
+    match think(context) {
+      failed(error) => {
+        if repaired { return stopped(error) }
+        repaired = true
+        rewrite context {
+          result(call, output) => result(call, truncate_middle(output, result_tokens_max))
+          unknown(_) => drop
+        }
+      }
+      ok(reply) => {
+        push context assistant(reply)
+        match reply {
+          answer(words) => { return answered(words) }
+          calls(requested) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return stopped("the turn ran out of rounds")
+}

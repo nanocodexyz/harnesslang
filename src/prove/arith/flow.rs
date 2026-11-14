@@ -38,6 +38,10 @@ impl Prover<'_> {
                 Some(self.compact(state))
             }
             Stmt::KeepBlobs { .. } => Some(state),
+            Stmt::Rewrite { field, arms } => {
+                let state = self.rewrite(state, *field, arms);
+                Some(self.compact(state))
+            }
             Stmt::If {
                 condition,
                 then,
@@ -239,6 +243,33 @@ impl Prover<'_> {
         self.value(&mut state, first);
         let mut state = self.shrink_to(state, field, &Kept::Last(count.clone()));
         self.push(&mut state, field);
+        state
+    }
+
+    fn rewrite(&mut self, state: State, field: usize, arms: &[crate::ir::RewriteArm]) -> State {
+        for arm in arms {
+            let crate::ir::Rewritten::Into(entry) = &arm.entry else {
+                continue;
+            };
+            let mut entered = state.clone();
+            for binding in arm.bindings.iter().flatten() {
+                self.bind(&mut entered, *binding, None);
+            }
+            self.value(&mut entered, entry);
+        }
+        if !crate::ir::rewrite_drops(arms) {
+            return state;
+        }
+        let mut state = state;
+        let program = self.program;
+        let name = program.state[field].name.clone();
+        let quantity = Quantity::FieldLen(field);
+        let cap = capacity(&program.state[field].ty).expect("a rewrite targets a list");
+        let length = Linear::var(state.env[&quantity]);
+        let var = self.fresh(&mut state, &format!("len({name})"), cap);
+        state.facts.extend(Linear::var(var).subtract(&length));
+        state.env.insert(quantity, var);
+        self.measure_shrink(format!("rewrite {name}"), cap, &state, None, &length, var);
         state
     }
 

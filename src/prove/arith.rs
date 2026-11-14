@@ -151,7 +151,7 @@ fn modified(statements: &[Stmt], program: &Program, out: &mut BTreeSet<Quantity>
                 }
                 _ => {}
             },
-            Stmt::Push { field, .. } | Stmt::Shrink { field, .. } => {
+            Stmt::Push { field, .. } | Stmt::Shrink { field, .. } | Stmt::Rewrite { field, .. } => {
                 out.insert(Quantity::FieldLen(*field));
             }
             Stmt::If {

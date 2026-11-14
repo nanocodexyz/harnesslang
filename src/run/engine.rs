@@ -166,6 +166,7 @@ pub struct ModelRequest<'a> {
     pub seq: u64,
     pub calls_max: u64,
     pub mode: Option<&'a str>,
+    pub settings: Option<&'a Json>,
     pub context: &'a Value,
     pub blobs: &'a Blobs,
 }
@@ -1019,6 +1020,7 @@ impl<'a> Engine<'a> {
             }
             Stmt::Push { field, value } => self.push(*field, value)?,
             Stmt::Shrink { field, kept } => self.shrink(*field, kept)?,
+            Stmt::Rewrite { field, arms } => self.rewrite(*field, arms)?,
             Stmt::KeepBlobs { field, count } => {
                 let attached = self
                     .program
@@ -1119,6 +1121,7 @@ impl<'a> Engine<'a> {
         );
         let mut values: Vec<Option<Value>> = vec![None; items.len()];
         let mut pending = Vec::with_capacity(items.len());
+        let first = self.seq;
         for (index, item) in items.iter().enumerate() {
             if let Some(waiting) = self.batch_call(parallel, index, item, &mut values)? {
                 pending.push(waiting);
@@ -1138,6 +1141,9 @@ impl<'a> Engine<'a> {
         if self.mutation == Mutation::BatchPushesReversed {
             ordered.reverse();
         }
+        if self.mutation == Mutation::LaneSeqShared {
+            self.seq = first;
+        }
         for (index, item) in ordered {
             let value = values[index]
                 .take()
@@ -1145,7 +1151,7 @@ impl<'a> Engine<'a> {
             self.locals[parallel.item] = Some(item);
             self.locals[parallel.result] = Some(value);
             if let Flow::Return(_) = self.block(&parallel.body)? {
-                panic!("the body of a parallel for only pushes");
+                panic!("the arms of a parallel for never return");
             }
         }
         Ok(())
@@ -1453,6 +1459,43 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    fn rewrite(&mut self, field: usize, arms: &[ir::RewriteArm]) -> Result<(), Halt> {
+        let replaying = self.sites.range(self.seq + 1..).next().is_some();
+        if self.mutation == Mutation::RewriteLiveOnly && replaying {
+            return Ok(());
+        }
+        let Value::List(items) = std::mem::replace(&mut self.state[field], Value::List(Vec::new()))
+        else {
+            panic!("the checker rewrites only lists");
+        };
+        let length = items.len();
+        let mut rewritten = Vec::with_capacity(length);
+        for item in items {
+            let (variant, fields) = item.as_variant();
+            let arm = &arms[variant];
+            assert_eq!(arm.variant, variant, "rewrite arms are in variant order");
+            match &arm.entry {
+                ir::Rewritten::Kept => rewritten.push(item),
+                ir::Rewritten::Dropped => {}
+                ir::Rewritten::Into(entry) => {
+                    for (binding, value) in arm.bindings.iter().zip(fields) {
+                        if let Some(local) = binding {
+                            self.locals[*local] = Some(value.clone());
+                        }
+                    }
+                    rewritten.push(self.eval(entry)?);
+                }
+            }
+        }
+        assert!(
+            rewritten.len() <= length,
+            "a rewrite never lengthens a list"
+        );
+        self.retired += (length - rewritten.len()) as u64;
+        self.state[field] = Value::List(rewritten);
+        Ok(())
+    }
+
     fn shrink(&mut self, field: usize, kept: &Kept) -> Result<(), Halt> {
         let (count, first) = match kept {
             Kept::Nothing => (0, None),
@@ -1683,7 +1726,7 @@ impl<'a> Engine<'a> {
                 let site = site.clone();
                 self.settle(&site, &recorded, &output)
             }
-            Some(SiteLog::Reply(response, recorded)) => {
+            Some(SiteLog::Reply(response, recorded, sent)) => {
                 if site.kind != SiteKind::Model {
                     return Err(self.diverged(seq, "a model reply", &call.tool));
                 }
@@ -1693,6 +1736,14 @@ impl<'a> Engine<'a> {
                         seq,
                         &format!("a model reply in {}", mode_text(recorded.as_deref())),
                         &format!("{} in {}", call.tool, mode_text(mode)),
+                    ));
+                }
+                let settings = self.settings(&args);
+                if sent != settings {
+                    return Err(self.diverged(
+                        seq,
+                        &format!("a model reply with {}", settings_text(sent.as_ref())),
+                        &format!("{} with {}", call.tool, settings_text(settings.as_ref())),
                     ));
                 }
                 self.reply(&response)
@@ -2470,6 +2521,10 @@ impl<'a> Engine<'a> {
         let sent = mode
             .as_deref()
             .filter(|_| self.mutation != Mutation::ModeDropped);
+        let settings = self.settings(args);
+        let sent_settings = settings
+            .as_ref()
+            .filter(|_| self.mutation != Mutation::SettingsDropped);
         let response = if preempted {
             interrupted_response()
         } else {
@@ -2481,6 +2536,7 @@ impl<'a> Engine<'a> {
                 seq,
                 calls_max,
                 mode: sent,
+                settings: sent_settings,
                 context: &args[0],
                 blobs: &self.blobs,
             })
@@ -2507,9 +2563,39 @@ impl<'a> Engine<'a> {
             seq,
             response: recorded.clone(),
             mode: mode.clone(),
+            settings: settings.clone(),
         });
-        self.sites.insert(seq, SiteLog::Reply(recorded, mode));
+        self.sites
+            .insert(seq, SiteLog::Reply(recorded, mode, settings));
         self.reply(&response)
+    }
+
+    fn settings(&self, args: &[Value]) -> Option<Json> {
+        let model = self
+            .program
+            .model
+            .as_ref()
+            .expect("the checker admits model calls only with a model");
+        if model.settings.is_empty() {
+            return None;
+        }
+        assert_eq!(
+            args.len(),
+            1 + model.settings.len(),
+            "a model site passes the context and every setting"
+        );
+        let fields = model
+            .settings
+            .iter()
+            .zip(&args[1..])
+            .map(|(setting, value)| {
+                (
+                    setting.name.clone(),
+                    value::to_json(self.program, &setting.ty, value),
+                )
+            })
+            .collect();
+        Some(Json::Object(fields))
     }
 
     fn run_site(
@@ -2912,6 +2998,13 @@ impl<'a> Engine<'a> {
             call_id(self.turn, seq)
         )))
     }
+}
+
+fn settings_text(settings: Option<&Json>) -> String {
+    settings.map_or_else(
+        || "no settings".to_owned(),
+        |settings| format!("settings {}", settings.encode()),
+    )
 }
 
 fn mode_text(mode: Option<&str>) -> String {

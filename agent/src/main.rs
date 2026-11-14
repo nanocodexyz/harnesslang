@@ -239,7 +239,7 @@ impl Agent {
         input: &Value,
         room: bool,
     ) -> tools::Ran {
-        let receipted = tool == "Bash" && self.children.is_some();
+        let receipted = matches!(tool, "Bash" | "Write") && self.children.is_some();
         if receipted && let Err(error) = self.workspace.dispatching(turn, seq) {
             return tools::Ran::Failed(format!(
                 "<tool_use_error>receipt: {error}</tool_use_error>"
@@ -266,7 +266,7 @@ impl Agent {
             Some(children) if tool == children::SPAWN_TOOL => children.spawn(turn, seq, input),
             Some(children) if tool == children::LIST_TOOL => children.list(input),
             None if tool == children::SUBMIT_TOOL => children::submitted(input),
-            _ if receipted => self.bash(turn, seq, input, room),
+            _ if receipted && tool == "Bash" => self.bash(turn, seq, input, room),
             _ => self.workspace.run(tool, input),
         };
         if receipted {
@@ -299,11 +299,12 @@ impl Agent {
         turn: u64,
         seq: u64,
         mode: Option<&str>,
+        effort: Option<&str>,
         context: &Value,
         attached: &anthropic::Attached<'_>,
     ) -> Value {
         let call = harness::call_id(turn, seq);
-        let body = match self.client.body(context, mode, attached) {
+        let body = match self.client.body(context, mode, effort, attached) {
             Ok(body) => body,
             Err(error) => {
                 return anthropic::transient(&format!("context does not render: {error}"), 0);
@@ -491,8 +492,18 @@ macro_rules! host_for {
                         )
                     })
                 };
-                let reply =
-                    self.run_model(request.turn, request.seq, request.mode, &context, &attached);
+                let effort = request
+                    .settings
+                    .and_then(|settings| settings.get(anthropic::EFFORT_SETTING))
+                    .and_then(|effort| effort.as_str());
+                let reply = self.run_model(
+                    request.turn,
+                    request.seq,
+                    request.mode,
+                    effort,
+                    &context,
+                    &attached,
+                );
                 $module::Json::decode(&reply.encode())
                     .expect("a reply the host built decodes as harness JSON")
             }
