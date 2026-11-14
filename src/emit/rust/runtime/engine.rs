@@ -50,6 +50,7 @@ pub enum Point {
     BeforeRun(Kind, EffectClass),
     AfterRun(Kind, EffectClass),
     BeforeAcknowledge,
+    Cell(CellPoint),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +104,7 @@ pub struct ToolRequest<'a> {
     pub effect: EffectClass,
     pub input: &'a Json,
     pub returns: Returns,
+    pub nested: Option<NestedRef>,
 }
 
 pub struct ModelRequest<'a> {
@@ -120,6 +122,10 @@ pub trait World {
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
     fn acknowledge(&mut self, finish: &Finish);
+    fn cell_start(&mut self, cell: u64, script: &str) -> Step;
+    fn cell_resume(&mut self, cell: u64, input: Input) -> Step;
+    fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
+    fn observe(&mut self, event: &CellEvent);
 }
 
 pub trait Host {
@@ -131,7 +137,35 @@ pub trait Host {
     fn now(&mut self) -> u64;
     fn random(&mut self) -> u64;
     fn acknowledge(&mut self, finish: &Finish);
+    fn cells(&mut self) -> Option<&mut dyn CellEngine> {
+        None
+    }
 }
+
+pub fn host_cell_start<H: Host>(host: &mut H, cell: u64, script: &str) -> Step {
+    match host.cells() {
+        Some(engine) => engine.start(cell, script),
+        None => Step::Threw {
+            error: NO_CELL_ENGINE.to_owned(),
+        },
+    }
+}
+
+pub fn host_cell_resume<H: Host>(host: &mut H, cell: u64, input: Input) -> Step {
+    let engine = host
+        .cells()
+        .expect("a host that started a cell resumes it with the same engine");
+    engine.resume(cell, input)
+}
+
+pub fn host_wait<H: Host>(host: &mut H, wait: &Wait) -> Result<(), Stop> {
+    let engine = host
+        .cells()
+        .expect("a host that armed a timer waits on it with the same engine");
+    engine.wait(wait)
+}
+
+pub const NO_CELL_ENGINE: &str = "the host runs no cell engine, so no code tool can run";
 
 pub enum Run<'a> {
     Tool(Returns),
@@ -178,6 +212,9 @@ pub struct Engine<'a> {
     attempts: u64,
     buffer: Vec<Record>,
     acknowledged: bool,
+    cells: BTreeMap<u64, CellLog>,
+    nested: BTreeMap<(u64, u64), SiteLog>,
+    next_cell: u64,
 }
 
 impl<'a> Engine<'a> {
@@ -190,7 +227,15 @@ impl<'a> Engine<'a> {
             attempts: log.attempts,
             buffer: Vec::new(),
             acknowledged: false,
+            cells: log.cells.clone(),
+            nested: log.nested.clone(),
+            next_cell: 0,
         }
+    }
+
+    pub fn with_next_cell(mut self, next_cell: u64) -> Self {
+        self.next_cell = next_cell;
+        self
     }
 
     pub fn append(&mut self, record: Record) {
@@ -274,9 +319,109 @@ impl<'a> Engine<'a> {
         Halt::Exit(Exit::Corrupt(format!("turn {} result: {error}", self.turn)))
     }
 
+    pub fn cell(&mut self, code: usize, call: Call) -> Result<Answer, Halt> {
+        self.seq += 1;
+        self.cell_site(code, self.seq, call)
+    }
+
+    fn cell_site(&mut self, code: usize, seq: u64, call: Call) -> Result<Answer, Halt> {
+        let call = Call {
+            effect: EffectClass::None,
+            ..call
+        };
+        match self.sites.get(&seq).cloned() {
+            Some(SiteLog::Done(recorded, output)) => {
+                self.same(seq, &recorded, &call)?;
+                return self.cell_answer(&output);
+            }
+            Some(SiteLog::Unknown(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                return Ok(Answer::Unknown);
+            }
+            Some(SiteLog::Reply(_)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Open(recorded)) => {
+                self.same(seq, &recorded, &call)?;
+                self.require_live(seq)?;
+            }
+            None => {
+                self.require_live(seq)?;
+                self.append(Record::Call {
+                    turn: self.turn,
+                    seq,
+                    tool: call.tool.clone(),
+                    effect: call.effect,
+                    input: call.input.clone(),
+                });
+                self.sites.insert(seq, SiteLog::Open(call.clone()));
+            }
+        }
+        let outcome = self.run_code(code, seq, &call)?;
+        let output = outcome.output();
+        self.append(Record::Result {
+            turn: self.turn,
+            seq,
+            output: output.clone(),
+        });
+        self.sites.insert(seq, SiteLog::Done(call, output.clone()));
+        self.cell_answer(&output)
+    }
+
+    fn run_code(&mut self, code: usize, seq: u64, call: &Call) -> Result<CellOutcome, Halt> {
+        let script = call.input.as_str().expect("a cell's input is its script").to_owned();
+        let existing = self.cells.get(&seq).cloned();
+        if let Some(log) = &existing
+            && log.finished
+        {
+            return Ok(CellOutcome::Unknown(divergence_text(
+                log.cell,
+                "it finished but its result was lost with the journal's tail",
+            )));
+        }
+        let fresh = self.next_cell;
+        assert!(fresh > 0, "a live turn knows its session's next cell id");
+        let nested = self.nested.clone();
+        let site = CellSite {
+            code,
+            session: program::HARNESS_NAME,
+            turn: self.turn,
+            seq,
+            script: &script,
+            cell: match &existing {
+                Some(log) => CellStart::Existing(log),
+                None => CellStart::Fresh(fresh),
+            },
+            nested: &nested,
+        };
+        if existing.is_none() {
+            self.next_cell += 1;
+        }
+        run_cell(site, self).map_err(Halt::from)
+    }
+
+    fn cell_answer(&self, output: &Output) -> Result<Answer, Halt> {
+        let outcome = CellOutcome::from_output(output).map_err(|error| self.corrupt(error))?;
+        Ok(match outcome {
+            CellOutcome::Done(text) => Answer::Output(Output::Ok(Json::String(text))),
+            CellOutcome::Threw(error) => Answer::Output(Output::Failed(error)),
+            CellOutcome::Unknown(_) => Answer::Unknown,
+        })
+    }
+
+    fn world(&mut self) -> &mut dyn World {
+        match &mut self.mode {
+            Mode::Live { world, .. } => &mut **world,
+            Mode::Replay => unreachable!("cells run only live"),
+        }
+    }
+
     pub fn effect(&mut self, site: Site, call: Call, run: Run<'_>) -> Result<Answer, Halt> {
         self.seq += 1;
         let seq = self.seq;
+        if site.kind == Kind::Dispatch
+            && let Some(code) = program::code_of(&call.tool)
+        {
+            return self.cell_site(code, seq, call);
+        }
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
@@ -377,6 +522,7 @@ impl<'a> Engine<'a> {
                 effect: call.effect,
                 input: &call.input,
                 returns,
+                nested: None,
             }),
         };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
@@ -408,6 +554,56 @@ impl<'a> Engine<'a> {
             self.turn,
             call_id(self.turn, seq)
         )))
+    }
+}
+
+impl CellHost for Engine<'_> {
+    fn append(&mut self, record: Record) {
+        Engine::append(self, record);
+    }
+
+    fn flush(&mut self) -> Result<(), Stop> {
+        Engine::flush(self).map_err(halt_stop)
+    }
+
+    fn hook(&mut self, point: CellPoint) -> Result<(), Stop> {
+        self.world().hook(Point::Cell(point))
+    }
+
+    fn start(&mut self, cell: u64, script: &str) -> Step {
+        self.world().cell_start(cell, script)
+    }
+
+    fn resume(&mut self, cell: u64, input: Input) -> Step {
+        self.world().cell_resume(cell, input)
+    }
+
+    fn tool(&mut self, request: &ToolRequest<'_>) -> Output {
+        self.world().tool(request)
+    }
+
+    fn clock(&mut self) -> u64 {
+        self.world().now()
+    }
+
+    fn random(&mut self) -> u64 {
+        self.world().random()
+    }
+
+    fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
+        self.world().wait(wait)
+    }
+
+    fn observe(&mut self, event: &CellEvent) {
+        self.world().observe(event);
+    }
+}
+
+fn halt_stop(halt: Halt) -> Stop {
+    match halt {
+        Halt::Exit(Exit::Stop(stop)) => stop,
+        Halt::Exit(Exit::Corrupt(error)) => panic!("a flush cannot find the journal corrupt, found {error}"),
+        Halt::Trap(trap) => panic!("a flush cannot trap, found {trap}"),
     }
 }
 
@@ -620,12 +816,24 @@ fn recover(log: &mut TurnLog) -> Vec<u64> {
     unknown
 }
 
+fn reopen_nested(log: &mut TurnLog) -> Vec<(u64, u64)> {
+    let unknown = log.open_nested(|class| class.may_be_unknown());
+    for id in &unknown {
+        let site = log.nested.get_mut(id).expect("an open nested call has a site");
+        let SiteLog::Open(call) = site else {
+            panic!("open_nested returns open calls");
+        };
+        *site = SiteLog::Unknown(call.clone());
+    }
+    unknown
+}
+
 pub fn run_turn(world: &mut dyn World, epoch: u64, records: &[Record], request: &TurnRequest) -> Result<Ran, Exit> {
     run_turn_from(world, epoch, Start::Beginning, records, request)
 }
 
 pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &[Record], request: &TurnRequest) -> Result<Ran, Exit> {
-    if let Start::Checkpoint(revision) = start {
+    if let Start::Checkpoint { revision, .. } = start {
         assert!(
             request.turn > revision,
             "a turn runs over a journal read from after it finished"
@@ -646,6 +854,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
     let state = state_before(&session, request.turn)?;
     let mut pending = None;
     let mut unknown = Vec::new();
+    let mut nested = Vec::new();
     let log = match session.turns.get(&request.turn) {
         Some(log) => {
             if log.handler != handler || log.arguments != arguments {
@@ -656,6 +865,7 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
             }
             let mut log = log.clone();
             unknown = recover(&mut log);
+            nested = reopen_nested(&mut log);
             log
         }
         None => {
@@ -674,25 +884,20 @@ pub fn run_turn_from(world: &mut dyn World, epoch: u64, start: Start, records: &
                 handler: handler.to_owned(),
                 arguments,
             });
-            TurnLog {
-                handler: handler.to_owned(),
-                arguments: Json::Null,
-                sites: BTreeMap::new(),
-                attempts: 0,
-                finished: None,
-            }
+            TurnLog::new(handler.to_owned(), Json::Null)
         }
     };
-    let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log);
+    let mut engine = Engine::new(Mode::Live { world, epoch }, request.turn, &log).with_next_cell(session.next_cell());
     if let Some(record) = pending {
         engine.append(record);
     }
-    if !unknown.is_empty() {
+    if !unknown.is_empty() || !nested.is_empty() {
         let attempt = engine.next_attempt();
         engine.append(Record::Recovery {
             turn: request.turn,
             attempt,
             unknown,
+            nested,
         });
     }
     engine

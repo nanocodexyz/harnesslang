@@ -13,8 +13,11 @@ use types::{Types, camel, constant, ident, sum_name};
 
 const RUNTIME_JOURNAL: &str = include_str!("runtime/journal.rs");
 const RUNTIME_ENGINE: &str = include_str!("runtime/engine.rs");
+const RUNTIME_CELL: &str = include_str!("runtime/cell.rs");
 const RUNTIME_JSONL: &str = include_str!("runtime/jsonl.rs");
 const SHARED_CELL_JOURNAL: &str = include_str!("../../run/cell_journal.rs");
+const SHARED_IMPORTS: [&str; 3] = ["use std::", "use crate::run::", "use crate::effect::"];
+const SHARED_PATHS: [&str; 1] = ["crate::run::journal::"];
 const SHARED_STRUCT_RENAMES: [(&str, &str); 1] = [("Fields", "CellFields")];
 const LINTS: &str = "#![allow(dead_code, unused_variables, unused_parens, unreachable_code, unused_comparisons, clippy::all)]\n";
 
@@ -37,6 +40,7 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     out.push_str(RUNTIME_JOURNAL);
     out.push_str(RUNTIME_ENGINE);
     out.push_str(&shared_source(SHARED_CELL_JOURNAL));
+    out.push_str(RUNTIME_CELL);
     match target {
         Target::NativeJsonl => out.push_str(RUNTIME_JSONL),
         Target::NativeSqlite | Target::ServerPostgres => out.push_str(&sql::store(target)?),
@@ -53,13 +57,16 @@ fn shared_source(source: &str) -> String {
     for line in source.lines() {
         if line.starts_with("use ") {
             assert!(
-                line.starts_with("use std::") || line.starts_with("use crate::run::json::"),
-                "a shared runtime source imports only std and the journal's Json, found {line}"
+                SHARED_IMPORTS.iter().any(|prefix| line.starts_with(prefix)),
+                "a shared runtime source imports only std and what the runtime defines, found {line}"
             );
             continue;
         }
         out.push_str(line);
         out.push('\n');
+    }
+    for path in SHARED_PATHS {
+        out = out.replace(path, "");
     }
     for (from, to) in SHARED_STRUCT_RENAMES {
         out = rename_word(&out, from, to);
@@ -166,6 +173,7 @@ fn generate(program: &Program, target: Target) -> String {
     state(&mut out, program, &mut types);
     arguments(&mut out, program, &mut types);
     dispatch(&mut out, program);
+    codes(&mut out, program);
     for handler in &program.handlers {
         handler_function(&mut out, program, handler, &mut types);
     }
@@ -331,6 +339,62 @@ fn dispatch(out: &mut String, program: &Program) {
         out,
         "pub fn dispatch_class(tool: &str) -> EffectClass {{\n    match tool {{\n{arms}        _ => EffectClass::{:?},\n    }}\n}}\n",
         EffectClass::undeclared()
+    )
+    .expect("writing to a string succeeds");
+}
+
+fn limit(bound: &ir::Bound) -> String {
+    format!(
+        "Limit {{ name: {:?}, value: {} }}",
+        bound.name,
+        constant(&bound.name)
+    )
+}
+
+fn nested_tool(program: &Program, tool: ir::ToolId) -> String {
+    let tool = &program.tools[tool];
+    let input: Vec<String> = tool
+        .params
+        .iter()
+        .map(|param| format!("({:?}, {:?})", param.name, param.ty.name(program)))
+        .collect();
+    format!(
+        "NestedTool {{ name: {:?}, effect: EffectClass::{:?}, returns: {}, input: &[{}] }}",
+        tool.name,
+        tool.effect,
+        Types::returns(&tool.returns),
+        input.join(", ")
+    )
+}
+
+fn codes(out: &mut String, program: &Program) {
+    let mut specs = String::new();
+    let mut arms = String::new();
+    for (index, code) in program.codes.iter().enumerate() {
+        let tools: Vec<String> = code
+            .tools
+            .iter()
+            .map(|tool| nested_tool(program, *tool))
+            .collect();
+        writeln!(
+            specs,
+            "    CodeSpec {{ name: {:?}, tools: &[{}], calls: {}, parallel: {}, timers: {}, timer_ms: {}, journal_bytes: {}, yield_ms: {} }},",
+            code.name,
+            tools.join(", "),
+            limit(&code.calls),
+            limit(&code.parallel),
+            limit(&code.timers),
+            limit(&code.timer_ms),
+            limit(&code.journal_bytes),
+            limit(&code.yield_ms)
+        )
+        .expect("writing to a string succeeds");
+        writeln!(arms, "        {:?} => Some({index}),", code.name)
+            .expect("writing to a string succeeds");
+    }
+    writeln!(
+        out,
+        "pub const CODES: &[CodeSpec] = &[\n{specs}];\n\npub fn code_of(tool: &str) -> Option<usize> {{\n    match tool {{\n{arms}        _ => None,\n    }}\n}}\n"
     )
     .expect("writing to a string succeeds");
 }

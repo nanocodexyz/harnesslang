@@ -60,6 +60,7 @@ pub struct SqlJournal {
     pub owner: String,
     pub lease_ms: u64,
     pub head: u64,
+    pub last_turn: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,27 +155,35 @@ pub fn sql_open(sql: &mut dyn Sql, journal: &mut SqlJournal) -> Result<Opened, O
         )));
     }
     journal.head = head;
+    journal.last_turn = rows_turn(&records, 0);
     Ok(Opened { records, epoch })
 }
 
-pub fn batch_json(records: &[Record], head: u64) -> String {
+pub fn rows_turn(records: &[Record], before: u64) -> u64 {
+    records.iter().fold(before, |turn, record| record.turn().unwrap_or(turn))
+}
+
+pub fn batch_json(records: &[Record], head: u64, last_turn: u64) -> String {
     assert!(!records.is_empty(), "a durability point commits at least one record");
     let mut rows = Vec::with_capacity(records.len());
+    let mut turn = last_turn;
     for (index, record) in records.iter().enumerate() {
+        turn = record.turn().unwrap_or(turn);
+        assert!(turn > 0, "a cell row follows its site's call row");
         let text = record_json(record).encode();
         assert_eq!(decode_line(&text, false).as_ref(), Ok(record), "a row's record decodes back");
         rows.push(Json::object(vec![
             ("kind", Json::text(record.tag())),
             ("record", Json::String(text)),
             ("seq", Json::Number(head + 1 + index as u64)),
-            ("turn", Json::Number(record.turn())),
+            ("turn", Json::Number(turn)),
         ]));
     }
     Json::Array(rows).encode()
 }
 
 pub fn sql_flush(sql: &mut dyn Sql, journal: &mut SqlJournal, epoch: u64, records: &[Record]) -> Result<(), Stop> {
-    let batch = batch_json(records, journal.head);
+    let batch = batch_json(records, journal.head, journal.last_turn);
     for statement in COMMIT {
         let values = journal.values(statement, epoch, &batch);
         match sql.query(statement, &values) {
@@ -190,6 +199,7 @@ pub fn sql_flush(sql: &mut dyn Sql, journal: &mut SqlJournal, epoch: u64, record
         }
     }
     journal.head += records.len() as u64;
+    journal.last_turn = rows_turn(records, journal.last_turn);
     Ok(())
 }
 
@@ -227,6 +237,20 @@ impl<H: Host> World for SqlWorld<'_, H> {
     fn acknowledge(&mut self, finish: &Finish) {
         self.host.acknowledge(finish)
     }
+
+    fn cell_start(&mut self, cell: u64, script: &str) -> Step {
+        host_cell_start(self.host, cell, script)
+    }
+
+    fn cell_resume(&mut self, cell: u64, input: Input) -> Step {
+        host_cell_resume(self.host, cell, input)
+    }
+
+    fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
+        host_wait(self.host, wait)
+    }
+
+    fn observe(&mut self, _event: &CellEvent) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

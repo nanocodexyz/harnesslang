@@ -432,7 +432,7 @@ fn check_tail(journal: &str, whole: &harness::Session) -> String {
     let mut disk = FileDisk::open(std::path::Path::new(journal)).expect("the journal opens");
     let tail = harness::jsonl_open_tail(&mut disk).expect("the journal's tail reads");
     assert_eq!(tail.dropped_bytes, 0, "the whole open already dropped the torn tail");
-    let Start::Checkpoint(revision) = tail.start else {
+    let Start::Checkpoint { revision, next_cell } = tail.start else {
         assert!(
             whole.turns.len() <= 1,
             "a journal of finished turns has a trusted checkpoint"
@@ -463,6 +463,15 @@ fn check_tail(journal: &str, whole: &harness::Session) -> String {
         whole.checkpoints.get(&revision),
         "the tail starts at the whole journal's checkpoint"
     );
+    let cells_before = whole
+        .cell_origins
+        .iter()
+        .filter(|(_, (turn, _))| *turn <= revision)
+        .map(|(cell, _)| cell + 1)
+        .max()
+        .unwrap_or(harness::FIRST_CELL);
+    assert_eq!(next_cell, cells_before, "the tail's next cell follows every cell before its checkpoint");
+    assert_eq!(session.next_cell(), whole.next_cell(), "the tail and the whole journal agree on the next cell");
     let older = harness::jsonl_open_for(&mut disk, revision).expect("the journal reads for an older turn");
     assert_eq!(older.start, Start::Beginning, "an older turn reads the whole journal");
     format!("tail_from={revision} tail_records={}", tail.records.len())

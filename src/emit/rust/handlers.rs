@@ -182,11 +182,22 @@ impl<'a, 'p> Body<'a, 'p> {
             let value = self.expr(arg);
             self.line(&format!("let argument{index} = {value};"));
         }
+        if let SiteKind::Cell(code) = site.kind {
+            assert_eq!(
+                site.durability,
+                Durability::Cell,
+                "a cell site has cell durability"
+            );
+            self.cell_site(code, &site.result);
+            self.depth -= 1;
+            self.line("};");
+            return;
+        }
         let durability = match site.durability {
             Durability::RidesNextFlush => "Durability::RidesNextFlush",
             Durability::FlushBeforeRun => "Durability::FlushBeforeRun",
             Durability::FlushBeforeRunWhenExternal => "Durability::FlushBeforeRunWhenExternal",
-            Durability::Cell => panic!("emit refuses programs with code tools"),
+            Durability::Cell => panic!("only a cell site has cell durability"),
         };
         let maybe = matches!(site.result, Type::Maybe(_));
         let (kind, run, decode) = self.site_call(site.kind, &site.result, args);
@@ -197,6 +208,21 @@ impl<'a, 'p> Body<'a, 'p> {
         self.line(&decode);
         self.depth -= 1;
         self.line("};");
+    }
+
+    fn cell_site(&mut self, code: ir::CodeId, result: &Type) {
+        assert_eq!(
+            result,
+            &Type::Maybe(Box::new(Type::Text)),
+            "a cell site yields maybe<text>"
+        );
+        self.line(&format!(
+            "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::String(argument0) }};",
+            self.program.codes[code].name,
+            EffectClass::None
+        ));
+        self.line(&format!("let answer = engine.cell({code}, call)?;"));
+        self.line("maybe(engine, answer, parse_text)?");
     }
 
     fn site_call(
@@ -263,7 +289,7 @@ impl<'a, 'p> Body<'a, 'p> {
                 let parse = self.types.from_json(result);
                 ("Model", run, format!("reply(answer, {parse})?"))
             }
-            SiteKind::Cell(_) => panic!("emit refuses programs with code tools"),
+            SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
             SiteKind::Now | SiteKind::Random => {
                 let (name, variant) = if kind == SiteKind::Now {
                     ("now", "Now")

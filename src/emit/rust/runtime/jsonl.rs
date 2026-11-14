@@ -1,5 +1,6 @@
 pub const PAGE_BYTES: u64 = 4096;
 const CHECKPOINT_OPENING: &[u8] = b"{\"checkpoint\":";
+const CELL_OPENING: &[u8] = b",\"record\":{\"cell\":{\"cell\":";
 
 pub trait Disk {
     fn length(&mut self) -> std::io::Result<u64>;
@@ -12,12 +13,14 @@ pub trait Disk {
 #[derive(Debug)]
 pub enum OpenError {
     Io(std::io::Error),
+    Corrupt(String),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "journal: {error}"),
+            Self::Corrupt(error) => write!(formatter, "journal: {error}"),
         }
     }
 }
@@ -50,11 +53,12 @@ pub fn jsonl_open_tail(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
                 return match decoded.records.first() {
                     Some(Record::Checkpoint { revision, .. }) => {
                         let revision = *revision;
+                        let next_cell = next_cell_before(disk, offset + start as u64)?;
                         jsonl_keep(
                             disk,
                             offset + start as u64,
                             decoded,
-                            Start::Checkpoint(revision),
+                            Start::Checkpoint { revision, next_cell },
                         )
                     }
                     _ => jsonl_open(disk),
@@ -82,8 +86,8 @@ pub fn jsonl_open_tail(disk: &mut dyn Disk) -> Result<Opened, OpenError> {
 pub fn jsonl_open_for(disk: &mut dyn Disk, turn: u64) -> Result<Opened, OpenError> {
     let opened = jsonl_open_tail(disk)?;
     match opened.start {
-        Start::Checkpoint(revision) if turn <= revision => jsonl_open(disk),
-        Start::Checkpoint(_) | Start::Beginning => Ok(opened),
+        Start::Checkpoint { revision, .. } if turn <= revision => jsonl_open(disk),
+        Start::Checkpoint { .. } | Start::Beginning => Ok(opened),
     }
 }
 
@@ -98,7 +102,7 @@ fn jsonl_keep(
             .map_err(OpenError::Io)?;
         disk.sync().map_err(OpenError::Io)?;
     }
-    if let Start::Checkpoint(revision) = start {
+    if let Start::Checkpoint { revision, .. } = start {
         let first = match decoded.records.first() {
             Some(Record::Checkpoint { revision, .. }) => Some(*revision),
             _ => None,
@@ -114,6 +118,59 @@ fn jsonl_keep(
         records: decoded.records,
         dropped_bytes: decoded.dropped_bytes,
     })
+}
+
+enum CellScan {
+    Found(u64),
+    Absent,
+    Wider,
+}
+
+fn next_cell_before(disk: &mut dyn Disk, end: u64) -> Result<u64, OpenError> {
+    if program::CODES.is_empty() {
+        return Ok(FIRST_CELL);
+    }
+    let mut start = end - end.min(PAGE_BYTES);
+    let mut bytes = disk.read_at(start, end - start).map_err(OpenError::Io)?;
+    loop {
+        match last_cell(&bytes, start == 0)? {
+            CellScan::Found(cell) => return Ok(cell + 1),
+            CellScan::Absent => return Ok(FIRST_CELL),
+            CellScan::Wider => {
+                assert!(start > 0, "a wider read has more of the journal to read");
+                let wider = start - start.min(end - start);
+                let mut earlier = disk.read_at(wider, start - wider).map_err(OpenError::Io)?;
+                earlier.extend_from_slice(&bytes);
+                bytes = earlier;
+                start = wider;
+            }
+        }
+    }
+}
+
+fn last_cell(bytes: &[u8], from_start: bool) -> Result<CellScan, OpenError> {
+    let found = bytes
+        .windows(CELL_OPENING.len())
+        .rposition(|window| window == CELL_OPENING);
+    let Some(at) = found else {
+        return Ok(if from_start { CellScan::Absent } else { CellScan::Wider });
+    };
+    let line_start = match bytes[..at].iter().rposition(|byte| *byte == LINE_END) {
+        Some(newline) => newline + 1,
+        None if from_start => 0,
+        None => return Ok(CellScan::Wider),
+    };
+    let corrupt = |what: String| OpenError::Corrupt(format!("the cell line before the checkpoint {what}"));
+    let length = bytes[at..]
+        .iter()
+        .position(|byte| *byte == LINE_END)
+        .ok_or_else(|| corrupt("has no end".to_owned()))?;
+    let line = std::str::from_utf8(&bytes[line_start..at + length]).map_err(|_| corrupt("is not utf-8".to_owned()))?;
+    match decode_line(line, true) {
+        Ok(Record::Cell { cell, .. }) => Ok(CellScan::Found(cell)),
+        Ok(other) => Err(corrupt(format!("decodes as a {} record", other.tag()))),
+        Err(error) => Err(corrupt(error)),
+    }
 }
 
 enum Scan {
@@ -297,6 +354,20 @@ impl<H: Host> World for JsonlWorld<'_, H> {
     fn acknowledge(&mut self, finish: &Finish) {
         self.host.acknowledge(finish)
     }
+
+    fn cell_start(&mut self, cell: u64, script: &str) -> Step {
+        host_cell_start(self.host, cell, script)
+    }
+
+    fn cell_resume(&mut self, cell: u64, input: Input) -> Step {
+        host_cell_resume(self.host, cell, input)
+    }
+
+    fn wait(&mut self, wait: &Wait) -> Result<(), Stop> {
+        host_wait(self.host, wait)
+    }
+
+    fn observe(&mut self, _event: &CellEvent) {}
 }
 
 #[derive(Debug)]
@@ -328,7 +399,7 @@ impl<'d> JsonlJournal<'d> {
         host: &mut H,
         request: &TurnRequest,
     ) -> Result<(Self, Ran), RunError> {
-        if let Start::Checkpoint(revision) = self.start
+        if let Start::Checkpoint { revision, .. } = self.start
             && request.turn <= revision
         {
             let opened = jsonl_open(&mut *self.disk).map_err(RunError::Open)?;
@@ -362,7 +433,11 @@ impl<'d> JsonlJournal<'d> {
             *revision, turn,
             "a finished turn checkpoints its own revision"
         );
-        self.start = Start::Checkpoint(turn);
+        let next_cell = next_cell_after(next_cell_after(self.start.first_cell(), &self.records), &flushed);
+        self.start = Start::Checkpoint {
+            revision: turn,
+            next_cell,
+        };
         self.records = vec![checkpoint];
     }
 }
