@@ -1,7 +1,7 @@
 harness subagents
 
-const rounds_max: u64 = 64
-const calls_per_round_max: u64 = 16
+const rounds_max: u64 = 32
+const calls_per_round_max: u64 = 8
 const context_entries_max: u64 = 4096
 const compact_kept: u64 = 32
 const agents_max: u64 = 4096
