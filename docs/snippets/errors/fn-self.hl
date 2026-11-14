@@ -1,0 +1,15 @@
+harness notes
+
+state {
+  count: u64
+}
+
+fn again() {
+  count = count + 1
+  again()
+}
+
+on ping() -> u64 {
+  again()
+  return count
+}

@@ -27,12 +27,7 @@ invariant turns_bounded: turns <= turns_max
 invariant context_bounded: len(context) <= context_entries_max
 invariant agents_bounded: len(agents) <= agents_max
 
-on prompt(input: text) -> outcome
-  requires turns < turns_max
-    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
-    and len(agents) + rounds_max * calls_per_round_max <= agents_max
-{
-  push context user(input)
+fn model_loop() {
   turns = turns + 1
   loop round below rounds_max {
     let reply = messages(context)
@@ -64,6 +59,15 @@ on prompt(input: text) -> outcome
   return exhausted
 }
 
+on prompt(input: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
+    and len(agents) + rounds_max * calls_per_round_max <= agents_max
+{
+  push context user(input)
+  model_loop()
+}
+
 on completion(agent: text, status: text, detail: text) -> outcome
   requires turns < turns_max
     and len(context) + 1 + rounds_max * (1 + calls_per_round_max) <= context_entries_max
@@ -76,33 +80,5 @@ on completion(agent: text, status: text, detail: text) -> outcome
   } else {
     push context user("Subagent " ++ agent ++ " was interrupted before finishing. Continue the current task: call list_agents to inspect it.")
   }
-  turns = turns + 1
-  loop round below rounds_max {
-    let reply = messages(context)
-    push context assistant(reply)
-    match reply {
-      answer(words) => { return completed(words) }
-      calls(requested) => {
-        for call in requested {
-          if call.tool == "spawn_agent" {
-            match spawn_agent(call.input) {
-              ok(spawned) => {
-                push agents spawned
-                push context result(call, spawned)
-              }
-              failed(error) => { push context error(call, error) }
-              unknown => { push context unknown(call) }
-            }
-          } else {
-            match dispatch(call) {
-              ok(output) => { push context result(call, output) }
-              failed(error) => { push context error(call, error) }
-              unknown => { push context unknown(call) }
-            }
-          }
-        }
-      }
-    }
-  }
-  return exhausted
+  model_loop()
 }

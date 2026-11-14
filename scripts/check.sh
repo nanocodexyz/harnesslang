@@ -49,10 +49,38 @@ expect_error examples/invalid/unbounded_list.hl any "unbounded_list.hl:8:22: err
 expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: error: the bound of loop 'step' must be a named constant, found number 64"
 expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
 expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': worst case 17408 outbound requests exceeds cloudflare's limit of 10000 outbound requests per invocation; loops: step below turn_steps_max (1024) x call below calls_per_step_max (16)"
+expect_error examples/invalid/fn_recursion.hl any "fn_recursion.hl:33:3: error: fn 'ask' is recursive: ask -> run_tools -> ask"
+expect_error examples/invalid/fn_arity.hl any "fn_arity.hl:16:3: error: fn 'note' takes 2 argument(s), found 1"
+expect_error examples/invalid/fn_hidden_name.hl any "fn_hidden_name.hl:10:14: error: fn 'remember' cannot see 'input'"
 for target in native-jsonl native-sqlite server-postgres vercel; do
   "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null
 done
 echo "check: every invalid example fails with its expected error"
+
+same_program() {
+  local with_fn=$1 written_out=$2 target
+  for target in $targets; do
+    "$hl" emit --target "$target" "$written_out" > "$scratch/written_out.emit"
+    if ! "$hl" emit --target "$target" "$with_fn" | cmp -s - "$scratch/written_out.emit"; then
+      echo "fn: $with_fn and $written_out emit different code for $target" >&2
+      return 1
+    fi
+  done
+  "$hl" check "$written_out" | sed "s#$written_out#FILE#" > "$scratch/written_out.check"
+  if ! "$hl" check "$with_fn" | sed "s#$with_fn#FILE#" | cmp -s - "$scratch/written_out.check"; then
+    echo "fn: $with_fn and $written_out check and prove differently" >&2
+    return 1
+  fi
+}
+same_program examples/subagents.hl examples/inlined/subagents.hl
+same_program docs/snippets/fn.hl docs/snippets/fn_inline.hl
+sed '/push agents spawned/{N;s/\(.*\)\n\(.*\)/\2\n\1/}' examples/inlined/subagents.hl > "$scratch/planted.hl"
+"$hl" check "$scratch/planted.hl" > /dev/null
+if same_program examples/subagents.hl "$scratch/planted.hl" 2> /dev/null; then
+  echo "fn: a written-out program with two pushes swapped still compares equal" >&2
+  exit 1
+fi
+echo "check: every fn program emits, checks and proves exactly as its written-out copy"
 
 pids=()
 for target in $targets; do

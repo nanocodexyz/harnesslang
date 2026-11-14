@@ -7,7 +7,8 @@
 (`crates/runtime/subagents/`). Everything below is what the ports had to
 leave out or approximate, ranked by how much of a real harness it blocks,
 each with the smallest language addition that would let it be written and
-how the compiler would keep checking it.
+how the compiler would keep checking it. A gap the language closes is removed
+and the others keep their numbers.
 
 ## 1. The model's reply type is fixed
 
@@ -73,15 +74,6 @@ Smallest addition: inbound events declared on the harness, `on cancel` and
 `steer` record when an event arrives (nanocode's turn inbox does this), and
 a read returns the events recorded before the current sequence number, so
 replay stays deterministic and a read costs no record when nothing arrived.
-
-## 4. No shared procedures
-
-`subagents.hl` has two handlers, `prompt` and `completion` (how nanocode
-starts a root turn per child completion: `completion_continuation_prompt`),
-that run the same model loop, so the loop is written twice; a child's
-follow-up message handler would be a third copy. Smallest addition:
-non-recursive `fn` blocks inlined at each call site before lowering, so
-effect sites, sequence numbers and the worst case stay per handler.
 
 ## 5. Parallel tool calls
 

@@ -1,0 +1,41 @@
+harness reporter
+
+const lines_max: u64 = 64
+
+type report = posted(text) | refused(text) | lost
+
+tool comment(change: text, body: text) -> text effect external
+
+state {
+  lines: list<text, lines_max>
+}
+
+fn note(label: text, detail: text) {
+  push lines label ++ ": " ++ detail
+}
+
+fn post(target: text, body: text) {
+  match comment(target, body) {
+    ok(link) => {
+      note("posted", link)
+      return posted(link)
+    }
+    failed(error) => {
+      note("refused", error)
+      return refused(error)
+    }
+    unknown => { return lost }
+  }
+}
+
+on approve(change: text) -> report
+  requires len(lines) < lines_max
+{
+  post(change, "approved")
+}
+
+on withdraw(change: text, reason: text) -> report
+  requires len(lines) < lines_max
+{
+  post(change, "withdrawn: " ++ reason)
+}
