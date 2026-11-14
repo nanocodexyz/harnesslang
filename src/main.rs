@@ -110,6 +110,7 @@ fn main() -> ExitCode {
         "run" => run_command(rest),
         "sim" => sim_command(rest),
         "emit" => emit_command(rest),
+        "assemble" => assemble_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
         "gen" => harnesslang::generate::cli::gen_command(rest),
@@ -669,6 +670,35 @@ fn traced_sweep(program: &Program, options: &Options, path: &str) -> Result<sim:
     let summary = sim::sweep_traced(program, options, Some(&mut sink))?;
     std::io::Write::flush(&mut sink).map_err(|error| format!("cannot write: {error}"))?;
     Ok(summary)
+}
+
+fn assemble_command(args: &[String]) -> ExitCode {
+    if !args.is_empty() {
+        return usage();
+    }
+    let mut text = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+        eprintln!("assemble: error: cannot read standard input: {error}");
+        return ExitCode::from(FAILURE_EXIT);
+    }
+    match harnesslang::emit::wasm::assemble::assemble(&text) {
+        Ok(module) => write_bytes(&module.encode()),
+        Err(error) => {
+            eprintln!("assemble: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
+fn write_bytes(bytes: &[u8]) -> ExitCode {
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(bytes) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: cannot write standard output: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
 }
 
 fn emit_command(args: &[String]) -> ExitCode {

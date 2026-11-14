@@ -1,6 +1,7 @@
 pub mod js;
 pub mod rust;
 pub mod sql;
+pub mod wasm;
 
 use crate::ir::Program;
 use crate::target::Target;
