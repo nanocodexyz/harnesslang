@@ -544,8 +544,13 @@ class Engine {
       this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
       this.sites.set(seq, { kind: "open", call });
     }
-    const outcome = await this.runCell(code, seq, call);
-    const output = cellOutcomeOutput(outcome);
+    let output;
+    const settled = this.cells.get(seq)?.finished === true;
+    if ((logged === undefined || settled) && this.cellPreempted(code)) {
+      output = { tag: "ok", value: STOPPED_TEXT };
+    } else {
+      output = cellOutcomeOutput(await this.runCell(code, seq, call));
+    }
     this.append({ kind: "result", turn: this.turn, seq, output });
     this.sites.set(seq, { kind: "done", call, output });
     return this.decodeCell(output);
@@ -606,6 +611,10 @@ class Engine {
     return this.decodeCell(output);
   }
 
+  cellPreempted(code) {
+    return PROGRAM.codes[code].cancel && this.mutation !== "cell_cancel_ignored" && this.preempted(CELL_INTERRUPTS);
+  }
+
   waitedCell(code, seq, id) {
     const name = PROGRAM.codes[code].name;
     const origins = [...this.cells.keys()].filter((origin) => origin < seq).sort((left, right) => left - right);
@@ -627,6 +636,11 @@ class Engine {
     const id = typeof input.cell_id === "string" ? input.cell_id : "";
     const terminate = input.terminate === true;
     const found = this.waitedCell(code, seq, id);
+    const settled = found === null || found[1].finished;
+    if ((!rerun || settled) && this.cellPreempted(code)) {
+      if (found !== null && !found[1].finished) this.stopCell(found[0]);
+      return { tag: "ok", value: STOPPED_TEXT };
+    }
     if (found === null) return { tag: "failed", error: NOT_FOUND_TEXT };
     const [origin, log] = found;
     if (log.finished) {
@@ -1134,6 +1148,14 @@ class EngineCellHost {
     return this.world.nestedAttempt(this.engine.turn, seq, nested);
   }
 
+  abandoned(seq, nested) {
+    const engine = this.engine;
+    engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]], replied: [], undispatched: [] });
+    const key = nestedKey(seq, nested);
+    const site = engine.nested.get(key);
+    if (site !== undefined && site.kind === "open") engine.nested.set(key, { kind: "unknown", call: site.call });
+  }
+
   async recovered(seq, nested) {
     const engine = this.engine;
     engine.append({ kind: "recovery", turn: engine.turn, attempt: engine.nextAttempt(), unknown: [], nested: [[seq, nested]], replied: [], undispatched: [] });
@@ -1145,6 +1167,12 @@ class EngineCellHost {
 
   clock() {
     return this.world.now();
+  }
+
+  async cellCancelled(code, drain) {
+    if (!PROGRAM.codes[code].cancel) return false;
+    if (drain) await this.engine.drain();
+    return this.engine.mutation !== "cell_cancel_ignored" && this.engine.preempted(CELL_INTERRUPTS);
   }
 
   deadline(site, cell) {
@@ -1170,6 +1198,8 @@ class EngineCellHost {
     return this.world.observe(event);
   }
 }
+
+const CELL_INTERRUPTS = { cancel: true, steer: false };
 
 function codeNamed(name) {
   const index = PROGRAM.codes.findIndex((code) => code.name === name);

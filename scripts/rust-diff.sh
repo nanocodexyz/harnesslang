@@ -44,6 +44,7 @@ plant_expression() {
     fork_hook_skipped) echo 's/program::run_forked(\&mut state, origin.to_owned(), discarded)/Ok::<(), Halt>(())/' ;;
     fork_entry_ignored) echo 's/let entry = \*revision == ENTRY_REVISION \&\& session.turns.is_empty() \&\& session.start == Start::Beginning;/let entry = *revision == ENTRY_REVISION \&\& session.turns.is_empty() \&\& session.start == Start::Beginning; if entry { return Ok(()); }/' ;;
     cell_leaks) echo 's/^        if !cells_yield() {$/        if true {/' ;;
+    cell_cancel_ignored) echo 's/^        if !program::CODES\[code\].cancel {$/        if true {/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

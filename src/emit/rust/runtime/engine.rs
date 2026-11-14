@@ -1479,6 +1479,7 @@ impl<'a> Engine<'a> {
             effect: EffectClass::None,
             ..call
         };
+        let fresh = !self.sites.contains_key(&seq);
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
                 self.same(seq, &recorded, &call)?;
@@ -1505,8 +1506,12 @@ impl<'a> Engine<'a> {
                 self.sites.insert(seq, SiteLog::Open(call.clone()));
             }
         }
-        let outcome = self.run_code(code, seq, &call)?;
-        let output = outcome.output();
+        let settled = self.cells.get(&seq).is_some_and(|log| log.finished);
+        let output = if (fresh || settled) && self.cell_preempted(code) {
+            Output::Ok(Json::text(STOPPED_TEXT))
+        } else {
+            self.run_code(code, seq, &call)?.output()
+        };
         self.append(Record::Result {
             turn: self.turn,
             seq,
@@ -1602,6 +1607,10 @@ impl<'a> Engine<'a> {
         self.cell_answer(&output)
     }
 
+    fn cell_preempted(&self, code: usize) -> bool {
+        program::CODES[code].cancel && self.preempted(CELL_INTERRUPTS)
+    }
+
     fn waited_cell(&self, code: usize, seq: u64, id: &str) -> Option<(u64, CellLog)> {
         let name = program::CODES[code].name;
         self.cells
@@ -1623,7 +1632,17 @@ impl<'a> Engine<'a> {
         };
         let id = input.get(WAIT_CELL_ID).and_then(Json::as_str).unwrap_or_default().to_owned();
         let terminate = input.get(WAIT_TERMINATE) == Some(&Json::Bool(true));
-        let Some((origin, log)) = self.waited_cell(code, seq, &id) else {
+        let found = self.waited_cell(code, seq, &id);
+        let settled = found.as_ref().is_none_or(|(_, log)| log.finished);
+        if (!rerun || settled) && self.cell_preempted(code) {
+            if let Some((origin, log)) = &found
+                && !log.finished
+            {
+                self.stop_cell(*origin);
+            }
+            return Ok(Output::Ok(Json::text(STOPPED_TEXT)));
+        }
+        let Some((origin, log)) = found else {
             return Ok(Output::Failed(NOT_FOUND_TEXT.to_owned()));
         };
         if log.finished {
@@ -2177,7 +2196,34 @@ impl CellHost for Engine<'_> {
     fn observe(&mut self, event: &CellEvent) {
         self.world().observe(event);
     }
+
+    fn cell_cancelled(&mut self, code: usize, drain: bool) -> Result<bool, Stop> {
+        if !program::CODES[code].cancel {
+            return Ok(false);
+        }
+        if drain {
+            self.drain().map_err(halt_stop)?;
+        }
+        Ok(self.preempted(CELL_INTERRUPTS))
+    }
+
+    fn abandoned(&mut self, seq: u64, nested: u64) {
+        let attempt = self.next_attempt();
+        self.append(Record::Recovery {
+            turn: self.turn,
+            attempt,
+            unknown: Vec::new(),
+            nested: vec![(seq, nested)],
+            replied: Vec::new(),
+            undispatched: Vec::new(),
+        });
+        if let Some(SiteLog::Open(call)) = self.nested.get(&(seq, nested)).cloned() {
+            self.nested.insert((seq, nested), SiteLog::Unknown(call));
+        }
+    }
 }
+
+const CELL_INTERRUPTS: Interrupts = Interrupts { cancel: true, steer: false };
 
 fn halt_stop(halt: Halt) -> Stop {
     match halt {

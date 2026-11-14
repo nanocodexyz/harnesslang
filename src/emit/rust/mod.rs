@@ -696,7 +696,7 @@ fn codes(out: &mut String, program: &Program) {
             .collect();
         writeln!(
             specs,
-            "    CodeSpec {{ name: {:?}, tools: &[{}], calls: {}, parallel: {}, timers: {}, timer_ms: {}, journal_bytes: {}, yield_ms: {}, waits: {:?} }},",
+            "    CodeSpec {{ name: {:?}, tools: &[{}], calls: {}, parallel: {}, timers: {}, timer_ms: {}, journal_bytes: {}, yield_ms: {}, waits: {:?}, cancel: {} }},",
             code.name,
             tools.join(", "),
             limit(&code.calls),
@@ -705,7 +705,8 @@ fn codes(out: &mut String, program: &Program) {
             limit(&code.timer_ms),
             limit(&code.journal_bytes),
             limit(&code.yield_ms),
-            code.waits.as_ref().map(|waits| waits.name.as_str())
+            code.waits.as_ref().map(|waits| waits.name.as_str()),
+            code.interrupts.cancel
         )
         .expect("writing to a string succeeds");
         writeln!(arms, "        {:?} => Some({index}),", code.name)

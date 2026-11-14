@@ -24,6 +24,7 @@ pub struct CodeSpec {
     pub journal_bytes: Limit,
     pub yield_ms: Limit,
     pub waits: Option<&'static str>,
+    pub cancel: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +106,8 @@ pub const RUNNING_KEY: &str = "running";
 pub const RUNNING_TEXT: &str = "Script running with cell ID ";
 pub const TERMINATED_TEXT: &str = "Script terminated";
 pub const NOT_FOUND_TEXT: &str = "exec cell ID not found";
+pub const STOPPED_TEXT: &str = "Tool execution stopped by the user. The cell was terminated and no nested tool call was left running.";
+pub const STOPPED_UNKNOWN_TEXT: &str = "Tool execution stopped by the user. The cell was terminated while a nested tool call was still running; that call's outcome is unknown. Do not assume it did not run or automatically repeat it.";
 
 pub fn running_text(cell: u64) -> String {
     format!("{RUNNING_TEXT}{cell}")
@@ -164,6 +167,8 @@ pub trait CellHost {
     fn random(&mut self) -> u64;
     fn wait(&mut self, wait: &Wait) -> Result<(), Stop>;
     fn observe(&mut self, event: &CellEvent);
+    fn cell_cancelled(&mut self, code: usize, drain: bool) -> Result<bool, Stop>;
+    fn abandoned(&mut self, seq: u64, nested: u64);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -226,7 +231,13 @@ pub fn run_cell(site: CellSite<'_>, host: &mut dyn CellHost) -> Result<CellOutco
     let outcome = match runner.drive() {
         Ok(outcome) => outcome,
         Err(Interrupt::Stop(stop)) => return Err(stop),
-        Err(Interrupt::Yield) => return Ok(runner.yielded()),
+        Err(Interrupt::Stopped(unknown)) => return runner.finish(stopped(unknown)),
+        Err(Interrupt::Yield) => {
+            if runner.host.cell_cancelled(runner.site.code, false)? {
+                return runner.finish(stopped(false));
+            }
+            return Ok(runner.yielded());
+        }
         Err(Interrupt::Threw(error)) => CellOutcome::Threw(error),
         Err(Interrupt::Diverged(reason)) => CellOutcome::Unknown(divergence_text(runner.cell, &reason)),
         Err(Interrupt::Overflow) => {
@@ -237,11 +248,19 @@ pub fn run_cell(site: CellSite<'_>, host: &mut dyn CellHost) -> Result<CellOutco
             CellOutcome::Unknown(divergence_text(runner.cell, &reason))
         }
     };
+    if runner.host.cell_cancelled(runner.site.code, false)? {
+        return runner.finish(stopped(false));
+    }
     runner.finish(outcome)
+}
+
+fn stopped(unknown: bool) -> CellOutcome {
+    CellOutcome::Done(if unknown { STOPPED_UNKNOWN_TEXT } else { STOPPED_TEXT }.to_owned())
 }
 
 enum Interrupt {
     Stop(Stop),
+    Stopped(bool),
     Yield,
     Threw(String),
     Diverged(String),
@@ -655,6 +674,9 @@ impl<'a, 'h> Runner<'a, 'h> {
     }
 
     fn dispatch(&mut self, id: u64, fresh: bool) -> Driven<()> {
+        if self.host.cell_cancelled(self.site.code, false)? {
+            return Err(Interrupt::Stopped(false));
+        }
         let call = self.calls[&id].clone();
         let tool = call.tool.expect("a dispatched call names a nested tool");
         let required = tool.effect == EffectClass::External;
@@ -675,6 +697,10 @@ impl<'a, 'h> Runner<'a, 'h> {
             self.header_unsaved = false;
         }
         let output = self.run_tool(id, tool)?;
+        if required && self.host.cell_cancelled(self.site.code, true)? {
+            self.host.abandoned(self.site.seq, id);
+            return Err(Interrupt::Stopped(true));
+        }
         if required {
             self.host.append(Record::NestedResult {
                 turn: self.site.turn,
@@ -817,6 +843,9 @@ impl<'a, 'h> Runner<'a, 'h> {
     fn deliver(&mut self, id: u64) -> Driven<Input> {
         if self.calls[&id].output.is_none() {
             self.dispatch(id, false)?;
+            if self.host.cell_cancelled(self.site.code, true)? {
+                return Err(Interrupt::Stopped(false));
+            }
         }
         let (encoded, success) = self.calls[&id].output.clone().expect("a delivered call has its output");
         self.append_entry(Entry::Result {
@@ -844,6 +873,9 @@ impl<'a, 'h> Runner<'a, 'h> {
             delay_ms,
             until_ms,
         })?;
+        if self.host.cell_cancelled(self.site.code, true)? {
+            return Err(Interrupt::Stopped(false));
+        }
         self.timers.remove(&id);
         self.append_entry(Entry::Timer { id })?;
         self.emit(false);

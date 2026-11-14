@@ -116,7 +116,9 @@ rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-p
 rust fork_entry_ignored docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js fork_hook_skipped docs/snippets/fork.hl cloudflare,vercel backend_equal
 rust cell_leaks docs/snippets/code_wait.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js cell_leaks docs/snippets/code_wait.hl cloudflare,vercel backend_equal"
+js cell_leaks docs/snippets/code_wait.hl cloudflare,vercel backend_equal
+rust cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js cell_cancel_ignored docs/snippets/code_stop.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 

@@ -37,6 +37,12 @@ const RUNNING_KEY = "running";
 const RUNNING_TEXT = "Script running with cell ID ";
 const TERMINATED_TEXT = "Script terminated";
 const NOT_FOUND_TEXT = "exec cell ID not found";
+const STOPPED_TEXT = "Tool execution stopped by the user. The cell was terminated and no nested tool call was left running.";
+const STOPPED_UNKNOWN_TEXT = "Tool execution stopped by the user. The cell was terminated while a nested tool call was still running; that call's outcome is unknown. Do not assume it did not run or automatically repeat it.";
+
+function cellStopped(unknown) {
+  return { kind: "done", text: unknown ? STOPPED_UNKNOWN_TEXT : STOPPED_TEXT };
+}
 
 function cellOutcomeOutput(outcome) {
   if (outcome.kind === "done") return { tag: "ok", value: outcome.text };
@@ -68,9 +74,14 @@ async function runCell(site, host) {
     outcome = await runner.drive();
   } catch (error) {
     if (!(error instanceof CellInterrupt)) throw error;
-    if (error.kind === "yield") return runner.yielded();
+    if (error.kind === "stopped") return runner.finish(cellStopped(error.text));
+    if (error.kind === "yield") {
+      if (await host.cellCancelled(site.code, false)) return runner.finish(cellStopped(false));
+      return runner.yielded();
+    }
     outcome = await runner.interrupted(error);
   }
+  if (await host.cellCancelled(site.code, false)) return runner.finish(cellStopped(false));
   return runner.finish(outcome);
 }
 
@@ -429,6 +440,7 @@ class CellRunner {
   }
 
   async dispatch(id, fresh) {
+    if (await this.host.cellCancelled(this.site.code, false)) throw new CellInterrupt("stopped", false);
     const call = this.calls.get(id);
     const effect = call.tool.effect;
     this.emit(false);
@@ -460,6 +472,10 @@ class CellRunner {
       assert(attempt === 1 || this.site.mutation === "cell_replay_ignores_journal", "a fresh nested external step starts at its first attempt");
     }
     const output = await this.runTool(id);
+    if (required && (await this.host.cellCancelled(this.site.code, true))) {
+      this.host.abandoned(this.site.seq, this.recordId(id));
+      throw new CellInterrupt("stopped", true);
+    }
     if (required) this.host.append({ kind: "nested_result", turn: this.site.turn, seq: this.site.seq, nested: this.recordId(id), output });
     if (step || late) {
       await this.host.flush();
@@ -554,7 +570,10 @@ class CellRunner {
   }
 
   async deliver(id) {
-    if (this.calls.get(id).output === null) await this.dispatch(id, false);
+    if (this.calls.get(id).output === null) {
+      await this.dispatch(id, false);
+      if (await this.host.cellCancelled(this.site.code, true)) throw new CellInterrupt("stopped", false);
+    }
     const output = this.calls.get(id).output;
     assert(output !== null, "a delivered call has its output");
     const [encoded, success] = output;
@@ -574,6 +593,7 @@ class CellRunner {
       this.headerUnsaved = false;
     }
     await this.host.waitTimer({ cell: this.cell, code: this.site.code, timer: id, delayMs, untilMs });
+    if (await this.host.cellCancelled(this.site.code, true)) throw new CellInterrupt("stopped", false);
     this.timers.delete(id);
     await this.appendEntry({ kind: "timer", id });
     this.emit(false);
