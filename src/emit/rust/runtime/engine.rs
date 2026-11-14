@@ -1242,7 +1242,9 @@ impl<'a> Engine<'a> {
                         admitted: admitted.as_deref(),
                         nested: None,
                     });
-                    spawn_output(turn, seq, &call.tool, checked_output(&call.tool, returns, output))
+                    spawn_output(turn, seq, &call.tool, {
+                        checked_output(&call.tool, returns, output)
+                    })
                 }
             },
         };
