@@ -110,7 +110,8 @@ class CellRunner {
     return this.site.mutation === "cell_limit_unchecked";
   }
 
-  diverged(reason) {
+  async diverged(reason) {
+    await this.host.observe({ kind: "diverged", cell: this.cell, reason });
     return new CellInterrupt("diverged", reason);
   }
 
@@ -132,7 +133,7 @@ class CellRunner {
       this.headerUnsaved = true;
       await this.host.hook(CELL_POINT_AFTER_HEADER);
     }
-    if (this.site.script !== this.script) throw this.diverged("its header holds another script than its call");
+    if (this.site.script !== this.script) throw await this.diverged("its header holds another script than its call");
     const context = {
       code: this.site.code,
       replay: this.replay.filter((entry) => !entryIsInput(entry)),
@@ -176,9 +177,9 @@ class CellRunner {
     throw new CellInterrupt("overflow", null);
   }
 
-  ended(outcome) {
+  async ended(outcome) {
     const entry = this.replay[this.cursor];
-    if (entry !== undefined) throw this.diverged(`the script ended where its journal holds ${describeEntry(entry)}`);
+    if (entry !== undefined) throw await this.diverged(`the script ended where its journal holds ${describeEntry(entry)}`);
     return outcome;
   }
 
@@ -222,7 +223,7 @@ class CellRunner {
     const recorded = this.replay[this.cursor];
     if (recorded !== undefined) {
       if (entryIsInput(recorded) || !sameStep(recorded, step)) {
-        throw this.diverged(`the script took ${describeEntry(step)} where its journal holds ${describeEntry(recorded)}`);
+        throw await this.diverged(`the script took ${describeEntry(step)} where its journal holds ${describeEntry(recorded)}`);
       }
       this.cursor += 1;
       await this.liveAtEnd();
@@ -302,7 +303,7 @@ class CellRunner {
   }
 
   async call(id, name, input) {
-    if (this.calls.has(id)) throw this.diverged(`the engine issued nested call ${id} twice`);
+    if (this.calls.has(id)) throw await this.diverged(`the engine issued nested call ${id} twice`);
     this.issued += 1n;
     const index = this.code.tools.find((candidate) => PROGRAM.tools[candidate].name === name);
     const tool = index === undefined ? null : { index, effect: PROGRAM.tools[index].effect };
@@ -311,7 +312,22 @@ class CellRunner {
     else if (this.issued > this.code.calls.value && !this.unchecked()) {
       refused = `the cell made its calls bound (${this.code.calls.name} = ${this.code.calls.value}) of nested calls`;
     }
-    this.calls.set(id, { name, tool, input, phase: "queued", output: null, refused });
+    let interrupt = null;
+    try {
+      await this.record({ kind: "call", id, name, input });
+    } catch (error) {
+      if (!(error instanceof CellInterrupt)) throw error;
+      interrupt = error;
+    }
+    const record = this.live ? id - Math.min(this.idShift, id - 1) : id;
+    this.calls.set(id, { name, tool, input, phase: "queued", output: null, refused, record });
+    if (interrupt !== null) {
+      if (interrupt.kind === "diverged" && this.site.mutation === "divergence_dispatches" && refused === null) {
+        this.calls.get(id).phase = "running";
+        await this.runTool(id);
+      }
+      throw interrupt;
+    }
     if (this.running() < this.code.parallel.value || this.unchecked()) {
       await this.startCall(id);
       return;
@@ -322,22 +338,14 @@ class CellRunner {
 
   async startCall(id) {
     const call = this.calls.get(id);
-    try {
-      await this.record({ kind: "call", id, name: call.name, input: call.input });
-    } catch (error) {
-      if (error instanceof CellInterrupt && error.kind === "diverged" && this.site.mutation === "divergence_dispatches" && call.refused === null) {
-        call.phase = "running";
-        await this.runTool(id);
-      }
-      throw error;
-    }
+    assert(call !== undefined, "a started call was issued");
     call.phase = "running";
     this.changed(id);
     if (this.live) await this.settle(id);
   }
 
   recordId(id) {
-    return id - Math.min(this.idShift, id - 1);
+    return this.calls.get(id).record;
   }
 
   async goLive() {
@@ -397,7 +405,7 @@ class CellRunner {
   async reopen(id) {
     const rid = this.recordId(id);
     if (this.inStep()) {
-      const attempt = await this.host.attempt(this.site.seq, rid);
+      const attempt = await this.host.attempt(this.site.seq, id);
       if (attempt > 1 && this.site.mutation !== "vercel_nested_retry_redispatches") {
         await this.host.recovered(this.site.seq, rid);
         this.headerUnsaved = false;
@@ -439,7 +447,7 @@ class CellRunner {
       }
     }
     if (first) {
-      const attempt = await this.host.attempt(this.site.seq, this.recordId(id));
+      const attempt = await this.host.attempt(this.site.seq, id);
       assert(attempt === 1 || this.site.mutation === "cell_replay_ignores_journal", "a fresh nested external step starts at its first attempt");
     }
     const output = await this.runTool(id);
@@ -464,7 +472,7 @@ class CellRunner {
       effect,
       input: call.input,
       returns: tool.returns,
-      nested: { id, cell: this.cell, code: this.site.code },
+      nested: { id, record: this.recordId(id), cell: this.cell, code: this.site.code },
     });
     await this.host.hook(nestedPoint("cell_after_nested", effect));
     return output;
@@ -479,7 +487,7 @@ class CellRunner {
         return { kind: "refused", error: `setTimeout: ${delayMs} ms is past timer_ms (${this.code.timerMs.name} = ${this.code.timerMs.value})` };
       }
     }
-    if (this.timers.has(id)) throw this.diverged(`the engine armed timer ${id} twice`);
+    if (this.timers.has(id)) throw await this.diverged(`the engine armed timer ${id} twice`);
     const entry = await this.record({ kind: "timeout", id, delayMs, atMs: 0n });
     assert(entry.kind === "timeout", "a timeout step records a timeout entry");
     this.timers.set(id, [delayMs, entry.atMs]);
@@ -507,7 +515,7 @@ class CellRunner {
     if (entry.kind === "result") {
       const call = this.calls.get(entry.id);
       if (call === undefined || call.phase !== "running") {
-        throw this.diverged(`its journal delivers nested call ${entry.id}, which the script has not started`);
+        throw await this.diverged(`its journal delivers nested call ${entry.id}, which the script has not started`);
       }
       this.cursor += 1;
       await this.liveAtEnd();
@@ -516,13 +524,13 @@ class CellRunner {
       return { kind: "result", id: entry.id, encoded: entry.encoded, success: entry.success };
     }
     if (entry.kind === "timer") {
-      if (!this.timers.has(entry.id)) throw this.diverged(`its journal fires timer ${entry.id}, which the script has not armed`);
+      if (!this.timers.has(entry.id)) throw await this.diverged(`its journal fires timer ${entry.id}, which the script has not armed`);
       this.timers.delete(entry.id);
       this.cursor += 1;
       await this.liveAtEnd();
       return { kind: "timer", id: entry.id };
     }
-    throw this.diverged(`the script waits where its journal holds ${describeEntry(entry)}`);
+    throw await this.diverged(`the script waits where its journal holds ${describeEntry(entry)}`);
   }
 
   async complete(id) {

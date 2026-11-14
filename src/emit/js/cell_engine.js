@@ -146,8 +146,7 @@ class ScriptEngine {
     assert(this.ended === null && this.steps === 0, "a script engine starts once");
     const promise = this.run(...this.scope());
     promise.then(
-      (value) => {
-        if (typeof value === "string") this.printed.push(value);
+      () => {
         this.ended = { kind: "done", output: this.printed.join("\n") };
       },
       (error) => {
