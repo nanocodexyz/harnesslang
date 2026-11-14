@@ -72,6 +72,19 @@ impl Checker<'_> {
         )
     }
 
+    pub(super) fn forked_parallel(&self, at: crate::syntax::Position) -> Checked<()> {
+        let Some(fork) = self.program.tools.iter().find(|tool| tool.fork.is_some()) else {
+            return Ok(());
+        };
+        error(
+            at,
+            format!(
+                "a parallel for dispatches tool calls at once, but fork tool '{}' fills its input from the journal before its call record is written: use a sequential for",
+                fork.name
+            ),
+        )
+    }
+
     pub(super) fn forked_call(&self, callee: &ast::Name) -> Checked<()> {
         if !self.forked {
             return Ok(());

@@ -673,6 +673,7 @@ impl Checker<'_> {
                 ),
             );
         }
+        self.forked_parallel(at)?;
         if let Some(kind) = self.dispatch_hooks().first() {
             return error(
                 at,
