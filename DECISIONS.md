@@ -310,7 +310,7 @@ Commands: `NANOCODE_DIR=<nanocode checkout> HL_AGENT=<hl-agent binary> sh evals/
 
 ## 2026-11-14: before tool, after tool and lifecycle hooks; spawn and join
 
-GAPS.md's gaps 5 and 7 are closed and removed (branch gaps-5-7, from master 21d98c9, merged with master at 8549e8a and 7fa419b).
+GAPS.md's gaps 5 and 7 are closed and removed (branch gaps-5-7, from master 21d98c9, merged with master at 8549e8a, 7fa419b and 6dea898).
 
 What this establishes:
 
