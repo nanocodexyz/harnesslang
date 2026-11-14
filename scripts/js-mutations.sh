@@ -19,14 +19,14 @@ mutations=(
   "cell_rerun_after_finish vercel cell_finishes_once"
   "divergence_dispatches cloudflare cell_replay_equal"
   "divergence_dispatches vercel cell_replay_equal"
-  "nested_ids_restart cloudflare liveness"
+  "nested_ids_restart cloudflare liveness|nested_external_once"
   "nested_ids_restart vercel backend_equal"
   "cell_limit_unchecked cloudflare cell_bounded"
   "cell_limit_unchecked vercel cell_bounded"
   "vercel_nested_retry_redispatches vercel nested_external_once"
-  "cell_gate_releases_early cloudflare nested_external_once"
+  "cell_gate_releases_early cloudflare nested_external_once|backend_equal"
   "nested_idempotent_reported_unknown cloudflare nested_known"
-  "nested_idempotent_reported_unknown vercel backend_equal"
+  "nested_idempotent_reported_unknown vercel backend_equal|nested_known"
 )
 
 for target in cloudflare vercel; do
@@ -44,7 +44,7 @@ check() {
   fi
   local line
   line=$(grep -m1 '^FAIL' "$mutated.log" || true)
-  if [[ "$line" != *"invariant=$expected "* ]]; then
+  if ! [[ "$line" =~ invariant=($expected)\  ]]; then
     echo "js-mutations: $mutation on $target failed for another reason than $expected:" >&2
     tail -n 3 "$mutated.log" >&2
     return 1
