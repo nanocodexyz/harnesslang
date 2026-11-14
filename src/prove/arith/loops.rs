@@ -11,12 +11,54 @@ type Spread = (Option<i128>, Option<i128>);
 struct Summary {
     delta: BTreeMap<Quantity, Spread>,
     absolute: BTreeMap<Quantity, Spread>,
+    indexed: BTreeMap<Quantity, (i128, i128, i128)>,
 }
+
+const INDEX_SLOPES: [i128; 2] = [-1, 1];
 
 fn finite(extent: Extent) -> Option<i128> {
     match extent {
         Extent::At(value) => Some(value),
         Extent::Infeasible | Extent::Unbounded => None,
+    }
+}
+
+fn index_sum(slope: i128, steps: i128, per_step: i128) -> Option<i128> {
+    let pairs = steps.checked_mul(steps.checked_sub(1)?)? / 2;
+    pairs
+        .checked_mul(slope)?
+        .checked_add(steps.checked_mul(per_step)?)
+}
+
+fn iteration_closed_form(
+    iteration: &mut State,
+    start: Var,
+    count: &Linear,
+    indexed: (i128, i128, i128),
+    now: Var,
+) {
+    let Some(count) = count.as_constant() else {
+        return;
+    };
+    let (slope, low, high) = indexed;
+    let base = Linear::var(start);
+    let now = Linear::var(now);
+    let last = count - 1;
+    if slope < 0
+        && let Some(lowest) = index_sum(slope, last, low)
+        && let Some(fact) = base
+            .plus(lowest.min(0))
+            .and_then(|bound| bound.subtract(&now))
+    {
+        iteration.facts.push(fact);
+    }
+    if slope > 0
+        && let Some(highest) = index_sum(slope, last, high)
+        && let Some(fact) = base
+            .plus(highest.max(0))
+            .and_then(|bound| now.subtract(&bound))
+    {
+        iteration.facts.push(fact);
     }
 }
 
@@ -110,6 +152,11 @@ impl Prover<'_> {
         let mut summary = Summary {
             delta: BTreeMap::new(),
             absolute: BTreeMap::new(),
+            indexed: BTreeMap::new(),
+        };
+        let index = match kind {
+            LoopKind::Below { index, .. } => end.env.get(&Quantity::Local(index)).copied(),
+            LoopKind::Each { .. } => None,
         };
         for quantity in quantities {
             let now = Linear::var(end.env[quantity]);
@@ -124,10 +171,70 @@ impl Prover<'_> {
                 finite(self.extent(&end, &now, false)),
                 finite(self.extent(&end, &now, true)),
             );
+            if let Some(index) = index
+                && let Some(indexed) = self.slope(&end, &delta, index, spread)
+            {
+                summary.indexed.insert(*quantity, indexed);
+            }
             summary.delta.insert(*quantity, spread);
             summary.absolute.insert(*quantity, absolute);
         }
         Some(summary)
+    }
+
+    fn slope(
+        &mut self,
+        end: &State,
+        delta: &Linear,
+        index: Var,
+        spread: Spread,
+    ) -> Option<(i128, i128, i128)> {
+        let mut best = match spread {
+            (Some(low), Some(high)) => (0, low, high),
+            _ => (0, i128::MIN, i128::MAX),
+        };
+        for slope in INDEX_SLOPES {
+            let Some(rest) = Linear::var(index)
+                .scale(slope)
+                .and_then(|scaled| delta.subtract(&scaled))
+            else {
+                continue;
+            };
+            let low = finite(self.extent(end, &rest, false));
+            let high = finite(self.extent(end, &rest, true));
+            if let (Some(low), Some(high)) = (low, high)
+                && high.checked_sub(low)? < best.2.checked_sub(best.1).unwrap_or(i128::MAX)
+            {
+                best = (slope, low, high);
+            }
+        }
+        (best.0 != 0).then_some(best)
+    }
+
+    fn closed_form(
+        &self,
+        exit: &mut State,
+        start: Var,
+        count: &Linear,
+        indexed: (i128, i128, i128),
+        now: Var,
+    ) {
+        let Some(count) = count.as_constant() else {
+            return;
+        };
+        let (slope, low, high) = indexed;
+        let base = Linear::var(start);
+        let now = Linear::var(now);
+        if let Some(lowest) = index_sum(slope, count, low)
+            && let Some(fact) = base.plus(lowest).and_then(|bound| bound.subtract(&now))
+        {
+            exit.facts.push(fact);
+        }
+        if let Some(highest) = index_sum(slope, count, high)
+            && let Some(fact) = base.plus(highest).and_then(|bound| now.subtract(&bound))
+        {
+            exit.facts.push(fact);
+        }
     }
 
     fn advance(
@@ -197,6 +304,13 @@ impl Prover<'_> {
                 &counter_value,
                 spread,
             );
+            if let Some(indexed) = summary
+                .as_ref()
+                .and_then(|summary| summary.indexed.get(quantity))
+            {
+                let now = iteration.env[quantity];
+                iteration_closed_form(&mut iteration, state.env[quantity], &count, *indexed, now);
+            }
         }
         self.bind_iteration(&mut iteration, kind, Some(counter));
         self.path.push(label);
@@ -230,6 +344,10 @@ impl Prover<'_> {
                 count,
                 summary.delta[quantity],
             );
+            if let Some(indexed) = summary.indexed.get(quantity) {
+                let now = exit.env[quantity];
+                self.closed_form(&mut exit, state.env[quantity], count, *indexed, now);
+            }
             if matches!(kind, LoopKind::Below { .. }) {
                 let now = Linear::var(exit.env[quantity]);
                 let (low, high) = summary.absolute[quantity];

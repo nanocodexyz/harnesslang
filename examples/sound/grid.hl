@@ -1,0 +1,22 @@
+harness grid
+
+const rows_max: u64 = 16
+const columns_max: u64 = 16
+const cells_max: u64 = 256
+
+invariant bounded: count <= cells_max
+
+state {
+  count: u64
+}
+
+on fill(note: text) -> u64
+  requires count == 0
+{
+  loop row below rows_max {
+    loop column below columns_max {
+      count = count + 1
+    }
+  }
+  return count
+}

@@ -14,7 +14,7 @@ use crate::prove::{
 
 const U64_MAX: i128 = u64::MAX as i128;
 const ZERO_STATE: &str = "(zero state)";
-const TEMPORARY: &str = crate::check::WILDCARD;
+pub(super) const TEMPORARY: &str = crate::check::WILDCARD;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Quantity {
@@ -286,6 +286,7 @@ impl<'a> Prover<'a> {
             self.bind(&mut state, *param, None);
         }
         for invariant in &program.invariants {
+            self.assume_in_range(&mut state, &invariant.condition);
             state = self.assume(state, &invariant.condition, true);
         }
         state

@@ -1,0 +1,27 @@
+harness and_overflow
+
+const limit: u64 = 1000000
+const cap: u64 = 5000000
+
+tool measure(what: text) -> u64 effect idempotent
+
+invariant bounded: total <= cap
+
+state {
+  total: u64
+}
+
+on take(what: text) -> u64 {
+  match measure(what) {
+    ok(value) => {
+      if value < limit and total + value <= cap {
+        total = total + value
+      }
+      if total >= value {
+        return total - value
+      }
+      return value - total
+    }
+    failed(error) => { return 0 }
+  }
+}
