@@ -1,3 +1,4 @@
+import { createContext, Script } from "node:vm";
 const VERCEL_TARGET = TARGET_MODEL;
 const VERCEL_EPOCH = 0;
 const STEPS_PER_EFFECT_MAX = 2;
@@ -59,8 +60,8 @@ class StepWorld {
     return attempt;
   }
 
-  cellStart(cell, script) {
-    return this.context.cells.start(cell, script);
+  cellStart(cell, script, context) {
+    return this.context.cells.start(cell, script, context);
   }
 
   cellResume(cell, input) {
@@ -97,6 +98,35 @@ class StepWorld {
 
   async acknowledge() {
     throw new Panic("a step ends at its flush, before the turn is acknowledged");
+  }
+}
+
+class ProcessCells {
+  constructor() {
+    this.engines = new Map();
+  }
+
+  async start(cell, script, context) {
+    let run;
+    try {
+      run = new Script(`(async function cell(${CELL_SCRIPT_PARAMETERS.join(", ")}) {\n${script}\n})`).runInContext(createContext(Object.create(null)));
+    } catch (error) {
+      return { kind: "threw", error: cellErrorText(error) };
+    }
+    const engine = new ScriptEngine(run, {
+      limits: context.limits,
+      replay: context.replay,
+      platform: platformCellValues(),
+      macrotask: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    });
+    this.engines.set(cell, engine);
+    return engine.start();
+  }
+
+  resume(cell, input) {
+    const engine = this.engines.get(cell);
+    assert(engine !== undefined, "a cell resumes after it started");
+    return engine.resume(input);
   }
 }
 
@@ -162,7 +192,7 @@ async function driveTurn(platform, lines, folded, requestText) {
 }
 
 const WORKFLOW_BINDING = [
-  "import { createHook, getStepMetadata } from \"workflow\";",
+  "import { createHook, getStepMetadata, sleep } from \"workflow\";",
   "import { harness } from \"./harness.mjs\";",
   "",
   "function host() {",
@@ -179,6 +209,10 @@ const WORKFLOW_BINDING = [
   "  \"use step\";",
   "  return harness.runStep(input, {",
   "    attempt: getStepMetadata().attempt,",
+  "    async nestedAttempt() {",
+  "      return getStepMetadata().attempt;",
+  "    },",
+  "    cells: harness.processCells(),",
   "    hook() {},",
   "    host: host(),",
   "    async acknowledge(finish) {",
@@ -201,6 +235,9 @@ const WORKFLOW_BINDING = [
   "    async step(name, input) {",
   "      return { output: await harnessStep(input), live: true };",
   "    },",
+  "    async sleep(name, wait) {",
+  "      await sleep(new Date(Number(wait.untilMs)));",
+  "    },",
   "    async hook() {},",
   "  });",
   "}",
@@ -214,6 +251,7 @@ const harness = {
   session,
   runStep,
   platformRandom,
+  processCells: () => new ProcessCells(),
   workflowBinding: WORKFLOW_BINDING,
 };
 

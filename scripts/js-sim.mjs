@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { DurableCells, TracedCells } from "./js-sim-cell.mjs";
+import { DurableCells, TracedCells, engineDifferential } from "./js-sim-cell.mjs";
 
 const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
@@ -540,7 +540,8 @@ async function vercelSeed(seed) {
 }
 
 const seeds = parseTrace(values.trace);
-const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0 };
+const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0 };
+const engineTotals = { cells: 0, steps: 0, unparsed: 0 };
 const started = performance.now();
 for (const traced of seeds) {
   const seed = new Seed(traced);
@@ -548,6 +549,11 @@ for (const traced of seeds) {
     seed.cursor.next("seed", "start of seed");
     if (values.target === "cloudflare") await cloudflareSeed(seed);
     else await vercelSeed(seed);
+    try {
+      await engineDifferential(rt, seed.cells, engineTotals);
+    } catch (error) {
+      throw new Failure("engine_equal", short(error.message));
+    }
   } catch (error) {
     const invariant = error instanceof Failure ? error.invariant : "panic";
     const detail = error instanceof Failure ? error.message : (error?.stack ?? String(error));
@@ -561,7 +567,7 @@ for (const traced of seeds) {
     process.exit(1);
   }
   totals.seeds += 1;
-  for (const key of ["turns", "runs", "crashes", "dispatches", "steps"]) totals[key] += seed.stats[key];
+  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits"]) totals[key] += seed.stats[key];
 }
 const elapsed = Math.round(performance.now() - started);
-console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps} ms=${elapsed}`);
+console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""} ms=${elapsed}`);

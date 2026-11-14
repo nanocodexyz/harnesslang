@@ -358,8 +358,8 @@ class EngineCellHost {
     return this.world.hook(point);
   }
 
-  start(cell, script) {
-    return this.world.cellStart(cell, script);
+  start(cell, script, context) {
+    return this.world.cellStart(cell, script, context);
   }
 
   resume(cell, input) {
@@ -607,5 +607,5 @@ const runtime = {
   Panic, Trap, Corrupt, DecodeError, HostError,
   encodeJson, decodeJson, crc32, encodeLine, decodeLine, encodeLines, decodeLines,
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
-  Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule,
+  Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS,
 };

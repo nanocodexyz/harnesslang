@@ -9,6 +9,7 @@ const RUNTIME: &str = include_str!("runtime.js");
 const CELL_JOURNAL: &str = include_str!("cell_journal.js");
 const CELL_RUNNER: &str = include_str!("cell_runner.js");
 const CELL_ENGINE: &str = include_str!("cell_engine.js");
+const CELL_ISOLATE: &str = include_str!("cell_isolate.js");
 const ENGINE: &str = include_str!("engine.js");
 const CLOUDFLARE: &str = include_str!("cloudflare.js");
 const VERCEL: &str = include_str!("vercel.js");
@@ -47,8 +48,11 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     out.push_str(CELL_JOURNAL);
     out.push_str(CELL_RUNNER);
     out.push_str(CELL_ENGINE);
-    writeln!(out, "const CELL_ENGINE_SOURCE = {};", js_string(CELL_ENGINE))
-        .expect("writing to a string succeeds");
+    if target == Target::Cloudflare {
+        let isolate = [CELL_ISOLATE, RUNTIME, CELL_JOURNAL, CELL_ENGINE].concat();
+        writeln!(out, "const CELL_ISOLATE_SOURCE = {};", js_string(&isolate))
+            .expect("writing to a string succeeds");
+    }
     out.push_str(ENGINE);
     for (index, handler) in program.handlers.iter().enumerate() {
         out.push_str(&handler_function(program, index, handler));

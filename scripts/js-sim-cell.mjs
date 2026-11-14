@@ -1,3 +1,4 @@
+import { createContext, Script } from "node:vm";
 const CATCH = ".catch((error) => error)";
 const TOOLS_PREFIX = "tools.";
 const SLEEP_PREFIX = "await new Promise((resolve) => setTimeout(resolve, ";
@@ -297,13 +298,14 @@ export class TracedCells {
     this.check = check;
     this.memory = new Map();
     this.replaying = new Map();
+    this.contexts = new Map();
   }
 
   key(cell) {
     return `${this.seed.stats.runs}/${cell}`;
   }
 
-  exchange(cell, kind, detail, live) {
+  exchange(cell, kind, detail, live, raw) {
     const key = this.key(cell);
     const remembered = this.memory.get(key) ?? [];
     const at = this.replaying.get(key);
@@ -315,13 +317,14 @@ export class TracedCells {
     }
     this.replaying.delete(key);
     const answer = live();
-    remembered.push({ detail, answer });
+    remembered.push({ kind, detail, answer, raw });
     this.memory.set(key, remembered);
     return answer;
   }
 
-  start(cell, script) {
+  start(cell, script, context) {
     const { rt, cursor, same } = this.check;
+    this.contexts.set(this.key(cell), { script, context });
     if (this.check.durable().finished(cell)) throw this.check.failure("cell_finishes_once", `the engine started on cell ${cell}, whose finished update is durable`);
     const key = this.key(cell);
     if (this.memory.has(key)) this.replaying.set(key, 0);
@@ -331,7 +334,7 @@ export class TracedCells {
       same("cell start script", event.script, script);
       this.seed.stats.cells += 1;
       return stepFromJson(rt, event.step);
-    });
+    }, null);
   }
 
   resume(cell, input) {
@@ -342,7 +345,7 @@ export class TracedCells {
       same("cell resume cell", event.cell, BigInt(cell));
       same("cell resume input", event.input, json);
       return stepFromJson(rt, event.step);
-    });
+    }, input);
   }
 
   observe(event) {
@@ -353,6 +356,69 @@ export class TracedCells {
       same("cell event", traced.observed, json);
       if (event.kind === "diverged") this.seed.stats.divergences += 1;
       return null;
+    }, event);
+  }
+}
+
+const SYNC_KINDS = ["clock", "monotonic", "random", "bytes"];
+const SCRIPTED_SYNTAX_ERROR = "SyntaxError: the scripted engine cannot run line";
+
+function stepText(rt, step) {
+  const shown = { ...step };
+  delete shown.value;
+  delete shown.data;
+  return rt.encodeJson(rt.object(Object.entries(shown).map(([key, value]) => [key, typeof value === "number" ? BigInt(value) : value])));
+}
+
+export async function engineDifferential(rt, cells, totals) {
+  for (const [key, exchanges] of cells.memory) {
+    if (exchanges.length === 0 || exchanges[0].kind !== "start") continue;
+    if (exchanges.some((exchange) => exchange.kind === "observe" && exchange.raw.kind === "diverged")) continue;
+    const first = exchanges[0].answer;
+    if (first.kind === "threw" && first.error.startsWith(SCRIPTED_SYNTAX_ERROR)) {
+      totals.unparsed += 1;
+      continue;
+    }
+    const { script, context } = cells.contexts.get(key);
+    const engineSteps = exchanges.filter((exchange) => exchange.kind !== "observe");
+    const values = engineSteps.filter((exchange) => exchange.kind === "resume" && SYNC_KINDS.includes(exchange.raw.kind)).map((exchange) => exchange.raw);
+    const take = (kind) => {
+      const next = values.shift();
+      if (next === undefined || next.kind !== kind) throw new Error(`cell ${key}: the script engine read ${kind} where the scripted engine read ${next?.kind ?? "nothing"}`);
+      return kind === "bytes" ? next.data : next.value;
+    };
+    let run;
+    try {
+      run = new Script(`(async function cell(${rt.CELL_SCRIPT_PARAMETERS.join(", ")}) {\n${script}\n})`).runInContext(createContext(Object.create(null)));
+    } catch (error) {
+      run = async () => {
+        throw error;
+      };
+    }
+    const engine = new rt.ScriptEngine(run, {
+      limits: context.limits,
+      replay: [],
+      platform: { clock: () => take("clock"), monotonic: () => take("monotonic"), random: () => take("random"), bytes: () => take("bytes") },
+      macrotask: () => new Promise((resolve) => setImmediate(resolve)),
     });
+    let step = await engine.start();
+    for (let index = 0; index < engineSteps.length; index++) {
+      const scripted = engineSteps[index].answer;
+      const next = engineSteps[index + 1];
+      if (scripted.kind === "timeout" && next !== undefined && next.raw.kind === "refused") {
+        index += 1;
+        const after = engineSteps[index].answer;
+        if (stepText(rt, step) !== stepText(rt, after)) throw new Error(`cell ${key} step ${index}: the scripted engine threw ${stepText(rt, after)} after a refused timer, the script engine took ${stepText(rt, step)}`);
+        totals.steps += 1;
+        break;
+      }
+      if (stepText(rt, step) !== stepText(rt, scripted)) {
+        throw new Error(`cell ${key} step ${index}: the scripted engine took ${stepText(rt, scripted)}, the script engine took ${stepText(rt, step)}`);
+      }
+      totals.steps += 1;
+      if (next === undefined || step.kind === "done" || step.kind === "threw") break;
+      step = await engine.resume(next.raw);
+    }
+    totals.cells += 1;
   }
 }

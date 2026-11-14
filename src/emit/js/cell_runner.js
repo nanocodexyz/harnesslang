@@ -91,7 +91,7 @@ class CellRunner {
       this.bytes = cellLogBytes(log);
       this.script = log.header.script;
     }
-    this.journaledCalls = new Map(site.cell.kind === "existing" ? [...site.cell.log.calls].map(([id, call]) => [id, call.state]) : []);
+    this.journaledCalls = new Map(site.cell.kind === "existing" && !ignores ? [...site.cell.log.calls].map(([id, call]) => [id, call.state]) : []);
     this.consult = site.cell.kind === "existing" && !ignores;
     this.live = this.replay.length === 0;
     this.cursor = 0;
@@ -133,7 +133,12 @@ class CellRunner {
       await this.host.hook(CELL_POINT_AFTER_HEADER);
     }
     if (this.site.script !== this.script) throw this.diverged("its header holds another script than its call");
-    let step = await this.host.start(this.cell, this.script);
+    const context = {
+      code: this.site.code,
+      replay: this.replay.filter((entry) => !entryIsInput(entry)),
+      limits: { timers: this.code.timers, timerMs: this.code.timerMs, unchecked: this.unchecked() },
+    };
+    let step = await this.host.start(this.cell, this.script, context);
     const stepsMax = cellStepsMax(this.code);
     for (let index = 0; index < stepsMax; index++) {
       let input;

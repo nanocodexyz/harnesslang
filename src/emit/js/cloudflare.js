@@ -1,4 +1,6 @@
 const CLOUDFLARE_TARGET = TARGET_MODEL;
+assert(CLOUDFLARE_TARGET.recovery === "at_load", "a Durable Object recovers open external calls when it loads");
+assert(CLOUDFLARE_TARGET.gateBeforeOutbound, "a Durable Object's output gate holds outbound requests until writes commit");
 const CLOUDFLARE_EPOCH = 0;
 const JOURNAL_SCHEMA = "CREATE TABLE IF NOT EXISTS hl_journal (position INTEGER PRIMARY KEY, record TEXT NOT NULL)";
 const JOURNAL_INSERT = "INSERT INTO hl_journal (position, record) VALUES (?, ?)";
@@ -52,8 +54,8 @@ class CloudflareWorld {
     throw new Panic("cloudflare recovers nested calls at load and counts no step attempts");
   }
 
-  cellStart(cell, script) {
-    return this.object.cells.start(cell, script);
+  cellStart(cell, script, context) {
+    return this.object.cells.start(cell, script, context);
   }
 
   cellResume(cell, input) {
@@ -108,6 +110,7 @@ class HarnessObject {
       now: () => Date.now(),
       random: platformRandom,
     });
+    this.name = ctx.id === undefined ? "session" : String(ctx.id);
     this.cells = env.HL_CELLS ?? new IsolateCells(env[LOADER_BINDING], this);
     this.storage.sql.exec(JOURNAL_SCHEMA);
     this.position = 0;
@@ -198,6 +201,86 @@ class HarnessObject {
       if (error instanceof Corrupt) return { ran: "corrupt", message: error.message };
       throw error;
     }
+  }
+}
+
+const LOADER_BINDING = "LOADER";
+const CELL_COMPATIBILITY_DATE = "2025-09-01";
+const CELL_MAIN_MODULE = "main.js";
+const CELL_SCRIPT_MODULE = "script.js";
+const TERMINAL_STEPS = ["done", "threw"];
+
+class StepChannel {
+  constructor() {
+    this.items = [];
+    this.waiting = null;
+    this.pending = null;
+  }
+
+  push(text) {
+    return new Promise((resolve) => this.deliver({ text, resolve }));
+  }
+
+  deliver(item) {
+    if (this.waiting === null) {
+      this.items.push(item);
+      return;
+    }
+    const waiting = this.waiting;
+    this.waiting = null;
+    waiting(item);
+  }
+
+  async next() {
+    const item = this.items.length > 0 ? this.items.shift() : await new Promise((resolve) => {
+      this.waiting = resolve;
+    });
+    const step = decodeOrCorrupt(() => engineStepFrom(decodeJson(item.text)));
+    if (TERMINAL_STEPS.includes(step.kind)) item.resolve(null);
+    else this.pending = item.resolve;
+    return step;
+  }
+
+  answer(input) {
+    assert(this.pending !== null, "an engine input answers a step the isolate is waiting on");
+    const resolve = this.pending;
+    this.pending = null;
+    resolve(encodeJson(engineInputJson(input)));
+  }
+}
+
+class IsolateCells {
+  constructor(loader, object) {
+    this.loader = loader;
+    this.object = object;
+    this.channels = new Map();
+    this.generation = 0;
+  }
+
+  async start(cell, script, context) {
+    if (this.loader === undefined) return { kind: "threw", error: `the object has no ${LOADER_BINDING} Worker Loader binding to run cells in` };
+    this.generation += 1;
+    const name = `${this.object.name}-cell-${cell}-${this.generation}`;
+    const worker = this.loader.get(name, () => ({
+      compatibilityDate: CELL_COMPATIBILITY_DATE,
+      mainModule: CELL_MAIN_MODULE,
+      modules: { [CELL_MAIN_MODULE]: CELL_ISOLATE_SOURCE, [CELL_SCRIPT_MODULE]: scriptEngineModule(script) },
+      globalOutbound: null,
+    }));
+    const channel = new StepChannel();
+    this.channels.set(cell, channel);
+    const contextText = encodeJson(cellContextJson(context, cellStepsMax(PROGRAM.codes[context.code])));
+    worker.getEntrypoint().run(contextText, (text) => channel.push(text)).catch((error) => {
+      channel.deliver({ text: encodeJson(engineStepJson({ kind: "threw", error: cellErrorText(error) })), resolve() {} });
+    });
+    return channel.next();
+  }
+
+  resume(cell, input) {
+    const channel = this.channels.get(cell);
+    assert(channel !== undefined, "a cell resumes after it started");
+    channel.answer(input);
+    return channel.next();
   }
 }
 

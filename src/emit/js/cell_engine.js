@@ -5,7 +5,7 @@ const CELL_SCRIPT_PARAMETERS = ["tools", "setTimeout", "Date", "performance", "M
 class CellRefusal extends Error {}
 
 function cellErrorText(error) {
-  if (error instanceof Error) return error.message;
+  if (error !== null && typeof error === "object" && typeof error.message === "string") return error.message;
   return String(error);
 }
 
@@ -103,7 +103,7 @@ class ScriptEngine {
     };
     const crypto = Object.freeze({
       getRandomValues(array) {
-        if (!(array instanceof Uint8Array)) throw new TypeError("getRandomValues fills a Uint8Array here");
+        if (Object.prototype.toString.call(array) !== "[object Uint8Array]") throw new TypeError("getRandomValues fills a Uint8Array here");
         const data = engine.read("bytes", () => engine.platform.bytes(array.length));
         if (data.length !== array.length) throw new TypeError("random bytes of another length");
         engine.emit({ kind: "bytes", length: BigInt(array.length), data: data.slice() });
@@ -215,5 +215,145 @@ class ScriptEngine {
 
 function scriptEngineModule(script) {
   return `export default async function cell(${CELL_SCRIPT_PARAMETERS.join(", ")}) {\n${script}\n}\n`;
+}
+
+function engineStepJson(step) {
+  switch (step.kind) {
+    case "call":
+      return object([["call", object([["id", BigInt(step.id)], ["input", step.input], ["name", step.name]])]]);
+    case "timeout":
+      return object([["timeout", object([["delay_ms", step.delayMs], ["id", BigInt(step.id)]])]]);
+    case "clock":
+    case "monotonic":
+      return object([[step.kind, object([["value", step.value]])]]);
+    case "random":
+      return object([["random", object([["value", new Fraction(step.value)]])]]);
+    case "bytes":
+      return object([["bytes", object([["data", step.data.map((byte) => BigInt(byte))], ["length", step.length]])]]);
+    case "idle":
+      return object([["idle", null]]);
+    case "done":
+      return object([["done", object([["output", step.output]])]]);
+    case "threw":
+      return object([["threw", object([["error", step.error]])]]);
+    default:
+      throw new Panic(`unknown engine step ${step.kind}`);
+  }
+}
+
+function engineStepFrom(json) {
+  const pair = tagged(json);
+  if (pair === null) throw new DecodeError("an engine step has one tag");
+  const [kind, body] = pair;
+  const fields = isObject(body) && !(body instanceof Fraction) ? new CellFields("engine step", body) : null;
+  switch (kind) {
+    case "call":
+      return { kind, id: fields.number("id"), name: fields.text("name"), input: fields.get("input") };
+    case "timeout":
+      return { kind, id: fields.number("id"), delayMs: fields.big("delay_ms") };
+    case "clock":
+    case "monotonic":
+      return { kind, value: fields.big("value") };
+    case "random": {
+      const value = fields.get("value");
+      if (!(value instanceof Fraction)) throw new DecodeError("a random step's value is a fraction");
+      return { kind, value: value.numerator };
+    }
+    case "bytes":
+      return { kind, length: fields.big("length"), data: fields.list("data", (item) => Number(item)) };
+    case "idle":
+      return { kind };
+    case "done":
+      return { kind, output: fields.text("output") };
+    case "threw":
+      return { kind, error: fields.text("error") };
+    default:
+      throw new DecodeError(`unknown engine step '${kind}'`);
+  }
+}
+
+function engineInputJson(input) {
+  switch (input.kind) {
+    case "issued":
+      return object([["issued", null]]);
+    case "refused":
+      return object([["refused", object([["error", input.error]])]]);
+    case "result":
+      return object([["result", object([["encoded", input.encoded], ["id", BigInt(input.id)], ["success", input.success]])]]);
+    case "timer":
+      return object([["timer", object([["id", BigInt(input.id)]])]]);
+    case "clock":
+    case "monotonic":
+      return object([[input.kind, object([["value", input.value]])]]);
+    case "random":
+      return object([["random", object([["value", new Fraction(input.value)]])]]);
+    case "bytes":
+      return object([["bytes", object([["data", input.data.map((byte) => BigInt(byte))]])]]);
+    default:
+      throw new Panic(`unknown engine input ${input.kind}`);
+  }
+}
+
+function engineInputFrom(json) {
+  const pair = tagged(json);
+  if (pair === null) throw new DecodeError("an engine input has one tag");
+  const [kind, body] = pair;
+  const fields = isObject(body) && !(body instanceof Fraction) ? new CellFields("engine input", body) : null;
+  switch (kind) {
+    case "issued":
+      return { kind };
+    case "refused":
+      return { kind, error: fields.text("error") };
+    case "result":
+      return { kind, id: fields.number("id"), encoded: fields.text("encoded"), success: fields.boolean("success") };
+    case "timer":
+      return { kind, id: fields.number("id") };
+    case "clock":
+    case "monotonic":
+      return { kind, value: fields.big("value") };
+    case "random": {
+      const value = fields.get("value");
+      if (!(value instanceof Fraction)) throw new DecodeError("a random input's value is a fraction");
+      return { kind, value: value.numerator };
+    }
+    case "bytes":
+      return { kind, data: fields.list("data", (item) => Number(item)) };
+    default:
+      throw new DecodeError(`unknown engine input '${kind}'`);
+  }
+}
+
+function cellContextJson(context, stepsMax) {
+  const bound = (value) => object([["name", value.name], ["value", value.value]]);
+  return object([
+    ["replay", context.replay.map(entryJson)],
+    ["steps_max", BigInt(stepsMax)],
+    ["timer_ms", bound(context.limits.timerMs)],
+    ["timers", bound(context.limits.timers)],
+    ["unchecked", context.limits.unchecked],
+  ]);
+}
+
+function cellContextFrom(json) {
+  const fields = new CellFields("cell context", cellMap(json, "a cell context"));
+  fields.exact(["replay", "steps_max", "timer_ms", "timers", "unchecked"]);
+  const bound = (key) => {
+    const inner = new CellFields(key, cellMap(fields.get(key), key));
+    return { name: inner.text("name"), value: inner.big("value") };
+  };
+  return {
+    replay: fields.list("replay", entryFrom),
+    stepsMax: fields.number("steps_max"),
+    limits: { timers: bound("timers"), timerMs: bound("timer_ms"), unchecked: fields.boolean("unchecked") },
+  };
+}
+
+function platformCellValues() {
+  return {
+    clock: () => BigInt(Date.now()),
+    monotonic: () => BigInt(Math.floor(performance.now())),
+    random: () => BigInt(crypto.getRandomValues(new Uint32Array(1))[0]),
+    bytes: (length) => Array.from(crypto.getRandomValues(new Uint8Array(length))),
+  };
 }
 
