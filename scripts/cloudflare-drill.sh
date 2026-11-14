@@ -15,11 +15,33 @@ scratch=output/cloudflare-drill
 mkdir -p "$scratch"
 
 cargo build --release --locked -j1 > /dev/null 2>&1 || cargo build --release --locked -j1
-if [ ! -x "$oracle/node_modules/.bin/workerd" ]; then
-  (cd "$oracle" && npm ci --no-audit --no-fund > /dev/null)
+npm_prefix=output/cloudflare-npm
+workerd="$npm_prefix/node_modules/.bin/workerd"
+if [ ! -x "$workerd" ] || ! cmp -s "$oracle/package-lock.json" "$npm_prefix/package-lock.json"; then
+  mkdir -p "$npm_prefix"
+  cp "$oracle/package.json" "$oracle/package-lock.json" "$npm_prefix/"
+  (cd "$npm_prefix" && npm ci --no-audit --no-fund > /dev/null)
 fi
-echo "cloudflare drill: $("$oracle/node_modules/.bin/workerd" --version)"
+echo "cloudflare drill: $("$workerd" --version)"
 node "$oracle/loader.mjs" --dir "$scratch/loader" | grep -E '^(fact|FAIL|loader facts)' | cut -c1-160
+storage_log="$scratch/storage.log"
+if ! node "$oracle/storage.mjs" --dir "$scratch/storage" > "$storage_log" 2>&1; then
+  cat "$storage_log" >&2
+  exit 1
+fi
+grep -E '^(fact|note|storage facts)' "$storage_log" | cut -c1-160
+cited=$(grep -oE 'storage\.mjs [a-z]+(_[a-z]+)+(, [a-z]+(_[a-z]+)+)*' src/target/mod.rs | cut -d' ' -f2- | tr -d ',' | tr ' ' '\n' | sort -u)
+if [ -z "$cited" ]; then
+  echo "cloudflare drill: src/target/mod.rs cites no fact of oracle/cloudflare/storage.mjs" >&2
+  exit 1
+fi
+for fact in $cited; do
+  if ! grep -q "^fact $fact:" "$storage_log"; then
+    echo "cloudflare drill: src/target/mod.rs cites $fact, which oracle/cloudflare/storage.mjs did not establish" >&2
+    exit 1
+  fi
+done
+echo "cloudflare drill: $(echo "$cited" | wc -l) facts src/target/mod.rs cites were measured"
 
 drill() {
   node "$oracle/drill.mjs" "$@"

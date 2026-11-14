@@ -1,23 +1,20 @@
-import { execFileSync, spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, openSync, readdirSync, writeFileSync, writeSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { copyFileSync, mkdirSync, openSync, writeFileSync, writeSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { WORKERD, objectFile, readRows } from "./local.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const WORKERD = join(HERE, "node_modules", ".bin", "workerd");
 const OBJECT_MODULE = join(HERE, "object.mjs");
 const COMPATIBILITY_DATE = "2026-11-01";
 const UNIQUE_KEY = "harnesslang-drill";
-const METADATA_FILE = "metadata.sqlite";
 const ALARM_METADATA_KEY = 1;
 const SESSION_NAME = "drill";
 const LOOPBACK = "127.0.0.1";
 const READY_POLL_MS = 10;
 const READY_WAIT_MS_MAX = 30000;
-const SQLITE_OUTPUT_BYTES_MAX = 1 << 30;
-const NO_SUCH_TABLE = "no such table";
 const UNCAUGHT_HEADER = "hl-drill-uncaught";
 const CRASH_MARKER = "hl-drill crash ";
 const ALARM_MARKER = "hl-drill alarm ";
@@ -177,25 +174,9 @@ class Platform {
     return true;
   }
 
-  objectFile() {
-    const dir = join(this.storage, UNIQUE_KEY);
-    if (!existsSync(dir)) return null;
-    const files = readdirSync(dir).filter((name) => name.endsWith(".sqlite") && name !== METADATA_FILE);
-    assert(files.length <= 1, "a drill session has one object");
-    return files.length === 0 ? null : join(dir, files[0]);
-  }
-
   query(sql) {
-    const file = this.objectFile();
-    if (file === null) return [];
-    let output;
-    try {
-      output = execFileSync("sqlite3", ["-json", "-readonly", file, sql], { encoding: "utf8", maxBuffer: SQLITE_OUTPUT_BYTES_MAX, stdio: ["ignore", "pipe", "pipe"] });
-    } catch (error) {
-      if (String(error.stderr).includes(NO_SUCH_TABLE)) return [];
-      throw error;
-    }
-    return output.trim() === "" ? [] : JSON.parse(output);
+    const file = objectFile(join(this.storage, UNIQUE_KEY));
+    return file === null ? [] : readRows(file, sql);
   }
 
   rows() {
@@ -203,8 +184,8 @@ class Platform {
   }
 
   alarm() {
-    const rows = this.query(`SELECT value FROM _cf_METADATA WHERE key = ${ALARM_METADATA_KEY}`);
-    return rows.length === 1 && rows[0].value !== null;
+    const rows = this.query(`SELECT value IS NOT NULL AS armed FROM _cf_METADATA WHERE key = ${ALARM_METADATA_KEY}`);
+    return rows.length === 1 && rows[0].armed === 1;
   }
 
   turn(body) {

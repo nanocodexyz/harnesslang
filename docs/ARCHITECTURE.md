@@ -256,7 +256,7 @@ A target is a durability model and a place.
 | `native-jsonl` | a process | append-only JSONL file, one per session | write and fsync | one record (checksummed; a torn tail is dropped) | nobody | the program's own |
 | `native-sqlite` | a process | SQLite rows through a host `Sql` | one transaction | one transaction | nobody | the program's own |
 | `server-postgres` | a server pool | Postgres rows through a host `Sql` | one transaction fenced by the owner's epoch | one transaction | a second owner after a lease expires; the fence refuses its writes | the program's own |
-| `cloudflare` | a Durable Object | the object's SQLite | none: writes in one event are atomic and the output gate holds outgoing requests until they commit | one event | nobody (one object per session); an alarm restarts it after a reset | outbound requests per invocation (memory is reported, not checked) |
+| `cloudflare` | a Durable Object | the object's SQLite | `storage.sync()`, which the output gate already waits for before the outbound request or response that follows every flush | one event | nobody else (one object per session), though another event enters it at any await; an alarm restarts it after a reset | outbound requests per invocation (memory is reported, not checked) |
 | `vercel` | a Function driving a Workflow run | the run's event log | the step boundary | one step | a retried step: steps run at least once | none (Function duration is reported, not checked) |
 
 Vercel documents no limit on the outbound requests of a Function
@@ -275,10 +275,15 @@ What the compiler does differently per target:
 - **server-postgres**: one transaction per durability point that first checks
   the session's owner epoch (`update ... where epoch = $owner`). A fenced write
   stops the handler; the new owner's recovery reports the open external calls.
-- **cloudflare**: no flushes. Journal inserts and the outgoing `fetch` are
-  issued in program order inside one event; the output gate makes the fetch
-  wait for the insert to commit. The alarm is armed before the first external
-  effect so a reset object resumes. When a handler's worst case exceeds the
+- **cloudflare**: journal inserts and the outgoing `fetch` are issued in
+  program order inside one event; the output gate makes the fetch wait for
+  the inserts to commit, and a flush awaits `storage.sync()` so the rows the
+  simulator counts as committed are. Turn requests and alarms queue behind
+  each other, since another event enters the object at any await. The alarm
+  is armed before the first external effect so a reset object resumes. Each
+  of these platform facts is a `Fact` in `src/target/mod.rs` with its
+  documentation and the probe in `oracle/cloudflare/storage.mjs` that
+  measures it on local workerd; `hl check --target cloudflare` prints them. When a handler's worst case exceeds the
   per-invocation request limit, `hl check --target cloudflare` refuses it;
   splitting it into continuations driven by the alarm is future work (see
   Next).

@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { execFileSync, spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { WORKERD, objectFile, readRows } from "./local.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const WORKERD = join(HERE, "node_modules", ".bin", "workerd");
 const COMPATIBILITY_DATE = "2026-11-01";
 const UNIQUE_KEY = "harnesslang-cell-facts";
 const LOOPBACK = "127.0.0.1";
@@ -46,12 +46,8 @@ function freePort() {
 }
 
 function journalRows() {
-  const folder = join(dir, "storage", UNIQUE_KEY);
-  if (!existsSync(folder)) return [];
-  const file = readdirSync(folder).find((name) => name.endsWith(".sqlite") && name !== "metadata.sqlite");
-  if (file === undefined) return [];
-  const output = execFileSync("sqlite3", ["-json", "-readonly", join(folder, file), "SELECT seq, entry FROM cell_journal ORDER BY seq"], { encoding: "utf8" });
-  return output.trim() === "" ? [] : JSON.parse(output);
+  const file = objectFile(join(dir, "storage", UNIQUE_KEY));
+  return file === null ? [] : readRows(file, "SELECT seq, entry FROM cell_journal ORDER BY seq");
 }
 
 function startHost() {
