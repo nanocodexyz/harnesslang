@@ -1,0 +1,12 @@
+harness worker
+
+type verdict = approved(text) | rejected(text)
+
+tool review(change: text) -> text effect idempotent
+
+on review_change(change: text) -> verdict {
+  match review(change) {
+    ok(notes) => { return approved(notes) }
+    failed(error) => { return rejected(error) }
+  }
+}

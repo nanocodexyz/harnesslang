@@ -53,9 +53,11 @@ mode_dropped docs/snippets/modes.hl --twice mode_sent
 resume_replays_suspend examples/hooks.hl --twice seq_unique
 suspend_before_flush examples/hooks.hl --twice suspend_durable
 resume_unmatched examples/hooks.hl --twice resume_matched
-wait_unjournaled examples/subagents.hl --twice idempotent_known
-wait_rerun_skips examples/subagents.hl --twice wait_until
-wait_oversleeps examples/subagents.hl --twice wait_until
+wait_unjournaled docs/snippets/park.hl --twice idempotent_known|liveness
+wait_rerun_skips docs/snippets/park.hl --twice wait_until
+wait_oversleeps docs/snippets/park.hl --twice wait_until
+deny_dispatches docs/snippets/hooks.hl --twice denied_unrun
+spawn_key_unscoped docs/snippets/spawn.hl --twice child_scoped
 truncate_uncut docs/snippets/recovery.hl --twice checkpoint_compacted
 usage_unchecked docs/snippets/recovery.hl --twice replay_equal
 retry_after_unjournaled docs/snippets/recovery.hl --twice mode_sent
@@ -77,7 +79,7 @@ rust timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-post
 rust nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js flush_after_dispatch examples/agent.hl vercel backend_equal
 js bound_message examples/agent.hl cloudflare,vercel backend_equal
-js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic
+js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic|liveness
 rust default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
 rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal

@@ -137,8 +137,11 @@ on prompt(input: text) -> outcome
 
 An effect is anything whose result the program cannot recompute: a tool, the
 model, `now()`, `random()`, `wait(c)` (and `wait(e) at most c`) and `suspend(key)`. Each effect site is
-journaled. Spawning child
-sessions and waiting on them are not in the language yet (see Next).
+journaled. A `spawn` tool (`spawn name runs handler from "file"`) is an external
+tool whose `ok` result the runtime records as the child's key, its own turn
+and sequence number `T.S`; the host keeps the child's session under the
+parent's and that key, and `join(key)`, a suspend, ends the parent's run until
+the child's completion resumes it with the child's result.
 
 | Class | Declared by | Result type | On recovery, when its result was not recorded |
 | --- | --- | --- | --- |
@@ -184,6 +187,20 @@ call before lowering, in a scope that sees only its parameters and the
 harness's declarations. There is no recursion (a fn may not call itself,
 directly or through others) and no unbounded loop: a handler is straight-line
 code over bounded loops, so its worst case is a number the checker computes.
+
+### Hooks
+
+`before tool` and `after tool` are inlined at every `match dispatch(...)`, and the
+lifecycle hooks (`on session start`, `on prompt submit(p: T)`, `on pre compact`,
+`on post compact`, `on stop`, `on subagent start`, `on subagent stop` and the
+handler `on session end`) at the points they name, as a fn is inlined. A
+decision lowers to hidden state fields (`_hook_decided`, `_hook_denied`,
+`_hook_reason`, `_hook_input`), so a hook's code appears once per dispatch: a
+`deny` in `before tool` is a `none` effect site that records the call as tool
+`deny` and its `failed` result without contacting the host, `allow(input)`
+dispatches the rewritten input, and a `deny` in `after tool` gives the match a
+`failed` outcome. Statements after an `if` or `match` that may decide run under
+`if not _hook_decided`.
 
 ### Events
 
@@ -642,8 +659,9 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
-- Subagent trees as sessions spawned by a `spawn` effect and joined by a
-  suspend that a child's completion resumes, simulated at 100K children.
+- Subagent trees deeper than one level (a spawned harness spawns nothing
+  today), side questions answered from a snapshot of the transcript, and the
+  simulator at 100K children.
 - Waits as durable sleeps outside the run: on Vercel a workflow `sleep()`
   between steps and on Cloudflare the object's alarm, so a wait spends no
   Function or alarm time.

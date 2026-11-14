@@ -19,35 +19,11 @@ listing notices and `finds` tool search, and the images and structured
 results of gap 8 by `blob<N>`, `text or blob<N>` tools and `keep L blobs
 last N` ([Listing notices and tool search](LANGUAGE.md#listing-notices-and-tool-search),
 [Blobs](LANGUAGE.md#blobs)); what is left of gap 8 is the prompt cache's
-lifetime. Numbers 9 to 11 are what
+lifetime. Gaps 5 (hooks around every tool and lifecycle event) and 7
+(subagents) are closed by `before tool`, `after tool`, the lifecycle hooks,
+`spawn` and `join` (LANGUAGE.md). Numbers 9 to 11 are what
 porting nanocode's Claude Code prompt and tools as `examples/claude_code.hl`
 left out.
-
-## 5. Hooks around every tool and every lifecycle event
-
-`hooked_handler` runs a hook before every tool, which may allow it, rewrite
-its input or deny it, and one after it (`agent.rs:562-621`); lifecycle hooks
-fire at `SessionStart`, `UserPromptSubmit`, `Stop`, `PreCompact`,
-`PostCompact`, `StopFailure`, `SubagentStart`, `SubagentStop` and
-`SessionEnd`, with `additional_context` (`hooks.rs:49-151`). `hooks.hl` writes a
-permission prompt and the `Stop` hook's reasons at the points it names, with
-`suspend`; it cannot rewrite a call's input, which has no record type, or fire
-at points that have no syntax, such as compaction or session end. Smallest
-addition: `before tool` and `after tool` blocks inlined at every dispatch site
-like a fn, whose `deny(text)` records the call's failure without running it,
-and handlers for the session's own events.
-
-## 7. Subagents, side questions and forks
-
-The backend spawns and forks child agents with their own scoped journals
-(`agent.rs:706-736`, `9204-9210`, `4590`) and answers a side question from a
-snapshot of the transcript without touching the main turn
-(`agent/side.rs:135-257`). `subagents.hl` calls `spawn_agent` as an external
-tool and waits for a child with `wait`. Smallest addition: a `spawn` effect
-that starts a child session of a declared harness, external in class and
-journaled under a scoped key, and a child's completion as a resume of a
-`suspend`, so a parent that waits on its children ends its run instead of
-sleeping.
 
 ## 8. Prompt cache lifetime
 

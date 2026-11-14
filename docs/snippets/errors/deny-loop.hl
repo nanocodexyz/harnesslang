@@ -1,0 +1,21 @@
+harness notes
+
+const tries_max: u64 = 4
+
+tool read(path: text) -> text effect none
+
+before tool(c: call) {
+  loop attempt below tries_max {
+    if c.tool == "write" {
+      deny("read only")
+    }
+  }
+}
+
+on ping(c: call) -> u64 {
+  match dispatch(c) {
+    ok(_) => { return 1 }
+    failed(_) => { return 0 }
+    unknown => { return 0 }
+  }
+}

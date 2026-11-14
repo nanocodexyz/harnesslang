@@ -62,10 +62,12 @@ pub enum Mutation {
     DiscoveryUnchecked,
     BlobUnjournaled,
     BlobsUnevicted,
+    DenyDispatches,
+    SpawnKeyUnscoped,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 60] = [
+    pub const ALL: [Self; 62] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -126,6 +128,8 @@ impl Mutation {
         Self::DiscoveryUnchecked,
         Self::BlobUnjournaled,
         Self::BlobsUnevicted,
+        Self::DenyDispatches,
+        Self::SpawnKeyUnscoped,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -190,6 +194,8 @@ impl Mutation {
             Self::DiscoveryUnchecked => "discovery_unchecked",
             Self::BlobUnjournaled => "blob_unjournaled",
             Self::BlobsUnevicted => "blobs_unevicted",
+            Self::DenyDispatches => "deny_dispatches",
+            Self::SpawnKeyUnscoped => "spawn_key_unscoped",
         }
     }
 
@@ -264,7 +270,9 @@ impl Mutation {
             | Self::SearchUnchecked
             | Self::DiscoveryUnchecked
             | Self::BlobUnjournaled
-            | Self::BlobsUnevicted => all,
+            | Self::BlobsUnevicted
+            | Self::DenyDispatches
+            | Self::SpawnKeyUnscoped => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

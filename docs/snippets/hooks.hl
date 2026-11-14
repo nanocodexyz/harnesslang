@@ -1,0 +1,84 @@
+harness guarded
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 4
+const context_max: u64 = 64
+const kept: u64 = 8
+
+type outcome = completed(text) | exhausted
+
+tool Read(file_path: text) -> text effect none
+tool Bash(command: text) -> text effect external
+
+model messages calls calls_max
+
+state {
+  context: list<entry, context_max>
+  greeted: bool
+}
+
+invariant context_bounded: len(context) <= context_max
+
+before tool(c: call) {
+  if c.tool == "web_fetch" {
+    deny("web_fetch is not offered here; the tool was not run")
+  }
+  if contains(c.input, "rm -rf") {
+    deny("rm -rf is refused; the tool was not run")
+  }
+  if c.tool == "Bash" {
+    let opening = before(c.input, "command")
+    let quote = after(opening, "{")
+    let strict = opening ++ "command" ++ quote ++ ":" ++ quote ++ "set -e; "
+    allow(strict ++ after(c.input, ":" ++ quote))
+  }
+}
+
+after tool(c: call, outcome: maybe<text>) {
+  match outcome {
+    ok(output) => {
+      if contains(output, "secret") {
+        deny("the output of " ++ c.tool ++ " held a secret and was withheld")
+      }
+    }
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on session start {
+  greeted = true
+}
+
+on prompt submit(input: text) {
+  push context user("Prompt submitted: " ++ input)
+}
+
+on pre compact {
+  push context user("Compacting.")
+}
+
+on prompt(input: text) -> outcome
+  requires len(context) + 2 + rounds_max * (1 + calls_max) <= context_max
+{
+  loop round below rounds_max {
+    if len(context) + 1 + (1 + calls_max) > context_max {
+      keep context last kept
+    }
+    let reply = messages(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}

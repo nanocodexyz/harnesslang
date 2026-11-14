@@ -1,0 +1,32 @@
+harness coordinator
+
+const reviews_max: u64 = 4
+
+type outcome = reviewed(text) | lost(text)
+
+spawn reviewer runs review_change from "spawn_child.hl"
+
+on resume
+
+state {
+  started: list<text, reviews_max>
+}
+
+invariant started_bounded: len(started) <= reviews_max
+
+on subagent start(agent: text) {
+  push started agent
+}
+
+on review(change: text) -> outcome
+  requires len(started) < reviews_max
+{
+  match reviewer(change) {
+    ok(agent) => {
+      let verdict = join(agent)
+      return reviewed(verdict)
+    }
+    failed(error) => { return lost(error) }
+    unknown => { return lost("the spawn's outcome is unknown") }
+  }
+}

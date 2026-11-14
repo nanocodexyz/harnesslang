@@ -494,11 +494,11 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `below` `blob` `blobs` `bound` `calls` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `reply` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `calls` `compact` `end` `finds` `fn` `from` `in` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `reply` `runs` `session` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `before` `contains` `dispatch` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
+Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `join` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -540,7 +540,7 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | code | model | state | invariant | function | handler | event ;
+item       = const | type | tool | listing | code | spawn | model | state | invariant | function | hook | lifecycle | handler | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
@@ -554,6 +554,11 @@ model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "m
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
+spawn      = "spawn" name "runs" name "from" text ;
+hook       = ( "before" | "after" ) "tool" params block ;
+lifecycle  = "on" ( "session" "start" | "prompt" "submit" | "pre" "compact" | "post" "compact"
+                  | "stop" | "subagent" "start" | "subagent" "stop" ) [ params ] block
+           | "on" "session" "end" params "->" type_expr [ "requires" expr ] block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
 event      = "on" name [ params "bound" bound ] ;
 params     = "(" [ name ":" type_expr { "," name ":" type_expr } ] ")" ;
@@ -1658,6 +1663,275 @@ fn reset() {
 on ping() -> u64 { return count }
 ```
 
+### Hooks
+
+`before tool` and `after tool` run at every dispatch, as nanocode's
+`hooked_handler` wraps every tool handler, and the lifecycle hooks run at the
+points of a session that have no statement of their own. Like a fn, each is
+inlined where it runs: it sees its parameters, its own bindings and the
+harness's declarations, every handler that reaches the point gets its own
+effect sites, worst case and proofs, and a hook that runs nowhere is refused.
+
+| Hook | Runs | Binds |
+| --- | --- | --- |
+| `before tool(c: call)` | before every `match dispatch(...)` | the call |
+| `after tool(c: call, outcome: maybe<text>)` | after the dispatch, before the match takes an arm | the call and its outcome |
+| `on session start` | at the start of the session's first turn, whichever handler it runs | nothing |
+| `on prompt submit(p: T)` | at the start of each handler that takes a parameter `p: T` | that parameter |
+| `on pre compact`, `on post compact` | before and after every `keep` or `clear` of a list of entries | nothing |
+| `on stop` | before every `return` | nothing |
+| `on subagent start(agent: text)` | in the ok arm of a match on a spawn tool, or on a dispatch of one | the child's key |
+| `on subagent stop(agent: text, result: text)` | after every `join` | the key and the child's result |
+| `on session end(p: T) -> R { ... }` | as the handler `session_end`, after which every handler is refused | its parameters |
+
+In `before tool`, `deny(reason)` refuses the call: the runtime appends a
+`call` record with tool `deny`, class `none` and input
+`{"id","input","reason","tool"}`, then its `failed(reason)` result, without
+contacting the host, and the match takes its `failed` arm. `allow(input)`
+dispatches the call with that text as its input instead, which the input gate
+then checks as it checks the model's. In `after tool`, `deny(reason)` withholds
+an outcome the tool already returned: the match takes `failed(reason)` though
+the tool's result stays in the journal. A block that ends without either lets
+the call through as it is. Statements after an `if` or `match` that decided
+run only when it did not, so guard clauses read as they do in nanocode:
+
+```hl docs/snippets/hooks.hl
+harness guarded
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 4
+const context_max: u64 = 64
+const kept: u64 = 8
+
+type outcome = completed(text) | exhausted
+
+tool Read(file_path: text) -> text effect none
+tool Bash(command: text) -> text effect external
+
+model messages calls calls_max
+
+state {
+  context: list<entry, context_max>
+  greeted: bool
+}
+
+invariant context_bounded: len(context) <= context_max
+
+before tool(c: call) {
+  if c.tool == "web_fetch" {
+    deny("web_fetch is not offered here; the tool was not run")
+  }
+  if contains(c.input, "rm -rf") {
+    deny("rm -rf is refused; the tool was not run")
+  }
+  if c.tool == "Bash" {
+    let opening = before(c.input, "command")
+    let quote = after(opening, "{")
+    let strict = opening ++ "command" ++ quote ++ ":" ++ quote ++ "set -e; "
+    allow(strict ++ after(c.input, ":" ++ quote))
+  }
+}
+
+after tool(c: call, outcome: maybe<text>) {
+  match outcome {
+    ok(output) => {
+      if contains(output, "secret") {
+        deny("the output of " ++ c.tool ++ " held a secret and was withheld")
+      }
+    }
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on session start {
+  greeted = true
+}
+
+on prompt submit(input: text) {
+  push context user("Prompt submitted: " ++ input)
+}
+
+on pre compact {
+  push context user("Compacting.")
+}
+
+on prompt(input: text) -> outcome
+  requires len(context) + 2 + rounds_max * (1 + calls_max) <= context_max
+{
+  loop round below rounds_max {
+    if len(context) + 1 + (1 + calls_max) > context_max {
+      keep context last kept
+    }
+    let reply = messages(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+```console
+$ hl check docs/snippets/hooks.hl
+docs/snippets/hooks.hl: harness guarded: 2 tool(s), 7 state field(s), 1 handler(s)
+  handler prompt: worst case 20 effects, 39 journal records, 20 outbound requests
+    effects: round below rounds_max (4) x call below calls_max (4)
+    journal records: round below rounds_max (4) x call below calls_max (4)
+    outbound requests: round below rounds_max (4) x call below calls_max (4)
+    plus one recovery record per restart
+...
+```
+
+The checker lowers the decision to four hidden state fields,
+`_hook_decided`, `_hook_denied`, `_hook_reason` and `_hook_input`, so a hook's
+code is inlined once per dispatch and the match's arms at most three times:
+after a deny, after a withheld outcome and after the call ran. `on session
+start` adds `_session_started` and `on session end` adds `_session_ended`, which
+every handler's `requires` then tests. Names starting with `_` are reserved, so
+no program can name them. A deny writes two records and no outbound request,
+so a denied path never costs more than the dispatch it replaces.
+
+What the checker refuses:
+
+```console
+$ hl check docs/snippets/errors/deny-outside.hl
+docs/snippets/errors/deny-outside.hl:6:3: error: 'deny' belongs in a 'before tool' or 'after tool' block, not in handler 'ping'
+$ hl check docs/snippets/errors/deny-loop.hl
+docs/snippets/errors/deny-loop.hl:8:3: error: a 'deny' or 'allow' decides the call once, so it cannot sit inside a loop
+$ hl check docs/snippets/errors/hook-dispatch.hl
+docs/snippets/errors/hook-dispatch.hl:14:9: error: a hook cannot dispatch: a dispatch inside it would run without the hooks every dispatch runs
+$ hl check docs/snippets/errors/plain-dispatch.hl
+docs/snippets/errors/plain-dispatch.hl:12:17: error: match on dispatch(...) directly: 'before tool' runs at every dispatch and decides the arm its match takes
+$ hl check docs/snippets/errors/hook-unused.hl
+docs/snippets/errors/hook-unused.hl:5:1: error: 'before tool' runs nowhere: no handler dispatches a call
+```
+
+```hl docs/snippets/errors/deny-outside.hl
+harness notes
+
+tool read(path: text) -> text effect none
+
+on ping(path: text) -> u64 {
+  deny("no")
+  return 1
+}
+```
+
+```hl docs/snippets/errors/deny-loop.hl
+harness notes
+
+const tries_max: u64 = 4
+
+tool read(path: text) -> text effect none
+
+before tool(c: call) {
+  loop attempt below tries_max {
+    if c.tool == "write" {
+      deny("read only")
+    }
+  }
+}
+
+on ping(c: call) -> u64 {
+  match dispatch(c) {
+    ok(_) => { return 1 }
+    failed(_) => { return 0 }
+    unknown => { return 0 }
+  }
+}
+```
+
+```hl docs/snippets/errors/hook-dispatch.hl
+harness notes
+
+const calls_max: u64 = 4
+
+tool read(path: text) -> text effect none
+
+model infer calls calls_max
+
+state {
+  context: list<entry, calls_max>
+}
+
+on stop {
+  match dispatch(call("audit", "read", "{}")) {
+    ok(_) => {}
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on ping(path: text) -> u64 {
+  return 1
+}
+```
+
+```hl docs/snippets/errors/plain-dispatch.hl
+harness notes
+
+tool read(path: text) -> text effect none
+
+before tool(c: call) {
+  if c.tool != "read" {
+    deny("read only")
+  }
+}
+
+on ping(c: call) -> u64 {
+  let outcome = dispatch(c)
+  return 1
+}
+```
+
+```hl docs/snippets/errors/hook-unused.hl
+harness notes
+
+tool read(path: text) -> text effect none
+
+before tool(c: call) {
+  if c.tool != "read" {
+    deny("read only")
+  }
+}
+
+on ping(path: text) -> u64 {
+  return 1
+}
+```
+
+A parallel for dispatches its calls at once, so a harness with `before tool`,
+`after tool` or `on subagent start` refuses one. The simulator watches the
+host: a tool request that arrives between a deny site's run points is
+`denied_unrun`, and the mutation `deny_dispatches`, a runtime that runs the
+denied call anyway, is caught at once:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/hooks.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1922 crashes=1418 power_losses=87 torn_writes=151 takeovers=0 fenced=0 dispatches=1563 unknown=339
+$ hl sim --target native-jsonl --seeds 0..200 --mutation deny_dispatches docs/snippets/hooks.hl
+FAIL invariant=denied_unrun seed=0 target=native-jsonl profile=errors mutation=deny_dispatches: call 2/6 was denied by its before tool block, yet the host ran web_fetch for it
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation deny_dispatches docs/snippets/hooks.hl
+```
+
+`examples/hooks.hl` ports nanocode's hooks: a `before tool` that applies the
+permission mode, asks a person in `"ask"` mode through `suspend`, and then asks
+a PreToolUse hook to allow, update or deny; an `after tool` that withholds an
+outcome when the PostToolUse hook fails, with nanocode's notice; and the
+SessionStart, UserPromptSubmit, PreCompact, PostCompact, Stop and SessionEnd
+hooks through a `lifecycle_hook` tool whose answer becomes additional context.
+
 ## Types
 
 | Type | Values | Operations |
@@ -2013,8 +2287,8 @@ decision:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation enum_unchecked examples/hooks.hl
-FAIL invariant=enum_valid seed=5 target=native-jsonl profile=lying mutation=enum_unchecked: call 3/45 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("beta-34"))]: a result outside its text enum must be recorded as failed
-replay: hl sim --target native-jsonl --seeds 5..6 --mutation enum_unchecked examples/hooks.hl
+FAIL invariant=enum_valid seed=0 target=native-jsonl profile=errors mutation=enum_unchecked: call 2/6 (pre_tool_use) records Ok(String("deny")), but the tool returned [Ok(String("alpha-16"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation enum_unchecked examples/hooks.hl
 ```
 
 The checker's text enum errors:
@@ -3408,10 +3682,135 @@ FAIL invariant=liveness seed=0 target=native-jsonl profile=errors mutation=wait_
 replay: hl sim --target native-jsonl --seeds 0..1 --mutation wait_unjournaled docs/snippets/park.hl
 ```
 
-`examples/hooks.hl` uses both halves: in `"ask"` mode a call other than
-`Read` waits for a person's `"allow"`, and any other answer is the reason the
+`examples/hooks.hl` uses both halves: in its `before tool` block, `"ask"` mode makes a
+call other than `Read` wait for a person's `"allow"`, and any other answer is the reason the
 call is denied; a Stop hook that blocks or stops the turn gives its reason by
 resuming the suspend at that point.
+
+### Spawn and join
+
+`spawn name runs handler from "file"` declares a tool that starts a child
+session of another harness, as nanocode's `spawn_agent` does. The checker
+reads and checks the file, beside the parent, and gives the tool the
+handler's parameters (`u64`, `bool` or `text`) and a `text` result: the
+child's key. The model can call it like any tool, and a harness can call it by
+name. It is external in class, so its call record is durable before the host
+starts the child, and a crash then leaves it `unknown`, never started twice.
+
+- The key is the spawn's place in the parent's journal, `T.S` for turn `T` and
+  sequence number `S`: the host keeps the child's session and journal under the
+  parent's session and that key, and the runtime records the key as the
+  spawn's `ok` result whatever the host answers, so a replay names the same
+  child.
+- `join(agent)` waits for a child. It is a `suspend` keyed by the child's key, so
+  it needs `on resume`; the run that reaches it ends instead of sleeping, and
+  the host resumes it with the child's result, the JSON of the value its
+  handler returned, once the child's status is durable.
+- `hl check` counts the spawns a handler can reach, `child sessions`, and adds
+  each child's worst case to the parent's. The prover counts the same spawns on
+  the plan and checks the child's outbound requests against the target's limit
+  per invocation, since each child runs in its own.
+- A spawned harness declares no spawn tool of its own, so a parent's worst case
+  holds every session it can start.
+
+```hl docs/snippets/spawn.hl
+harness coordinator
+
+const reviews_max: u64 = 4
+
+type outcome = reviewed(text) | lost(text)
+
+spawn reviewer runs review_change from "spawn_child.hl"
+
+on resume
+
+state {
+  started: list<text, reviews_max>
+}
+
+invariant started_bounded: len(started) <= reviews_max
+
+on subagent start(agent: text) {
+  push started agent
+}
+
+on review(change: text) -> outcome
+  requires len(started) < reviews_max
+{
+  match reviewer(change) {
+    ok(agent) => {
+      let verdict = join(agent)
+      return reviewed(verdict)
+    }
+    failed(error) => { return lost(error) }
+    unknown => { return lost("the spawn's outcome is unknown") }
+  }
+}
+```
+
+```hl docs/snippets/spawn_child.hl
+harness worker
+
+type verdict = approved(text) | rejected(text)
+
+tool review(change: text) -> text effect idempotent
+
+on review_change(change: text) -> verdict {
+  match review(change) {
+    ok(notes) => { return approved(notes) }
+    failed(error) => { return rejected(error) }
+  }
+}
+```
+
+```console
+$ hl check --target cloudflare docs/snippets/spawn.hl | grep child
+    child sessions: 1, no loops
+    with its child sessions: 3 effects, 12 journal records, 2 outbound requests
+  proved handler review on cloudflare: worst_case: 1 child session(s) on the plan's longest path, as hl check counts (no loops), each in its own run; with them 3 effects, 12 journal records, 2 outbound requests
+$ hl check docs/snippets/errors/join-undeclared.hl
+docs/snippets/errors/join-undeclared.hl:6:16: error: 'join' waits for a spawned session, but the harness declares no spawn tool
+```
+
+```hl docs/snippets/errors/join-undeclared.hl
+harness notes
+
+on resume
+
+on ping(agent: text) -> text {
+  let result = join(agent)
+  return result
+}
+```
+
+The simulator is the host. A spawn it accepts runs the child as a session of
+its own, on the same target with its own seed, faults and crashes, and checks
+every invariant on the child's journal; a violation in a child fails the
+parent's seed. It starts at most `CHILD_SESSIONS_PER_SEED_MAX` = 16 children per
+seed, as nanocode keeps `DEFAULT_MAX_RESIDENT_SUBAGENTS` (16) resident, and
+refuses more with a failure. A `join` on a child's key is resumed with that
+child's result, and the model names a child it started in half its text
+inputs (`CHILD_NAMED_PPM` = 500000 per million), so joins find their children.
+`child_scoped` requires every recorded key to be its spawn's `T.S` and to name a
+child the host started; `spawn_key_unscoped`, a runtime that keys a child by
+its sequence number alone, is caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/spawn.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=839 runs=2322 crashes=1147 power_losses=166 torn_writes=230 takeovers=0 fenced=0 dispatches=877 unknown=184 sleeps=0 suspensions=336 children=335 joined=271 child_crashes=353
+$ hl sim --target native-jsonl --seeds 0..200 --mutation spawn_key_unscoped docs/snippets/spawn.hl
+FAIL invariant=child_scoped seed=0 target=native-jsonl profile=errors mutation=spawn_key_unscoped: spawn reviewer at turn 1 seq 1 records child key "1", but its call starts the child session "1.1"
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation spawn_key_unscoped docs/snippets/spawn.hl
+```
+
+`children` counts the child sessions started, `joined` the joins resumed with
+a child's result and `child_crashes` the crashes inside children. The
+generated code needs nothing new for a spawn beyond recording the key: the
+child is the host's, and the completion is a resume, so the differential runs
+of `examples/subagents.hl` on every target replay the same answers.
+`examples/subagents.hl` ports nanocode's subagent runtime: `spawn_agent` starts
+`examples/subagent_child.hl`, `wait_agent` joins the child the model names, and
+`on subagent start` and `on subagent stop` keep its roster.
 
 ### Traps
 

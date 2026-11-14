@@ -32,6 +32,44 @@ pub struct WorstCase {
     pub requests: Cost,
     pub wait_ms: Cost,
     pub blob_bytes: Cost,
+    pub spawns: Cost,
+    pub family: Option<Family>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Family {
+    pub child: [u64; 3],
+    pub total: [u64; 3],
+}
+
+fn family(program: &Program, own: [u64; 3], spawns: &Cost) -> Result<Option<Family>, Overflow> {
+    if spawns.total == 0 {
+        return Ok(None);
+    }
+    let mut child = [0; 3];
+    for (_, spawn) in program.spawns() {
+        let worst = &spawn.child().worst;
+        let measured = [
+            worst.effects.total,
+            worst.records.total,
+            worst.requests.total,
+        ];
+        for (widest, value) in child.iter_mut().zip(measured) {
+            *widest = (*widest).max(value);
+        }
+    }
+    let mut total = [0; 3];
+    for index in 0..3 {
+        total[index] = spawns
+            .total
+            .checked_mul(child[index])
+            .and_then(|children| children.checked_add(own[index]))
+            .ok_or_else(|| Overflow {
+                measure: MEASURES[index],
+                loops: spawns.loops.clone(),
+            })?;
+    }
+    Ok(Some(Family { child, total }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,12 +78,13 @@ pub struct Overflow {
     pub loops: Vec<Factor>,
 }
 
-pub const MEASURES: [&str; 5] = [
+pub const MEASURES: [&str; 6] = [
     "effects",
     "journal records",
     "outbound requests",
     "milliseconds of waits",
     "blob bytes",
+    "child sessions",
 ];
 
 type Costs = [Cost; MEASURES.len()];
@@ -119,6 +158,7 @@ fn costs(effects: u64, records: u64, requests: u64, wait_ms: u64) -> Costs {
         Cost::of(records),
         Cost::of(requests),
         Cost::of(wait_ms),
+        Cost::default(),
         Cost::default(),
     ]
 }
@@ -262,9 +302,15 @@ fn blob_bytes(program: &Program, kind: SiteKind) -> u64 {
 }
 
 fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
+    let spawns = match kind {
+        SiteKind::Tool(tool) => program.tools[tool].spawn.is_some(),
+        SiteKind::Dispatch => program.spawns().next().is_some(),
+        _ => false,
+    };
     let plain = |records| {
         let mut plain = costs(1, records, u64::from(kind.outbound()), 0);
         plain[4] = Cost::of(blob_bytes(program, kind));
+        plain[5] = Cost::of(u64::from(spawns));
         plain
     };
     match kind {
@@ -281,7 +327,8 @@ fn site_cost(program: &Program, kind: SiteKind) -> Result<Costs, Overflow> {
         | SiteKind::Listing(_)
         | SiteKind::Now
         | SiteKind::Random
-        | SiteKind::Suspend => Ok(plain(EFFECT_RECORDS)),
+        | SiteKind::Suspend
+        | SiteKind::Deny => Ok(plain(EFFECT_RECORDS)),
         SiteKind::Wait(constant) => {
             let mut waited = plain(EFFECT_RECORDS);
             waited[3] = Cost::of(program.constants[constant].value);
@@ -357,12 +404,19 @@ pub fn compute(program: &Program, handler: &Handler) -> Result<WorstCase, Overfl
     let longest =
         either(body.through, body.ended).expect("a block keeps a path through it or ending in it");
     let admission = costs(0, ADMISSION_RECORDS, 0, 0);
-    let [effects, records, requests, wait_ms, blob_bytes] = combine(admission, longest)?;
+    let [effects, records, requests, wait_ms, blob_bytes, spawns] = combine(admission, longest)?;
+    let family = family(
+        program,
+        [effects.total, records.total, requests.total],
+        &spawns,
+    )?;
     Ok(WorstCase {
         effects,
         records,
         requests,
         wait_ms,
         blob_bytes,
+        spawns,
+        family,
     })
 }

@@ -160,6 +160,7 @@ fn site_literal(program: &Program, site: &Site) -> String {
         | SiteKind::Random
         | SiteKind::Wait(_)
         | SiteKind::Suspend
+        | SiteKind::Deny
         | SiteKind::Cell(_) => "null".to_owned(),
     };
     let (ms, cap) = match site.kind {
@@ -229,17 +230,22 @@ fn program_literal(program: &Program) -> String {
         let finds = tool
             .finds
             .map_or_else(String::new, |listing| format!(", finds: {listing}"));
+        let spawns = if tool.spawn.is_some() {
+            ", spawn: true"
+        } else {
+            ""
+        };
         let attaches = tool.attaches.as_ref().map_or_else(String::new, |bytes| {
             format!(", attaches: {}", type_literal(&Type::Blob(bytes.clone())))
         });
         writeln!(
             out,
-            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\"{finds}{attaches} }},",
+            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\"{finds}{attaches}{spawns} }},",
             js_string(&tool.name),
             fields_literal(&tool.params),
             defaults_literal(&tool.defaults),
             type_literal(&tool.returns),
-            tool.effect.name()
+            tool.effect.name(),
         )
         .expect("writing to a string succeeds");
     }

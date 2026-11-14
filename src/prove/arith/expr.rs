@@ -267,7 +267,15 @@ impl Prover<'_> {
 
     pub(super) fn assume(&mut self, mut state: State, condition: &Expr, truth: bool) -> State {
         let Some(alternatives) = self.goals(&state, condition, truth) else {
-            return state;
+            return match condition {
+                Expr::Binary {
+                    op, left, right, ..
+                } if (*op == BinaryOp::And && truth) || (*op == BinaryOp::Or && !truth) => {
+                    let state = self.assume(state, left, truth);
+                    self.assume(state, right, truth)
+                }
+                _ => state,
+            };
         };
         let mut possible = Vec::new();
         for alternative in alternatives {
