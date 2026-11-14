@@ -436,20 +436,23 @@ impl<'a, 'p> Body<'a, 'p> {
             }
             SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
             SiteKind::Wait(constant_id) | SiteKind::Hold(constant_id) => {
+                let (tool, variant) = match kind {
+                    SiteKind::Hold(_) => (ir::HOLD_TOOL, "Hold"),
+                    _ => (ir::WAIT_TOOL, "Wait"),
+                };
                 let cap = &self.program.constants[constant_id].name;
                 self.line(&format!(
                     "let argument0 = wait_capped(argument0, {}, {cap:?})?;",
                     constant(cap)
                 ));
                 self.line(&format!(
-                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
-                    ir::WAIT_TOOL,
+                    "let call = Call {{ tool: {tool:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number(argument0))]) }};",
                     EffectClass::None,
                     crate::run::engine::WAIT_MS
                 ));
                 (
-                    "Wait",
-                    "Run::Wait".to_owned(),
+                    variant,
+                    format!("Run::{variant}"),
                     "scalar(engine, answer)?".to_owned(),
                 )
             }

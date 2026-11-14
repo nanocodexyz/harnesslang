@@ -207,6 +207,25 @@ fn generate(program: &Program, target: Target) -> String {
         &mut out,
         format!("pub const STEER_EVENT: Option<(&str, u64)> = {steers};"),
     );
+    let jobs = events.jobs.as_ref().map_or_else(
+        || "None".to_owned(),
+        |bound| format!("Some(({:?}, {}))", bound.name, constant(&bound.name)),
+    );
+    line(
+        &mut out,
+        format!("pub const JOB_EVENT: Option<(&str, u64)> = {jobs};"),
+    );
+    let model_interrupts = program
+        .model
+        .as_ref()
+        .map_or_else(ir::Interrupts::default, |model| model.interrupts);
+    line(
+        &mut out,
+        format!(
+            "pub const MODEL_INTERRUPTS: Interrupts = {};",
+            interrupts(model_interrupts)
+        ),
+    );
     line(
         &mut out,
         format!(
@@ -575,6 +594,57 @@ fn dispatch(out: &mut String, program: &Program) {
         )
     };
     writeln!(out, "pub fn spawns({pattern}\n}}\n").expect("writing to a string succeeds");
+    in_flight(out, program);
+}
+
+fn interrupts(interrupts: ir::Interrupts) -> String {
+    format!(
+        "Interrupts {{ cancel: {}, steer: {} }}",
+        interrupts.cancel, interrupts.steer
+    )
+}
+
+fn in_flight(out: &mut String, program: &Program) {
+    let mut interrupt_arms = String::new();
+    let mut recoverable = Vec::new();
+    let mut job_arms = String::new();
+    for tool in &program.tools {
+        if tool.interrupts.any() {
+            writeln!(
+                interrupt_arms,
+                "        {:?} => {},",
+                tool.name,
+                interrupts(tool.interrupts)
+            )
+            .expect("writing to a string succeeds");
+        }
+        if tool.recoverable {
+            recoverable.push(format!("{:?}", tool.name));
+        }
+        if let Some(bound) = &tool.jobs {
+            writeln!(
+                job_arms,
+                "        {:?} => Some(({:?}, {})),",
+                tool.name,
+                bound.name,
+                constant(&bound.name)
+            )
+            .expect("writing to a string succeeds");
+        }
+    }
+    let recoverable = if recoverable.is_empty() {
+        "_tool: &str) -> bool {\n    false".to_owned()
+    } else {
+        format!(
+            "tool: &str) -> bool {{\n    matches!(tool, {})",
+            recoverable.join(" | ")
+        )
+    };
+    writeln!(
+        out,
+        "pub fn tool_interrupts(tool: &str) -> Interrupts {{\n    match tool {{\n{interrupt_arms}        _ => Interrupts::NONE,\n    }}\n}}\n\npub fn recoverable({recoverable}\n}}\n\npub fn jobs_of(tool: &str) -> Option<(&'static str, u64)> {{\n    match tool {{\n{job_arms}        _ => None,\n    }}\n}}\n"
+    )
+    .expect("writing to a string succeeds");
 }
 
 fn limit(bound: &ir::Bound) -> String {

@@ -296,6 +296,18 @@ impl<H: Host> World for SqlWorld<'_, H> {
         self.host.resumed(suspension, resume, matched)
     }
 
+    fn recover(&mut self, request: &ToolRequest<'_>) -> Recovered {
+        self.host.recover(request)
+    }
+
+    fn jobs(&mut self, turn: u64, open: &[String]) -> Vec<String> {
+        self.host.jobs(turn, open)
+    }
+
+    fn hold(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        self.host.hold(turn, seq, until_ms)
+    }
+
     fn scope(&self) -> String {
         self.host.scope()
     }
