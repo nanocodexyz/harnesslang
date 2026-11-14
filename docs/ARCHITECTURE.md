@@ -281,6 +281,7 @@ Invariants, named as nanocode-sim names them:
 | `liveness` | every turn finishes within its bound of restarts |
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
 | `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed |
+| `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
 
 Each invariant comes with a planted bug (a mutation of the lowering or of a
 target adapter) that the simulator must catch, as tempoxyz/zempo and
@@ -291,7 +292,23 @@ and `scripts/mutations.sh` runs them all.
 
 `oracle/` folds harnesslang journals with nanocode's own `nanocode-turnlog`
 crate and checks that every turn's phase, outcome and open calls agree with the
-interpreter's.
+interpreter's. `hl sim --dump-journal DIR` writes each seed's journal and,
+beside it, the interpreter's summary after every record: the turn it touched,
+its phase, outcome, recovery attempt, model replies, every call's effect class,
+its open calls and the external ones a recovery must report `unknown`. The
+`hl-oracle` binary reads the journal with its own line rules (CRC-32 from the
+`crc` crate, a torn or failing line ends the journal), decodes each record
+with `nanocode_turnlog::Record`, applies it to a `nanocode_turnlog::Fold` and
+compares the fold with the summary at every prefix, since every load the
+interpreter makes is a prefix of the final journal. It also checks what only
+nanocode's fold can say: each call's class is what nanocode's `Effects` gives
+for the program's declarations (`now` and `random` are `none`, an undeclared
+tool `external`), a recovery's attempt is the fold's `next_attempt`, an
+at-load recovery reports exactly the fold's open external calls of its turn and
+an in-step one exactly one of them, and no call is open when its turn finishes.
+`scripts/oracle.sh` sweeps every example on every target and requires the
+oracle to disagree with the journals of the mutations whose records nanocode's
+fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
 ## Layout
 
