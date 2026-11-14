@@ -1,5 +1,6 @@
 mod anthropic;
 mod json;
+mod stream;
 mod tools;
 
 include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
@@ -126,6 +127,12 @@ fn failed(text: &str) -> Json {
 }
 
 impl Agent {
+    fn stream_file(&self, request: &ModelRequest<'_>) -> PathBuf {
+        self.workspace
+            .state
+            .join(format!("stream-{}-{}.sse", request.turn, request.seq))
+    }
+
     fn backoff(&mut self) {
         let base = (RETRY_BASE_MS << self.failures.min(RETRY_DOUBLINGS_MAX)).min(RETRY_CAP_MS);
         let jitter = base * RETRY_JITTER_PERCENT / PERCENT;
@@ -181,20 +188,40 @@ impl Host for Agent {
     }
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
+        let call = harness::call_id(request.turn, request.seq);
         let context = to_value(&(request.context)());
-        let body = match self.client.body(&context) {
+        let body = match self.client.body(&context, request.mode) {
             Ok(body) => body,
             Err(error) => return failed(&format!("context does not render: {error}")),
         };
-        eprintln!(
-            "hl-agent: {} model {}",
-            harness::call_id(request.turn, request.seq),
-            self.client.model
-        );
-        let answer = match self.client.send(&body) {
-            Ok((status, text)) => anthropic::interpret(status, &text),
+        let partial = self.stream_file(request);
+        if let Ok(cut) = std::fs::metadata(&partial) {
+            eprintln!(
+                "hl-agent: {call} a crash cut the previous stream of this call after {} bytes; requesting it again",
+                cut.len()
+            );
+            self.ledger.append(Value::object([
+                ("kind", Value::text("stream_discarded")),
+                ("at_ms", Value::number(now_ms())),
+                ("call", Value::text(&call)),
+                ("bytes", Value::number(cut.len())),
+            ]));
+        }
+        if let Err(error) = std::fs::write(&partial, "") {
+            return failed(&format!("{}: {error}", partial.display()));
+        }
+        let mode = request
+            .mode
+            .map(|mode| format!(" mode {mode}"))
+            .unwrap_or_default();
+        eprintln!("hl-agent: {call} model {}{mode}", self.client.model);
+        let answer = match self.client.send(&body, &partial) {
+            Ok((status, text)) => anthropic::interpret_stream(status, &text),
             Err(error) => Answer::Retry(error),
         };
+        if let Err(error) = std::fs::remove_file(&partial) {
+            eprintln!("hl-agent: {}: {error}", partial.display());
+        }
         match answer {
             Answer::Reply(reply, used) => {
                 self.failures = 0;

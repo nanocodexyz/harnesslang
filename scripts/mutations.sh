@@ -48,6 +48,8 @@ cell_gate_releases_early examples/code_agent.hl --twice nested_external_once 0..
 postgres_cell_unfenced examples/code_agent.hl --twice seq_unique 0..300
 nested_idempotent_reported_unknown examples/code_agent.hl --twice nested_known 0..300
 nested_enum_unchecked examples/code_tasks.hl --twice nested_enum_valid 0..300
+default_unfilled docs/snippets/defaults.hl --twice tool_admitted
+mode_dropped docs/snippets/modes.hl --twice mode_sent
 resume_replays_suspend examples/hooks.hl --twice seq_unique
 suspend_before_flush examples/hooks.hl --twice suspend_durable
 resume_unmatched examples/hooks.hl --twice resume_matched
@@ -67,7 +69,13 @@ rust timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-post
 rust nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js flush_after_dispatch examples/agent.hl vercel backend_equal
 js bound_message examples/agent.hl cloudflare,vercel backend_equal
-js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic"
+js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic
+rust default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
+rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
+js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
+js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 

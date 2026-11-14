@@ -1,0 +1,3 @@
+harness notes
+
+on ping(page: text, count: u64) -> bool { return contains(page, count) }

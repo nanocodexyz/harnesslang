@@ -89,6 +89,10 @@ impl<'a> Names<'a> {
             ),
             Expr::Not(operand) => format!("not {}", self.operand(operand)),
             Expr::Len(operand) => format!("len({})", self.expr(operand)),
+            Expr::TextBuiltin { op, args } => {
+                let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
+                format!("{}({})", op.name(), args.join(", "))
+            }
             Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
         }
     }

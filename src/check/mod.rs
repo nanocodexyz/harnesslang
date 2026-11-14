@@ -11,7 +11,9 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 6] = ["dispatch", "now", "random", "len", "wait", "suspend"];
+pub const BUILTIN_FUNCTIONS: [&str; 10] = [
+    "dispatch", "now", "random", "len", "wait", "suspend", "contains", "before", "after", "trim",
+];
 pub const WILDCARD: &str = "_";
 pub const EVENT_CANCEL: &str = "cancel";
 pub const EVENT_STEER: &str = "steer";
@@ -171,11 +173,25 @@ fn model(
         }
         claim(values, &model.name, "model")?;
         let calls = bound(program, globals, &model.calls, "the model's calls bound")?;
+        let mut modes: Vec<String> = Vec::with_capacity(model.modes.len());
+        for mode in &model.modes {
+            if modes.contains(&mode.text) {
+                return error(
+                    mode.at,
+                    format!(
+                        "model '{}' declares mode '{}' twice",
+                        model.name.text, mode.text
+                    ),
+                );
+            }
+            modes.push(mode.text.clone());
+        }
         globals.model = Some(model.name.text.clone());
         program.model = Some(ir::Model {
             name: model.name.text.clone(),
             calls,
             reply: ir::Reply::Builtin,
+            modes,
         });
     }
     Ok(())
@@ -619,6 +635,7 @@ fn tools(
             );
         }
         let params = params(program, globals, &tool.params)?;
+        let defaults = defaults(program, globals, &params, &tool.defaults)?;
         let returns = resolve(program, globals, &tool.returns)?;
         if !matches!(returns, Type::U64 | Type::Bool | Type::Text)
             && program.text_enum(&returns).is_none()
@@ -634,6 +651,7 @@ fn tools(
         program.tools.push(ir::Tool {
             name: tool.name.text.clone(),
             params,
+            defaults,
             returns,
             effect: tool.effect,
         });
@@ -661,6 +679,61 @@ fn params(
         });
     }
     Ok(params)
+}
+
+fn defaults(
+    program: &ir::Program,
+    globals: &Globals,
+    params: &[ir::Field],
+    declared: &[Option<ast::Expr>],
+) -> Checked<Vec<Option<ir::Literal>>> {
+    assert_eq!(
+        params.len(),
+        declared.len(),
+        "the parser gives every tool parameter a default slot"
+    );
+    params
+        .iter()
+        .zip(declared)
+        .map(|(param, default)| {
+            default
+                .as_ref()
+                .map(|default| default_value(program, globals, param, default))
+                .transpose()
+        })
+        .collect()
+}
+
+fn default_value(
+    program: &ir::Program,
+    globals: &Globals,
+    param: &ir::Field,
+    default: &ast::Expr,
+) -> Checked<ir::Literal> {
+    let literal = match (&param.ty, default) {
+        (Type::U64, ast::Expr::Number(value, _)) => Some(ir::Literal::U64(*value)),
+        (Type::U64, ast::Expr::Name(name)) => globals
+            .constants
+            .get(&name.text)
+            .map(|id| ir::Literal::U64(program.constants[*id].value)),
+        (Type::Bool, ast::Expr::Bool(value, _)) => Some(ir::Literal::Bool(*value)),
+        (Type::Text, ast::Expr::Text(value, _)) => Some(ir::Literal::Text(value.clone())),
+        (ty, ast::Expr::Text(value, _)) => program
+            .text_enum(ty)
+            .filter(|sum| sum.variants.iter().any(|variant| variant.name == *value))
+            .map(|_| ir::Literal::Text(value.clone())),
+        _ => None,
+    };
+    literal.ok_or_else(|| {
+        Diagnostic::new(
+            default.at(),
+            format!(
+                "the default of parameter '{}' must be a literal of {} or, for u64, a named constant",
+                param.name,
+                param.ty.name(program)
+            ),
+        )
+    })
 }
 
 fn listings(
@@ -696,6 +769,7 @@ fn listings(
         }
         let bound = bound(program, globals, &listing.bound, "a listing's bound")?;
         let params = params(program, globals, &listing.params)?;
+        let defaults = defaults(program, globals, &params, &listing.defaults)?;
         globals
             .listings
             .insert(name.text.clone(), program.listings.len());
@@ -703,6 +777,7 @@ fn listings(
             name: name.text.clone(),
             bound,
             params,
+            defaults,
             effect: listing.effect,
         });
     }

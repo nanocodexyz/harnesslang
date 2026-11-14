@@ -7,7 +7,6 @@ use crate::json::Value;
 pub const COMMAND_BYTES_MAX: usize = 1024 * 1024;
 pub const DESCRIPTION_BYTES_MAX: usize = 1024;
 pub const STREAM_BYTES_MAX: usize = 30_000;
-pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
 pub const TIMEOUT_MAX_MS: u64 = 600_000;
 pub const ERROR_CHARS: usize = 10_000;
 pub const ERROR_CHARS_SLACK: usize = 1_024;
@@ -51,43 +50,6 @@ const MEDIA_EXTENSIONS: [&str; 6] = [".png", ".jpg", ".jpeg", ".gif", ".webp", "
 
 pub fn unknown_outcome() -> &'static str {
     UNKNOWN_OUTCOME
-}
-
-pub struct Field {
-    pub name: &'static str,
-    pub default: Value,
-}
-
-pub fn optional_fields(tool: &str) -> Vec<Field> {
-    let field = |name, default| Field { name, default };
-    match tool {
-        "Bash" => vec![
-            field("timeout", Value::number(TIMEOUT_DEFAULT_MS)),
-            field("description", Value::text("")),
-            field("run_in_background", Value::Bool(false)),
-            field("dangerouslyDisableSandbox", Value::Bool(false)),
-        ],
-        "Read" => vec![
-            field("offset", Value::number(1)),
-            field("limit", Value::number(0)),
-            field("pages", Value::text("")),
-            field("allow_large", Value::Bool(false)),
-        ],
-        "Edit" => vec![field("replace_all", Value::Bool(false))],
-        _ => Vec::new(),
-    }
-}
-
-pub fn with_defaults(tool: &str, mut input: Value) -> Value {
-    if !matches!(input, Value::Object(_)) {
-        return input;
-    }
-    for field in optional_fields(tool) {
-        if input.get(field.name).is_none() {
-            input.insert(field.name, field.default);
-        }
-    }
-    input
 }
 
 pub fn unavailable(name: &str, offered: &[&str]) -> String {

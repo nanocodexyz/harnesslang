@@ -70,6 +70,7 @@ pub struct VariantDef {
 pub struct Tool {
     pub name: Name,
     pub params: Vec<Param>,
+    pub defaults: Vec<Option<Expr>>,
     pub returns: TypeExpr,
     pub effect: EffectClass,
 }
@@ -92,6 +93,7 @@ pub struct Listing {
     pub name: Name,
     pub bound: Name,
     pub params: Vec<Param>,
+    pub defaults: Vec<Option<Expr>>,
     pub effect: EffectClass,
 }
 
@@ -100,6 +102,7 @@ pub struct Model {
     pub name: Name,
     pub calls: Name,
     pub reply: Option<Name>,
+    pub modes: Vec<Name>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +299,7 @@ pub enum Expr {
     Call {
         callee: Name,
         args: Vec<Expr>,
+        mode: Option<Name>,
     },
     Binary {
         at: Position,

@@ -482,7 +482,7 @@ impl<'a> Inliner<'a> {
                 Expr::Number(..) | Expr::Text(..) | Expr::Bool(..) => {}
                 Expr::Name(name) => walk.reference(&self.declared, name)?,
                 Expr::Member { base, .. } => pending.push(base),
-                Expr::Call { callee, args } => {
+                Expr::Call { callee, args, .. } => {
                     if self.functions.contains_key(callee.text.as_str()) {
                         return error(
                             callee.at,

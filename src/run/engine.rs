@@ -145,6 +145,7 @@ pub struct ModelRequest<'a> {
     pub turn: u64,
     pub seq: u64,
     pub calls_max: u64,
+    pub mode: Option<&'a str>,
     pub context: &'a Value,
 }
 
@@ -892,7 +893,7 @@ impl<'a> Engine<'a> {
                 values[index] = Some(self.decode(site, &output)?);
                 Ok(None)
             }
-            Some(SiteLog::Reply(_)) => Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
             Some(SiteLog::Unknown(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 values[index] = Some(Value::Variant(ir::UNKNOWN, Vec::new()));
@@ -1157,6 +1158,9 @@ impl<'a> Engine<'a> {
                     self.program.dispatch_class(&tool)
                 };
                 let input = match value::tool_input(self.program, &tool, raw) {
+                    value::Input::Typed(_) if self.mutation == Mutation::DefaultUnfilled => {
+                        crate::run::json::decode(raw).expect("typed input decoded once already")
+                    }
                     value::Input::Typed(input) => input,
                     value::Input::Untyped | value::Input::Invalid(_) => {
                         Json::String(raw.to_owned())
@@ -1242,7 +1246,7 @@ impl<'a> Engine<'a> {
         }
         let replayed = matches!(
             self.sites.get(&seq),
-            Some(SiteLog::Done(..) | SiteLog::Reply(_))
+            Some(SiteLog::Done(..) | SiteLog::Reply(..))
         );
         if replayed && self.mutation == Mutation::EventDrainOnReplay {
             self.drain()?;
@@ -1254,9 +1258,17 @@ impl<'a> Engine<'a> {
                 self.admit_listing(site, &output)?;
                 self.decode(site, &output)
             }
-            Some(SiteLog::Reply(response)) => {
+            Some(SiteLog::Reply(response, recorded)) => {
                 if site.kind != SiteKind::Model {
                     return Err(self.diverged(seq, "a model reply", &call.tool));
+                }
+                let mode = site.mode.map(|mode| self.program.mode_name(mode));
+                if recorded.as_deref() != mode {
+                    return Err(self.diverged(
+                        seq,
+                        &format!("a model reply in {}", mode_text(recorded.as_deref())),
+                        &format!("{} in {}", call.tool, mode_text(mode)),
+                    ));
                 }
                 self.reply(&response)
             }
@@ -1310,7 +1322,7 @@ impl<'a> Engine<'a> {
                 }
                 self.suspend(seq, &recorded)
             }
-            Some(SiteLog::Reply(_)) => Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
             None => {
                 self.require_live(seq)?;
                 self.suspend_fresh(seq, call)
@@ -1400,7 +1412,7 @@ impl<'a> Engine<'a> {
                 }
                 self.reopen(site_id, seq, recorded, args)
             }
-            Some(SiteLog::Reply(_)) => Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
             None => {
                 self.require_live(seq)?;
                 let ms = wait_ms(&call.input).expect("a wait's input holds its duration");
@@ -1479,7 +1491,9 @@ impl<'a> Engine<'a> {
                 self.same(seq, &recorded, &call)?;
                 return Ok(Value::Variant(ir::UNKNOWN, Vec::new()));
             }
-            Some(SiteLog::Reply(_)) => return Err(self.diverged(seq, "a model reply", &call.tool)),
+            Some(SiteLog::Reply(..)) => {
+                return Err(self.diverged(seq, "a model reply", &call.tool));
+            }
             Some(SiteLog::Open(recorded)) => {
                 self.same(seq, &recorded, &call)?;
                 self.require_live(seq)?;
@@ -1694,10 +1708,17 @@ impl<'a> Engine<'a> {
                     .model
                     .as_ref()
                     .map_or(0, |model| model.calls.value);
+                let mode = site
+                    .mode
+                    .map(|mode| self.program.mode_name(mode).to_owned());
+                let sent = mode
+                    .as_deref()
+                    .filter(|_| self.mutation != Mutation::ModeDropped);
                 let response = world.model(&ModelRequest {
                     turn: self.turn,
                     seq,
                     calls_max,
+                    mode: sent,
                     context: &args[0],
                 });
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
@@ -1709,8 +1730,10 @@ impl<'a> Engine<'a> {
                     turn: self.turn,
                     seq,
                     response: response.clone(),
+                    mode: mode.clone(),
                 });
-                self.sites.insert(seq, SiteLog::Reply(response.clone()));
+                self.sites
+                    .insert(seq, SiteLog::Reply(response.clone(), mode));
                 return self.reply(&response);
             }
             SiteKind::Now => Output::Ok(Json::Number(world.now())),
@@ -1893,6 +1916,10 @@ impl<'a> Engine<'a> {
     }
 }
 
+fn mode_text(mode: Option<&str>) -> String {
+    mode.map_or_else(|| "no mode".to_owned(), |mode| format!("mode {mode}"))
+}
+
 fn cell_start_observed(engine: &mut Engine<'_>, cell: u64, script: &str) {
     engine.world().cell_start(cell, script);
 }
@@ -2060,6 +2087,7 @@ fn reads_cancelled(expr: &Expr) -> bool {
         Expr::Construct { fields, .. } => fields.iter().any(reads_cancelled),
         Expr::Binary { left, right, .. } => reads_cancelled(left) || reads_cancelled(right),
         Expr::Not(operand) | Expr::Len(operand) => reads_cancelled(operand),
+        Expr::TextBuiltin { args, .. } => args.iter().any(reads_cancelled),
     }
 }
 
@@ -2098,6 +2126,17 @@ pub fn evaluate(
             Value::List(items) => Value::U64(items.len() as u64),
             other => panic!("the checker types len's operand as a list, found {other:?}"),
         },
+        Expr::TextBuiltin { op, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(eval(arg)?.as_text().to_owned());
+            }
+            let subject = values.first().expect("a text builtin reads its subject");
+            match ir::text_op(*op, subject, values.get(1).map(String::as_str)) {
+                ir::TextValue::Bool(flag) => Value::Bool(flag),
+                ir::TextValue::Text(text) => Value::Text(text),
+            }
+        }
         Expr::Cancelled => {
             Value::Bool(cancelled.expect("a turn reads its events before it evaluates 'cancelled'"))
         }

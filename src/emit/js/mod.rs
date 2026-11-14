@@ -117,6 +117,19 @@ fn type_literal(ty: &Type) -> String {
     }
 }
 
+fn defaults_literal(defaults: &[Option<crate::ir::Literal>]) -> String {
+    let items: Vec<String> = defaults
+        .iter()
+        .map(|default| match default {
+            None => "null".to_owned(),
+            Some(crate::ir::Literal::U64(value)) => format!("{value}n"),
+            Some(crate::ir::Literal::Bool(value)) => value.to_string(),
+            Some(crate::ir::Literal::Text(value)) => js_string(value),
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
 fn fields_literal(fields: &[crate::ir::Field]) -> String {
     let items: Vec<String> = fields
         .iter()
@@ -161,8 +174,11 @@ fn site_literal(program: &Program, site: &Site) -> String {
         Durability::FlushBeforeRunWhenExternal => "flush_before_run_when_external",
         Durability::Cell => "cell",
     };
+    let mode = site
+        .mode
+        .map_or("null".to_owned(), |mode| js_string(program.mode_name(mode)));
     format!(
-        "{{ kind: \"{}\", tool: {tool}, code: {code}, ms: {ms}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",
+        "{{ kind: \"{}\", tool: {tool}, code: {code}, ms: {ms}, class: \"{class}\", result: {}, durability: \"{durability}\", mode: {mode} }}",
         site.kind.name(),
         type_literal(&site.result)
     )
@@ -202,9 +218,10 @@ fn program_literal(program: &Program) -> String {
     for tool in &program.tools {
         writeln!(
             out,
-            "    {{ name: {}, params: {}, returns: {}, effect: \"{}\" }},",
+            "    {{ name: {}, params: {}, defaults: {}, returns: {}, effect: \"{}\" }},",
             js_string(&tool.name),
             fields_literal(&tool.params),
+            defaults_literal(&tool.defaults),
             type_literal(&tool.returns),
             tool.effect.name()
         )
@@ -218,11 +235,12 @@ fn program_literal(program: &Program) -> String {
     for listing in &program.listings {
         writeln!(
             out,
-            "    {{ name: {}, bound: {}n, boundName: {}, params: {}, effect: \"{}\" }},",
+            "    {{ name: {}, bound: {}n, boundName: {}, params: {}, defaults: {}, effect: \"{}\" }},",
             js_string(&listing.name),
             listing.bound.value,
             js_string(&listing.bound.name),
             fields_literal(&listing.params),
+            defaults_literal(&listing.defaults),
             listing.effect.name()
         )
         .expect("writing to a string succeeds");
@@ -530,6 +548,10 @@ fn expr(program: &Program, expression: &Expr) -> String {
         } => binary(*op, expr(program, left), expr(program, right)),
         Expr::Not(operand) => format!("!({})", expr(program, operand)),
         Expr::Len(operand) => format!("BigInt(({}).length)", expr(program, operand)),
+        Expr::TextBuiltin { op, args } => {
+            let args: Vec<String> = args.iter().map(|arg| expr(program, arg)).collect();
+            format!("text_{}({})", op.name(), args.join(", "))
+        }
         Expr::Cancelled => "rt.cancelled()".to_owned(),
     }
 }

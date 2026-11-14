@@ -814,7 +814,7 @@ impl<'a, 'h> Runner<'a, 'h> {
             Some(SiteLog::Done(_, output)) => self.set_output(id, encode_output(&output)),
             Some(SiteLog::Unknown(_)) => self.unknown(id),
             Some(SiteLog::Open(_)) => self.reopen(id)?,
-            Some(SiteLog::Reply(_)) => panic!("a nested call never holds a model reply"),
+            Some(SiteLog::Reply(..)) => panic!("a nested call never holds a model reply"),
             None if class == EffectClass::External => self.dispatch(id, true)?,
             None if !started && self.site.mutation == Mutation::NestedIdempotentReportedUnknown => {
                 self.unknown(id)

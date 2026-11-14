@@ -25,6 +25,9 @@ plant_expression() {
     timeout_rides) echo 's/if self.header_unsaved {/if false \&\& self.header_unsaved {/' ;;
     enum_unchecked) echo 's/checked_output(&call.tool, returns, output)$/output/' ;;
     nested_enum_unchecked) echo 's/Ok(checked_output(tool.name, tool.returns, output))$/Ok(output)/' ;;
+    default_unfilled) echo 's/fields.entry(name.to_owned()).or_insert(value);/drop((fields, name, value));/' ;;
+    mode_dropped) echo 's/                    mode: site.mode,$/                    mode: None,/' ;;
+    text_before_whole) echo 's/Some((before, _)) => before.to_owned(),/Some(_) => subject.clone(),/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

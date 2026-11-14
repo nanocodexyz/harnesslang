@@ -13,6 +13,7 @@ pub type LocalId = usize;
 pub type SiteId = usize;
 pub type VariantId = usize;
 pub type CodeId = usize;
+pub type ModeId = usize;
 
 pub const CALL: SumId = 0;
 pub const REPLY: SumId = 1;
@@ -225,6 +226,35 @@ impl Program {
             .map(|(id, _)| self.listings[id].params.as_slice())
     }
 
+    pub fn input_defaults(&self, tool: &str) -> Option<&[Option<Literal>]> {
+        let defaults = if let Some((_, declared)) = self.tool(tool) {
+            assert_eq!(
+                declared.defaults.len(),
+                declared.params.len(),
+                "a tool has one default slot per parameter"
+            );
+            &declared.defaults
+        } else {
+            let (id, _) = self.listed(tool)?;
+            let listing = &self.listings[id];
+            assert_eq!(
+                listing.defaults.len(),
+                listing.params.len(),
+                "a listing has one default slot per parameter"
+            );
+            &listing.defaults
+        };
+        Some(defaults.as_slice())
+    }
+
+    pub fn mode_name(&self, mode: ModeId) -> &str {
+        &self
+            .model
+            .as_ref()
+            .expect("a model call carries a mode only with a model")
+            .modes[mode]
+    }
+
     pub fn code(&self, name: &str) -> Option<(CodeId, &Code)> {
         self.codes
             .iter()
@@ -278,6 +308,7 @@ pub struct Constant {
 pub struct Tool {
     pub name: String,
     pub params: Vec<Field>,
+    pub defaults: Vec<Option<Literal>>,
     pub returns: Type,
     pub effect: EffectClass,
 }
@@ -287,7 +318,15 @@ pub struct Listing {
     pub name: String,
     pub bound: Bound,
     pub params: Vec<Field>,
+    pub defaults: Vec<Option<Literal>>,
     pub effect: EffectClass,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Literal {
+    U64(u64),
+    Bool(bool),
+    Text(String),
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +334,7 @@ pub struct Model {
     pub name: String,
     pub calls: Bound,
     pub reply: Reply,
+    pub modes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +389,7 @@ pub struct Site {
     pub class: SiteClass,
     pub result: Type,
     pub durability: Durability,
+    pub mode: Option<ModeId>,
 }
 
 impl Site {
@@ -655,5 +696,82 @@ pub enum Expr {
     },
     Not(Box<Expr>),
     Len(Box<Expr>),
+    TextBuiltin {
+        op: TextOp,
+        args: Vec<Expr>,
+    },
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextOp {
+    Contains,
+    Before,
+    After,
+    Trim,
+}
+
+pub const TEXT_WHITESPACE: [char; 5] = [' ', '\t', '\n', '\x0c', '\r'];
+
+impl TextOp {
+    pub const ALL: [Self; 4] = [Self::Contains, Self::Before, Self::After, Self::Trim];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Contains => "contains",
+            Self::Before => "before",
+            Self::After => "after",
+            Self::Trim => "trim",
+        }
+    }
+
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Contains | Self::Before | Self::After => 2,
+            Self::Trim => 1,
+        }
+    }
+
+    pub fn result(self) -> Type {
+        match self {
+            Self::Contains => Type::Bool,
+            Self::Before | Self::After | Self::Trim => Type::Text,
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.name() == name)
+    }
+}
+
+pub enum TextValue {
+    Bool(bool),
+    Text(String),
+}
+
+pub fn text_op(op: TextOp, subject: &str, separator: Option<&str>) -> TextValue {
+    match (op, separator) {
+        (TextOp::Contains, Some(separator)) => TextValue::Bool(subject.contains(separator)),
+        (TextOp::Before, Some(separator)) => TextValue::Text(
+            subject
+                .split_once(separator)
+                .map_or(subject, |(before, _)| before)
+                .to_owned(),
+        ),
+        (TextOp::After, Some(separator)) => TextValue::Text(
+            subject
+                .split_once(separator)
+                .map_or("", |(_, after)| after)
+                .to_owned(),
+        ),
+        (TextOp::Trim, None) => {
+            TextValue::Text(subject.trim_matches(TEXT_WHITESPACE.as_slice()).to_owned())
+        }
+        (op, separator) => panic!(
+            "text builtin {} takes {} argument(s), given a separator: {}",
+            op.name(),
+            op.arity(),
+            separator.is_some()
+        ),
+    }
 }
