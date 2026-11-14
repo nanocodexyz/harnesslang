@@ -262,10 +262,10 @@ impl Agent {
         if let Err(error) = std::fs::write(&partial, "") {
             return anthropic::transient(&format!("{}: {error}", partial.display()), 0);
         }
-        let mode = mode.map(|mode| format!(" mode {mode}")).unwrap_or_default();
-        eprintln!("{}: {call} model {}{mode}", self.label, self.client.model);
+        let shown = mode.map(|mode| format!(" mode {mode}")).unwrap_or_default();
+        eprintln!("{}: {call} model {}{shown}", self.label, self.client.model);
         let (reply, used) = match self.client.send(&body, &partial) {
-            Ok((status, text, retry_after_ms)) if request.mode == Some(anthropic::MODE_REFRESH) => {
+            Ok((status, text, retry_after_ms)) if mode == Some(anthropic::MODE_REFRESH) => {
                 anthropic::interpret(status, &text, retry_after_ms)
             }
             Ok((status, text, retry_after_ms)) => {

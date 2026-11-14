@@ -331,6 +331,11 @@ fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
         Ok(child_harness::Ran::Suspended(_)) => {
             panic!("the child harness declares no suspend, so its turn never waits")
         }
+        Ok(child_harness::Ran::NotDue(_)) => {
+            panic!(
+                "the child harness declares no idle handler, so its prompt is never refused as not due"
+            )
+        }
         Err(error) => Err(format!("{error:?}")),
     }
 }
