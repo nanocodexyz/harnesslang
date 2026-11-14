@@ -1048,6 +1048,7 @@ impl<'a> Engine<'a> {
         );
         let mut values: Vec<Option<Value>> = vec![None; items.len()];
         let mut pending = Vec::with_capacity(items.len());
+        let first = self.seq;
         for (index, item) in items.iter().enumerate() {
             if let Some(waiting) = self.batch_call(parallel, index, item, &mut values)? {
                 pending.push(waiting);
@@ -1067,6 +1068,9 @@ impl<'a> Engine<'a> {
         if self.mutation == Mutation::BatchPushesReversed {
             ordered.reverse();
         }
+        if self.mutation == Mutation::LaneSeqShared {
+            self.seq = first;
+        }
         for (index, item) in ordered {
             let value = values[index]
                 .take()
@@ -1074,7 +1078,7 @@ impl<'a> Engine<'a> {
             self.locals[parallel.item] = Some(item);
             self.locals[parallel.result] = Some(value);
             if let Flow::Return(_) = self.block(&parallel.body)? {
-                panic!("the body of a parallel for only pushes");
+                panic!("the arms of a parallel for never return");
             }
         }
         Ok(())

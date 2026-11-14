@@ -671,12 +671,12 @@ impl Checker<'_> {
                 ),
             );
         }
-        if let Some(kind) = self.dispatch_hooks().first() {
+        if self.dispatch_hooks().contains(&ast::HookKind::BeforeTool) {
             return error(
                 at,
                 format!(
-                    "a parallel for dispatches its calls at once, so '{}' cannot run at each: use a sequential for",
-                    kind.describe()
+                    "a parallel for dispatches its calls at once, so '{}' cannot run before each: use a sequential for",
+                    ast::HookKind::BeforeTool.describe()
                 ),
             );
         }
@@ -691,7 +691,7 @@ impl Checker<'_> {
         let (match_at, subject, arms) = parallel_body(at, name, body)?;
         for arm in arms {
             for statement in &arm.body.statements {
-                self.parallel_push(statement)?;
+                self.lane_statement(statement)?;
             }
         }
         let (item, lowered) = self.scoped(|checker| {
@@ -701,8 +701,19 @@ impl Checker<'_> {
             assert!(!returned, "the arms of a parallel for only push");
             Ok((item, lowered))
         })?;
-        let [Stmt::Effect { site, args, result }, tail @ ..] = lowered.as_slice() else {
-            panic!("a parallel for's match starts with its dispatch, found {lowered:?}");
+        let at_dispatch = lowered
+            .iter()
+            .position(|statement| matches!(statement, Stmt::Effect { .. }))
+            .expect("a parallel for's match dispatches");
+        let (prelude, rest) = lowered.split_at(at_dispatch);
+        assert!(
+            prelude
+                .iter()
+                .all(|statement| matches!(statement, Stmt::Let { .. } | Stmt::Assign { .. })),
+            "only an after tool hook's bindings come before a parallel for's dispatch, found {prelude:?}"
+        );
+        let [Stmt::Effect { site, args, result }, after @ ..] = rest else {
+            unreachable!("the dispatch was found at this position");
         };
         assert_eq!(
             self.sites[*site].kind,
@@ -710,13 +721,26 @@ impl Checker<'_> {
             "a parallel for dispatches"
         );
         assert!(
-            matches!(args.as_slice(), [Expr::Local(local)] if *local == item),
-            "a parallel for dispatches its own item"
+            prelude.is_empty() || args.len() == 1,
+            "a hooked dispatch passes one call"
         );
         assert!(
-            pushes_only(tail),
-            "a parallel for's arms push values without effects"
+            !prelude.is_empty()
+                || matches!(args.as_slice(), [Expr::Local(local)] if *local == item),
+            "a parallel for dispatches its own item"
         );
+        let args = vec![Expr::Local(item)];
+        let mut tail = prelude.to_vec();
+        tail.extend_from_slice(after);
+        let tail = tail.as_slice();
+        if let Some(what) = self.lane_refusal(tail) {
+            return error(
+                match_at,
+                format!(
+                    "the arms of a parallel for run after its batch, one call after another, so they cannot {what}"
+                ),
+            );
+        }
         out.push(Stmt::Parallel(ir::Parallel {
             item,
             list,
@@ -729,75 +753,45 @@ impl Checker<'_> {
         Ok(false)
     }
 
-    fn parallel_push(&self, statement: &ast::Stmt) -> Checked<()> {
-        let values: Vec<&ast::Expr> = match statement {
-            ast::Stmt::Push { value, .. }
-            | ast::Stmt::Let { value, .. }
-            | ast::Stmt::Assign { value, .. } => vec![value],
-            ast::Stmt::If {
-                condition,
-                then,
-                otherwise,
-                ..
-            } => {
-                for nested in then
-                    .statements
-                    .iter()
-                    .chain(otherwise.iter().flat_map(|block| &block.statements))
-                {
-                    self.parallel_push(nested)?;
-                }
-                vec![condition]
-            }
-            _ => {
-                return parallel_error(
-                    statement,
-                    "the arms of a parallel for only push, bind and assign",
-                );
-            }
-        };
-        for value in values {
-            if let Some(callee) = self.effect_in(value) {
-                return error(
-                    callee.at,
-                    format!(
-                        "an arm of a parallel for runs no effect: found a call of '{}'",
-                        callee.text
-                    ),
-                );
-            }
-            if let Some(read) = event_read(value) {
-                return error(
-                    read.at(),
-                    "an arm of a parallel for reads no events: read them before or after the batch",
-                );
-            }
+    fn lane_statement(&self, statement: &ast::Stmt) -> Checked<()> {
+        match statement {
+            ast::Stmt::Return { .. } => parallel_error(
+                statement,
+                "the arms of a parallel for run for every call of the batch, so they cannot return",
+            ),
+            ast::Stmt::For { parallel: true, .. } => parallel_error(
+                statement,
+                "a parallel for cannot be nested in another parallel for",
+            ),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
-    fn effect_in<'e>(&self, value: &'e ast::Expr) -> Option<&'e ast::Name> {
-        match value {
-            ast::Expr::Number(..) | ast::Expr::Text(..) | ast::Expr::Bool(..) => None,
-            ast::Expr::Name(_) | ast::Expr::Take { .. } => None,
-            ast::Expr::Member { base, .. } => self.effect_in(base),
-            ast::Expr::Not { operand, .. } => self.effect_in(operand),
-            ast::Expr::Binary { left, right, .. }
-            | ast::Expr::With {
-                list: left,
-                entry: right,
-                ..
-            } => self.effect_in(left).or_else(|| self.effect_in(right)),
-            ast::Expr::Call { callee, args, .. } => {
-                let effect = self.globals.tools.contains_key(&callee.text)
-                    || self.globals.model.as_deref() == Some(callee.text.as_str())
-                    || EFFECT_BUILTINS.contains(&callee.text.as_str());
-                if effect {
-                    return Some(callee);
+    fn lane_refusal(&self, statements: &[Stmt]) -> Option<&'static str> {
+        for statement in statements {
+            let found = match statement {
+                Stmt::Finish { .. } => Some("return"),
+                Stmt::Parallel(_) => Some("run another parallel for"),
+                Stmt::Take { .. } => Some("read events: read them before or after the batch"),
+                Stmt::Effect { site, .. } if self.sites[*site].kind == SiteKind::Dispatch => {
+                    Some("dispatch again")
                 }
-                args.iter().find_map(|arg| self.effect_in(arg))
+                Stmt::If {
+                    then, otherwise, ..
+                } => self
+                    .lane_refusal(then)
+                    .or_else(|| self.lane_refusal(otherwise)),
+                Stmt::Match { arms, .. } => {
+                    arms.iter().find_map(|arm| self.lane_refusal(&arm.body))
+                }
+                Stmt::Loop { body, .. } | Stmt::For { body, .. } => self.lane_refusal(body),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
             }
         }
+        None
     }
 
     fn rewrite(
@@ -1885,10 +1879,6 @@ impl Checker<'_> {
     }
 }
 
-const EFFECT_BUILTINS: [&str; 7] = [
-    "dispatch", "now", "random", "wait", "hold", "suspend", "join",
-];
-
 fn parallel_body<'b>(
     at: Position,
     name: &ast::Name,
@@ -1953,35 +1943,6 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         } => format!("a call of fn '{}'", callee.text),
     };
     error(at, format!("{shape}: found {found}"))
-}
-
-fn pushes_only(statements: &[Stmt]) -> bool {
-    statements.iter().all(|statement| match statement {
-        Stmt::Push { .. } | Stmt::Let { .. } | Stmt::Assign { .. } => true,
-        Stmt::If {
-            then, otherwise, ..
-        } => pushes_only(then) && pushes_only(otherwise),
-        Stmt::Match { arms, .. } => arms.iter().all(|arm| pushes_only(&arm.body)),
-        _ => false,
-    })
-}
-
-fn event_read(value: &ast::Expr) -> Option<&ast::Expr> {
-    match value {
-        ast::Expr::Take { .. } => Some(value),
-        ast::Expr::Name(name) if name.text == CANCELLED_READ => Some(value),
-        ast::Expr::Number(..) | ast::Expr::Text(..) | ast::Expr::Bool(..) | ast::Expr::Name(_) => {
-            None
-        }
-        ast::Expr::Member { base, .. } | ast::Expr::Not { operand: base, .. } => event_read(base),
-        ast::Expr::Binary { left, right, .. }
-        | ast::Expr::With {
-            list: left,
-            entry: right,
-            ..
-        } => event_read(left).or_else(|| event_read(right)),
-        ast::Expr::Call { args, .. } => args.iter().find_map(event_read),
-    }
 }
 
 pub(super) fn statement_at(statement: &ast::Stmt) -> Position {

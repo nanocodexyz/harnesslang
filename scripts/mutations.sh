@@ -52,6 +52,7 @@ default_unfilled docs/snippets/defaults.hl --twice tool_admitted
 mode_dropped docs/snippets/modes.hl --twice mode_sent
 settings_dropped docs/snippets/settings.hl --twice settings_sent
 rewrite_live_only docs/snippets/rewrite.hl --twice checkpoint_compacted
+lane_seq_shared docs/snippets/lanes.hl --twice liveness
 resume_replays_suspend examples/hooks.hl --twice seq_unique
 suspend_before_flush examples/hooks.hl --twice suspend_durable
 resume_unmatched examples/hooks.hl --twice resume_matched

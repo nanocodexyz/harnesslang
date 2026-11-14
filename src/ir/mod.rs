@@ -1004,6 +1004,30 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
     }
 }
 
+fn runs_effects(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Stmt::Effect { .. } | Stmt::Parallel(_) => true,
+        Stmt::If {
+            then, otherwise, ..
+        } => runs_effects(then) || runs_effects(otherwise),
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| runs_effects(&arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => runs_effects(body),
+        _ => false,
+    })
+}
+
+fn lanes_run_effects(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Stmt::Parallel(parallel) => runs_effects(&parallel.body),
+        Stmt::If {
+            then, otherwise, ..
+        } => lanes_run_effects(then) || lanes_run_effects(otherwise),
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| lanes_run_effects(&arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => lanes_run_effects(body),
+        _ => false,
+    })
+}
+
 pub fn has_parallel(statements: &[Stmt]) -> bool {
     statements.iter().any(|statement| match statement {
         Stmt::Parallel(_) => true,
@@ -1130,6 +1154,12 @@ impl Program {
         self.handlers
             .iter()
             .any(|handler| has_parallel(&handler.body))
+    }
+
+    pub fn lanes_run_effects(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| lanes_run_effects(&handler.body))
     }
 
     pub fn sequential(&self) -> Self {

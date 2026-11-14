@@ -419,8 +419,8 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     "a parallel for dispatches its own item"
                 );
                 assert!(
-                    parallel_pushes_only(&parallel.body),
-                    "the body of a parallel for only pushes after its dispatch"
+                    lane_valid(handler, &parallel.body),
+                    "the arms of a parallel for neither return, dispatch, read events nor nest a batch"
                 );
                 expr(program, handler, &parallel.list);
                 block(
@@ -453,14 +453,16 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
     }
 }
 
-fn parallel_pushes_only(statements: &[Stmt]) -> bool {
+fn lane_valid(handler: &Handler, statements: &[Stmt]) -> bool {
     statements.iter().all(|statement| match statement {
-        Stmt::Push { .. } | Stmt::Let { .. } | Stmt::Assign { .. } => true,
+        Stmt::Finish { .. } | Stmt::Parallel(_) | Stmt::Take { .. } => false,
+        Stmt::Effect { site, .. } => handler.sites[*site].kind != SiteKind::Dispatch,
         Stmt::If {
             then, otherwise, ..
-        } => parallel_pushes_only(then) && parallel_pushes_only(otherwise),
-        Stmt::Match { arms, .. } => arms.iter().all(|arm| parallel_pushes_only(&arm.body)),
-        _ => false,
+        } => lane_valid(handler, then) && lane_valid(handler, otherwise),
+        Stmt::Match { arms, .. } => arms.iter().all(|arm| lane_valid(handler, &arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => lane_valid(handler, body),
+        _ => true,
     })
 }
 

@@ -3564,8 +3564,9 @@ points above, never less.
 
 `for call in requested parallel { ... }` runs a reply's tool calls at once, as
 nanocode runs the calls of a reply that its tools allow in parallel. Its body
-is one `match dispatch(call)` on the item it walks, whose arms push, bind
-and assign values that run no effect and read no events. A turn runs it in three steps:
+is one `match dispatch(call)` on the item it walks, whose arms are each
+call's lane: they may run effects of their own, but neither return, dispatch
+again nor read events. A turn runs it in three steps:
 
 1. In list order, each call takes the next sequence number and appends its
    `call` record (a call the journal already holds is replayed). Nothing is
@@ -3576,7 +3577,8 @@ and assign values that run no effect and read no events. A turn runs it in three
    external call runs, one flush makes every `call` record of the batch
    durable (durability point 1, once for the whole batch). Each group's
    results are appended in list order, whatever order they completed in.
-3. The arms run in list order with each call's result.
+3. The arms run in list order with each call's result, and each arm's effects
+   take the sequence numbers after the batch's, one call after another.
 
 So the journal holds, per sequence number, exactly what the plain `for`
 writes: the same `call` and `result` records, the calls of a batch
@@ -3655,8 +3657,8 @@ ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1444
 ```
 
 Anything else in the body is an error: a statement before the match, a match
-on something other than the item's dispatch, an arm that does more than push, bind and assign,
-and a parallel for inside another.
+on something other than the item's dispatch, an arm that returns, and a
+parallel for inside another.
 
 ```console
 $ hl check docs/snippets/errors/parallel-statement.hl
@@ -3664,7 +3666,7 @@ docs/snippets/errors/parallel-statement.hl:11:9: error: the body of a parallel f
 $ hl check docs/snippets/errors/parallel-dispatch.hl
 docs/snippets/errors/parallel-dispatch.hl:13:11: error: a parallel for matches on dispatch(call), the item it walks
 $ hl check docs/snippets/errors/parallel-arm.hl
-docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for only push, bind and assign: found a return
+docs/snippets/errors/parallel-arm.hl:12:23: error: the arms of a parallel for run for every call of the batch, so they cannot return: found a return
 $ hl check docs/snippets/errors/parallel-nested.hl
 docs/snippets/errors/parallel-nested.hl:11:5: error: a parallel for cannot be nested in another parallel for
 ```
@@ -3755,6 +3757,99 @@ on run(requested: list<call, calls_max>) -> u64 {
   }
   return 0
 }
+```
+
+#### Lanes
+
+An arm of a parallel for is its call's lane, as nanocode's Claude loop runs
+each `durable_tool` of a batch through `hooked_handler`, the handler with its
+PostToolUse hook. The lane runs after the batch, in list order, with its
+call's result, and its effects are ordinary effects: each takes the next
+sequence number after the batch's, appends its own records and follows its
+own durability point, so a crash in a lane leaves the batch's results
+journaled and the lane's call as a crash leaves any call. An `after tool`
+hook runs in each lane, before the match takes an arm; a `before tool` hook
+would decide each call before the batch dispatches it, which a lane cannot
+do, so a harness with one is refused a parallel for:
+
+```hl docs/snippets/lanes.hl
+harness lanes
+
+const calls_max: u64 = 4
+const context_max: u64 = 64
+const summary_tokens_max: u64 = 32
+
+tool Read(path: text) -> text effect none
+tool Grep(pattern: text) -> text effect none
+tool Bash(command: text) -> text effect external
+tool scan(output: text) -> bool effect none
+tool summarize(output: text) -> text effect idempotent
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+after tool(c: call, outcome: maybe<text>) {
+  match outcome {
+    ok(output) => {
+      match scan(output) {
+        ok(flagged) => {
+          if flagged { deny("the output of " ++ c.tool ++ " was flagged and withheld") }
+        }
+        failed(_) => {}
+      }
+    }
+    failed(_) => {}
+    unknown => {}
+  }
+}
+
+on ask(question: text) -> text
+  requires len(context) + 2 + calls_max <= context_max
+{
+  push context user(question)
+  let reply = think(context)
+  push context assistant(reply)
+  match reply {
+    answer(words) => { return words }
+    calls(requested) => {
+      for call in requested parallel {
+        match dispatch(call) {
+          ok(output) => {
+            match summarize(output) {
+              ok(short) => { push context result(call, truncate_middle(short, summary_tokens_max)) }
+              failed(error) => { push context error(call, error) }
+            }
+          }
+          failed(error) => { push context error(call, error) }
+          unknown => { push context unknown(call) }
+        }
+      }
+      return "ran the calls"
+    }
+  }
+}
+```
+
+The worst case is the plain loop's, lanes included, since every effect keeps
+its own record. The simulator runs the lanes' effects with crashes between
+them on every target; a parallel for whose lanes run effects numbers them
+after the batch where the plain loop interleaves them with its calls, so its
+journal is not compared with the plain loop's (`sequential_equal` holds for
+batches whose arms only push). `lane_seq_shared` numbers the lanes' effects
+from the batch's first sequence number instead, and the rerun's replay
+diverges:
+
+```console
+$ hl check docs/snippets/lanes.hl | grep -E 'handler ask: worst|proved for'
+  handler ask: worst case 13 effects, 28 journal records, 13 outbound requests
+docs/snippets/lanes.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+$ hl sim --target cloudflare --seeds 0..200 docs/snippets/lanes.hl
+ok target=cloudflare mutation=none seeds=0..200 (200 seeds): turns=504 runs=1612 crashes=1108 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=1962 unknown=133
+$ hl sim --target native-jsonl --seeds 0..200 --twice --mutation lane_seq_shared docs/snippets/lanes.hl | head -n 1
+FAIL invariant=liveness seed=0 target=native-jsonl profile=errors mutation=lane_seq_shared: turn 2: replay of turn 2 diverged at seq 2: the journal records spawn_agent, the program runs 'scan' (2/2)
 ```
 
 ### Waits
