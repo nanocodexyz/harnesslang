@@ -117,11 +117,16 @@ docs/snippets/tutorial/2-requires.hl: harness agent: 0 tool(s), 1 state field(s)
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
   proved handler prompt: no_overflow: 1 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 2 push(es) proved below capacity (14 prover steps)
   proved handler prompt on native-jsonl: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
+  proved handler prompt on native-jsonl: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
   proved handler prompt on native-sqlite: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
+  proved handler prompt on native-sqlite: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
   proved handler prompt on server-postgres: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
+  proved handler prompt on server-postgres: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
   proved handler prompt on cloudflare: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
+  proved handler prompt on cloudflare: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
   proved handler prompt on cloudflare: worst_case: 1 outbound requests <= 10000 outbound requests per invocation (no loops)
   proved handler prompt on vercel: durability: 0 external effect site(s) run only after a flush of their call and every record before it; 6 acknowledgement point(s) follow their status flush
+  proved handler prompt on vercel: worst_case: 4 journal records per run on the plan's longest path, as hl check counts (no loops)
 docs/snippets/tutorial/2-requires.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
 ```
 
@@ -390,6 +395,7 @@ examples/agent.hl: harness agent: 3 tool(s), 2 state field(s), 1 handler(s)
   proved zero state: invariant_initial: 2 invariant(s) hold
   proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4098 prover steps)
   proved handler prompt on cloudflare: durability: 1 external effect site(s) run only after a flush of their call and every record before it; 10 acknowledgement point(s) follow their status flush
+  proved handler prompt on cloudflare: worst_case: 2115 journal records per run on the plan's longest path, as hl check counts (step below turn_steps_max (64) x call below calls_per_step_max (16))
   proved handler prompt on cloudflare: worst_case: 1088 outbound requests <= 10000 outbound requests per invocation (step below turn_steps_max (64) x call below calls_per_step_max (16))
 examples/agent.hl: proved for cloudflare
 target cloudflare: runs in a Durable Object; journal: the object's SQLite; flush: OutputGate; atomic unit: Event; who else may run: AlarmAfterReset
@@ -1126,7 +1132,43 @@ tool, `now` or `random` call (`call` and `result`), `MODEL_RECORDS` = 1 per mode
 reply and `FINISH_RECORDS` = 2 per finish (`status` and checkpoint); a
 recovery adds one record per restart, reported apart. Outbound requests count
 tool and model calls, not `now` or `random`. A `for` counts its list's
-capacity, a `loop` its bound, a `match` or `if` its widest arm.
+capacity, a `loop` its bound, a `match` or `if` its widest arm. A `return`
+ends its path: a loop counts the iterations before a return in full and the
+returning one only up to its return, so a lookup that returns from its first
+iteration costs one request, not one per element:
+
+```hl docs/snippets/early_return.hl
+harness lookup
+
+const notes_max: u64 = 20000
+
+tool fetch(key: text) -> text effect idempotent
+
+state {
+  notes: list<text, notes_max>
+}
+
+on first() -> text {
+  for note in notes {
+    match fetch(note) {
+      ok(body) => { return body }
+      failed(error) => { return error }
+    }
+  }
+  return "no notes"
+}
+```
+
+```console
+$ hl check --target cloudflare docs/snippets/early_return.hl | grep -E 'worst|ok for'
+  handler first: worst case 1 effects, 5 journal records, 1 outbound requests
+  proved handler first on cloudflare: worst_case: 5 journal records per run on the plan's longest path, as hl check counts (no loops)
+  proved handler first on cloudflare: worst_case: 1 outbound requests <= 10000 outbound requests per invocation (no loops)
+docs/snippets/early_return.hl: ok for cloudflare
+```
+
+The prover counts the same records again on each target's lowered plan, where
+every path ends at its finish, and requires the two counts to agree.
 
 The compiler's own bounds:
 
@@ -1195,7 +1237,7 @@ including crash and rerun paths:
 | `no_overflow` | every `+`, `-` and `*` stays in range, in `requires` too |
 | `push_bound` | every `push` finds room |
 | `invariant_initial`, `invariant_preserved` | invariants hold in the zero state, at every `return` and at every trap left |
-| `worst_case` | outbound requests per invocation fit the target's limit |
+| `worst_case` | journal records per run, counted on each target's plan, equal `hl check`'s count; outbound requests per invocation fit the target's limit |
 
 What the proofs assume and leave out is in
 [ARCHITECTURE.md](ARCHITECTURE.md#proofs).
