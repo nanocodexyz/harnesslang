@@ -355,6 +355,7 @@ impl Checker<'_> {
             ast::Stmt::Clear { list, .. } => format!("clear '{}'", list.text),
             ast::Stmt::Keep { list, .. } => format!("keep the end of '{}'", list.text),
             ast::Stmt::KeepBlobs { list, .. } => format!("keep the blobs of '{}'", list.text),
+            ast::Stmt::Rewrite { list, .. } => format!("rewrite '{}'", list.text),
             ast::Stmt::For { parallel: true, .. } => "dispatch a parallel for".to_owned(),
             _ => return Ok(()),
         };
@@ -467,6 +468,11 @@ impl Checker<'_> {
                 };
                 out.push(Stmt::Shrink { field, kept });
                 self.compaction(ast::HookKind::PostCompact, compacts, *keep_at, out)?;
+                Ok(false)
+            }
+            ast::Stmt::Rewrite { at, list, arms } => {
+                let rewrite = self.rewrite(*at, list, arms)?;
+                out.push(rewrite);
                 Ok(false)
             }
             ast::Stmt::KeepBlobs { at, list, count } => {
@@ -665,12 +671,12 @@ impl Checker<'_> {
                 ),
             );
         }
-        if let Some(kind) = self.dispatch_hooks().first() {
+        if self.dispatch_hooks().contains(&ast::HookKind::BeforeTool) {
             return error(
                 at,
                 format!(
-                    "a parallel for dispatches its calls at once, so '{}' cannot run at each: use a sequential for",
-                    kind.describe()
+                    "a parallel for dispatches its calls at once, so '{}' cannot run before each: use a sequential for",
+                    ast::HookKind::BeforeTool.describe()
                 ),
             );
         }
@@ -685,7 +691,7 @@ impl Checker<'_> {
         let (match_at, subject, arms) = parallel_body(at, name, body)?;
         for arm in arms {
             for statement in &arm.body.statements {
-                self.parallel_push(statement)?;
+                self.lane_statement(statement)?;
             }
         }
         let (item, lowered) = self.scoped(|checker| {
@@ -695,8 +701,19 @@ impl Checker<'_> {
             assert!(!returned, "the arms of a parallel for only push");
             Ok((item, lowered))
         })?;
-        let [Stmt::Effect { site, args, result }, tail @ ..] = lowered.as_slice() else {
-            panic!("a parallel for's match starts with its dispatch, found {lowered:?}");
+        let at_dispatch = lowered
+            .iter()
+            .position(|statement| matches!(statement, Stmt::Effect { .. }))
+            .expect("a parallel for's match dispatches");
+        let (prelude, rest) = lowered.split_at(at_dispatch);
+        assert!(
+            prelude
+                .iter()
+                .all(|statement| matches!(statement, Stmt::Let { .. } | Stmt::Assign { .. })),
+            "only an after tool hook's bindings come before a parallel for's dispatch, found {prelude:?}"
+        );
+        let [Stmt::Effect { site, args, result }, after @ ..] = rest else {
+            unreachable!("the dispatch was found at this position");
         };
         assert_eq!(
             self.sites[*site].kind,
@@ -704,13 +721,26 @@ impl Checker<'_> {
             "a parallel for dispatches"
         );
         assert!(
-            matches!(args.as_slice(), [Expr::Local(local)] if *local == item),
-            "a parallel for dispatches its own item"
+            prelude.is_empty() || args.len() == 1,
+            "a hooked dispatch passes one call"
         );
         assert!(
-            pushes_only(tail),
-            "a parallel for's arms push values without effects"
+            !prelude.is_empty()
+                || matches!(args.as_slice(), [Expr::Local(local)] if *local == item),
+            "a parallel for dispatches its own item"
         );
+        let args = vec![Expr::Local(item)];
+        let mut tail = prelude.to_vec();
+        tail.extend_from_slice(after);
+        let tail = tail.as_slice();
+        if let Some(what) = self.lane_refusal(tail) {
+            return error(
+                match_at,
+                format!(
+                    "the arms of a parallel for run after its batch, one call after another, so they cannot {what}"
+                ),
+            );
+        }
         out.push(Stmt::Parallel(ir::Parallel {
             item,
             list,
@@ -723,75 +753,141 @@ impl Checker<'_> {
         Ok(false)
     }
 
-    fn parallel_push(&self, statement: &ast::Stmt) -> Checked<()> {
-        let values: Vec<&ast::Expr> = match statement {
-            ast::Stmt::Push { value, .. }
-            | ast::Stmt::Let { value, .. }
-            | ast::Stmt::Assign { value, .. } => vec![value],
-            ast::Stmt::If {
-                condition,
-                then,
-                otherwise,
-                ..
-            } => {
-                for nested in then
-                    .statements
-                    .iter()
-                    .chain(otherwise.iter().flat_map(|block| &block.statements))
-                {
-                    self.parallel_push(nested)?;
+    fn lane_statement(&self, statement: &ast::Stmt) -> Checked<()> {
+        match statement {
+            ast::Stmt::Return { .. } => parallel_error(
+                statement,
+                "the arms of a parallel for run for every call of the batch, so they cannot return",
+            ),
+            ast::Stmt::For { parallel: true, .. } => parallel_error(
+                statement,
+                "a parallel for cannot be nested in another parallel for",
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    fn lane_refusal(&self, statements: &[Stmt]) -> Option<&'static str> {
+        for statement in statements {
+            let found = match statement {
+                Stmt::Finish { .. } => Some("return"),
+                Stmt::Parallel(_) => Some("run another parallel for"),
+                Stmt::Take { .. } => Some("read events: read them before or after the batch"),
+                Stmt::Effect { site, .. } if self.sites[*site].kind == SiteKind::Dispatch => {
+                    Some("dispatch again")
                 }
-                vec![condition]
+                Stmt::If {
+                    then, otherwise, ..
+                } => self
+                    .lane_refusal(then)
+                    .or_else(|| self.lane_refusal(otherwise)),
+                Stmt::Match { arms, .. } => {
+                    arms.iter().find_map(|arm| self.lane_refusal(&arm.body))
+                }
+                Stmt::Loop { body, .. } | Stmt::For { body, .. } => self.lane_refusal(body),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
             }
+        }
+        None
+    }
+
+    fn rewrite(
+        &mut self,
+        at: Position,
+        list: &ast::Name,
+        arms: &[ast::RewriteArm],
+    ) -> Checked<Stmt> {
+        let (field, element) = self.list_field(list, "rewrite")?;
+        let variants = match element.variants(self.program) {
+            Some(variants) if self.program.text_enum(&element).is_none() => variants,
             _ => {
-                return parallel_error(
-                    statement,
-                    "the arms of a parallel for only push, bind and assign",
-                );
-            }
-        };
-        for value in values {
-            if let Some(callee) = self.effect_in(value) {
                 return error(
-                    callee.at,
+                    at,
                     format!(
-                        "an arm of a parallel for runs no effect: found a call of '{}'",
-                        callee.text
+                        "'rewrite {}' maps the entries of a list of a sum, found a list of {}",
+                        list.text,
+                        self.type_name(&element)
                     ),
                 );
             }
-            if let Some(read) = event_read(value) {
+        };
+        let mut checked: Vec<Option<ir::RewriteArm>> = vec![None; variants.len()];
+        for arm in arms {
+            let index = self.arm_index(&element, &variants, &arm.pattern)?;
+            let name = arm.pattern.name();
+            if checked[index].is_some() {
                 return error(
-                    read.at(),
-                    "an arm of a parallel for reads no events: read them before or after the batch",
+                    name.at,
+                    format!("variant '{}' is rewritten twice", name.text),
                 );
             }
-        }
-        Ok(())
-    }
-
-    fn effect_in<'e>(&self, value: &'e ast::Expr) -> Option<&'e ast::Name> {
-        match value {
-            ast::Expr::Number(..) | ast::Expr::Text(..) | ast::Expr::Bool(..) => None,
-            ast::Expr::Name(_) | ast::Expr::Take { .. } => None,
-            ast::Expr::Member { base, .. } => self.effect_in(base),
-            ast::Expr::Not { operand, .. } => self.effect_in(operand),
-            ast::Expr::Binary { left, right, .. }
-            | ast::Expr::With {
-                list: left,
-                entry: right,
-                ..
-            } => self.effect_in(left).or_else(|| self.effect_in(right)),
-            ast::Expr::Call { callee, args, .. } => {
-                let effect = self.globals.tools.contains_key(&callee.text)
-                    || self.globals.model.as_deref() == Some(callee.text.as_str())
-                    || EFFECT_BUILTINS.contains(&callee.text.as_str());
-                if effect {
-                    return Some(callee);
-                }
-                args.iter().find_map(|arg| self.effect_in(arg))
+            let fields = &variants[index].fields;
+            let ast::Pattern::Variant {
+                bindings: names, ..
+            } = &arm.pattern
+            else {
+                unreachable!("arm_index admits only variant patterns on a sum");
+            };
+            if names.len() != fields.len() {
+                return error(
+                    name.at,
+                    format!(
+                        "variant '{}' has {} field(s), the pattern binds {}",
+                        name.text,
+                        fields.len(),
+                        names.len()
+                    ),
+                );
             }
+            let rewritten = self.scoped(|checker| {
+                let mut bindings = Vec::new();
+                for (binding, field) in names.iter().zip(fields) {
+                    bindings.push(if binding.text == WILDCARD {
+                        None
+                    } else {
+                        Some(checker.declare(binding, field.clone())?)
+                    });
+                }
+                let entry = match &arm.entry {
+                    None => ir::Rewritten::Dropped,
+                    Some(value) => {
+                        let value_at = value.at();
+                        let mut effects = Vec::new();
+                        let checked = checker.expr(value, Some(&element), &mut effects);
+                        if !effects.is_empty() {
+                            return error(
+                                value_at,
+                                "a rewrite arm runs no effect: it only maps an entry to another",
+                            );
+                        }
+                        let (value, ty) = checked?;
+                        checker.expect(value_at, &element, &ty)?;
+                        ir::Rewritten::Into(value)
+                    }
+                };
+                Ok(ir::RewriteArm {
+                    variant: index,
+                    bindings,
+                    entry,
+                })
+            })?;
+            checked[index] = Some(rewritten);
         }
+        let arms = checked
+            .into_iter()
+            .enumerate()
+            .map(|(variant, arm)| {
+                arm.unwrap_or(ir::RewriteArm {
+                    variant,
+                    bindings: Vec::new(),
+                    entry: ir::Rewritten::Kept,
+                })
+            })
+            .collect();
+        Ok(Stmt::Rewrite { field, arms })
     }
 
     fn match_statement(
@@ -1081,6 +1177,80 @@ impl Checker<'_> {
         Ok(read)
     }
 
+    fn settings(
+        &mut self,
+        callee: &ast::Name,
+        given: Option<&ast::Settings>,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<Vec<Expr>> {
+        let declared = self
+            .program
+            .model
+            .as_ref()
+            .expect("a model name is bound only with a model")
+            .settings
+            .clone();
+        let fields = given.map_or(&[][..], |given| given.fields.as_slice());
+        if let (Some(given), true) = (given, declared.is_empty()) {
+            return error(
+                given.at,
+                format!("model '{}' declares no settings", callee.text),
+            );
+        }
+        for (index, (name, _)) in fields.iter().enumerate() {
+            if !declared.iter().any(|setting| setting.name == name.text) {
+                return error(
+                    name.at,
+                    format!(
+                        "model '{}' declares no setting '{}'",
+                        callee.text, name.text
+                    ),
+                );
+            }
+            if fields[..index]
+                .iter()
+                .any(|(earlier, _)| earlier.text == name.text)
+            {
+                return error(name.at, format!("setting '{}' is given twice", name.text));
+            }
+        }
+        let mut values = Vec::with_capacity(declared.len());
+        for setting in &declared {
+            let Some((_, value)) = fields.iter().find(|(name, _)| name.text == setting.name) else {
+                values.push(self.setting_default(setting));
+                continue;
+            };
+            let at = value.at();
+            let (value, ty) = self.expr(value, Some(&setting.ty), out)?;
+            self.expect(at, &setting.ty, &ty)?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    fn setting_default(&self, setting: &ir::Setting) -> Expr {
+        match &setting.default {
+            ir::Literal::Bool(value) => Expr::Bool(*value),
+            ir::Literal::Text(value) => {
+                let sum = self
+                    .program
+                    .text_enum(&setting.ty)
+                    .expect("a text setting is a text enum");
+                let variant = sum
+                    .variants
+                    .iter()
+                    .position(|candidate| candidate.name == *value)
+                    .expect("the checker took the default from the enum's values");
+                Expr::Construct {
+                    ty: setting.ty.clone(),
+                    variant,
+                    fields: Vec::new(),
+                }
+            }
+            ir::Literal::U64(_) => panic!("a model setting is a bool or a text enum"),
+        }
+    }
+
     fn mode(&self, callee: &ast::Name, mode: &ast::Name) -> Checked<ir::ModeId> {
         let model = self
             .program
@@ -1256,6 +1426,7 @@ impl Checker<'_> {
         callee: &ast::Name,
         args: &[ast::Expr],
         mode: Option<&ast::Name>,
+        settings: Option<&ast::Settings>,
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
@@ -1268,6 +1439,15 @@ impl Checker<'_> {
                 format!(
                     "'mode {}' follows a call of '{}': only a model call takes a mode",
                     mode.text, callee.text
+                ),
+            );
+        }
+        if let Some(settings) = settings.filter(|_| !is_model) {
+            return error(
+                settings.at,
+                format!(
+                    "'with {{...}}' follows a call of '{}': only a model call takes settings",
+                    callee.text
                 ),
             );
         }
@@ -1351,11 +1531,13 @@ impl Checker<'_> {
                 .expect("a model name is bound only with a model")
                 .result();
             let mode = mode.map(|mode| self.mode(callee, mode)).transpose()?;
+            let mut args = vec![value];
+            args.extend(self.settings(callee, settings, out)?);
             let called = self.site(
                 SiteKind::Model,
                 SiteClass::Fixed(EffectClass::Idempotent),
                 result,
-                vec![value],
+                args,
                 out,
             );
             self.sites
@@ -1560,9 +1742,19 @@ impl Checker<'_> {
                     ),
                 }
             }
-            ast::Expr::Call { callee, args, mode } => {
-                self.call(callee, args, mode.as_ref(), expected, out)
-            }
+            ast::Expr::Call {
+                callee,
+                args,
+                mode,
+                settings,
+            } => self.call(
+                callee,
+                args,
+                mode.as_ref(),
+                settings.as_ref(),
+                expected,
+                out,
+            ),
             ast::Expr::Binary {
                 at,
                 op,
@@ -1687,10 +1879,6 @@ impl Checker<'_> {
     }
 }
 
-const EFFECT_BUILTINS: [&str; 7] = [
-    "dispatch", "now", "random", "wait", "hold", "suspend", "join",
-];
-
 fn parallel_body<'b>(
     at: Position,
     name: &ast::Name,
@@ -1710,7 +1898,7 @@ fn parallel_body<'b>(
     };
     let dispatches_item = matches!(
         subject,
-        ast::Expr::Call { callee, args, mode: None }
+        ast::Expr::Call { callee, args, mode: None, settings: None }
             if callee.text == "dispatch"
                 && matches!(args.as_slice(), [ast::Expr::Name(item)] if item.text == name.text)
     );
@@ -1743,6 +1931,7 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         ast::Stmt::Push { .. } => "a push".to_owned(),
         ast::Stmt::Clear { .. } => "a clear".to_owned(),
         ast::Stmt::Keep { .. } | ast::Stmt::KeepBlobs { .. } => "a keep".to_owned(),
+        ast::Stmt::Rewrite { .. } => "a rewrite".to_owned(),
         ast::Stmt::If { .. } => "an if".to_owned(),
         ast::Stmt::Match { .. } => "a match".to_owned(),
         ast::Stmt::Loop { .. } => "a loop".to_owned(),
@@ -1756,35 +1945,6 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
     error(at, format!("{shape}: found {found}"))
 }
 
-fn pushes_only(statements: &[Stmt]) -> bool {
-    statements.iter().all(|statement| match statement {
-        Stmt::Push { .. } | Stmt::Let { .. } | Stmt::Assign { .. } => true,
-        Stmt::If {
-            then, otherwise, ..
-        } => pushes_only(then) && pushes_only(otherwise),
-        Stmt::Match { arms, .. } => arms.iter().all(|arm| pushes_only(&arm.body)),
-        _ => false,
-    })
-}
-
-fn event_read(value: &ast::Expr) -> Option<&ast::Expr> {
-    match value {
-        ast::Expr::Take { .. } => Some(value),
-        ast::Expr::Name(name) if name.text == CANCELLED_READ => Some(value),
-        ast::Expr::Number(..) | ast::Expr::Text(..) | ast::Expr::Bool(..) | ast::Expr::Name(_) => {
-            None
-        }
-        ast::Expr::Member { base, .. } | ast::Expr::Not { operand: base, .. } => event_read(base),
-        ast::Expr::Binary { left, right, .. }
-        | ast::Expr::With {
-            list: left,
-            entry: right,
-            ..
-        } => event_read(left).or_else(|| event_read(right)),
-        ast::Expr::Call { args, .. } => args.iter().find_map(event_read),
-    }
-}
-
 pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
     match statement {
         ast::Stmt::Let { name, .. } | ast::Stmt::Assign { name, .. } => name.at,
@@ -1794,6 +1954,7 @@ pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
         | ast::Stmt::Clear { at, .. }
         | ast::Stmt::Keep { at, .. }
         | ast::Stmt::KeepBlobs { at, .. }
+        | ast::Stmt::Rewrite { at, .. }
         | ast::Stmt::If { at, .. }
         | ast::Stmt::Match { at, .. }
         | ast::Stmt::Loop { at, .. }

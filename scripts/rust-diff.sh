@@ -34,6 +34,8 @@ plant_expression() {
     nested_enum_unchecked) echo 's/Ok(checked_output(tool.name, tool.returns, output))$/Ok(output)/' ;;
     default_unfilled) echo 's/fields.entry(name.to_owned()).or_insert(value);/drop((fields, name, value));/' ;;
     mode_dropped) echo 's/                    mode: site.mode,$/                    mode: None,/' ;;
+    rewrite_kept_lost) echo 's/ => rewritten.push(kept),$/ => drop(kept),/' ;;
+    settings_dropped) echo 's/                        settings: settings.as_ref(),$/                        settings: None,/' ;;
     text_before_whole) echo 's/Some((before, _)) => before.to_owned(),/Some(_) => subject.clone(),/' ;;
     blob_unjournaled) echo 's/Json::object(\[(BLOB_KEY, Json::text(\&digest)), (DATA_KEY, Json::text(base64))\])/digest_json(\&digest)/' ;;
     grandchild_unscoped) echo 's/^    if scope.is_empty() {$/    if true {/' ;;

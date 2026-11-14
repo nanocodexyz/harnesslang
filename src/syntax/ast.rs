@@ -181,8 +181,16 @@ pub struct Model {
     pub calls: Name,
     pub reply: Option<Name>,
     pub modes: Vec<Name>,
+    pub settings: Vec<Param>,
+    pub setting_defaults: Vec<Option<Expr>>,
     pub window: Option<Name>,
     pub interrupts: Vec<Name>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Settings {
+    pub at: Position,
+    pub fields: Vec<(Name, Expr)>,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +296,11 @@ pub enum Stmt {
         count: Expr,
         first: Option<Expr>,
     },
+    Rewrite {
+        at: Position,
+        list: Name,
+        arms: Vec<RewriteArm>,
+    },
     KeepBlobs {
         at: Position,
         list: Name,
@@ -337,6 +350,12 @@ pub enum Stmt {
 pub struct Arm {
     pub pattern: Pattern,
     pub body: Block,
+}
+
+#[derive(Clone, Debug)]
+pub struct RewriteArm {
+    pub pattern: Pattern,
+    pub entry: Option<Expr>,
 }
 
 #[derive(Clone, Debug)]
@@ -402,6 +421,7 @@ pub enum Expr {
         callee: Name,
         args: Vec<Expr>,
         mode: Option<Name>,
+        settings: Option<Settings>,
     },
     Binary {
         at: Position,

@@ -181,7 +181,7 @@ does (`native_call_admitted`); both refusals are recorded failures.
 `let`, assignment to a state field, `push list value`, `clear list`,
 `keep list last n` (drop all but the last `n` entries), `keep list last n after e` (the same, with `e` put first: a summary replacing what it summarizes), `if` / `else`, `match`
 (exhaustive), `loop name below N` (`N` a constant), `for name in list`,
-`for call in list parallel` (one `match dispatch(call)` whose arms only push, bind and assign:
+`for call in list parallel` (one `match dispatch(call)` whose arms, each call's lane, run after the batch:
 every call record is appended before any dispatch, none and idempotent calls
 run at once, an external call alone after one flush of the batch, results in
 list order),

@@ -1,0 +1,7 @@
+harness notes
+
+const calls_max: u64 = 4
+
+model think calls calls_max settings(budget: u64 = calls_max)
+
+on ping() -> u64 { return 1 }

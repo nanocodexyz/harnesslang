@@ -399,6 +399,7 @@ fn statement_cost(
         | Stmt::Push { .. }
         | Stmt::Take { .. }
         | Stmt::KeepBlobs { .. }
+        | Stmt::Rewrite { .. }
         | Stmt::Shrink { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {

@@ -11,7 +11,7 @@ use crate::run::session;
 use crate::run::session::{Session, SiteLog};
 use crate::run::turn;
 use crate::run::value;
-use crate::sim::world::SimWorld;
+use crate::sim::world::{Sent, SimWorld};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Invariant {
@@ -57,10 +57,11 @@ pub enum Invariant {
     InterruptHonored,
     JobOnce,
     JobReported,
+    SettingsSent,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -103,6 +104,7 @@ impl Invariant {
         Self::InterruptHonored,
         Self::JobOnce,
         Self::JobReported,
+        Self::SettingsSent,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -149,6 +151,7 @@ impl Invariant {
             Self::InterruptHonored => "interrupt_honored",
             Self::JobOnce => "job_once",
             Self::JobReported => "job_reported",
+            Self::SettingsSent => "settings_sent",
         }
     }
 }
@@ -769,6 +772,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     nested_enum_valid(world, records)?;
     let refused = tool_admitted(world, records)?;
     mode_sent(world, records)?;
+    settings_sent(world, records)?;
     blob_journaled(world.program, records)?;
     search_listed(world.program, records)?;
     interrupt_honored(world.program, records)?;
@@ -1092,13 +1096,31 @@ fn mode_named(mode: Option<&str>) -> String {
     mode.map_or_else(|| "no mode".to_owned(), |mode| format!("mode {mode}"))
 }
 
-fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+fn answered<'w>(world: &'w SimWorld<'_>, turn: u64, seq: u64, response: &Json) -> Vec<&'w Sent> {
+    world
+        .model_modes
+        .get(&(turn, seq))
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|sent| sent.response == *response)
+        .collect()
+}
+
+fn settings_named(settings: Option<&Json>) -> String {
+    settings.map_or_else(
+        || "no settings".to_owned(),
+        |settings| format!("settings {}", settings.encode()),
+    )
+}
+
+fn settings_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
     for record in records {
         let Record::Model {
             turn,
             seq,
             response,
-            mode,
+            settings,
+            ..
         } = record
         else {
             continue;
@@ -1106,13 +1128,47 @@ fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> 
         if *response == crate::run::engine::interrupted_response() {
             continue;
         }
-        let answered: Vec<&Option<String>> = world
-            .model_modes
-            .get(&(*turn, *seq))
-            .map_or(&[][..], Vec::as_slice)
+        let answered = answered(world, *turn, *seq, response);
+        let Some(sent) = answered
             .iter()
-            .filter(|(_, reply)| reply == response)
-            .map(|(sent, _)| sent)
+            .find(|sent| sent.settings == *settings)
+            .or(answered.last())
+        else {
+            continue;
+        };
+        if sent.settings != *settings {
+            return violation(
+                Invariant::SettingsSent,
+                format!(
+                    "model call {} is journaled with {} but its reply answered a request sent with {}",
+                    call_id(*turn, *seq),
+                    settings_named(settings.as_ref()),
+                    settings_named(sent.settings.as_ref())
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    for record in records {
+        let Record::Model {
+            turn,
+            seq,
+            response,
+            mode,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if *response == crate::run::engine::interrupted_response() {
+            continue;
+        }
+        let answered: Vec<&Option<String>> = answered(world, *turn, *seq, response)
+            .into_iter()
+            .map(|sent| &sent.mode)
             .collect();
         let Some(sent) = answered
             .iter()

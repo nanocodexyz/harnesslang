@@ -1,0 +1,19 @@
+harness notes
+
+const calls_max: u64 = 4
+const context_max: u64 = 8
+
+tool summarize(text: text) -> text effect none
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on shorten() -> u64 {
+  rewrite context {
+    user(words) => user(summarize(words))
+  }
+  return len(context)
+}

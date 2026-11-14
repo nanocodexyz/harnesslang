@@ -111,6 +111,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     constants(source, &mut program, &mut globals, &mut values)?;
     model(source, &mut program, &mut globals, &mut values)?;
     sums(source, &mut program, &mut globals)?;
+    settings(source, &mut program, &globals)?;
     tools(source, &mut program, &mut globals, &mut values)?;
     spawns(source, &mut program, &mut globals, &mut values, load)?;
     codes(source, &mut program, &mut globals, &mut values)?;
@@ -245,9 +246,59 @@ fn model(
             reply: ir::Reply::Builtin,
             window: None,
             modes,
+            settings: Vec::new(),
             interrupts: ir::Interrupts::default(),
         });
     }
+    Ok(())
+}
+
+fn settings(source: &ast::Program, program: &mut ir::Program, globals: &Globals) -> Checked<()> {
+    let Some(model) = source.items.iter().find_map(|item| match item {
+        Item::Model(model) => Some(model),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let fields = params(program, globals, &model.settings)?;
+    let mut settings = Vec::with_capacity(fields.len());
+    for ((field, param), default) in fields
+        .into_iter()
+        .zip(&model.settings)
+        .zip(&model.setting_defaults)
+    {
+        if field.ty != Type::Bool && program.text_enum(&field.ty).is_none() {
+            return error(
+                param.ty.at(),
+                format!(
+                    "setting '{}' of model '{}' is {}: a model setting is a bool or a text enum, the values a host can send",
+                    field.name,
+                    model.name.text,
+                    field.ty.name(program)
+                ),
+            );
+        }
+        let Some(default) = default else {
+            return error(
+                param.name.at,
+                format!(
+                    "setting '{}' of model '{}' needs a default, which a call that leaves it out sends",
+                    field.name, model.name.text
+                ),
+            );
+        };
+        let default = default_value(program, globals, &field, default)?;
+        settings.push(ir::Setting {
+            name: field.name,
+            ty: field.ty,
+            default,
+        });
+    }
+    program
+        .model
+        .as_mut()
+        .expect("the model pass declared the model")
+        .settings = settings;
     Ok(())
 }
 

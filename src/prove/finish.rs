@@ -128,6 +128,7 @@ impl Walk<'_> {
             | Stmt::Push { .. }
             | Stmt::Shrink { .. }
             | Stmt::KeepBlobs { .. }
+            | Stmt::Rewrite { .. }
             | Stmt::Effect { .. }
             | Stmt::Take { .. } => true,
         }

@@ -550,6 +550,7 @@ function recordJson(record) {
         ["turn", turn],
       ];
       if (record.mode !== null) entries.push([MODEL_MODE, record.mode]);
+      if (record.settings !== null) entries.push([MODEL_SETTINGS, record.settings]);
       return object([["model", object(entries)]]);
     }
     case "recovery": {
@@ -763,16 +764,21 @@ function recordFrom(json) {
       return { kind: "nested_result", turn, seq, nested, output };
     }
     case "model": {
-      let mode = null;
-      if (Object.hasOwn(fields.map, MODEL_MODE)) {
-        fields.exact(["call_id", MODEL_MODE, "response", "seq", "turn"]);
-        mode = fields.text(MODEL_MODE);
-      } else {
-        fields.exact(["call_id", "response", "seq", "turn"]);
+      const keys = ["call_id", "response", "seq", "turn"];
+      const moded = Object.hasOwn(fields.map, MODEL_MODE);
+      const set = Object.hasOwn(fields.map, MODEL_SETTINGS);
+      if (moded) keys.push(MODEL_MODE);
+      if (set) keys.push(MODEL_SETTINGS);
+      fields.exact(keys);
+      const mode = moded ? fields.text(MODEL_MODE) : null;
+      let settings = null;
+      if (set) {
+        settings = fields.get(MODEL_SETTINGS);
+        if (!isObject(settings)) throw new DecodeError(`a model record's ${MODEL_SETTINGS} is not an object`);
       }
       const [turn, seq, nested] = fields.call();
       if (nested !== null) throw new DecodeError("a model reply has a nested call id");
-      return { kind: "model", turn, seq, response: fields.get("response"), mode };
+      return { kind: "model", turn, seq, response: fields.get("response"), mode, settings };
     }
     case "cell":
       return cellFrom(fields);
@@ -971,7 +977,7 @@ function applyRecord(session, record) {
     }
     case "model": {
       const log = runningLog(session, record.turn, "a model reply");
-      nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response, mode: record.mode });
+      nextSite(log, record.turn, record.seq, { kind: "reply", response: record.response, mode: record.mode, settings: record.settings });
       return;
     }
     case "nested_call":
@@ -1366,6 +1372,7 @@ function dispatchClass(tool) {
 }
 
 const MODEL_MODE = "mode";
+const MODEL_SETTINGS = "settings";
 
 function inputDefaults(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);

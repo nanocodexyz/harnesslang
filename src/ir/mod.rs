@@ -577,7 +577,15 @@ pub struct Model {
     pub reply: Reply,
     pub window: Option<Window>,
     pub modes: Vec<String>,
+    pub settings: Vec<Setting>,
     pub interrupts: Interrupts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Setting {
+    pub name: String,
+    pub ty: Type,
+    pub default: Literal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -860,6 +868,10 @@ pub enum Stmt {
         field: FieldId,
         count: Bound,
     },
+    Rewrite {
+        field: FieldId,
+        arms: Vec<RewriteArm>,
+    },
     If {
         condition: Expr,
         then: Vec<Stmt>,
@@ -985,10 +997,35 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
         | Stmt::Push { .. }
         | Stmt::Shrink { .. }
         | Stmt::KeepBlobs { .. }
+        | Stmt::Rewrite { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
         | Stmt::Finish { .. } => statement.clone(),
     }
+}
+
+fn runs_effects(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Stmt::Effect { .. } | Stmt::Parallel(_) => true,
+        Stmt::If {
+            then, otherwise, ..
+        } => runs_effects(then) || runs_effects(otherwise),
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| runs_effects(&arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => runs_effects(body),
+        _ => false,
+    })
+}
+
+fn lanes_run_effects(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        Stmt::Parallel(parallel) => runs_effects(&parallel.body),
+        Stmt::If {
+            then, otherwise, ..
+        } => lanes_run_effects(then) || lanes_run_effects(otherwise),
+        Stmt::Match { arms, .. } => arms.iter().any(|arm| lanes_run_effects(&arm.body)),
+        Stmt::Loop { body, .. } | Stmt::For { body, .. } => lanes_run_effects(body),
+        _ => false,
+    })
 }
 
 pub fn has_parallel(statements: &[Stmt]) -> bool {
@@ -1004,6 +1041,7 @@ pub fn has_parallel(statements: &[Stmt]) -> bool {
         | Stmt::Push { .. }
         | Stmt::Shrink { .. }
         | Stmt::KeepBlobs { .. }
+        | Stmt::Rewrite { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
         | Stmt::Finish { .. } => false,
@@ -1085,6 +1123,13 @@ fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
                 block_cuts(&parallel.body, constants, out);
             }
             Stmt::Effect { args, .. } => args.iter().for_each(|arg| expr_cuts(arg, constants, out)),
+            Stmt::Rewrite { arms, .. } => {
+                for arm in arms {
+                    if let Rewritten::Into(entry) = &arm.entry {
+                        expr_cuts(entry, constants, out);
+                    }
+                }
+            }
             Stmt::Take { .. } | Stmt::KeepBlobs { .. } => {}
         }
     }
@@ -1111,6 +1156,12 @@ impl Program {
             .any(|handler| has_parallel(&handler.body))
     }
 
+    pub fn lanes_run_effects(&self) -> bool {
+        self.handlers
+            .iter()
+            .any(|handler| lanes_run_effects(&handler.body))
+    }
+
     pub fn sequential(&self) -> Self {
         let mut program = self.clone();
         for handler in &mut program.handlers {
@@ -1118,6 +1169,25 @@ impl Program {
         }
         program
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct RewriteArm {
+    pub variant: VariantId,
+    pub bindings: Vec<Option<LocalId>>,
+    pub entry: Rewritten,
+}
+
+#[derive(Clone, Debug)]
+pub enum Rewritten {
+    Kept,
+    Into(Expr),
+    Dropped,
+}
+
+pub fn rewrite_drops(arms: &[RewriteArm]) -> bool {
+    arms.iter()
+        .any(|arm| matches!(arm.entry, Rewritten::Dropped))
 }
 
 #[derive(Clone, Debug)]
