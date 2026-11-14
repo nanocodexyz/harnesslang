@@ -839,8 +839,31 @@ function zeroValue(type) {
   if (type === "u64") return 0n;
   if (type === "bool") return false;
   if (type === "text") return "";
+  if (type.sum !== undefined) {
+    assert(PROGRAM.sums[type.sum].text === true, "the checker admits only text enums among sum state fields");
+    return variant(0, []);
+  }
   assert(type.list !== undefined, "the checker admits only state fields with a zero value");
   return [];
+}
+
+function returnedName(type) {
+  if (type === "u64") return "a u64";
+  if (type === "bool") return "a bool";
+  if (type === "text") return "text";
+  assert(type.sum !== undefined && PROGRAM.sums[type.sum].text === true, "the checker admits only scalar or text enum tool results");
+  return `a value of ${PROGRAM.sums[type.sum].name}`;
+}
+
+function checkedOutput(tool, returns, output) {
+  if (output.tag !== "ok") return output;
+  try {
+    fromJson(returns, output.value);
+    return output;
+  } catch (error) {
+    if (!(error instanceof DecodeError)) throw error;
+  }
+  return { tag: "failed", error: `${tool} returned ${encodeJson(output.value)}, which is not ${returnedName(returns)}` };
 }
 
 function initialState() {

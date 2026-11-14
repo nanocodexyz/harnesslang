@@ -61,6 +61,9 @@ impl Host for Drill {
             Returns::U64 => Json::Number(self.rng.draw() >> 32),
             Returns::Bool => Json::Bool(self.rng.draw() & 1 == 1),
             Returns::Text => Json::String(format!("{}-{id}", request.tool)),
+            Returns::Values { values, .. } => {
+                Json::String(values[(self.rng.draw() % values.len() as u64) as usize].to_owned())
+            }
         })
     }
 

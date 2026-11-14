@@ -2,8 +2,8 @@ mod handler;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::{self, Bound, Sum, Type, Variant};
-use crate::syntax::ast::{self, Item, TypeExpr};
+use crate::ir::{self, Bound, Sum, SumKind, Type, Variant};
+use crate::syntax::ast::{self, Item, TypeBody, TypeExpr};
 use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
@@ -154,6 +154,7 @@ fn model(
 fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
     let call = Sum {
         name: BUILTIN_SUM_NAMES[ir::CALL].to_owned(),
+        kind: SumKind::Tagged,
         variants: vec![Variant {
             name: BUILTIN_SUM_NAMES[ir::CALL].to_owned(),
             fields: vec![Type::Text, Type::Text, Type::Text],
@@ -162,6 +163,7 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
     let Some(model) = &program.model else {
         let placeholder = |name: &str| Sum {
             name: name.to_owned(),
+            kind: SumKind::Tagged,
             variants: Vec::new(),
         };
         return vec![
@@ -180,6 +182,7 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
     };
     let reply = Sum {
         name: BUILTIN_SUM_NAMES[ir::REPLY].to_owned(),
+        kind: SumKind::Tagged,
         variants: vec![
             variant("answer", vec![Type::Text]),
             variant("calls", vec![calls]),
@@ -188,6 +191,7 @@ fn builtin_sums(program: &ir::Program) -> Vec<Sum> {
     let call_type = Type::Sum(ir::CALL);
     let entry = Sum {
         name: BUILTIN_SUM_NAMES[ir::ENTRY].to_owned(),
+        kind: SumKind::Tagged,
         variants: vec![
             variant("user", vec![Type::Text]),
             variant("assistant", vec![Type::Sum(ir::REPLY)]),
@@ -216,39 +220,94 @@ fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals)
                 format!("type '{}' is already declared or builtin", name.text),
             );
         }
+        let kind = match definition.body {
+            TypeBody::Variants(_) => SumKind::Tagged,
+            TypeBody::Values(_) => SumKind::Text,
+        };
         globals.types.insert(name.text.clone(), program.sums.len());
         program.sums.push(Sum {
             name: name.text.clone(),
+            kind,
             variants: Vec::new(),
         });
         declared.push(definition);
     }
     for definition in declared {
         let id = globals.types[&definition.name.text];
-        let mut seen = BTreeSet::new();
-        let mut variants = Vec::new();
-        for variant in &definition.variants {
-            if !seen.insert(variant.name.text.clone()) {
-                return error(
-                    variant.name.at,
-                    format!(
-                        "variant '{}' appears twice in '{}'",
-                        variant.name.text, definition.name.text
-                    ),
-                );
+        program.sums[id].variants = match &definition.body {
+            TypeBody::Variants(variants) => {
+                tagged_variants(program, globals, definition, variants)?
             }
-            let mut fields = Vec::new();
-            for field in &variant.fields {
-                fields.push(resolve(program, globals, field)?);
-            }
-            variants.push(Variant {
-                name: variant.name.text.clone(),
-                fields,
-            });
-        }
-        program.sums[id].variants = variants;
+            TypeBody::Values(values) => text_values(definition, values)?,
+        };
     }
     acyclic(source, program, globals)
+}
+
+pub fn quoted(text: &str) -> String {
+    let mut out = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn tagged_variants(
+    program: &ir::Program,
+    globals: &Globals,
+    definition: &ast::TypeDef,
+    declared: &[ast::VariantDef],
+) -> Checked<Vec<Variant>> {
+    let mut seen = BTreeSet::new();
+    let mut variants = Vec::new();
+    for variant in declared {
+        if !seen.insert(variant.name.text.clone()) {
+            return error(
+                variant.name.at,
+                format!(
+                    "variant '{}' appears twice in '{}'",
+                    variant.name.text, definition.name.text
+                ),
+            );
+        }
+        let mut fields = Vec::new();
+        for field in &variant.fields {
+            fields.push(resolve(program, globals, field)?);
+        }
+        variants.push(Variant {
+            name: variant.name.text.clone(),
+            fields,
+        });
+    }
+    Ok(variants)
+}
+
+fn text_values(definition: &ast::TypeDef, values: &[ast::Name]) -> Checked<Vec<Variant>> {
+    let mut seen = BTreeSet::new();
+    let mut variants = Vec::new();
+    for value in values {
+        if !seen.insert(value.text.clone()) {
+            return error(
+                value.at,
+                format!(
+                    "value {} appears twice in '{}'",
+                    quoted(&value.text),
+                    definition.name.text
+                ),
+            );
+        }
+        variants.push(Variant {
+            name: value.text.clone(),
+            fields: Vec::new(),
+        });
+    }
+    Ok(variants)
 }
 
 fn contained(ty: &Type, out: &mut Vec<ir::SumId>) {
@@ -338,7 +397,11 @@ fn variant_names(program: &ir::Program) -> BTreeSet<String> {
         .iter()
         .map(|name| (*name).to_owned())
         .collect();
-    for sum in &program.sums {
+    for sum in program
+        .sums
+        .iter()
+        .filter(|sum| sum.kind == SumKind::Tagged)
+    {
         names.extend(sum.variants.iter().map(|variant| variant.name.clone()));
     }
     names
@@ -375,8 +438,13 @@ fn tools(
             });
         }
         let returns = resolve(program, globals, &tool.returns)?;
-        if !matches!(returns, Type::U64 | Type::Bool | Type::Text) {
-            return error(tool.returns.at(), "a tool returns u64, bool or text");
+        if !matches!(returns, Type::U64 | Type::Bool | Type::Text)
+            && program.text_enum(&returns).is_none()
+        {
+            return error(
+                tool.returns.at(),
+                "a tool returns u64, bool, text or a text enum",
+            );
         }
         globals
             .tools
@@ -410,11 +478,11 @@ fn state(
         for field in &state.fields {
             claim(values, &field.name, "state field")?;
             let ty = resolve(program, globals, &field.ty)?;
-            if crate::run::value::Value::zero(&ty).is_none() {
+            if crate::run::value::Value::zero(program, &ty).is_none() {
                 return error(
                     field.ty.at(),
                     format!(
-                        "state field '{}' has no initial value: state fields are u64, bool, text or lists",
+                        "state field '{}' has no initial value: state fields are u64, bool, text, text enums or lists",
                         field.name.text
                     ),
                 );

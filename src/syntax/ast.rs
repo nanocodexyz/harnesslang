@@ -40,7 +40,13 @@ pub struct Const {
 #[derive(Clone, Debug)]
 pub struct TypeDef {
     pub name: Name,
-    pub variants: Vec<VariantDef>,
+    pub body: TypeBody,
+}
+
+#[derive(Clone, Debug)]
+pub enum TypeBody {
+    Variants(Vec<VariantDef>),
+    Values(Vec<Name>),
 }
 
 #[derive(Clone, Debug)]
@@ -163,9 +169,22 @@ pub enum Stmt {
 
 #[derive(Clone, Debug)]
 pub struct Arm {
-    pub variant: Name,
-    pub bindings: Vec<Name>,
+    pub pattern: Pattern,
     pub body: Block,
+}
+
+#[derive(Clone, Debug)]
+pub enum Pattern {
+    Variant { name: Name, bindings: Vec<Name> },
+    Value(Name),
+}
+
+impl Pattern {
+    pub const fn name(&self) -> &Name {
+        match self {
+            Self::Variant { name, .. } | Self::Value(name) => name,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -48,6 +48,8 @@ expect_error examples/invalid/unchecked_external.hl any "unchecked_external.hl:1
 expect_error examples/invalid/unbounded_list.hl any "unbounded_list.hl:8:22: error: a list needs a capacity"
 expect_error examples/invalid/literal_bound.hl any "literal_bound.hl:13:19: error: the bound of loop 'step' must be a named constant, found number 64"
 expect_error examples/invalid/unknown_name.hl any "unknown_name.hl:13:21: error: unknown name 'inpt'"
+expect_error examples/invalid/enum_missing_value.hl any 'enum_missing_value.hl:6:3: error: match on status is missing "interrupted"'
+expect_error examples/invalid/enum_unknown_value.hl any 'enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status'
 expect_error examples/invalid/over_cloudflare.hl cloudflare "handler 'prompt': worst case 17408 outbound requests exceeds cloudflare's limit of 10000 outbound requests per invocation; loops: step below turn_steps_max (1024) x call below calls_per_step_max (16)"
 for target in native-jsonl native-sqlite server-postgres vercel; do
   "$hl" check --target "$target" examples/invalid/over_cloudflare.hl > /dev/null

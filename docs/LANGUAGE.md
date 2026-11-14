@@ -535,7 +535,7 @@ the tokens above.
 program    = "harness" name { item } ;
 item       = const | type | tool | model | state | invariant | handler ;
 const      = "const" name ":" type_expr "=" number ;
-type       = "type" name "=" variant { "|" variant } ;
+type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
@@ -559,7 +559,7 @@ statement  = "let" name "=" expr
            | "return" expr
            | name "=" expr ;
 if         = "if" expr block [ "else" ( if | block ) ] ;
-arm        = name [ "(" name { "," name } ")" ] "=>" block ;
+arm        = ( name [ "(" name { "," name } ")" ] | text ) "=>" block ;
 expr       = and { "or" and } ;
 and        = not { "and" not } ;
 not        = "not" not | comparison ;
@@ -633,7 +633,8 @@ on ping(limit: u64) -> u64 {
 `type name = variant | variant(type, ...) | ...` declares a sum type. Variants
 carry only what that case has. A variant name may appear in several types; a
 type may not contain itself, directly or through other types or lists, since
-its values would have no bound.
+its values would have no bound. `type name = "value" | "value" | ...` declares
+a [text enum](#text-enums) instead.
 
 ```console
 $ hl check docs/snippets/errors/recursive-type.hl
@@ -651,13 +652,15 @@ on ping() -> u64 { return 1 }
 ### tool
 
 `tool name(param: type, ...) -> type effect class` declares a tool the model
-may call and the program may call directly. It returns `u64`, `bool` or
-`text`, so that every target and the simulator can carry its result. The class
-is `none`, `idempotent` or `external` ([Effects](#effects)).
+may call and the program may call directly. It returns `u64`, `bool`, `text`
+or a text enum, so that every target and the simulator can carry its result. A
+result that does not fit the declared type is recorded as the call's failure
+([Text enums](#text-enums)). The class is `none`, `idempotent` or `external`
+([Effects](#effects)).
 
 ```console
 $ hl check docs/snippets/errors/tool-returns.hl
-docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool or text
+docs/snippets/errors/tool-returns.hl:7:26: error: a tool returns u64, bool, text or a text enum
 ```
 
 ```hl docs/snippets/errors/tool-returns.hl
@@ -694,13 +697,14 @@ on ping(said: entry) -> u64 { return 1 }
 ### state
 
 `state { name: type ... }` is the session's state, the only thing that lives
-across turns. Fields start at zero (`0`, `false`, empty text, an empty list),
-so a field is `u64`, `bool`, `text` or a list. State is not journaled: it is a
+across turns. Fields start at zero (`0`, `false`, empty text, a text enum's
+first value, an empty list), so a field is `u64`, `bool`, `text`, a text enum
+or a list. State is not journaled: it is a
 function of the journal, rebuilt by replay from the latest checkpoint.
 
 ```console
 $ hl check docs/snippets/errors/state-sum.hl
-docs/snippets/errors/state-sum.hl:6:12: error: state field 'current' has no initial value: state fields are u64, bool, text or lists
+docs/snippets/errors/state-sum.hl:6:12: error: state field 'current' has no initial value: state fields are u64, bool, text, text enums or lists
 ```
 
 ```hl docs/snippets/errors/state-sum.hl
@@ -779,6 +783,7 @@ on ping() -> u64
 | `bool` | `true`, `false` | `and`, `or`, `not`, `== !=` |
 | `text` | UTF-8 text | `++` (concatenate), `== !=` |
 | a declared sum | its variants | construct, `match` |
+| a text enum | its listed texts | a text literal where it is expected, `match` |
 | `list<T, N>` | up to `N` values of `T` | `push` (state fields only), `for`, `len(list)` |
 | `known<T>` | `ok(T)`, `failed(text)` | `match` |
 | `maybe<T>` | `ok(T)`, `failed(text)`, `unknown` | `match`, which must have an `unknown` arm |
@@ -964,6 +969,143 @@ on echo(input: text) -> text {
 }
 ```
 
+### Text enums
+
+`type name = "value" | "value" | ...` declares a text enum: a type whose
+values are the listed texts and nothing else, such as a subagent's completion
+status or a hook's decision. It is a parameter, state field, tool result or
+handler result type like any other, and its values are any texts, spaces
+included.
+
+- A text literal where a text enum is expected (an assignment's field, a
+  `push`'s list, a `return`, an argument) must be one of its values, and is
+  that value. Anywhere else a literal is `text`. There is no conversion
+  between a text enum and `text`, and `==` does not compare text enums:
+  `match` them.
+- `match` takes one arm per value, written as the text. It is exhaustive like
+  a sum's: a missing value, an unlisted one or a variant pattern is an error.
+- A state field of a text enum starts at its first value.
+- The journal holds the text itself: an argument in the `admitted` record, a
+  field in a checkpoint and a tool's result are JSON strings.
+- Every boundary checks the value and never falls back to another one. An
+  argument, or a value read back from the journal, that is not one of the
+  values is refused: `hl run` and the generated code's argument decoding
+  reject it, and a journal holding one is corrupt. A tool result that is not
+  one of them is recorded as the call's failure, `TOOL returned JSON, which is
+  not a value of TYPE`, so the program meets it in its `failed` arm. The same
+  rule holds for every tool result: one that does not fit the declared type is
+  recorded as failed.
+- `hl sim` draws arguments from the values, every value as likely as the
+  next, and tool results from them too, except
+  `TEXT_ENUM_INVALID_PPM` = 100000 results per million that lie outside them
+  and must come back as failures (the `enum_valid` invariant).
+
+```hl docs/snippets/text_enums.hl
+harness reviews
+
+const approvals_max: u64 = 1000
+
+type verdict = "approve" | "request changes" | "comment"
+type outcome = merged(text) | blocked(text)
+
+tool review(change: text) -> verdict effect idempotent
+
+state {
+  last: verdict
+  approvals: u64
+}
+
+on submit(change: text) -> outcome
+  requires approvals < approvals_max
+{
+  match review(change) {
+    ok(said) => {
+      last = said
+      match said {
+        "approve" => {
+          approvals = approvals + 1
+          return merged(change)
+        }
+        "request changes" => { return blocked("changes requested") }
+        "comment" => { return blocked("no verdict yet") }
+      }
+    }
+    failed(error) => { return blocked(error) }
+  }
+}
+
+on record(said: verdict) -> verdict {
+  last = said
+  return "comment"
+}
+```
+
+```console
+$ hl run docs/snippets/text_enums.hl --handler record --arg "request changes"
+{"crc":1525710037,"record":{"admitted":{"digest":"record","first":1,"hand":null,"metadata":{"handler":"record"},"prompt":{"said":"request changes"},"turn":"1"}}}
+{"crc":2322276109,"record":{"status":{"status":{"finished":{"last":0,"outcome":"completed","result":"comment"}},"turn":"1"}}}
+{"crc":2374166743,"record":{"checkpoint":{"payload":"{\"approvals\":0,\"last\":\"request changes\"}","revision":1,"state":"reviews"}}}
+$ hl run docs/snippets/text_enums.hl --handler record --arg approved
+docs/snippets/text_enums.hl: error: argument 'said': 'approved' is not a variant of verdict
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/text_enums.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=846 crashes=342 power_losses=40 torn_writes=47 takeovers=0 fenced=0 dispatches=359 unknown=0
+```
+
+The planted bug `enum_unchecked` skips the check and takes an unlisted result
+as the enum's last value, the fallback an `else` branch writes by hand. The
+simulator catches it in `examples/hooks.hl`, whose stop hook returns a
+decision:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --mutation enum_unchecked examples/hooks.hl
+FAIL invariant=enum_valid seed=0 target=native-jsonl profile=errors mutation=enum_unchecked: call 2/28 (stop_hook) records Ok(String("stop")), but the tool returned [Ok(String("eta-1"))]: a result outside its text enum must be recorded as failed
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation enum_unchecked examples/hooks.hl
+```
+
+The checker's text enum errors:
+
+```console
+$ hl check examples/invalid/enum_missing_value.hl
+examples/invalid/enum_missing_value.hl:6:3: error: match on status is missing "interrupted"
+$ hl check examples/invalid/enum_unknown_value.hl
+examples/invalid/enum_unknown_value.hl:10:10: error: "cancelled" is not a value of status
+$ hl check docs/snippets/errors/text-enum-pattern.hl
+docs/snippets/errors/text-enum-pattern.hl:7:5: error: status is a text enum: match its values as text, such as "completed"
+$ hl check docs/snippets/errors/text-enum-compare.hl
+docs/snippets/errors/text-enum-compare.hl:5:49: error: '==' compares u64, bool or text, not status
+$ hl check docs/snippets/errors/text-enum-duplicate.hl
+docs/snippets/errors/text-enum-duplicate.hl:3:40: error: value "completed" appears twice in 'status'
+```
+
+```hl docs/snippets/errors/text-enum-pattern.hl
+harness notes
+
+type status = "completed" | "failed"
+
+on show(status: status) -> text {
+  match status {
+    completed => { return "done" }
+    failed => { return "failed" }
+  }
+}
+```
+
+```hl docs/snippets/errors/text-enum-compare.hl
+harness notes
+
+type status = "completed" | "failed"
+
+on show(status: status) -> bool { return status == "completed" }
+```
+
+```hl docs/snippets/errors/text-enum-duplicate.hl
+harness notes
+
+type status = "completed" | "failed" | "completed"
+
+on ping() -> u64 { return 1 }
+```
+
 ## Statements
 
 | Statement | Meaning |
@@ -972,7 +1114,7 @@ on echo(input: text) -> text {
 | `field = e` | assign a state field |
 | `push field e` | append to a state list; a full list traps with `bound(field)` |
 | `if c { } else if c { } else { }` | `c` is `bool` |
-| `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas |
+| `match e { variant(a, _) => { } ... }` | one arm per variant, no more, no fewer; arms may be separated by commas; a text enum's arms are its values, `"value" => { }` |
 | `loop i below N { }` | runs the body with `i` = 0 to N - 1, `N` a constant; there is no `break` |
 | `for x in list { }` | runs the body once per element of the list as it was when the loop started |
 | `return e` | finish the turn with `e`, of the handler's result type |

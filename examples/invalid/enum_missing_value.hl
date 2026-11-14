@@ -1,0 +1,10 @@
+harness enum_missing_value
+
+type status = "completed" | "failed" | "interrupted"
+
+on completion(agent: text, status: status) -> text {
+  match status {
+    "completed" => { return agent ++ " completed" }
+    "failed" => { return agent ++ " failed" }
+  }
+}

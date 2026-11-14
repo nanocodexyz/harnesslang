@@ -1,7 +1,7 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Const, Expr, Handler, Invariant, Item, Model, Name, Param, Program,
-    State, Stmt, Tool, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Const, Expr, Handler, Invariant, Item, Model, Name, Param, Pattern,
+    Program, State, Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -203,12 +203,35 @@ impl<'a> Parser<'a> {
         self.word("type")?;
         let name = self.name("a type name")?;
         self.symbol(Symbol::Assign)?;
+        if matches!(self.peek().token, Token::Text(_)) {
+            let mut values = vec![self.text_value("a text value")?];
+            while self.is_symbol(Symbol::Bar) {
+                self.advance();
+                values.push(self.text_value("a text value")?);
+            }
+            return Ok(TypeDef {
+                name,
+                body: TypeBody::Values(values),
+            });
+        }
         let mut variants = vec![self.variant()?];
         while self.is_symbol(Symbol::Bar) {
             self.advance();
             variants.push(self.variant()?);
         }
-        Ok(TypeDef { name, variants })
+        Ok(TypeDef {
+            name,
+            body: TypeBody::Variants(variants),
+        })
+    }
+
+    fn text_value(&mut self, what: &str) -> Parsed<Name> {
+        let at = self.at();
+        let Token::Text(text) = self.peek().token.clone() else {
+            return Err(self.unexpected(what));
+        };
+        self.advance();
+        Ok(Name { text, at })
     }
 
     fn variant(&mut self) -> Parsed<VariantDef> {
@@ -481,33 +504,37 @@ impl<'a> Parser<'a> {
         self.symbol(Symbol::LeftBrace)?;
         let mut arms = Vec::new();
         while !self.is_symbol(Symbol::RightBrace) {
-            let variant = self.name("a variant pattern")?;
-            let mut bindings = Vec::new();
-            if self.is_symbol(Symbol::LeftParen) {
-                self.advance();
-                loop {
-                    bindings.push(self.name("a binding name")?);
-                    if self.is_symbol(Symbol::Comma) {
-                        self.advance();
-                        continue;
-                    }
-                    self.symbol(Symbol::RightParen)?;
-                    break;
-                }
-            }
+            let pattern = self.pattern()?;
             self.symbol(Symbol::FatArrow)?;
             let body = self.block()?;
-            arms.push(Arm {
-                variant,
-                bindings,
-                body,
-            });
+            arms.push(Arm { pattern, body });
             if self.is_symbol(Symbol::Comma) {
                 self.advance();
             }
         }
         self.advance();
         Ok(Stmt::Match { at, subject, arms })
+    }
+
+    fn pattern(&mut self) -> Parsed<Pattern> {
+        if matches!(self.peek().token, Token::Text(_)) {
+            return Ok(Pattern::Value(self.text_value("a value pattern")?));
+        }
+        let name = self.name("a variant pattern")?;
+        let mut bindings = Vec::new();
+        if self.is_symbol(Symbol::LeftParen) {
+            self.advance();
+            loop {
+                bindings.push(self.name("a binding name")?);
+                if self.is_symbol(Symbol::Comma) {
+                    self.advance();
+                    continue;
+                }
+                self.symbol(Symbol::RightParen)?;
+                break;
+            }
+        }
+        Ok(Pattern::Variant { name, bindings })
     }
 
     pub fn expr(&mut self) -> Parsed<Expr> {

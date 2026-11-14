@@ -1,0 +1,37 @@
+harness reviews
+
+const approvals_max: u64 = 1000
+
+type verdict = "approve" | "request changes" | "comment"
+type outcome = merged(text) | blocked(text)
+
+tool review(change: text) -> verdict effect idempotent
+
+state {
+  last: verdict
+  approvals: u64
+}
+
+on submit(change: text) -> outcome
+  requires approvals < approvals_max
+{
+  match review(change) {
+    ok(said) => {
+      last = said
+      match said {
+        "approve" => {
+          approvals = approvals + 1
+          return merged(change)
+        }
+        "request changes" => { return blocked("changes requested") }
+        "comment" => { return blocked("no verdict yet") }
+      }
+    }
+    failed(error) => { return blocked(error) }
+  }
+}
+
+on record(said: verdict) -> verdict {
+  last = said
+  return "comment"
+}

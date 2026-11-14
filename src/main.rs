@@ -211,6 +211,9 @@ fn argument(program: &Program, ty: &Type, text: &str) -> Result<Value, String> {
             .parse()
             .map(Value::Bool)
             .map_err(|_| format!("'{text}' is not a bool")),
+        other if program.text_enum(other).is_some() => {
+            value::from_json(program, other, &json::Json::text(text))
+        }
         other => value::from_json(program, other, &json::decode(text)?),
     }
 }

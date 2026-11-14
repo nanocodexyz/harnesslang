@@ -654,14 +654,19 @@ impl<'a> Engine<'a> {
                     Type::Known(inner) | Type::Maybe(inner) => (**inner).clone(),
                     other => panic!("a tool site yields known or maybe, found {other:?}"),
                 };
-                world.tool(&ToolRequest {
+                let output = world.tool(&ToolRequest {
                     turn: self.turn,
                     seq,
                     tool: &call.tool,
                     effect: call.effect,
                     input: &call.input,
                     returns: &returns,
-                })
+                });
+                if self.mutation == Mutation::EnumUnchecked {
+                    value::fallback_output(self.program, &returns, output)
+                } else {
+                    value::checked_output(self.program, &call.tool, &returns, output)
+                }
             }
         };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
