@@ -6,7 +6,8 @@ use crate::effect::EffectClass;
 use crate::ir::Program;
 use crate::run::cell::{CellEvent, Input, Step, Wait};
 use crate::run::engine::{
-    Answer, Exit, Finish, ListingRequest, ModelRequest, Point, Read, Stop, ToolRequest, World,
+    Answer, Exit, Finish, ListingRequest, ModelRequest, Point, Read, Resume, Stop, Suspension,
+    ToolRequest, World,
 };
 use crate::run::journal::{self, Delivery, Output, Record};
 use crate::run::json::Json;
@@ -265,7 +266,7 @@ impl Run<'_, '_> {
         self.state.sim.second_owner_runs(false);
         self.nested = false;
         match ran {
-            Ok(Ran::Finished(_)) => {}
+            Ok(Ran::Finished(_) | Ran::Suspended(_)) => {}
             Ok(Ran::AlreadyFinished(finish)) => World::acknowledge(&mut self.state.sim, &finish),
             Err(exit) => self
                 .state
@@ -569,6 +570,29 @@ impl World for Run<'_, '_> {
         World::observe(&mut self.state.sim, event);
     }
 
+    fn clock(&mut self) -> u64 {
+        let mut rng = Rng::derive_keyed(self.session.seed, "clock", &[self.state.clock]);
+        self.state.clock += rng.range(1, CLOCK_STEP_MAX);
+        self.state.clock
+    }
+
+    fn sleep(&mut self, turn: u64, seq: u64, until_ms: u64) -> Result<u64, Stop> {
+        let before = self.state.clock;
+        self.state.clock = before.max(until_ms);
+        self.state
+            .sim
+            .check_sleep(turn, seq, until_ms, self.state.clock - before);
+        Ok(self.state.clock)
+    }
+
+    fn resume(&mut self, suspension: &Suspension) -> Option<Resume> {
+        World::resume(&mut self.state.sim, suspension)
+    }
+
+    fn resumed(&mut self, suspension: &Suspension, resume: &Resume, matched: bool) {
+        World::resumed(&mut self.state.sim, suspension, resume, matched);
+    }
+
     fn inbox(&mut self, turn: u64) -> Vec<Delivery> {
         World::inbox(&mut self.state.sim, turn)
     }
@@ -682,6 +706,10 @@ impl<'a> Search<'_, 'a> {
     }
 
     fn admit(&mut self, mut state: State<'a>) -> Result<(), Stopped> {
+        let request =
+            self.session.requests[usize::try_from(state.turn - 1).expect("turns fit")].clone();
+        state.sim.enter_turn(&request);
+        state.sim.parking.run_waited_ms = 0;
         if let Err(violation) = begin_run(&mut state, self.session.target) {
             let violation = specific(&state, violation);
             return Err(self.fail(&state, violation));
@@ -726,6 +754,13 @@ impl<'a> Search<'_, 'a> {
     fn after_run(&mut self, mut state: State<'a>, ran: Result<Ran, Exit>) -> Result<(), Stopped> {
         match ran {
             Ok(Ran::Finished(_)) => self.next_turn(state),
+            Ok(Ran::Suspended(suspension)) => {
+                if let Err(violation) = state.sim.suspended(&suspension) {
+                    return Err(self.fail(&state, violation));
+                }
+                state.runs = 0;
+                self.admit(state)
+            }
             Ok(Ran::AlreadyFinished(finish)) => {
                 World::acknowledge(&mut state.sim, &finish);
                 self.next_turn(state)

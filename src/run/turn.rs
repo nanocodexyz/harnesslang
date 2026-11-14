@@ -1,5 +1,7 @@
 use crate::ir::{Handler, Program};
-use crate::run::engine::{Engine, Exit, Finish, Mode, Setup, World, close_inbox, steer_count};
+use crate::run::engine::{
+    End, Engine, Exit, Finish, Mode, Setup, Suspension, World, close_inbox, steer_count,
+};
 use crate::run::journal::Inbound;
 use crate::run::journal::{Output, Record};
 use crate::run::json::Json;
@@ -19,6 +21,7 @@ pub struct TurnRequest {
 pub enum Ran {
     Finished(Finish),
     AlreadyFinished(Finish),
+    Suspended(Suspension),
 }
 
 pub fn arguments_json(program: &Program, handler: &Handler, arguments: &[Value]) -> Json {
@@ -114,10 +117,15 @@ pub fn replay_retiring(
         mutation: Mutation::None,
     };
     let ran = Engine::new(setup, handler, Mode::Replay, turn, state, log).run(&arguments)?;
-    if ran.finish.outcome != finished.outcome || ran.finish.result != finished.result {
+    let End::Finished(finish) = &ran.end else {
+        return Err(corrupt(format!(
+            "replay of turn {turn} suspends, where the journal says it finished"
+        )));
+    };
+    if finish.outcome != finished.outcome || finish.result != finished.result {
         return Err(corrupt(format!(
             "replay of turn {turn} finished {} where the journal says {}",
-            ran.finish.result.encode(),
+            finish.result.encode(),
             finished.result.encode()
         )));
     }
@@ -356,7 +364,8 @@ pub fn run_turn(
             output: Output::Failed(error),
         });
     }
-    engine
-        .run(&request.arguments)
-        .map(|ran| Ran::Finished(ran.finish))
+    engine.run(&request.arguments).map(|ran| match ran.end {
+        End::Finished(finish) => Ran::Finished(finish),
+        End::Suspended(suspension) => Ran::Suspended(suspension),
+    })
 }

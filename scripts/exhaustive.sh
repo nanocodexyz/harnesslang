@@ -112,3 +112,42 @@ if "$hl" sim --exhaustive --target native-jsonl --seeds 0..1 --mutation divergen
 fi
 grep -q 'injects no engine divergence' "$scratch/stderr"
 echo "exhaustive: $cell_file seeds $cell_seeds at depth 1 pass on every target; $caught cell mutation and target pairs caught with their invariant at depth 1 in seeds $mutation_seeds; divergence_dispatches refused"
+
+park_file=docs/snippets/park.hl
+park_seeds="${EXHAUSTIVE_PARK_SEEDS:-0..3}"
+pids=()
+for target in $targets; do
+  "$hl" sim --exhaustive --depth 1 --target "$target" --seeds "$park_seeds" "$park_file" > "$scratch/exhaustive-park-$target.log" 2>&1 &
+  pids+=($!)
+done
+failed=0
+for pid in "${pids[@]}"; do
+  if ! wait "$pid"; then
+    failed=1
+  fi
+done
+cat "$scratch"/exhaustive-park-*.log
+if [ "$failed" -ne 0 ]; then
+  echo "exhaustive: a clean exploration of $park_file failed" >&2
+  exit 1
+fi
+
+park_mutations="resume_replays_suspend:seq_unique suspend_before_flush:suspend_durable resume_unmatched:resume_matched wait_unjournaled:idempotent_known wait_rerun_skips:wait_until wait_oversleeps:wait_until"
+caught=0
+for entry in $park_mutations; do
+  mutation=${entry%%:*}
+  invariants=${entry#*:}
+  for target in $targets; do
+    set +e
+    output=$("$hl" sim --exhaustive --depth 1 --target "$target" --seeds "$mutation_seeds" --mutation "$mutation" "$park_file" 2> /dev/null)
+    status=$?
+    set -e
+    if [ "$status" -ne 1 ] || ! grep -qE "^FAIL invariant=($invariants) " <<< "$output"; then
+      echo "exhaustive: mutation $mutation on $target was not caught with $invariants in $park_file seeds $mutation_seeds at depth 1:" >&2
+      echo "$output" >&2
+      exit 1
+    fi
+    caught=$((caught + 1))
+  done
+done
+echo "exhaustive: $park_file seeds $park_seeds at depth 1 pass on every target, crashing at every hook while suspended and mid-wait; $caught wait and suspend mutation and target pairs caught with their invariant at depth 1 in seeds $mutation_seeds"

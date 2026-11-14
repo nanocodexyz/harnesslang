@@ -2,6 +2,7 @@ import { createContext, Script } from "node:vm";
 const VERCEL_TARGET = { ...TARGET_MODEL, inbound: "after_flush" };
 const VERCEL_EPOCH = 0;
 const STEPS_PER_EFFECT_MAX = 2;
+const STEPS_PER_SUSPENSION_MAX = 2;
 const STEPS_PER_TURN_FIXED = 2;
 
 assert(VERCEL_TARGET.recovery === "in_step", "the Vercel adapter recovers external effects in their step");
@@ -30,9 +31,30 @@ function waitFrom(json) {
 }
 
 class StepWorld {
-  constructor(context, waited) {
+  constructor(context, waited, resume) {
     this.context = context;
     this.waitedTimers = waited;
+    this.delivered = resume;
+    this.resuming = null;
+  }
+
+  clock() {
+    return this.context.host.clock();
+  }
+
+  sleep(turn, seq, untilMs) {
+    return this.context.host.sleep(turn, seq, untilMs);
+  }
+
+  async resume(suspension) {
+    const resume = this.context.resume !== undefined ? await this.context.resume(suspension) : this.delivered;
+    if (resume !== null) this.resuming = { suspension, resume };
+    return resume;
+  }
+
+  async resumed(suspension, resume, matched) {
+    assert(!matched, "a matched resume's flush ends the step before it is answered");
+    if (this.context.resumed !== undefined) await this.context.resumed(suspension, resume, matched);
   }
 
   append() {}
@@ -164,11 +186,21 @@ async function runStep(input, context) {
   const request = decodeOrCorrupt(() => turnRequestFromJson(decodeJson(input.request)));
   const setup = { target: VERCEL_TARGET, mutation: context.mutation ?? "none" };
   const waited = (input.waited ?? []).map((text) => decodeOrCorrupt(() => waitFrom(decodeJson(text))));
+  const delivered = input.resume === undefined || input.resume === null ? null : decodeOrCorrupt(() => resumeFrom(decodeJson(input.resume)));
+  const world = new StepWorld(context, waited, delivered);
   try {
-    const ran = await runTurn(setup, new StepWorld(context, waited), VERCEL_EPOCH, records, request);
+    const ran = await runTurn(setup, world, VERCEL_EPOCH, records, request);
+    if (ran.ran === "suspended") return { lines: [], suspended: encodeJson(suspensionJson(ran.suspension)) };
     throw new Panic(`a step ends at a flush, found the turn ${ran.ran}`);
   } catch (error) {
-    if (error instanceof StepEnd) return { lines: error.records.map((record) => encodeLine(record, false)) };
+    if (error instanceof StepEnd) {
+      const output = { lines: error.records.map((record) => encodeLine(record, false)) };
+      const answered = world.resuming;
+      if (answered !== null && error.records.some((record) => record.kind === "result" && record.turn === answered.suspension.turn && record.seq === answered.suspension.seq)) {
+        output.resumed = encodeJson(object([["resume", resumeJson(answered.resume)], ["suspension", suspensionJson(answered.suspension)]]));
+      }
+      return output;
+    }
     if (error instanceof StepWait) return { lines: [], wait: encodeJson(waitJson(error.wait)) };
     throw error;
   }
@@ -186,9 +218,10 @@ async function session(platform) {
 async function driveTurn(platform, lines, folded, requestText) {
   const request = decodeOrCorrupt(() => turnRequestFromJson(decodeJson(requestText)));
   const handler = handlerNamed(request.handler);
-  const stepsMax = STEPS_PER_EFFECT_MAX * handler.effectsMax + STEPS_PER_TURN_FIXED;
+  const stepsMax = (STEPS_PER_EFFECT_MAX + STEPS_PER_SUSPENSION_MAX) * handler.effectsMax + STEPS_PER_TURN_FIXED;
   let live = false;
   const waited = [];
+  let resume = null;
   for (let step = 0; step < stepsMax; step++) {
     const log = folded.turns.get(request.turn);
     if (log !== undefined && log.finished !== null) {
@@ -198,7 +231,13 @@ async function driveTurn(platform, lines, folded, requestText) {
       if (eventsTaken()) await closeTurnInbox(platform, request.turn, log, acknowledged.live);
       return;
     }
-    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice() });
+    const done = await platform.step(`turn ${request.turn} step ${step}`, { kind: "run", lines: lines.slice(), request: requestText, waited: waited.slice(), resume });
+    resume = null;
+    if (done.output.suspended !== undefined) {
+      const suspension = decodeOrCorrupt(() => suspensionFrom(decodeJson(done.output.suspended)));
+      resume = await platform.resume(`turn ${request.turn} resume ${suspension.seq} at step ${step}`, suspension);
+      continue;
+    }
     if (done.output.wait !== undefined) {
       assert(done.output.lines.length === 0, "a step that waits flushed before it waited");
       await platform.sleep(`turn ${request.turn} sleep ${step}`, decodeOrCorrupt(() => waitFrom(decodeJson(done.output.wait))));
@@ -214,6 +253,10 @@ async function driveTurn(platform, lines, folded, requestText) {
     if (live) await platform.hook(POINT_AFTER_FLUSH);
     const ran = folded.turns.get(request.turn);
     if (eventsTaken() && ran.finished === null) await recordEvents(platform, lines, folded, request.turn, live);
+    if (live && done.output.resumed !== undefined) {
+      const answered = decodeJson(done.output.resumed);
+      await platform.resumed(decodeOrCorrupt(() => suspensionFrom(answered.suspension)), decodeOrCorrupt(() => resumeFrom(answered.resume)), true);
+    }
   }
   throw new Panic(`turn ${request.turn} did not finish within its ${stepsMax} steps`);
 }
@@ -289,6 +332,7 @@ const WORKFLOW_BINDING = [
   "export async function harnessSession(sessionId, turnsMax) {",
   "  \"use workflow\";",
   "  const inboxes = new Map();",
+  "  const suspended = new Map();",
   "  return harness.session({",
   "    turnsMax,",
   "    async request(index) {",
@@ -302,6 +346,16 @@ const WORKFLOW_BINDING = [
   "    async sleep(name, wait) {",
   "      await sleep(new Date(Number(wait.untilMs)));",
   "    },",
+  "    async resume(name, suspension) {",
+  "      let resumes = suspended.get(suspension.turn + \"/\" + suspension.seq);",
+  "      if (resumes === undefined) {",
+  "        resumes = createHook({ token: sessionId + \":\" + suspension.turn + \":\" + suspension.seq + \":resume\" })[Symbol.asyncIterator]();",
+  "        suspended.set(suspension.turn + \"/\" + suspension.seq, resumes);",
+  "      }",
+  "      const next = await resumes.next();",
+  "      return harness.runtime.encodeJson(harness.runtime.resumeJson(harness.runtime.resumeFrom(harness.runtime.decodeJson(next.value.resume))));",
+  "    },",
+  "    async resumed() {},",
   "    async hook() {},",
   "    async inbox(turn) {",
   "      let inbox = inboxes.get(turn);",

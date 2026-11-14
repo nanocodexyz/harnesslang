@@ -131,14 +131,20 @@ fn fields_literal(fields: &[crate::ir::Field]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-fn site_literal(site: &Site) -> String {
+fn site_literal(program: &Program, site: &Site) -> String {
     let tool = match site.kind {
         SiteKind::Tool(tool) | SiteKind::Listing(tool) => tool.to_string(),
         SiteKind::Dispatch
         | SiteKind::Model
         | SiteKind::Now
         | SiteKind::Random
+        | SiteKind::Wait(_)
+        | SiteKind::Suspend
         | SiteKind::Cell(_) => "null".to_owned(),
+    };
+    let ms = match site.kind {
+        SiteKind::Wait(constant) => format!("{}n", program.constants[constant].value),
+        _ => "null".to_owned(),
     };
     let code = match site.kind {
         SiteKind::Cell(code) => code.to_string(),
@@ -156,7 +162,7 @@ fn site_literal(site: &Site) -> String {
         Durability::Cell => "cell",
     };
     format!(
-        "{{ kind: \"{}\", tool: {tool}, code: {code}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",
+        "{{ kind: \"{}\", tool: {tool}, code: {code}, ms: {ms}, class: \"{class}\", result: {}, durability: \"{durability}\" }}",
         site.kind.name(),
         type_literal(&site.result)
     )
@@ -246,7 +252,7 @@ fn program_literal(program: &Program) -> String {
     )
     .expect("writing to a string succeeds");
     for (index, handler) in program.handlers.iter().enumerate() {
-        out.push_str(&handler_literal(index, handler));
+        out.push_str(&handler_literal(program, index, handler));
     }
     out.push_str("  ],\n};\n");
     out
@@ -275,13 +281,17 @@ fn code_literal(code: &crate::ir::Code) -> String {
     )
 }
 
-fn handler_literal(index: usize, handler: &Handler) -> String {
+fn handler_literal(program: &Program, index: usize, handler: &Handler) -> String {
     let params: Vec<crate::ir::Field> = handler
         .params
         .iter()
         .map(|local| handler.locals[*local].clone())
         .collect();
-    let sites: Vec<String> = handler.sites.iter().map(site_literal).collect();
+    let sites: Vec<String> = handler
+        .sites
+        .iter()
+        .map(|site| site_literal(program, site))
+        .collect();
     format!(
         "    {{\n      name: {},\n      params: {},\n      returns: {},\n      effectsMax: {},\n      sites: [\n        {}\n      ],\n      run: handler_{index},\n    }},\n",
         js_string(&handler.name),

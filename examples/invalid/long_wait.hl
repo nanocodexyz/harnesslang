@@ -1,0 +1,10 @@
+harness long_wait
+
+const hour_ms: u64 = 3600000
+
+type outcome = done(u64)
+
+on nap() -> outcome {
+  let woke = wait(hour_ms)
+  return done(woke)
+}

@@ -1,3 +1,20 @@
+const WAIT_TOOL = "wait";
+const WAIT_MS = "ms";
+const WAIT_UNTIL = "until";
+const SUSPEND_TOOL = "suspend";
+const SUSPEND_KEY = "key";
+
+class Suspended {
+  constructor(suspension) {
+    this.suspension = suspension;
+  }
+}
+
+function withoutUntil(call) {
+  if (!isObject(call.input)) return call;
+  return { ...call, input: object(Object.keys(call.input).filter((key) => key !== WAIT_UNTIL).map((key) => [key, call.input[key]])) };
+}
+
 class Engine {
   constructor(setup, handler, mode, turn, state, log) {
     assert(log.handler === handler.name, "a turn runs the handler it was admitted for");
@@ -71,6 +88,7 @@ class Engine {
     try {
       value = await this.handler.run(this, this.state, args);
     } catch (error) {
+      if (error instanceof Suspended) return { suspended: error.suspension, state: this.state };
       if (!(error instanceof Trap)) throw error;
       trap = error.message;
     }
@@ -156,6 +174,10 @@ class Engine {
         return { tool: PROGRAM.model.name, effect: "idempotent", input: null };
       case "cell":
         return { tool: PROGRAM.codes[site.code].name, effect: "none", input: args[0] };
+      case "wait":
+        return { tool: WAIT_TOOL, effect: "none", input: object([[WAIT_MS, site.ms]]) };
+      case "suspend":
+        return { tool: SUSPEND_TOOL, effect: "none", input: object([[SUSPEND_KEY, args[0]]]) };
       default:
         return { tool: site.kind, effect: "none", input: null };
     }
@@ -168,6 +190,8 @@ class Engine {
     const call = this.resolve(site, args);
     const code = site.kind === "cell" ? site.code : site.kind === "dispatch" ? codeNamed(call.tool) : null;
     if (code !== null) return this.cellSite(code, seq, { ...call, effect: "none" });
+    if (site.kind === "suspend") return this.suspendSite(siteId, seq, call);
+    if (site.kind === "wait") return this.waitSite(siteId, seq, call, args);
     if (site.class !== "dispatched") {
       assert(site.class === call.effect, "a fixed site runs with its declared class");
     }
@@ -198,6 +222,84 @@ class Engine {
       case "open":
         this.same(seq, logged.call, call);
         return this.reopen(siteId, seq, call, args);
+      default:
+        throw new Panic(`unknown site log ${logged.kind}`);
+    }
+  }
+
+  async suspendSite(siteId, seq, call) {
+    const site = this.handler.sites[siteId];
+    const logged = this.sites.get(seq);
+    if (logged === undefined) {
+      this.requireLive(seq);
+      this.append({ kind: "call", turn: this.turn, seq, tool: call.tool, effect: call.effect, input: call.input });
+      this.sites.set(seq, { kind: "open", call });
+      return this.suspend(seq, call);
+    }
+    switch (logged.kind) {
+      case "done":
+        this.same(seq, logged.call, call);
+        return this.decode(site, logged.output);
+      case "reply":
+        throw this.diverged(seq, "a model reply", call.tool);
+      case "open":
+      case "unknown": {
+        this.same(seq, logged.call, call);
+        this.requireLive(seq);
+        const suspension = { turn: this.turn, seq, key: logged.call.input[SUSPEND_KEY] };
+        const world = this.mode.world;
+        const resume = await world.resume(suspension);
+        if (resume !== null) {
+          if (resume.key === suspension.key) {
+            const output = { tag: "ok", value: resume.answer };
+            this.append({ kind: "result", turn: this.turn, seq, output });
+            this.sites.set(seq, { kind: "done", call: logged.call, output });
+            await this.flush();
+            await world.resumed(suspension, resume, true);
+            return this.decode(site, output);
+          }
+          await world.resumed(suspension, resume, false);
+        }
+        return this.suspend(seq, logged.call);
+      }
+      default:
+        throw new Panic(`unknown site log ${logged.kind}`);
+    }
+  }
+
+  async suspend(seq, call) {
+    await this.flush();
+    assert(this.buffer.length === 0, "a suspend's call record is durable before the turn waits");
+    await this.hook(runPoint("before_run", "suspend", "none"));
+    const key = isObject(call.input) ? call.input[SUSPEND_KEY] : undefined;
+    if (typeof key !== "string") throw new Corrupt(`turn ${this.turn} seq ${seq}: a suspend's input lacks its key`);
+    throw new Suspended({ turn: this.turn, seq, key });
+  }
+
+  async waitSite(siteId, seq, call, args) {
+    const site = this.handler.sites[siteId];
+    const logged = this.sites.get(seq);
+    if (logged === undefined) {
+      this.requireLive(seq);
+      const clock = await this.mode.world.clock();
+      const until = clock + site.ms;
+      if (until > U64_MAX) throw new Corrupt(`turn ${this.turn} seq ${seq}: the clock ${clock} plus the wait's ${site.ms} ms passes u64`);
+      const timed = { ...call, input: object([[WAIT_MS, site.ms], [WAIT_UNTIL, until]]) };
+      this.append({ kind: "call", turn: this.turn, seq, tool: timed.tool, effect: timed.effect, input: timed.input });
+      this.sites.set(seq, { kind: "open", call: timed });
+      await this.mode.world.beforeExternal();
+      return this.execute(siteId, seq, timed, args);
+    }
+    switch (logged.kind) {
+      case "done":
+        this.same(seq, withoutUntil(logged.call), call);
+        return this.decode(site, logged.output);
+      case "reply":
+        throw this.diverged(seq, "a model reply", call.tool);
+      case "open":
+      case "unknown":
+        this.same(seq, withoutUntil(logged.call), call);
+        return this.reopen(siteId, seq, logged.call, args);
       default:
         throw new Panic(`unknown site log ${logged.kind}`);
     }
@@ -425,7 +527,11 @@ class Engine {
       return this.reply(response);
     }
     let output;
-    if (site.kind === "now") {
+    if (site.kind === "wait") {
+      const until = isObject(call.input) ? call.input[WAIT_UNTIL] : undefined;
+      if (typeof until !== "bigint") throw new Corrupt(`turn ${this.turn} seq ${seq}: a wait's input lacks its deadline`);
+      output = { tag: "ok", value: await world.sleep(this.turn, seq, until) };
+    } else if (site.kind === "now") {
       output = { tag: "ok", value: await world.now() };
     } else if (site.kind === "random") {
       output = { tag: "ok", value: await world.random() };
@@ -491,6 +597,10 @@ class Engine {
 
   decode(site, output) {
     const corrupt = (message) => new Corrupt(`turn ${this.turn} result: ${message}`);
+    if (site.result === "text" && output.tag === "ok") {
+      if (typeof output.value !== "string") throw corrupt(`${encodeJson(output.value)} is not text`);
+      return output.value;
+    }
     if (site.result === "u64" && output.tag === "ok") {
       if (typeof output.value !== "bigint") throw corrupt(`${encodeJson(output.value)} is not u64`);
       return output.value;
@@ -634,6 +744,7 @@ async function replayTurn(setup, turn, log, state) {
   if (log.finished === null) throw new Corrupt(`turn ${turn} is replayed before it finished`);
   const replaySetup = { target: setup.target, mutation: "none" };
   const ran = await new Engine(replaySetup, handler, { live: false }, turn, state, log).run(args);
+  if (ran.suspended !== undefined) throw new Corrupt(`replay of turn ${turn} suspends, where the journal says it finished`);
   if (ran.finish.outcome !== log.finished.outcome || !jsonEqual(ran.finish.result, log.finished.result)) {
     throw new Corrupt(`replay of turn ${turn} finished ${encodeJson(ran.finish.result)} where the journal says ${encodeJson(log.finished.result)}`);
   }
@@ -735,6 +846,7 @@ async function runTurn(setup, world, epoch, records, request) {
     engine.append({ kind: "nested_result", turn: request.turn, seq, nested, output });
   }
   const ran = await engine.run(request.arguments);
+  if (ran.suspended !== undefined) return { ran: "suspended", suspension: ran.suspended };
   return { ran: "finished", finish: ran.finish };
 }
 
@@ -749,6 +861,25 @@ function turnRequestFromJson(json) {
 
 function finishJson(finish) {
   return object([["outcome", finish.outcome], ["result", finish.result], ["turn", BigInt(finish.turn)]]);
+}
+
+function suspensionJson(suspension) {
+  return object([["key", suspension.key], ["seq", BigInt(suspension.seq)], ["turn", BigInt(suspension.turn)]]);
+}
+
+function suspensionFrom(json) {
+  if (!isObject(json)) throw new DecodeError("a suspension is an object");
+  if (typeof json.key !== "string") throw new DecodeError("a suspension names its key");
+  return { turn: smallNumber(json.turn, "a suspension's turn"), seq: smallNumber(json.seq, "a suspension's seq"), key: json.key };
+}
+
+function resumeJson(resume) {
+  return object([["answer", resume.answer], ["key", resume.key]]);
+}
+
+function resumeFrom(json) {
+  if (!isObject(json) || typeof json.key !== "string" || typeof json.answer !== "string") throw new DecodeError("a resume carries a text key and a text answer");
+  return { key: json.key, answer: json.answer };
 }
 
 function finishFromJson(json) {
@@ -808,6 +939,19 @@ function defaultHost(config) {
     now() {
       return BigInt(config.now());
     },
+    clock() {
+      return BigInt(config.now());
+    },
+    async sleep(turn, seq, untilMs) {
+      const left = Number(untilMs) - Number(config.now());
+      if (left > 0) await new Promise((resolve) => setTimeout(resolve, left));
+      const clock = BigInt(config.now());
+      return clock > untilMs ? clock : untilMs;
+    },
+    async resume() {
+      return null;
+    },
+    async resumed() {},
     random() {
       const value = config.random();
       assert(typeof value === "bigint" && value >= 0n && value <= U64_MAX, "random yields a u64");
@@ -830,5 +974,5 @@ const runtime = {
   encodeJson, decodeJson, crc32, encodeLine, decodeLine, encodeLines, decodeLines,
   recordJson, recordFrom, fold, toJson, fromJson, finishJson, defaultHost,
   Fraction, object, cellOutcomeOutput, ScriptEngine, scriptEngineModule, PROGRAM, CELL_SCRIPT_PARAMETERS, sameStep, entryIsInput, isObject,
-  deliveryJson, deliveryFrom,
+  deliveryJson, deliveryFrom, suspensionJson, suspensionFrom, resumeJson, resumeFrom,
 };

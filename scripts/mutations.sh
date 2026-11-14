@@ -47,7 +47,13 @@ vercel_nested_retry_redispatches examples/code_agent.hl --twice nested_external_
 cell_gate_releases_early examples/code_agent.hl --twice nested_external_once 0..300
 postgres_cell_unfenced examples/code_agent.hl --twice seq_unique 0..300
 nested_idempotent_reported_unknown examples/code_agent.hl --twice nested_known 0..300
-nested_enum_unchecked examples/code_tasks.hl --twice nested_enum_valid 0..300"
+nested_enum_unchecked examples/code_tasks.hl --twice nested_enum_valid 0..300
+resume_replays_suspend examples/hooks.hl --twice seq_unique
+suspend_before_flush examples/hooks.hl --twice suspend_durable
+resume_unmatched examples/hooks.hl --twice resume_matched
+wait_unjournaled examples/subagents.hl --twice idempotent_known
+wait_rerun_skips examples/subagents.hl --twice wait_until
+wait_oversleeps examples/subagents.hl --twice wait_until"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal

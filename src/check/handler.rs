@@ -1,6 +1,6 @@
 use crate::check::{
-    CANCELLED_READ, Checked, EVENT_STEER, Globals, STEER_PARAMETER, STEERS_READ, WILDCARD, bound,
-    error, quoted, resolve,
+    CANCELLED_READ, Checked, EVENT_RESUME, EVENT_STEER, Globals, STEER_PARAMETER, STEERS_READ,
+    WILDCARD, bound, error, quoted, resolve,
 };
 use crate::effect::EffectClass;
 use crate::ir::{
@@ -781,7 +781,7 @@ impl Checker<'_> {
             kind,
             class,
             result: result.clone(),
-            durability: Durability::of(class),
+            durability: Durability::of_site(kind, class),
         });
         let local = self.temporary(site, result.clone());
         out.push(Stmt::Effect {
@@ -790,6 +790,42 @@ impl Checker<'_> {
             result: local,
         });
         (Expr::Local(local), result)
+    }
+
+    fn wait(
+        &mut self,
+        at: Position,
+        args: &[ast::Expr],
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
+        let [ast::Expr::Name(name)] = args else {
+            return match args {
+                [other] => error(
+                    other.at(),
+                    "the duration of 'wait' must be a named constant in milliseconds",
+                ),
+                _ => error(
+                    at,
+                    format!("wait takes 1 argument(s), found {}", args.len()),
+                ),
+            };
+        };
+        let Some(&constant) = self.globals.constants.get(&name.text) else {
+            return error(
+                name.at,
+                format!(
+                    "the duration of 'wait' must be a named constant in milliseconds: '{}' is not a constant",
+                    name.text
+                ),
+            );
+        };
+        Ok(self.site(
+            SiteKind::Wait(constant),
+            SiteClass::Fixed(EffectClass::None),
+            Type::U64,
+            Vec::new(),
+            out,
+        ))
     }
 
     fn args(
@@ -930,6 +966,23 @@ impl Checker<'_> {
                     SiteKind::Dispatch,
                     SiteClass::Dispatched,
                     Type::Maybe(Box::new(Type::Text)),
+                    args,
+                    out,
+                ))
+            }
+            "wait" => self.wait(at, args, out),
+            "suspend" => {
+                if !self.program.events.resume {
+                    return error(
+                        at,
+                        format!("'suspend' needs 'on {EVENT_RESUME}' on the harness"),
+                    );
+                }
+                let args = self.args(at, "suspend", args, &[Type::Text], out)?;
+                Ok(self.site(
+                    SiteKind::Suspend,
+                    SiteClass::Fixed(EffectClass::None),
+                    Type::Text,
                     args,
                     out,
                 ))
@@ -1186,7 +1239,7 @@ impl Checker<'_> {
     }
 }
 
-const EFFECT_BUILTINS: [&str; 3] = ["dispatch", "now", "random"];
+const EFFECT_BUILTINS: [&str; 5] = ["dispatch", "now", "random", "wait", "suspend"];
 
 fn parallel_body<'b>(
     at: Position,

@@ -367,6 +367,33 @@ impl<'a, 'p> Body<'a, 'p> {
                 ("Model", run, decode)
             }
             SiteKind::Cell(_) => panic!("a cell site is emitted by cell_site"),
+            SiteKind::Wait(constant_id) => {
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::Number({}))]) }};",
+                    ir::WAIT_TOOL,
+                    EffectClass::None,
+                    crate::run::engine::WAIT_MS,
+                    constant(&self.program.constants[constant_id].name)
+                ));
+                (
+                    "Wait",
+                    "Run::Wait".to_owned(),
+                    "scalar(engine, answer)?".to_owned(),
+                )
+            }
+            SiteKind::Suspend => {
+                self.line(&format!(
+                    "let call = Call {{ tool: {:?}.to_owned(), effect: EffectClass::{:?}, input: Json::object(vec![({:?}, Json::String(argument0))]) }};",
+                    ir::SUSPEND_TOOL,
+                    EffectClass::None,
+                    crate::run::engine::SUSPEND_KEY
+                ));
+                (
+                    "Suspend",
+                    "Run::Suspend".to_owned(),
+                    "answer_text(engine, answer)?".to_owned(),
+                )
+            }
             SiteKind::Now | SiteKind::Random => {
                 let (name, variant) = if kind == SiteKind::Now {
                     ("now", "Now")

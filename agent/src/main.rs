@@ -480,6 +480,13 @@ fn main() {
             eprintln!("hl-agent: the harness trapped: {}", finish.result.encode());
             ("trap".to_owned(), EXIT_HARNESS_ERROR)
         }
+        Ok(Ran::Suspended(suspension)) => {
+            eprintln!(
+                "hl-agent: turn {} waits on suspend {} ({}), which this host never resumes",
+                suspension.turn, suspension.seq, suspension.key
+            );
+            ("suspended".to_owned(), EXIT_HARNESS_ERROR)
+        }
         Err(RunError::Open(error)) => {
             eprintln!("hl-agent: journal: {error}");
             ("error".to_owned(), EXIT_HARNESS_ERROR)

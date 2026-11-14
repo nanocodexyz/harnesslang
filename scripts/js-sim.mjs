@@ -42,6 +42,8 @@ class SimReset {}
 
 class Suspend {}
 
+class ParkEnd {}
+
 function short(text) {
   return text.length > DETAIL_CHARACTERS_MAX ? text.slice(0, DETAIL_CHARACTERS_MAX) + "..." : text;
 }
@@ -107,7 +109,7 @@ class Seed {
     this.acks = [];
     this.dispatched = new Map();
     this.nestedDispatched = new Map();
-    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0 };
+    this.stats = { turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0 };
     this.durableLines = () => [];
     this.checks = new CellChecks(rt, (invariant, detail) => new Failure(invariant, detail));
     this.cells = new TracedCells(this, {
@@ -262,6 +264,42 @@ class Seed {
     return this.cursor.next("now", "now").answer;
   }
 
+  clock() {
+    return this.cursor.next("clock", "clock").answer;
+  }
+
+  sleep(turn, seq, untilMs) {
+    const recorded = this.durableLines().map((line) => rt.decodeLine(line, false)).find((record) => record.kind === "call" && record.turn === turn && record.seq === seq);
+    const durable = recorded === undefined || !rt.isObject(recorded.input) ? undefined : recorded.input.until;
+    if (durable !== untilMs) throw new Failure("wait_until", `wait ${turn}/${seq} sleeps until ${untilMs} while its durable call record holds ${durable}`);
+    const event = this.cursor.next("sleep", `${turn}/${seq}`);
+    same("sleep turn", event.turn, BigInt(turn));
+    same("sleep seq", event.seq, BigInt(seq));
+    same("sleep until", event.until, untilMs);
+    this.stats.sleeps += 1;
+    if (event.answer === "crash") {
+      this.stats.crashes += 1;
+      throw new SimReset();
+    }
+    return event.clock;
+  }
+
+  resume(suspension) {
+    if (this.cursor.peek()?.event !== "resume") return null;
+    const event = this.cursor.next("resume", `${suspension.turn}/${suspension.seq}`);
+    same("resume turn", event.turn, BigInt(suspension.turn));
+    same("resume seq", event.seq, BigInt(suspension.seq));
+    return { key: event.key, answer: event.answer };
+  }
+
+  resumed(suspension, resume, matched) {
+    const event = this.cursor.next("resumed", `${suspension.turn}/${suspension.seq}`);
+    same("resumed turn", event.turn, BigInt(suspension.turn));
+    same("resumed seq", event.seq, BigInt(suspension.seq));
+    same("resumed match", event.matched, matched);
+    this.stats.resumes += 1;
+  }
+
   inbox(turn) {
     const event = this.cursor.next("inbox", `turn ${turn}`);
     same("inbox turn", event.turn, BigInt(turn));
@@ -334,6 +372,12 @@ class Seed {
       },
       async wait(wait) {
         seed.wait(wait);
+      },
+      clock() {
+        return seed.clock();
+      },
+      async sleep(turn, seq, untilMs) {
+        return seed.sleep(turn, seq, untilMs);
       },
       async observe(event) {
         seed.cells.observe(event);
@@ -440,6 +484,8 @@ async function cloudflareSeed(seed) {
     hook: (point) => seed.hook(point),
     inbox: (turn) => seed.inbox(turn),
     answer: (turn, position, answers) => seed.answered(turn, position, answers),
+    resume: (suspension) => seed.resume(suspension),
+    resumed: (suspension, resume, matched) => seed.resumed(suspension, resume, matched),
     tools: (world, requests, limit) => seed.tools(world, requests, limit),
     gate: (records) => {
       const bytes = storage.pendingBytes();
@@ -476,12 +522,12 @@ async function cloudflareSeed(seed) {
           const response = await instance.fetch(new Request(TURN_URL, { method: "POST", body }));
           if (response.status !== HTTP_OK) throw new Failure("liveness", `turn ${turn.turn}: the object answered ${response.status}: ${await response.text()}`);
           driven = { ran: response.headers.get(harness.ranHeader), finish: rt.decodeJson(await response.text()) };
-          driven.finish = { turn: Number(driven.finish.turn), outcome: driven.finish.outcome, result: driven.finish.result };
+          if (driven.ran !== "suspended") driven.finish = { turn: Number(driven.finish.turn), outcome: driven.finish.outcome, result: driven.finish.result };
         }
         if (storage.pendingRows.length > 0) throw new Failure("backend_equal", "rows were written after the turn's last flush");
         storage.commit();
-        if (driven.ran !== "finished" && driven.ran !== "already_finished") throw new Failure("liveness", `the alarm found ${driven.ran}`);
-        seed.acknowledged(driven.finish, durableStatus);
+        if (driven.ran !== "finished" && driven.ran !== "already_finished" && driven.ran !== "suspended") throw new Failure("liveness", `the alarm found ${driven.ran}`);
+        if (driven.ran !== "suspended") seed.acknowledged(driven.finish, durableStatus);
         kind = driven.ran;
       } catch (error) {
         if (!(error instanceof SimReset)) throw error;
@@ -490,7 +536,7 @@ async function cloudflareSeed(seed) {
         kind = "crash";
       }
       seed.exited(kind);
-      if (kind !== "crash") break;
+      if (kind !== "crash" && kind !== "suspended") break;
     }
   }
   seed.ended(storage.medium());
@@ -577,13 +623,15 @@ class SimWorkflow {
       },
       hook: (point) => seed.hook(point),
       tools: (world, requests, limit) => seed.tools(world, requests, limit),
+      resume: (suspension) => seed.resume(suspension),
+      resumed: (suspension, resume, matched) => seed.resumed(suspension, resume, matched),
       host: this.state.host,
       mutation: values.mutation,
       acknowledge: async (finish) => seed.acknowledged(finish, (turn) => statusIn(this.state.lines(), turn)),
       answer: async (turn, position, answers) => seed.answered(turn, position, answers),
     };
     const output = await harness.runStep(input, context);
-    if (input.kind === "run" && output.wait === undefined) {
+    if (input.kind === "run" && output.wait === undefined && output.suspended === undefined) {
       this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
       this.seed.checks.flushed([...this.state.lines(), ...output.lines]);
       const request = rt.decodeJson(input.request);
@@ -594,6 +642,22 @@ class SimWorkflow {
     }
     log.push({ name, output });
     return { output, live: true };
+  }
+
+  async resume(name, suspension) {
+    const index = this.stepIndex;
+    this.stepIndex += 1;
+    const log = this.state.log;
+    if (index < log.length) {
+      if (log[index].name !== name) throw differ(`workflow resume ${index} on replay`, log[index].name, name);
+      return null;
+    }
+    log.push({ name, output: { lines: [] } });
+    throw new ParkEnd();
+  }
+
+  async resumed(suspension, resume, matched) {
+    this.seed.resumed(suspension, resume, matched);
   }
 
   async sleep(name, wait) {
@@ -634,18 +698,19 @@ async function vercelSeed(seed) {
         kind = workflow.statusLive ? "finished" : "already_finished";
       } catch (error) {
         if (error instanceof Suspend) kind = workflow.statusLive ? "finished" : "already_finished";
+        else if (error instanceof ParkEnd) kind = "suspended";
         else if (error instanceof SimReset) kind = "crash";
         else throw error;
       }
       seed.exited(kind);
-      if (kind !== "crash") break;
+      if (kind !== "crash" && kind !== "suspended") break;
     }
   }
   seed.ended(state.lines().map((line) => line + "\n").join(""));
 }
 
 const seeds = parseTrace(values.trace);
-const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0 };
+const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0 };
 const engineTotals = { cells: 0, steps: 0, unparsed: 0 };
 const started = performance.now();
 for (const traced of seeds) {
@@ -672,7 +737,7 @@ for (const traced of seeds) {
     process.exit(1);
   }
   totals.seeds += 1;
-  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits"]) totals[key] += seed.stats[key];
+  for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits", "sleeps", "resumes"]) totals[key] += seed.stats[key];
 }
 const elapsed = Math.round(performance.now() - started);
-console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""} ms=${elapsed}`);
+console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""} ms=${elapsed}`);
