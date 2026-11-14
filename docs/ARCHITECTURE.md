@@ -522,7 +522,24 @@ Invariants, named as nanocode-sim names them:
 Each invariant comes with a planted bug (a mutation of the lowering or of a
 target adapter) that the simulator must catch, as tempoxyz/zempo and
 nanocode-sim require: `hl sim --mutation <name>` fails within its seed range,
-and `scripts/mutations.sh` runs them all.
+and `scripts/mutations.sh` runs them all. Its census fails when a mutation `hl
+sim` accepts has no plan, or an invariant is exercised by no mutation and no
+planted program in `scripts/strict.sh`. Under `--strict`, a run that went past
+its handler's worst case is reported as `worst_case` before the journal is
+checked, since the overrun is the cause of whatever the journal shows later.
+
+The differential runs have planted bugs of their own: `RUST_DIFF_PLANT` and
+`JS_DIFF_PLANT` edit the emitted code with sed (a flush skipped, a decode
+message changed, a second fsync, a batch's sequence numbers off by one, the
+recovery skipped, the enum check removed), and `scripts/mutations.sh --diff`
+requires each to fail on every target it changes with the invariant its plan
+names. A plant that leaves a target's code unchanged needs no plan there; one
+that changes it without failing needs an exemption with its reason.
+`scripts/check.sh` runs every example through both differential runs, and its
+census fails when an example was not swept by `hl sim` or by a differential
+run on any target. It runs its independent steps in a pool of `CHECK_JOBS`
+jobs (`nproc` by default), each in its own process group, stops the rest at
+the first failure and prints that job's log, and kills every job on exit.
 
 ### Oracle
 
