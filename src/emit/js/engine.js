@@ -143,6 +143,18 @@ class Engine {
     this.state[field] = [...items, value];
   }
 
+  keepAfter(field, count, first) {
+    const items = this.state[field];
+    assert(Array.isArray(items), "a list field holds a list");
+    const definition = PROGRAM.state[field];
+    const kept = count < BigInt(items.length) ? Number(count) : items.length;
+    if (BigInt(kept) >= definition.ty.capacity) {
+      throw new Trap(`bound(${definition.name})`);
+    }
+    this.state[field] = [first, ...items.slice(items.length - kept)];
+    assert(this.state[field].length === kept + 1, "keep after leaves the first entry and at most the last count entries");
+  }
+
   keep(field, count) {
     const items = this.state[field];
     assert(Array.isArray(items), "a list field holds a list");
@@ -175,7 +187,7 @@ class Engine {
       case "cell":
         return { tool: PROGRAM.codes[site.code].name, effect: "none", input: args[0] };
       case "wait":
-        return { tool: WAIT_TOOL, effect: "none", input: object([[WAIT_MS, site.ms]]) };
+        return { tool: WAIT_TOOL, effect: "none", input: object([[WAIT_MS, args[0]]]) };
       case "suspend":
         return { tool: SUSPEND_TOOL, effect: "none", input: object([[SUSPEND_KEY, args[0]]]) };
       default:
@@ -185,6 +197,7 @@ class Engine {
 
   async effect(siteId, args) {
     const site = this.handler.sites[siteId];
+    if (site.kind === "wait" && args[0] > site.ms) throw new Trap(`bound(${site.cap})`);
     this.seq += 1;
     const seq = this.seq;
     const call = this.resolve(site, args);
@@ -282,9 +295,10 @@ class Engine {
     if (logged === undefined) {
       this.requireLive(seq);
       const clock = await this.mode.world.clock();
-      const until = clock + site.ms;
-      if (until > U64_MAX) throw new Corrupt(`turn ${this.turn} seq ${seq}: the clock ${clock} plus the wait's ${site.ms} ms passes u64`);
-      const timed = { ...call, input: object([[WAIT_MS, site.ms], [WAIT_UNTIL, until]]) };
+      const ms = call.input[WAIT_MS];
+      const until = clock + ms;
+      if (until > U64_MAX) throw new Corrupt(`turn ${this.turn} seq ${seq}: the clock ${clock} plus the wait's ${ms} ms passes u64`);
+      const timed = { ...call, input: object([[WAIT_MS, ms], [WAIT_UNTIL, until]]) };
       this.append({ kind: "call", turn: this.turn, seq, tool: timed.tool, effect: timed.effect, input: timed.input });
       this.sites.set(seq, { kind: "open", call: timed });
       await this.mode.world.beforeExternal();
@@ -586,6 +600,7 @@ class Engine {
   }
 
   reply(response) {
+    if (PROGRAM.model.window !== null) return attemptOutcome(response);
     if (PROGRAM.model.declared) return modelOutcome(response);
     try {
       return fromJson({ sum: SUM_REPLY }, response);

@@ -213,6 +213,59 @@ pub fn model_outcome(program: &Program, response: &Json) -> Value {
     }
 }
 
+pub fn usage_over(response: &Json, window: u64) -> Option<String> {
+    let Json::Object(map) = response else {
+        return None;
+    };
+    let Some(Json::Array(fields)) = map.get(ir::ATTEMPT_VARIANTS[ir::ATTEMPT_OK]) else {
+        return None;
+    };
+    ir::USAGE_FIELDS
+        .iter()
+        .enumerate()
+        .find_map(|(index, name)| {
+            let used = fields.get(ir::ATTEMPT_USAGE + index)?.as_u64()?;
+            (used > window).then(|| {
+                format!(
+                    "model reply: {name} usage of {used} tokens exceeds the window of {window} tokens"
+                )
+            })
+        })
+}
+
+pub fn without_retry_after(response: &Json) -> Json {
+    let Json::Object(map) = response else {
+        return response.clone();
+    };
+    let delayed = [ir::ATTEMPT_THROTTLED, ir::ATTEMPT_TRANSIENT]
+        .map(|variant| ir::ATTEMPT_VARIANTS[variant]);
+    let mut out = map.clone();
+    for name in delayed {
+        if let Some(Json::Array(fields)) = out.get_mut(name)
+            && let Some(slot) = fields.get_mut(ir::ATTEMPT_RETRY_AFTER)
+        {
+            *slot = Json::Number(0);
+        }
+    }
+    Json::Object(out)
+}
+
+pub fn attempt(program: &Program, response: &Json, usage_checked: bool) -> Value {
+    let window = program
+        .model
+        .as_ref()
+        .and_then(|model| model.window.as_ref())
+        .expect("an attempt belongs to a model with a window");
+    let rejected = |error: String| Value::Variant(ir::ATTEMPT_REJECTED, vec![Value::Text(error)]);
+    match from_json(program, &Type::Sum(window.attempt), response) {
+        Err(error) => rejected(format!("model reply: {error}")),
+        Ok(value) => match usage_over(response, window.tokens.value) {
+            Some(error) if usage_checked => rejected(error),
+            _ => value,
+        },
+    }
+}
+
 pub fn returned(program: &Program, returns: &Type) -> String {
     match program.text_enum(returns) {
         Some(sum) => format!("a value of {}", sum.name),

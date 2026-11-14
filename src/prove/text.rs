@@ -88,7 +88,15 @@ impl<'a> Names<'a> {
                 self.operand(right)
             ),
             Expr::Not(operand) => format!("not {}", self.operand(operand)),
-            Expr::Len(operand) => format!("len({})", self.expr(operand)),
+            Expr::Len(operand) | Expr::TextLen(operand) => format!("len({})", self.expr(operand)),
+            Expr::Truncate { text, tokens } => format!(
+                "truncate_middle({}, {})",
+                self.expr(text),
+                self.program.constants[*tokens].name
+            ),
+            Expr::With { list, entry } => {
+                format!("{} with {}", self.operand(list), self.operand(entry))
+            }
             Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
         }
     }

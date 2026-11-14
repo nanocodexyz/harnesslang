@@ -249,7 +249,11 @@ fn arithmetic(value: &Expr) -> bool {
                 || arithmetic(left)
                 || arithmetic(right)
         }
-        Expr::Not(operand) | Expr::Len(operand) => arithmetic(operand),
+        Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand)
+        | Expr::Truncate { text: operand, .. } => arithmetic(operand),
+        Expr::With { list, entry } => arithmetic(list) || arithmetic(entry),
         Expr::Member { base, .. } => arithmetic(base),
         Expr::Construct { fields, .. } => fields.iter().any(arithmetic),
         Expr::U64(_)
@@ -426,11 +430,16 @@ impl Lowering<'_> {
                 let name = &self.program.state[*field].name;
                 ops.push(self.trap(format!("push onto {name}")));
             }
-            Stmt::Shrink { kept, .. } => {
-                if let Kept::Last(count) = kept {
+            Stmt::Shrink { field, kept } => match kept {
+                Kept::Nothing => {}
+                Kept::Last(count) => self.arithmetic_trap(count, ops),
+                Kept::LastAfter { count, first } => {
                     self.arithmetic_trap(count, ops);
+                    self.arithmetic_trap(first, ops);
+                    let name = &self.program.state[*field].name;
+                    ops.push(self.trap(format!("keep {name} after a first entry")));
                 }
-            }
+            },
             Stmt::If {
                 condition,
                 then,
@@ -492,6 +501,10 @@ impl Lowering<'_> {
             Stmt::Parallel(parallel) => self.parallel(parallel, ops),
             Stmt::Effect { site, args, .. } => {
                 args.iter().for_each(|arg| self.arithmetic_trap(arg, ops));
+                if let SiteKind::Wait(cap) = self.handler.sites[*site].kind {
+                    let cap = &self.program.constants[cap].name;
+                    ops.push(self.trap(format!("a wait past {cap}")));
+                }
                 ops.extend(self.effect(*site, args));
                 if self.handler.sites[*site].traps_on_decode() {
                     ops.push(self.trap(format!(

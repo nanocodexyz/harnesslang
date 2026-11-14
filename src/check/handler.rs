@@ -341,15 +341,23 @@ impl Checker<'_> {
                 });
                 Ok(false)
             }
-            ast::Stmt::Keep { list, count, .. } => {
-                let (field, _) = self.list_field(list, "keep the end of")?;
+            ast::Stmt::Keep {
+                list, count, first, ..
+            } => {
+                let (field, element) = self.list_field(list, "keep the end of")?;
                 let at = count.at();
                 let (count, ty) = self.expr(count, Some(&Type::U64), out)?;
                 self.expect(at, &Type::U64, &ty)?;
-                out.push(Stmt::Shrink {
-                    field,
-                    kept: Kept::Last(count),
-                });
+                let kept = match first {
+                    None => Kept::Last(count),
+                    Some(first) => {
+                        let at = first.at();
+                        let (first, ty) = self.expr(first, Some(&element), out)?;
+                        self.expect(at, &element, &ty)?;
+                        Kept::LastAfter { count, first }
+                    }
+                };
+                out.push(Stmt::Shrink { field, kept });
                 Ok(false)
             }
             ast::Stmt::If {
@@ -571,19 +579,50 @@ impl Checker<'_> {
     }
 
     fn parallel_push(&self, statement: &ast::Stmt) -> Checked<()> {
-        let ast::Stmt::Push { value, .. } = statement else {
-            return parallel_error(statement, "the arms of a parallel for only push");
+        let values: Vec<&ast::Expr> = match statement {
+            ast::Stmt::Push { value, .. }
+            | ast::Stmt::Let { value, .. }
+            | ast::Stmt::Assign { value, .. } => vec![value],
+            ast::Stmt::If {
+                condition,
+                then,
+                otherwise,
+                ..
+            } => {
+                for nested in then
+                    .statements
+                    .iter()
+                    .chain(otherwise.iter().flat_map(|block| &block.statements))
+                {
+                    self.parallel_push(nested)?;
+                }
+                vec![condition]
+            }
+            _ => {
+                return parallel_error(
+                    statement,
+                    "the arms of a parallel for only push, bind and assign",
+                );
+            }
         };
-        match self.effect_in(value) {
-            Some(callee) => error(
-                callee.at,
-                format!(
-                    "a push in a parallel for runs no effect: found a call of '{}'",
-                    callee.text
-                ),
-            ),
-            None => Ok(()),
+        for value in values {
+            if let Some(callee) = self.effect_in(value) {
+                return error(
+                    callee.at,
+                    format!(
+                        "an arm of a parallel for runs no effect: found a call of '{}'",
+                        callee.text
+                    ),
+                );
+            }
+            if let Some(read) = event_read(value) {
+                return error(
+                    read.at(),
+                    "an arm of a parallel for reads no events: read them before or after the batch",
+                );
+            }
         }
+        Ok(())
     }
 
     fn effect_in<'e>(&self, value: &'e ast::Expr) -> Option<&'e ast::Name> {
@@ -592,9 +631,12 @@ impl Checker<'_> {
             ast::Expr::Name(_) | ast::Expr::Take { .. } => None,
             ast::Expr::Member { base, .. } => self.effect_in(base),
             ast::Expr::Not { operand, .. } => self.effect_in(operand),
-            ast::Expr::Binary { left, right, .. } => {
-                self.effect_in(left).or_else(|| self.effect_in(right))
-            }
+            ast::Expr::Binary { left, right, .. }
+            | ast::Expr::With {
+                list: left,
+                entry: right,
+                ..
+            } => self.effect_in(left).or_else(|| self.effect_in(right)),
             ast::Expr::Call { callee, args } => {
                 let effect = self.globals.tools.contains_key(&callee.text)
                     || self.globals.model.as_deref() == Some(callee.text.as_str())
@@ -798,33 +840,116 @@ impl Checker<'_> {
         args: &[ast::Expr],
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
-        let [ast::Expr::Name(name)] = args else {
-            return match args {
-                [other] => error(
+        let (duration, cap) = match args {
+            [ast::Expr::Name(name)] => (None, name),
+            [duration, ast::Expr::Name(cap)] => (Some(duration), cap),
+            [other] => {
+                return error(
                     other.at(),
-                    "the duration of 'wait' must be a named constant in milliseconds",
-                ),
-                _ => error(
+                    "the duration of 'wait' must be a named constant in milliseconds, or bounded by one: wait(duration) at most constant",
+                );
+            }
+            _ => {
+                return error(
                     at,
                     format!("wait takes 1 argument(s), found {}", args.len()),
-                ),
-            };
+                );
+            }
         };
-        let Some(&constant) = self.globals.constants.get(&name.text) else {
+        let Some(&constant) = self.globals.constants.get(&cap.text) else {
+            let what = if duration.is_some() {
+                "the most a wait sleeps"
+            } else {
+                "the duration of 'wait'"
+            };
             return error(
-                name.at,
+                cap.at,
                 format!(
-                    "the duration of 'wait' must be a named constant in milliseconds: '{}' is not a constant",
-                    name.text
+                    "{what} must be a named constant in milliseconds: '{}' is not a constant",
+                    cap.text
                 ),
             );
+        };
+        let duration = match duration {
+            None => Expr::Constant(constant),
+            Some(duration) => {
+                let duration_at = duration.at();
+                let (value, ty) = self.expr(duration, Some(&Type::U64), out)?;
+                self.expect(duration_at, &Type::U64, &ty)?;
+                value
+            }
         };
         Ok(self.site(
             SiteKind::Wait(constant),
             SiteClass::Fixed(EffectClass::None),
             Type::U64,
-            Vec::new(),
+            vec![duration],
             out,
+        ))
+    }
+
+    fn truncate(
+        &mut self,
+        at: Position,
+        args: &[ast::Expr],
+        out: &mut Vec<Stmt>,
+    ) -> Checked<(Expr, Type)> {
+        let [subject, tokens] = args else {
+            return error(
+                at,
+                format!(
+                    "truncate_middle takes 2 argument(s), found {}",
+                    args.len()
+                ),
+            );
+        };
+        let constant = match tokens {
+            ast::Expr::Name(name) => self.globals.constants.get(&name.text).copied(),
+            _ => None,
+        };
+        let Some(constant) = constant else {
+            return error(
+                tokens.at(),
+                "the tokens truncate_middle keeps must be a named constant",
+            );
+        };
+        let units = ir::truncated_units_max(self.program.constants[constant].value);
+        if units.is_none() {
+            return error(
+                tokens.at(),
+                format!(
+                    "truncate_middle keeps {} tokens, whose text bound passes u64",
+                    self.program.constants[constant].value
+                ),
+            );
+        }
+        let subject_at = subject.at();
+        let (value, ty) = self.expr(subject, Some(&Type::Text), out)?;
+        self.expect(subject_at, &Type::Text, &ty)?;
+        Ok((
+            Expr::Truncate {
+                text: Box::new(value),
+                tokens: constant,
+            },
+            Type::Text,
+        ))
+    }
+
+    fn context(&mut self, context: &ast::Expr, out: &mut Vec<Stmt>) -> Checked<(Expr, Type)> {
+        let ast::Expr::With { list, entry, .. } = context else {
+            return self.expr(context, None, out);
+        };
+        let (list, ty) = self.expr(list, None, out)?;
+        let entry_type = Type::Sum(ir::ENTRY);
+        let entry_at = entry.at();
+        let (entry, found) = self.expr(entry, Some(&entry_type), out)?;
+        self.expect(entry_at, &entry_type, &found)?;
+        Ok((
+            Expr::With {
+                list: Box::new(list),
+                entry: Box::new(entry),
+            },
+            ty,
         ))
     }
 
@@ -918,7 +1043,7 @@ impl Checker<'_> {
                 );
             };
             let context_at = context.at();
-            let (value, ty) = self.expr(context, None, out)?;
+            let (value, ty) = self.context(context, out)?;
             let is_context =
                 matches!(&ty, Type::List { element, .. } if **element == Type::Sum(ir::ENTRY));
             if !is_context {
@@ -948,18 +1073,20 @@ impl Checker<'_> {
         match callee.text.as_str() {
             "len" => {
                 let [list] = args else {
-                    return error(at, "len takes one list");
+                    return error(at, "len takes one list or text");
                 };
                 let list_at = list.at();
                 let (value, ty) = self.expr(list, None, out)?;
-                if !matches!(ty, Type::List { .. }) {
-                    return error(
+                match ty {
+                    Type::List { .. } => Ok((Expr::Len(Box::new(value)), Type::U64)),
+                    Type::Text => Ok((Expr::TextLen(Box::new(value)), Type::U64)),
+                    _ => error(
                         list_at,
-                        format!("len takes a list, found {}", self.type_name(&ty)),
-                    );
+                        format!("len takes a list or text, found {}", self.type_name(&ty)),
+                    ),
                 }
-                Ok((Expr::Len(Box::new(value)), Type::U64))
             }
+            "truncate_middle" => self.truncate(at, args, out),
             "dispatch" => {
                 let args = self.args(at, "dispatch", args, &[Type::Sum(ir::CALL)], out)?;
                 Ok(self.site(
@@ -1132,6 +1259,10 @@ impl Checker<'_> {
                 Ok((Expr::Not(Box::new(operand)), Type::Bool))
             }
             ast::Expr::Take { at, events } => self.take(*at, events, out),
+            ast::Expr::With { at, .. } => error(
+                *at,
+                "'with' adds an entry to the context a model call reads: it is only a model call's argument",
+            ),
         }
     }
 
@@ -1308,10 +1439,31 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
 
 fn pushes_only(statements: &[Stmt]) -> bool {
     statements.iter().all(|statement| match statement {
-        Stmt::Push { .. } => true,
+        Stmt::Push { .. } | Stmt::Let { .. } | Stmt::Assign { .. } => true,
+        Stmt::If {
+            then, otherwise, ..
+        } => pushes_only(then) && pushes_only(otherwise),
         Stmt::Match { arms, .. } => arms.iter().all(|arm| pushes_only(&arm.body)),
         _ => false,
     })
+}
+
+fn event_read(value: &ast::Expr) -> Option<&ast::Expr> {
+    match value {
+        ast::Expr::Take { .. } => Some(value),
+        ast::Expr::Name(name) if name.text == CANCELLED_READ => Some(value),
+        ast::Expr::Number(..) | ast::Expr::Text(..) | ast::Expr::Bool(..) | ast::Expr::Name(_) => {
+            None
+        }
+        ast::Expr::Member { base, .. } | ast::Expr::Not { operand: base, .. } => event_read(base),
+        ast::Expr::Binary { left, right, .. }
+        | ast::Expr::With {
+            list: left,
+            entry: right,
+            ..
+        } => event_read(left).or_else(|| event_read(right)),
+        ast::Expr::Call { args, .. } => args.iter().find_map(event_read),
+    }
 }
 
 pub(super) fn statement_at(statement: &ast::Stmt) -> Position {

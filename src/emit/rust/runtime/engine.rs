@@ -1537,6 +1537,97 @@ pub fn push<T>(list: &mut Vec<T>, value: T, capacity: u64, field: &str) -> Resul
     Ok(())
 }
 
+pub fn keep_last_after<T>(list: &mut Vec<T>, count: u64, first: T, capacity: u64, field: &str) -> Result<(), Halt> {
+    let length = list.len() as u64;
+    let kept = count.min(length);
+    if kept >= capacity {
+        return Err(Halt::Trap(format!("bound({field})")));
+    }
+    let dropped = usize::try_from(length - kept).expect("a list's length fits usize");
+    list.drain(..dropped);
+    list.insert(0, first);
+    assert_eq!(
+        list.len() as u64,
+        kept + 1,
+        "keep after leaves the first entry and at most the last count entries"
+    );
+    Ok(())
+}
+
+pub fn with_entry<T>(list: Vec<T>, entry: T) -> Vec<T> {
+    let mut items = list;
+    items.push(entry);
+    items
+}
+
+pub fn wait_capped(ms: u64, cap: u64, name: &str) -> Result<u64, Halt> {
+    if ms > cap {
+        return Err(Halt::Trap(format!("bound({name})")));
+    }
+    Ok(ms)
+}
+
+pub const UTF16_UNITS_PER_TOKEN: u64 = 4;
+pub const TRUNCATION_OPEN: &str = "\u{2026}";
+pub const TRUNCATION_CLOSE: &str = " tokens truncated\u{2026}";
+
+pub fn utf16_len(text: &str) -> u64 {
+    text.encode_utf16().count() as u64
+}
+
+pub fn truncate_middle(text: &str, tokens_max: u64) -> String {
+    let total = utf16_len(text).div_ceil(UTF16_UNITS_PER_TOKEN);
+    if total <= tokens_max {
+        return text.to_owned();
+    }
+    let side = tokens_max.saturating_mul(UTF16_UNITS_PER_TOKEN / 2);
+    let mut units = 0_u64;
+    let head = text
+        .char_indices()
+        .find(|(_, character)| {
+            units += character.len_utf16() as u64;
+            units > side
+        })
+        .map_or(text.len(), |(end, _)| end);
+    units = 0;
+    let tail = text
+        .char_indices()
+        .rev()
+        .find(|(_, character)| {
+            units += character.len_utf16() as u64;
+            units > side
+        })
+        .map_or(0, |(start, character)| start + character.len_utf8())
+        .max(head);
+    format!("{}{TRUNCATION_OPEN}{}{TRUNCATION_CLOSE}{}", &text[..head], total - tokens_max, &text[tail..])
+}
+
+pub const ATTEMPT_OK: &str = "ok";
+pub const USAGE_FIELDS: [&str; 4] = ["input", "output", "cache_read", "cache_write"];
+pub const ATTEMPT_USAGE: usize = 2;
+
+pub fn usage_over(response: &Json, window: u64) -> Option<String> {
+    let Json::Object(map) = response else { return None };
+    let Some(Json::Array(fields)) = map.get(ATTEMPT_OK) else { return None };
+    USAGE_FIELDS.iter().enumerate().find_map(|(index, name)| {
+        let used = fields.get(ATTEMPT_USAGE + index)?.as_u64()?;
+        (used > window).then(|| format!("model reply: {name} usage of {used} tokens exceeds the window of {window} tokens"))
+    })
+}
+
+pub fn attempt_reply<T>(answer: Answer, parse: fn(&Json) -> Result<T, String>, window: u64, rejected: fn(String) -> T) -> T {
+    match answer {
+        Answer::Reply(response) => match parse(&response) {
+            Err(error) => rejected(format!("model reply: {error}")),
+            Ok(attempt) => match usage_over(&response, window) {
+                Some(error) => rejected(error),
+                None => attempt,
+            },
+        },
+        Answer::Output(_) | Answer::Unknown => panic!("a model site gets a reply"),
+    }
+}
+
 pub fn keep_last<T>(list: &mut Vec<T>, count: u64) {
     let length = list.len() as u64;
     if count >= length {

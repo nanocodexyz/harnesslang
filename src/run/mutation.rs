@@ -52,10 +52,13 @@ pub enum Mutation {
     WaitUnjournaled,
     WaitRerunSkips,
     WaitOversleeps,
+    RetryAfterUnjournaled,
+    TruncateUncut,
+    UsageUnchecked,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 53] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -106,6 +109,9 @@ impl Mutation {
         Self::WaitUnjournaled,
         Self::WaitRerunSkips,
         Self::WaitOversleeps,
+        Self::RetryAfterUnjournaled,
+        Self::TruncateUncut,
+        Self::UsageUnchecked,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -160,6 +166,9 @@ impl Mutation {
             Self::WaitUnjournaled => "wait_unjournaled",
             Self::WaitRerunSkips => "wait_rerun_skips",
             Self::WaitOversleeps => "wait_oversleeps",
+            Self::RetryAfterUnjournaled => "retry_after_unjournaled",
+            Self::TruncateUncut => "truncate_uncut",
+            Self::UsageUnchecked => "usage_unchecked",
         }
     }
 
@@ -224,7 +233,10 @@ impl Mutation {
             | Self::ResumeUnmatched
             | Self::WaitUnjournaled
             | Self::WaitRerunSkips
-            | Self::WaitOversleeps => all,
+            | Self::WaitOversleeps
+            | Self::RetryAfterUnjournaled
+            | Self::TruncateUncut
+            | Self::UsageUnchecked => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

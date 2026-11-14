@@ -11,7 +11,15 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 6] = ["dispatch", "now", "random", "len", "wait", "suspend"];
+pub const BUILTIN_FUNCTIONS: [&str; 7] = [
+    "dispatch",
+    "now",
+    "random",
+    "len",
+    "wait",
+    "suspend",
+    "truncate_middle",
+];
 pub const WILDCARD: &str = "_";
 pub const EVENT_CANCEL: &str = "cancel";
 pub const EVENT_STEER: &str = "steer";
@@ -58,6 +66,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
         invariants: Vec::new(),
         handlers: Vec::new(),
         events: ir::Events::default(),
+        cuts: Vec::new(),
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -80,6 +89,7 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
     invariants(&expanded, &mut program, &globals)?;
     handlers(&expanded, &mut program, &globals)?;
+    program.cuts = program.find_cuts();
     ir::validate::program(&program);
     Ok(program)
 }
@@ -176,6 +186,7 @@ fn model(
             name: model.name.text.clone(),
             calls,
             reply: ir::Reply::Builtin,
+            window: None,
         });
     }
     Ok(())
@@ -247,6 +258,60 @@ fn builtin_sums(program: &ir::Program, declared: Option<&str>) -> Vec<Sum> {
     vec![call, reply, entry]
 }
 
+fn declared_window(source: &ast::Program) -> Option<&ast::Name> {
+    source.items.iter().find_map(|item| match item {
+        Item::Model(model) => model.window.as_ref(),
+        _ => None,
+    })
+}
+
+fn window(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &mut Globals,
+) -> Checked<()> {
+    let Some(name) = declared_window(source) else {
+        return Ok(());
+    };
+    let tokens = bound(program, globals, name, "the model's context window")?;
+    if tokens.value == 0 {
+        return error(
+            name.at,
+            format!("the model's context window '{}' is 0 tokens", name.text),
+        );
+    }
+    let stop = program.sums.len();
+    program.sums.push(Sum {
+        name: ir::STOP_TYPE.to_owned(),
+        kind: SumKind::Text,
+        variants: ir::STOP_VALUES
+            .iter()
+            .map(|value| Variant {
+                name: (*value).to_owned(),
+                fields: Vec::new(),
+            })
+            .collect(),
+    });
+    let attempt = program.sums.len();
+    program.sums.push(Sum {
+        name: ir::ATTEMPT_TYPE.to_owned(),
+        kind: SumKind::Tagged,
+        variants: ir::attempt_variants(stop),
+    });
+    globals.types.insert(ir::STOP_TYPE.to_owned(), stop);
+    globals.types.insert(ir::ATTEMPT_TYPE.to_owned(), attempt);
+    program
+        .model
+        .as_mut()
+        .expect("a window belongs to the model")
+        .window = Some(ir::Window {
+        tokens,
+        stop,
+        attempt,
+    });
+    Ok(())
+}
+
 fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals) -> Checked<()> {
     let reply = declared_reply(source);
     program.sums = builtin_sums(program, reply.map(|name| name.text.as_str()));
@@ -255,6 +320,7 @@ fn sums(source: &ast::Program, program: &mut ir::Program, globals: &mut Globals)
             globals.types.insert((*name).to_owned(), id);
         }
     }
+    window(source, program, globals)?;
     let mut declared = Vec::new();
     for item in &source.items {
         let Item::Type(definition) = item else {
