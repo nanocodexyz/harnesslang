@@ -482,7 +482,7 @@ Symbols: `{` `}` `(` `)` `<` `<=` `>` `>=` `,` `:` `=` `==` `!=` `->` `=>` `+` `
 
 Keywords, which cannot be used as names:
 
-Keywords: `harness` `const` `type` `tool` `model` `state` `on` `let` `push` `if` `else` `match` `loop` `for` `return` `true` `false` `and` `or` `not` `list` `effect` `invariant` `requires`
+Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `push` `if` `else` `match` `loop` `for` `return` `true` `false` `and` `or` `not` `list` `effect` `invariant` `requires`
 
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
@@ -533,12 +533,13 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | model | state | invariant | handler ;
+item       = const | type | tool | code | model | state | invariant | handler ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" variant { "|" variant } ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name params "->" type_expr "effect" effect_class ;
 effect_class = "none" | "idempotent" | "external" ;
+code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
 model      = "model" name "calls" bound ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
@@ -1281,12 +1282,17 @@ and the kill -9 drill of generated code.
 
 `check`, `prove` and `sim` exit 1 when something fails and 2 on a usage error.
 
-## Code mode (in progress)
+## Code mode
 
 Code mode lets the model answer with a JavaScript cell that calls the
 harness's tools as nested calls, as nanocode's Code Mode does. A `code`
-declaration names the tool, the tools a cell may call and the engine's
-limits; a nested external call is journaled with the cell's header before it
-runs and is never dispatched twice. It is specified in
-[CODE_MODE.md](CODE_MODE.md) and being built; the parser does not accept
-`code` yet, so this reference does not document it.
+declaration names the tool, the tools a cell may call (`tools`, a comma
+separated list) and the engine's limits, each a named constant: `calls`,
+`parallel`, `timers`, `timer_ms`, `journal_bytes` and `yield_ms`, in any order,
+each once. The checker requires a model, a non-empty set of declared tools that
+are not code tools, `parallel` at least 1 and at most `calls`. Calling the tool
+(`exec(script)`) or reaching it through `dispatch` yields `maybe<text>`:
+`unknown` only when the cell could not be resumed. A nested external call is
+journaled and flushed with the cell's header before it runs and is never
+dispatched twice. `examples/code_agent.hl` is a complete harness, and
+[CODE_MODE.md](CODE_MODE.md) the whole design.

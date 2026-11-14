@@ -285,7 +285,6 @@ pub fn describe(model: &Model) -> String {
         model.atomic,
         model.others
     )];
-    lines.push(format!("  cells run in: {}", model.cells.describe()));
     let limits = [
         ("memory", model.limits.memory),
         (
