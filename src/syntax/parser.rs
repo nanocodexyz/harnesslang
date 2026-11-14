@@ -1,8 +1,8 @@
 use crate::effect::EffectClass;
 use crate::syntax::ast::{
-    Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Function, Handler, Hook, HookKind,
-    Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State, Stmt, Tool,
-    TypeBody, TypeDef, TypeExpr, VariantDef,
+    Arm, BinaryOp, Block, Code, CodeField, Const, Event, Expr, Fork, Function, Handler, Hook,
+    HookKind, Idle, Invariant, Item, Listing, Model, Name, Param, Pattern, Program, Spawn, State,
+    Stmt, Tool, TypeBody, TypeDef, TypeExpr, VariantDef,
 };
 use crate::syntax::lexer::{Lexeme, Symbol, Token};
 use crate::syntax::{Diagnostic, Position};
@@ -39,7 +39,7 @@ pub const KEYWORDS: [&str; 27] = [
     "requires",
 ];
 
-const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'code', 'spawn', 'model', 'state', 'invariant', 'fn', 'before', 'after' or 'on'";
+const ITEMS: &str = "'const', 'type', 'tool', 'tools', 'code', 'spawn', 'fork', 'model', 'state', 'invariant', 'fn', 'before', 'after' or 'on'";
 pub const SESSION_END_HANDLER: &str = "session_end";
 pub const CODE_TOOLS_FIELD: &str = "tools";
 pub const WAIT_BUILTIN: &str = "wait";
@@ -185,6 +185,7 @@ impl<'a> Parser<'a> {
             "invariant" => self.invariant().map(Item::Invariant),
             "fn" => self.function().map(Item::Function),
             "spawn" => self.spawn().map(Item::Spawn),
+            "fork" => self.fork().map(Item::Fork),
             "before" | "after" => self.tool_hook().map(Item::Hook),
             "on" => self.handler_or_event(),
             _ => Err(self.unexpected(ITEMS)),
@@ -484,6 +485,14 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn fork(&mut self) -> Parsed<Fork> {
+        self.word("fork")?;
+        let name = self.name("a fork tool name")?;
+        self.word("at")?;
+        let at = self.name("'latest' or 'turn', the boundary a fork starts from")?;
+        Ok(Fork { name, at })
+    }
+
     fn tool_hook(&mut self) -> Parsed<Hook> {
         let at = self.at();
         let kind = if self.is_word("before") {
@@ -540,7 +549,10 @@ impl<'a> Parser<'a> {
         }
         let Some(kind) = HookKind::ALL.into_iter().find(|kind| {
             let (one, two) = kind.words();
-            !kind.denies() && one == first && second.as_deref() == (!two.is_empty()).then_some(two)
+            !kind.denies()
+                && *kind != HookKind::Forked
+                && one == first
+                && second.as_deref() == (!two.is_empty()).then_some(two)
         }) else {
             return Ok(None);
         };
@@ -575,6 +587,9 @@ impl<'a> Parser<'a> {
             HookKind::BeforeTool | HookKind::AfterTool => {
                 panic!("a tool hook starts with before or after, not on")
             }
+            HookKind::Forked => {
+                panic!("on forked takes parameters, so it parses as a handler does")
+            }
         }
         let params = if self.is_symbol(Symbol::LeftParen) {
             self.params()?
@@ -599,6 +614,9 @@ impl<'a> Parser<'a> {
             let mut handler = self.handler(name, params)?;
             handler.side = true;
             return Ok(Item::Handler(handler));
+        }
+        if self.is_word("forked") && self.peek_second() == &Token::Symbol(Symbol::LeftParen) {
+            return self.forked();
         }
         if let Some(item) = self.lifecycle()? {
             return Ok(item);
@@ -626,6 +644,26 @@ impl<'a> Parser<'a> {
             name,
             params,
             bound: Some(bound),
+        }))
+    }
+
+    fn forked(&mut self) -> Parsed<Item> {
+        let at = self.at();
+        self.word("forked")?;
+        let params = self.params()?;
+        if self.is_symbol(Symbol::Arrow) {
+            let name = Name {
+                text: HookKind::Forked.words().0.to_owned(),
+                at,
+            };
+            return self.handler(name, params).map(Item::Handler);
+        }
+        let body = self.block()?;
+        Ok(Item::Hook(Hook {
+            kind: HookKind::Forked,
+            at,
+            params,
+            body,
         }))
     }
 

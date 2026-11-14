@@ -1,4 +1,5 @@
 mod blobs;
+mod fork;
 mod handlers;
 mod sql;
 mod types;
@@ -17,6 +18,7 @@ const RUNTIME_ENGINE: &str = include_str!("runtime/engine.rs");
 const RUNTIME_BLOB: &str = include_str!("runtime/blob.rs");
 const RUNTIME_CELL: &str = include_str!("runtime/cell.rs");
 const RUNTIME_JSONL: &str = include_str!("runtime/jsonl.rs");
+const RUNTIME_FORK: &str = include_str!("runtime/fork.rs");
 const SHARED_CELL_JOURNAL: &str = include_str!("../../run/cell_journal.rs");
 const SHARED_IMPORTS: [&str; 3] = ["use std::", "use crate::run::", "use crate::effect::"];
 const SHARED_PATHS: [&str; 1] = ["crate::run::journal::"];
@@ -44,6 +46,7 @@ pub fn emit(program: &Program, target: Target) -> Result<String, String> {
     out.push_str(RUNTIME_BLOB);
     out.push_str(&shared_source(SHARED_CELL_JOURNAL));
     out.push_str(RUNTIME_CELL);
+    out.push_str(RUNTIME_FORK);
     match target {
         Target::NativeJsonl => out.push_str(RUNTIME_JSONL),
         Target::NativeSqlite | Target::ServerPostgres => out.push_str(&sql::store(target)?),
@@ -252,6 +255,7 @@ fn generate(program: &Program, target: Target) -> String {
     for handler in program.handlers.iter().chain(&program.sides) {
         handler_function(&mut out, program, handler, &mut types);
     }
+    fork::emit(&mut out, program, &mut types);
     types.emit_codecs(&mut out);
     out
 }

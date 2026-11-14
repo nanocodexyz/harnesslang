@@ -41,6 +41,8 @@ plant_expression() {
     interrupt_ignored) echo 's/let interrupted = self.drain_interrupting(interrupts)? \&\& !preempted;/let interrupted = self.drain_interrupting(interrupts)? \&\& false;/' ;;
     recover_skipped) echo 's/let recovered = if program::recoverable(&call.tool) {/let recovered = if false {/' ;;
     job_lost_dropped) echo 's/        .map(|key| lost_delivery(key))$/        .filter(|_| false).map(|key| lost_delivery(key))/' ;;
+    fork_hook_skipped) echo 's/program::run_forked(\&mut state, origin.to_owned(), discarded)/Ok::<(), Halt>(())/' ;;
+    fork_entry_ignored) echo 's/let entry = \*revision == ENTRY_REVISION \&\& session.turns.is_empty() \&\& session.start == Start::Beginning;/let entry = *revision == ENTRY_REVISION \&\& session.turns.is_empty() \&\& session.start == Start::Beginning; if entry { return Ok(()); }/' ;;
     *) echo "rust-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }

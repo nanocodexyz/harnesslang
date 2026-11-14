@@ -75,7 +75,9 @@ interrupt_ignored docs/snippets/in_flight.hl --twice interrupt_honored
 interrupt_reruns docs/snippets/in_flight.hl --twice external_once
 recover_trusts_lost docs/snippets/in_flight.hl --twice external_once
 job_lost_dropped docs/snippets/in_flight.hl --twice job_reported 0..1000
-job_lost_all docs/snippets/in_flight.hl --twice job_once"
+job_lost_all docs/snippets/in_flight.hl --twice job_once
+fork_live_state docs/snippets/fork.hl --twice fork_state_equal
+fork_hook_skipped docs/snippets/fork.hl --twice fork_state_equal"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
@@ -107,7 +109,10 @@ rust recover_skipped docs/snippets/in_flight.hl native-jsonl,native-sqlite,serve
 rust job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js interrupt_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 js recover_reply_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
-js job_unopened docs/snippets/in_flight.hl cloudflare,vercel backend_equal"
+js job_unopened docs/snippets/in_flight.hl cloudflare,vercel backend_equal
+rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust fork_entry_ignored docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js fork_hook_skipped docs/snippets/fork.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 

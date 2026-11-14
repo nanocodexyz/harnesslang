@@ -181,6 +181,7 @@ pub struct Program {
     pub notice: Option<VariantId>,
     pub blobs: Option<Blobs>,
     pub idle: Option<Idle>,
+    pub forked: Option<Handler>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -313,6 +314,12 @@ impl Program {
     pub fn kind_of(&self, handler: &Handler) -> &'static str {
         if self.side(&handler.name).is_some() {
             "side handler"
+        } else if self
+            .forked
+            .as_ref()
+            .is_some_and(|forked| std::ptr::eq(forked, handler))
+        {
+            "hook"
         } else {
             "handler"
         }
@@ -334,6 +341,18 @@ impl Program {
     pub fn spawn_of(&self, tool: &str) -> Option<&Spawn> {
         self.tool(tool)
             .and_then(|(_, declared)| declared.spawn.as_ref())
+    }
+
+    pub fn fork_of(&self, tool: &str) -> Option<ForkAt> {
+        self.tool(tool).and_then(|(_, declared)| declared.fork)
+    }
+
+    pub fn forks(&self) -> bool {
+        self.tools.iter().any(|tool| tool.fork.is_some())
+    }
+
+    pub fn starts_sessions(&self, tool: &Tool) -> bool {
+        tool.spawn.is_some() || tool.fork.is_some()
     }
 
     pub fn spawns(&self) -> impl Iterator<Item = (&Tool, &Spawn)> {
@@ -494,7 +513,34 @@ pub struct Tool {
     pub interrupts: Interrupts,
     pub jobs: Option<Bound>,
     pub spawn: Option<Spawn>,
+    pub fork: Option<ForkAt>,
     pub finds: Option<ListingId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkAt {
+    Latest,
+    Turn,
+}
+
+impl ForkAt {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Turn => "turn",
+        }
+    }
+}
+
+pub const FORKED_HOST_KEY: &str = "forked";
+pub const FORKED_HOOK: &str = "forked";
+pub const FORK_TURN: &str = "turn";
+pub const FORK_ORIGIN: &str = "origin";
+pub const FORK_DISCARDED: &str = "discarded";
+pub const FORK_STATE: &str = "state";
+
+pub fn fork_missing(turn: u64) -> String {
+    format!("no finished turn {turn} to fork from")
 }
 
 #[derive(Clone, Debug)]
@@ -1097,7 +1143,7 @@ impl Program {
 
     pub fn find_cuts(&self) -> Vec<u64> {
         let mut cuts = Vec::new();
-        for handler in self.handlers.iter().chain(&self.sides) {
+        for handler in self.handlers.iter().chain(&self.sides).chain(&self.forked) {
             block_cuts(&handler.body, &self.constants, &mut cuts);
         }
         cuts.sort_unstable();

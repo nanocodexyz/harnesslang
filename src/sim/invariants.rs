@@ -57,10 +57,11 @@ pub enum Invariant {
     InterruptHonored,
     JobOnce,
     JobReported,
+    ForkStateEqual,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -103,6 +104,7 @@ impl Invariant {
         Self::InterruptHonored,
         Self::JobOnce,
         Self::JobReported,
+        Self::ForkStateEqual,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -149,6 +151,7 @@ impl Invariant {
             Self::InterruptHonored => "interrupt_honored",
             Self::JobOnce => "job_once",
             Self::JobReported => "job_reported",
+            Self::ForkStateEqual => "fork_state_equal",
         }
     }
 }
@@ -1147,8 +1150,12 @@ fn tool_admitted(world: &SimWorld<'_>, records: &[Record]) -> Result<BTreeSet<St
     let (calls, admissions, results) = admissions(program, records);
     for (id, executions) in &world.executed {
         for executed in executions {
+            let input = match program.fork_of(&executed.tool) {
+                Some(at) => crate::run::fork::request_of(at, &executed.input),
+                None => executed.input.clone(),
+            };
             if let Some(params) = program.input_params(&executed.tool)
-                && let Err(error) = value::input_fits(program, params, &executed.input)
+                && let Err(error) = value::input_fits(program, params, &input)
             {
                 return violation(
                     Invariant::ToolAdmitted,
@@ -1215,7 +1222,11 @@ fn refused(
                 value::Input::Invalid(invalid) => Some(invalid),
                 value::Input::Untyped | value::Input::Typed(_) => None,
             },
-            _ => None,
+            input => program.fork_of(call.tool).and_then(|at| {
+                input.get(crate::ir::FORK_STATE).is_none().then(|| {
+                    crate::ir::fork_missing(crate::run::fork::requested(at, input).unwrap_or(0))
+                })
+            }),
         };
         let expected = invalid.or_else(|| {
             let (listing, name) = program.listed(call.tool)?;
@@ -1245,6 +1256,7 @@ fn canonical_key(record: &Record) -> (u64, u8, u64, u8) {
         Record::Event { turn, at, .. } => (*turn, 2, *at, 2),
         Record::Status { turn, .. } => (*turn, 3, 0, 0),
         Record::Checkpoint { revision, .. } => (*revision, 4, 0, 0),
+        Record::Host { .. } => (0, 0, 0, 0),
         Record::NestedCall { .. } | Record::NestedResult { .. } | Record::Cell { .. } => {
             panic!("the checker refuses parallel for in a harness with a code tool")
         }

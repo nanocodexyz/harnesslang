@@ -538,6 +538,9 @@ pub fn run_turn(
     if let Some(snapshot) = snapshot {
         engine = engine.with_snapshot(snapshot);
     }
+    if program.forks() {
+        engine = engine.with_fork_base(session.clone());
+    }
     for record in pending {
         engine.append(record);
     }

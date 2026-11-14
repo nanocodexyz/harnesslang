@@ -3,6 +3,7 @@ pub mod dump;
 pub mod events;
 pub mod exhaustive;
 pub mod faults;
+pub mod fork;
 pub mod idle;
 pub mod invariants;
 pub mod jobs;
@@ -251,6 +252,15 @@ fn run_seed_unguarded(
             world.stats.entry_states += 1;
         }
     }
+    let mut entry_lines = Vec::new();
+    if strict == strict::Mode::Off
+        && let Some(entry) = fork::forked_entry(program, &world.target, seed)
+    {
+        for record in &entry {
+            world.seed_entry(record);
+            entry_lines.push(Json::String(crate::run::journal::to_json(record).encode()));
+        }
+    }
     world.trace = trace;
     let profile_name = world.profile.name;
     world.record("seed", || {
@@ -262,6 +272,9 @@ fn run_seed_unguarded(
         ];
         if !scope.is_empty() {
             fields.push(("scope", Json::text(scope)));
+        }
+        if !entry_lines.is_empty() {
+            fields.push(("entry", Json::Array(entry_lines.clone())));
         }
         fields
     });
@@ -492,6 +505,7 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     };
     total.entry_states += more.entry_states;
     total.children += more.children;
+    total.forks += more.forks;
     total.joined += more.joined;
     total.child_crashes += more.child_crashes;
     total.side_questions += more.side_questions;
@@ -731,7 +745,11 @@ pub fn report(summary: &Summary, options: &Options, file: &str) -> String {
                 } else {
                     String::new()
                 }
-            ) + &if stats.side_questions > 0 {
+            ) + &if stats.forks > 0 {
+                format!(" forks={}", stats.forks)
+            } else {
+                String::new()
+            } + &if stats.side_questions > 0 {
                 format!(" side_questions={}", stats.side_questions)
             } else {
                 String::new()

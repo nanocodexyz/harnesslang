@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `end` `finds` `fn` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `runs` `session` `sessions` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `end` `finds` `fn` `fork` `forked` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `runs` `session` `sessions` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
 
 Builtin functions, whose names declarations may not take:
 
@@ -540,7 +540,7 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | code | spawn | model | state | invariant | function | hook | lifecycle | handler | side | event ;
+item       = const | type | tool | listing | code | spawn | fork | model | state | invariant | function | hook | lifecycle | handler | side | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
@@ -557,11 +557,13 @@ state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
 spawn      = "spawn" name "runs" name "from" text [ "sessions" "at" "most" name ] ;
+fork       = "fork" name "at" name ;
 hook       = ( "before" | "after" ) "tool" params block ;
 lifecycle  = "on" ( "session" "start" | "prompt" "submit" | "pre" "compact" | "post" "compact"
                   | "stop" | "subagent" "start" | "subagent" "stop" ) [ params ] block
            | "on" "session" "end" params "->" type_expr [ "requires" expr ] block
-           | "on" "idle" name params "at" name "bound" bound "->" type_expr [ "requires" expr ] block ;
+           | "on" "idle" name params "at" name "bound" bound "->" type_expr [ "requires" expr ] block
+           | "on" "forked" params block ;
 handler    = "on" name params "->" type_expr [ "requires" expr ] block ;
 side       = "on" "side" name params "->" type_expr [ "requires" expr ] block ;
 event      = "on" name [ params "bound" bound ] ;
@@ -4163,6 +4165,166 @@ replay: hl sim --target native-jsonl --seeds 0..1 --mutation side_journaled docs
 The differential runs carry them too: generated Rust and JavaScript answer
 every question the interpreter asks, mid-turn and between runs, with the same
 requests and answers.
+
+### Fork and rewind
+
+`fork name at latest` and `fork name at turn` declare a tool that starts a new
+session of the same harness from this session's state at a finished turn, as
+nanocode forks a conversation at a boundary and rewinds one into a new session.
+`at latest` takes no input and forks at the last finished turn; `at turn`
+takes `turn: u64`, a finished turn of this session or `0` for the entry
+state, so a fork at an earlier turn is a rewind. The tool is external like a
+spawn and its result is the child's key, the call's scoped `T.S`.
+
+The runtime fills the call's input before its call record is written:
+`{"discarded": D, "origin": KEY, "state": P, "turn": N}`, where `P` is the
+state after turn `N`, taken from the durable journal as a side question's
+snapshot is, then passed through `on forked`, and `D` counts the finished
+turns after `N`. A host needs only the input to write the child's first two
+records, a `forked` host record and the entry checkpoint:
+
+```text
+{"host":{"key":"forked","value":{"discarded":D,"origin":KEY,"turn":N}}}
+{"checkpoint":{"payload":P,"revision":0,"state":NAME}}
+```
+
+Every target's load takes such a journal and starts turn 1 from `P`. A turn
+that is neither `0` nor a finished turn is the call's `failed("no finished
+turn N to fork from")` and never reaches the host. The same function, a
+`fork_entry` over a session's records, a turn or `latest` and the origin,
+lets a host fork a session it holds without a tool call: the interpreter's
+`run::fork::fork_entry`, the generated Rust's `fork_entry(start, records, at,
+origin)`, which returns the two records or `ForkRefused`, and Vercel's
+`harness.fork(lines, at, origin)`. Vercel's `harnessSession` takes the
+forked lines as its third argument, and a Durable Object loads the two rows a
+host wrote before the first turn.
+
+`on forked(origin: text, discarded: u64) { ... }` shapes the state a fork
+starts from: it may assign, push, clear and keep, but runs no effect and does
+not return. `docs/snippets/fork.hl` keeps the parent's key and, on a rewind,
+adds nanocode's rewind notice under its list's capacity:
+
+```hl docs/snippets/fork.hl
+harness brancher
+
+const steps_max: u64 = 2
+const calls_max: u64 = 2
+const entries_max: u64 = 64
+
+type outcome = completed(text) | exhausted
+
+tool Bash(command: text) -> text effect external
+
+fork rewind at turn
+
+model infer calls calls_max
+
+state {
+  context: list<entry, entries_max>
+  parent: text
+}
+
+invariant context_bounded: len(context) <= entries_max
+
+on prompt(input: text) -> outcome
+  requires len(context) + 1 + steps_max * (1 + calls_max) <= entries_max
+{
+  push context user(input)
+  loop step below steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+
+on forked(origin: text, discarded: u64) {
+  parent = origin
+  if discarded > 0 and len(context) < entries_max {
+    push context user("This conversation was explicitly rewound into a new session. External effects from discarded turns may still exist; reconcile their current state before repeating any action. Historical tool calls must not be replayed.")
+  }
+}
+```
+
+`hl check` counts each fork as one child session: the child runs no turn
+inside the call. The prover proves the hook like a handler without
+`requires`, over any state that satisfies the invariants, so its push sits
+under `if len(context) < entries_max`. The fork site is an external effect,
+durable before it runs:
+
+```console
+$ hl check --target cloudflare docs/snippets/fork.hl | grep -E 'child sessions|hook forked'
+    child sessions: 4, step below steps_max (2) x call below calls_max (2)
+    with its child sessions: 6 effects, 13 journal records, 6 outbound requests
+  proved hook forked: no_overflow: 0 arithmetic operation(s) proved in range; invariant_preserved: 1 invariant check(s) at returns and trap points; push_bound: 1 push(es) proved below capacity (96 prover steps)
+$ hl check docs/snippets/errors/forked-effect.hl
+docs/snippets/errors/forked-effect.hl:16:9: error: 'on forked' cannot call tool 'Bash': it runs inside the fork's call, before the call is journaled, so it runs no effect
+```
+
+```hl docs/snippets/errors/forked-effect.hl
+harness notes
+
+tool Bash(command: text) -> text effect external
+
+fork branch at latest
+
+state {
+  last: text
+}
+
+on prompt(input: text) -> text {
+  return input
+}
+
+on forked(origin: text, discarded: u64) {
+  match Bash(origin) {
+    ok(output) => { last = output }
+    failed(error) => { last = error }
+    unknown => { last = "unknown" }
+  }
+}
+```
+
+The simulator's model forks at an earlier turn and, a quarter of the time
+(`FORK_TURN_PAST_PPM` = 250000 per million), at one not finished yet. The
+host writes the child's two records from the input and runs up to
+`FORK_CHILD_TURNS_MAX` (2) turns of the harness over them, with faults and
+every invariant, as a spawned child is run. A quarter of the seeds of a
+harness with a fork tool (`FORKED_ENTRY_PPM` = 250000) start from a forked
+entry themselves, so every backend's load of one is checked in the
+differential runs. `fork_state_equal` requires the
+records to equal the hook applied to the state after turn `N` of the
+parent's durable journal up to the call, with `N`, `D` and the key in the
+`forked` record. `fork_live_state`, a runtime that forks from the running
+turn's state, and `fork_hook_skipped`, one that skips the hook, are caught:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/fork.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=978 runs=2975 crashes=1997 power_losses=233 torn_writes=316 takeovers=0 fenced=0 dispatches=1030 unknown=300 forks=315
+$ hl sim --target native-jsonl --seeds 0..200 --mutation fork_live_state docs/snippets/fork.hl
+FAIL invariant=fork_state_equal seed=0 target=native-jsonl profile=errors mutation=fork_live_state: fork rewind at turn 4 seq 2 starts the child with 'context' = 20 entries in its entry checkpoint, where the hook over the parent's durable journal gives 13 entries
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation fork_live_state docs/snippets/fork.hl
+$ hl sim --target native-jsonl --seeds 0..200 --mutation fork_hook_skipped docs/snippets/fork.hl
+FAIL invariant=fork_state_equal seed=0 target=native-jsonl profile=errors mutation=fork_hook_skipped: fork rewind at turn 4 seq 2 starts the child with 'context' = 12 entries in its entry checkpoint, where the hook over the parent's durable journal gives 13 entries
+replay: hl sim --target native-jsonl --seeds 0..1 --mutation fork_hook_skipped docs/snippets/fork.hl
+```
+
+`forks` counts the forked sessions the host started, printed only when there
+are some. This departs from nanocode, which forks from a checkpoint the
+running turn published: here the snapshot is a finished turn's, the same on
+every target, and a fork never sees a turn a crash could roll back. A harness
+with blobs cannot fork, since a checkpoint holds no blob's bytes.
 
 ### Idle turns
 

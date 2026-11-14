@@ -28,6 +28,7 @@ pub enum Item {
     Event(Event),
     Hook(Hook),
     Spawn(Spawn),
+    Fork(Fork),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,10 +42,11 @@ pub enum HookKind {
     Stop,
     SubagentStart,
     SubagentStop,
+    Forked,
 }
 
 impl HookKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::BeforeTool,
         Self::AfterTool,
         Self::SessionStart,
@@ -54,6 +56,7 @@ impl HookKind {
         Self::Stop,
         Self::SubagentStart,
         Self::SubagentStop,
+        Self::Forked,
     ];
 
     pub const fn words(self) -> (&'static str, &'static str) {
@@ -67,6 +70,7 @@ impl HookKind {
             Self::Stop => ("stop", ""),
             Self::SubagentStart => ("subagent", "start"),
             Self::SubagentStop => ("subagent", "stop"),
+            Self::Forked => ("forked", ""),
         }
     }
 
@@ -99,6 +103,12 @@ pub struct Spawn {
     pub handler: Name,
     pub file: Name,
     pub sessions: Option<Name>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Fork {
+    pub name: Name,
+    pub at: Name,
 }
 
 #[derive(Clone, Debug)]
