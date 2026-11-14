@@ -512,6 +512,67 @@ Measurements (5-core Hand shared with other agents, `nice`):
 
 Commands: `hl check examples/claude_code.hl`, `hl check --target native-jsonl F` on variants of claude_code.hl in output/, `hl sim --target T --seeds 0..50 docs/snippets/{keep,side,tree}.hl`, `scripts/agent-drill.sh`, `hl-agent run --instruction I --cwd W --model claude-haiku-4-5 --journal J`, `CHECK_JOBS=2 nice scripts/check.sh`.
 
+## 2026-11-14: hl-agent against nanocode again: the Bash fix, a system prompt that asks for few tool calls, and one interleaved run of both agents
+
+What this establishes (branch beat-baseline, from master 7fa419b; merged real-agent 0ad1c37 and master at 6872fd1, 22a99bf and 553d5f0):
+
+- **Why hl-agent cost more and took longer** in the eval entry above, from the meter's records of that run (`output/eval/main` of the eval lane, 60 attempts per agent): per request the two agents read about the same prompt (hl-agent 25,666 cache-read tokens per request, nanocode 23,320), and hl-agent's fixed prefix is smaller (system 3,747 characters and four tools, about 2,800 tokens cached, against nanocode's 8,578 with the `exec` description). Parameters were the same (streaming aside: model, `max_tokens` 128,000, adaptive thinking with summarized display, effort high; nanocode also sends `context_management` `clear_thinking_20251015` with `keep: all`, which clears nothing, and a top-level `cache_control` where hl-agent marks the system, the last tool and the last block). The difference was the number of requests and what each kept: nanocode's Code Mode prompt tells Claude to orchestrate related calls in one `exec` cell and to "return only the results needed for the next reasoning step", so a cell runs several steps and prints a few lines; hl-agent, offered Bash, Read, Edit and Write directly, made one call per request (nginx-request-logging 13.7 requests against 6.0, openssl-selfsigned-cert 9.7 against 4.0) and read whole files (build-cython-ext: `invariants.py` 62,365 characters, `spacecurve.py` 50,797, kept in every later request; that task alone was $0.038 of the $0.028 per-attempt gap). Wall time was dominated by the Bash hang (kv-store-grpc and pypi-server at the 900 s timeout, 85 s per attempt over the suite) and by non-streamed requests the Hand's egress dropped. Read's limits are nanocode's own (`MAX_READ_BYTES` 262,144, `MAX_READ_TOKENS` 25,000 in `crates/backends/claude/tools/src/tools/text_files.rs`), so they were not the cause.
+- **Fixes.** (1) real-agent's 0ad1c37 (Bash waits for the shell, output to files) merged; the conflict was the removed `PIPE_CHUNK_BYTES` beside master's removed `RESULT_TOKENS_MAX`, both dropped. (2) Streaming came with master. (3) `agent/prompts/claude-code-system.json` gains a "# Tool calls" block, the direct-tool counterpart of nanocode's Code Mode guidance: steps whose order is known go in one Bash command, independent calls in one response, read only the part of a file needed (search first), return only the output the next decision needs, start servers in the background and check them in the same command, separate calls only for a judgment. The system prompt is the host's, so this is host work; `examples/claude_code.hl` did not change.
+- **Code Mode for hl-agent was not taken.** Offering `code exec { tools Bash, Read, Edit, Write ... }` in claude_code.hl with nanocode-like limits is refused on Cloudflare: `hl check` reports 131,584 outbound requests (131,072 nested calls in cells: 512 rounds x 16 calls x 16 cell calls) against the 10,000 per invocation, while check.sh checks every example on every target. hl-agent would also need a djs-backed `CellEngine` with nanocode crates as dependencies, which agent/ does not have. Left open.
+
+Pilots (hl-agent only, 1 attempt, root with the prompt block, $2.63): pilot 1 on six tasks: 6/6, 7.5 requests and $0.091 per attempt (the same tasks in the eval entry: hl-agent 9.3 and $0.133, nanocode 5.4 and $0.115); pilot 2 on build-cython-ext, kv-store-grpc, pypi-server, polyglot-c-py, vulnerable-secret, cobol-modernization: 5 of 6 passed (polyglot-c-py failed on its answer), build-cython-ext $0.845 against the eval entry's $1.839 (hl-agent) and $1.076 (nanocode).
+
+**The run.** `python3 evals/run.py --suite evals/suite.txt --tasks output/eval/tasks --agent-root output/eval/root-merged --out output/eval/final --agents nanocode,hl-agent --attempts 3 --model claude-sonnet-4-6 --parallel 3 --limits none --meter-port 18792 --relay-port 13142`, then `python3 evals/report.py output/eval/final`. Rows go attempt by task by agent, so the two agents of a task and attempt run side by side in the same pool. nanocode c7679e3 (sha256 of the unpatched binary 2cd1984e…), hl-agent built at 22a99bf. Hosted Hand, Linux 6.18.56 x86_64, 5 cores, 14 GB, shared with two other agents, rustc 1.100.0, `nice`; `scripts/check.sh` with `CHECK_JOBS=2 nice -n 19` ran during the first 15 minutes of it. Prices as in the eval entry.
+
+| Agent | Attempts | Passed | Failed | Errored | Pass rate (95% Wilson) | Cost | Cost/attempt | Wall/attempt | Requests/attempt | Prompt tokens/attempt | Output tokens/attempt |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| nanocode | 60 | 51 | 9 | 0 | 85.0% (73.9-91.9%) | $15.24 | $0.254 | 252 s | 9.8 | 280,438 | 8,236 |
+| hl-agent | 60 | 52 | 8 | 0 | 86.7% (75.8-93.1%) | $11.37 | $0.190 | 200 s | 10.3 | 160,701 | 6,820 |
+
+Paired by task and attempt (60 pairs), hl-agent minus nanocode, mean with its 95% normal interval (report.py's new section): cost -$0.0644 (-$0.1462 to $0.0175), wall -52.1 s (-109.8 to 5.6 s), requests 0.53 (-2.32 to 3.39), prompt tokens -119,737 (-245,310 to 5,836). hl-agent was cheaper in 39 of 60 pairs (median -$0.0088) and faster in 30 (median 0 s). Leaving out the 12 pairs where either side had a request the upstream connection dropped (nanocode 8 rows, hl-agent 9): 48 pairs, cost mean -$0.0148 (median -$0.0080, cheaper in 32), wall mean -32.9 s (median +0.5 s, faster in 22); totals nanocode $7.87 and 6,228 s, hl-agent $7.16 and 4,647 s.
+
+So: hl-agent matched nanocode's pass rate and was cheaper and faster on average in this run, but neither difference is outside its 95% interval, and the per-attempt median wall time is a tie; the mean wall gain comes from the long tail (nanocode's kv-store-grpc 2 and sqlite-db-truncate 2 and regex-log 2 ran to the timeout after dropped connections). nanocode cost more here than in the eval entry ($0.254 against $0.202), mostly largest-eigenval ($1.154 per attempt, 38 requests) and dropped-connection retries.
+
+| Task | nanocode pass | $ | s | req | hl-agent pass | $ | s | req |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| extract-todos | 3/3 | 0.026 | 16 | 3.3 | 3/3 | 0.012 | 11 | 3.0 |
+| uppercase-message | 3/3 | 0.018 | 14 | 3.0 | 3/3 | 0.009 | 13 | 3.0 |
+| write-greeting | 3/3 | 0.012 | 5 | 2.0 | 3/3 | 0.007 | 5 | 2.0 |
+| build-cython-ext | 3/3 | 1.144 | 514 | 47.7 | 3/3 | 0.948 | 381 | 65.7 |
+| cancel-async-tasks | 1/3 | 0.116 | 84 | 5.3 | 0/3 | 0.064 | 57 | 3.7 |
+| cobol-modernization | 3/3 | 0.576 | 550 | 12.3 | 3/3 | 0.578 | 483 | 15.3 |
+| fix-git | 2/3 | 0.056 | 35 | 5.3 | 3/3 | 0.055 | 41 | 7.3 |
+| git-leak-recovery | 3/3 | 0.065 | 40 | 5.0 | 3/3 | 0.048 | 38 | 7.0 |
+| kv-store-grpc | 2/3 | 0.089 | 620 | 9.7 | 3/3 | 0.057 | 54 | 10.0 |
+| largest-eigenval | 1/3 | 1.154 | 910 | 38.3 | 1/3 | 0.072 | 910 | 5.7 |
+| log-summary-date-ranges | 3/3 | 0.070 | 35 | 4.7 | 3/3 | 0.055 | 32 | 4.3 |
+| multi-source-data-merger | 3/3 | 0.080 | 50 | 4.0 | 3/3 | 0.111 | 81 | 6.7 |
+| nginx-request-logging | 3/3 | 0.102 | 74 | 6.0 | 3/3 | 0.074 | 68 | 10.3 |
+| openssl-selfsigned-cert | 3/3 | 0.065 | 39 | 4.3 | 1/3 | 0.058 | 43 | 4.7 |
+| polyglot-c-py | 2/3 | 0.429 | 650 | 10.3 | 2/3 | 0.378 | 664 | 7.7 |
+| prove-plus-comm | 3/3 | 0.102 | 70 | 5.3 | 3/3 | 0.116 | 89 | 6.7 |
+| pypi-server | 3/3 | 0.096 | 64 | 8.7 | 3/3 | 0.092 | 78 | 14.3 |
+| regex-log | 2/3 | 0.255 | 486 | 6.0 | 3/3 | 0.432 | 537 | 7.0 |
+| sqlite-db-truncate | 2/3 | 0.400 | 521 | 6.7 | 3/3 | 0.315 | 206 | 7.0 |
+| vulnerable-secret | 3/3 | 0.223 | 270 | 8.0 | 3/3 | 0.312 | 215 | 15.3 |
+
+Losses, read from each row's verifier log and meter records:
+
+- **openssl-selfsigned-cert (hl-agent 1/3, nanocode 3/3).** Attempt 1: `check_cert.py` imports `cryptography`, which the image lacks, and exits 1 ("Required library missing"); attempt 3: the script falls back to its own parser and prints no YYYY-MM-DD date, which the test requires. Both are the model's script, not run by the agent the way the verifier runs it; the new prompt's "check the result in that same command" did not stop it. Not a harness fault, but it may be the prompt trading a verification call for fewer requests; 3 attempts cannot tell.
+- **cancel-async-tasks (hl-agent 0/3, nanocode 1/3).** Both agents fail it nearly always (0/3 each in the eval entry); one attempt.
+- **largest-eigenval wall (hl-agent 910 s with 5.7 requests).** In attempt 1 a stream the egress dropped stayed open 717 s before curl gave up: hl-agent's `STREAM_IDLE_SECONDS_MAX` is 600 s, nanocode's `MESSAGES_STREAM_IDLE_TIMEOUT` is 300 s (`crates/backends/claude/client/src/lib.rs:54`). Matching it is the next host fix; it was found after the run and is not in the measured binary.
+- **Higher hl-agent cost** on multi-source-data-merger, prove-plus-comm, regex-log, vulnerable-secret: more requests (vulnerable-secret 15.3 against 8.0) of small Bash calls; single-attempt variance is large (regex-log hl-agent $0.25 to $0.67).
+- hl-agent's wins in pass count (fix-git, kv-store-grpc, regex-log, sqlite-db-truncate) are each one attempt, three of them nanocode attempts that hit the timeout after dropped connections.
+
+Losses and limits, kept:
+
+- The run measured hl-agent built at 22a99bf. master then merged subagents (553d5f0): the head offers `spawn_agent`, `wait_agent` and `list_agents` beside the four tools, which every request carries (a 3-task smoke at 553d5f0: 3/3, $0.021 per attempt against $0.009 to $0.012 at 22a99bf, the difference mostly the new prefix's cache writes). The suite was not rerun at the head.
+- A first full run at ca4f33a was stopped after 30 rows when master moved and is not counted (`output/eval/final-premerge`, $2.75).
+- Docker cannot apply cgroup limits on this Hand (`--limits none`), and the egress drops some long requests for both agents, as in the eval entry.
+- Spend: $26.61 for the measured run, $2.75 for the stopped one, $2.66 for the pilots and $0.09 for smokes, about $32 in all.
+
+Commands: `python3 evals/report.py output/eval/main` (the eval lane's run), `hl check output/cm.hl` (claude_code.hl with a code tool), `python3 evals/run.py ... --only T` (pilots), the run above, `python3 evals/report.py output/eval/final`, `CHECK_JOBS=2 nice scripts/check.sh`.
+
 ## 2026-11-14: in-flight: interruptible effects, background jobs and recovery hooks (gaps 1, 4 and 6)
 
 Branch in-flight, from master 17f5d21, closes gaps 1, 4 and 6 of docs/GAPS.md with three declarations (LANGUAGE.md, Effects in flight), in the checker, the interpreter, the simulator, the prover, the generated Rust and JavaScript, `examples/claude_code.hl` and hl-agent.
@@ -533,6 +594,7 @@ Measurements (5-core Hand shared with other agents, `nice`, release builds):
 
 - `hl sim --target T --seeds 0..2000 docs/snippets/in_flight.hl`: native-jsonl 17,764 runs, 12,732 crashes, 378 interrupted, recovery answered 1,165 replies, 2,441 not dispatched, 1,575 unknown, 528 jobs, 141 notices, 284 died; native-sqlite 348 interrupted, 513 jobs; server-postgres 1,057 takeovers, 332 interrupted; cloudflare 456 interrupted, 511 jobs; vercel 486 interrupted, 538 jobs.
 - `hl check examples/claude_code.hl`: proved on all five targets, 4,329,878 prover steps (4,078,944 for master's file), 19,971 journal records per run, plus at most 8 event records per turn.
+- Merging master adbf1f5 (Bash output to files, 0ad1c37): a Bash call moved to the background keeps its output in its own pair of files (`bash-N.stdout`, `bash-N.stderr` in the state directory, N a per-process sequence), read when the job ends; a job whose files cannot be read reports that it lost its output in its notice instead of a completed state.
 - `scripts/agent-drill.sh` (mock): the slow step (`sleep 3`, timeout 100 ms) becomes job 1.15, the drill kills hl-agent while it runs, and the next run records `lost:1.15`; seeds 1, 4, 5, 6, 7 pass with 4 to 8 recovery replies per run (seed 1: `{'reply': 5, 'unknown': 2}`), each external call dispatched once. The drill now skips a child whose spawn its parent recovered `unknown` (an orphan that is never joined; master's drill fails seed 5 on that child's cut stream).
 - A real background server (`output/real-job`: start `python3 -m http.server` in the background, curl it, write fetched.txt): exit 0 in 9.9 s, 4 requests, 3 tool calls, 7,912 input and 414 output tokens, the server stopped at the turn's end; before, the server call would have waited out Bash's 120 s timeout.
 - nanoeval 556e56b local tasks, each in a scratch copy of its environment then its `tests/test.sh`: extract-todos reward 1 (5.2 s, 3 requests, 2 tool calls, 7,856 input, 4,182 cache-write, 355 output tokens), uppercase-message 1 (5.7 s, 3, 2, 7,783, 4,143, 289), write-greeting 1 (3.5 s, 2, 1, 7,793, 0, 136).

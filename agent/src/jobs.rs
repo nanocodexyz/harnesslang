@@ -57,18 +57,25 @@ impl Jobs {
                 .expect("a finished job was running");
             let mut started = job.started;
             let status = started.child.wait().expect("wait for a finished job");
-            let shell = tools::settled(started, status, false);
-            let code = tools::exit_code(&shell);
-            let (state, summary) = if code == 0 {
-                ("completed", "completed".to_owned())
-            } else {
-                ("failed", format!("failed with exit code {code}"))
+            let notice = match tools::settled(started, status, false) {
+                Ok(shell) => {
+                    let code = tools::exit_code(&shell);
+                    let (state, summary) = if code == 0 {
+                        ("completed", "completed".to_owned())
+                    } else {
+                        ("failed", format!("failed with exit code {code}"))
+                    };
+                    format!(
+                        "<task-notification>\n<task-id>{key}</task-id>\n<status>{state}</status>\n<summary>Background command \"{}\" {summary}</summary>\n</task-notification>\n{}",
+                        job.command,
+                        tools::shown(&shell)
+                    )
+                }
+                Err(error) => format!(
+                    "<task-notification>\n<task-id>{key}</task-id>\n<status>failed</status>\n<summary>Background command \"{}\" lost its output: {error}</summary>\n</task-notification>",
+                    job.command
+                ),
             };
-            let notice = format!(
-                "<task-notification>\n<task-id>{key}</task-id>\n<status>{state}</status>\n<summary>Background command \"{}\" {summary}</summary>\n</task-notification>\n{}",
-                job.command,
-                tools::shown(&shell)
-            );
             self.finished.insert(key, notice);
         }
     }

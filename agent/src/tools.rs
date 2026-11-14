@@ -1,3 +1,4 @@
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ pub const READ_BYTES_MAX: u64 = 262_144;
 pub const READ_TOKENS_MAX: usize = 25_000;
 pub const BYTES_PER_TOKEN: usize = 4;
 pub const SELECTED_BYTES_PER_TOKEN: u64 = 128;
-pub const PIPE_CHUNK_BYTES: usize = 8192;
+static SHELL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub const MILLISECONDS_PER_MINUTE: u128 = 60_000;
 pub const MILLISECONDS_PER_SECOND: u128 = 1_000;
 pub const PAGE_FILL: f64 = 0.85;
@@ -456,7 +457,14 @@ impl Workspace {
     fn spawn_shell(&self, command: &str) -> Result<Started, String> {
         let script = self.state.join("bash-command");
         std::fs::write(&script, command).map_err(|error| error.to_string())?;
-        let spawn = |shell: &str| {
+        let sequence = SHELL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stdout_path = self.state.join(format!("bash-{sequence}.stdout"));
+        let stderr_path = self.state.join(format!("bash-{sequence}.stderr"));
+        let spawn = |shell: &str| -> std::io::Result<std::process::Child> {
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            let stdout = std::fs::File::create(&stdout_path)?;
+            let stderr = std::fs::File::create(&stderr_path)?;
             Command::new(shell)
                 .arg("-c")
                 .arg(BASH_WRAPPER)
@@ -464,22 +472,20 @@ impl Workspace {
                 .arg(self.state.join("bash"))
                 .current_dir(self.cwd())
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stdout(stdout)
+                .stderr(stderr)
                 .process_group(0)
                 .spawn()
         };
-        let mut child = match spawn(SHELL) {
+        let child = match spawn(SHELL) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => spawn(SHELL_FALLBACK),
             spawned => spawned,
         }
         .map_err(|error| error.to_string())?;
-        let stdout = capture(child.stdout.take().expect("piped stdout"));
-        let stderr = capture(child.stderr.take().expect("piped stderr"));
         Ok(Started {
             child,
-            stdout,
-            stderr,
+            stdout: stdout_path,
+            stderr: stderr_path,
         })
     }
 
@@ -500,7 +506,7 @@ impl Workspace {
                 }
                 kill_group(&started.child);
                 let status = started.child.wait().map_err(|error| error.to_string())?;
-                let mut shell = settled(started, status, true);
+                let mut shell = settled(started, status, true)?;
                 shell.message = Some(format!(
                     "Command timed out after {}",
                     timed_out_after(timeout)
@@ -509,14 +515,14 @@ impl Workspace {
             }
             std::thread::sleep(TIMEOUT_POLL);
         };
-        Ok(Waited::Done(settled(started, status, false)))
+        Ok(Waited::Done(settled(started, status, false)?))
     }
 }
 
 pub struct Started {
     pub child: std::process::Child,
-    stdout: std::thread::JoinHandle<(String, bool)>,
-    stderr: std::thread::JoinHandle<(String, bool)>,
+    stdout: PathBuf,
+    stderr: PathBuf,
 }
 
 pub enum Waited {
@@ -537,9 +543,15 @@ pub fn kill_group(child: &std::process::Child) {
         .status();
 }
 
-pub fn settled(started: Started, status: std::process::ExitStatus, timed_out: bool) -> Shell {
-    let (stdout, stdout_cut) = started.stdout.join().expect("stdout reader");
-    let (stderr, stderr_cut) = started.stderr.join().expect("stderr reader");
+pub fn settled(
+    started: Started,
+    status: std::process::ExitStatus,
+    timed_out: bool,
+) -> Result<Shell, String> {
+    let (stdout, stdout_cut) = captured(&started.stdout)?;
+    let (stderr, stderr_cut) = captured(&started.stderr)?;
+    let _ = std::fs::remove_file(&started.stdout);
+    let _ = std::fs::remove_file(&started.stderr);
     let code = match (timed_out, status.code()) {
         (true, _) => TIMED_OUT_STATUS,
         (false, Some(code)) => code,
@@ -548,14 +560,14 @@ pub fn settled(started: Started, status: std::process::ExitStatus, timed_out: bo
                 + std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
         }
     };
-    Shell {
+    Ok(Shell {
         stdout,
         stdout_cut,
         stderr,
         stderr_cut,
         code,
         message: None,
-    }
+    })
 }
 
 pub fn shown(shell: &Shell) -> String {
@@ -580,30 +592,20 @@ pub struct Shell {
     message: Option<String>,
 }
 
-fn capture(
-    mut stream: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<(String, bool)> {
-    std::thread::spawn(move || {
-        let mut kept = Vec::with_capacity(STREAM_BYTES_MAX);
-        let mut buffer = [0_u8; PIPE_CHUNK_BYTES];
-        let mut cut = false;
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => {
-                    let room = STREAM_BYTES_MAX - kept.len();
-                    kept.extend_from_slice(&buffer[..count.min(room)]);
-                    cut |= count > room;
-                }
-            }
-        }
-        let mut text = String::from_utf8_lossy(&kept).into_owned();
-        if cut {
-            let end = text.floor_char_boundary(STREAM_BYTES_MAX);
-            text.truncate(end);
-        }
-        (text, cut)
-    })
+fn captured(path: &Path) -> Result<(String, bool), String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut kept = Vec::with_capacity(STREAM_BYTES_MAX + 1);
+    file.take(STREAM_BYTES_MAX as u64 + 1)
+        .read_to_end(&mut kept)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let cut = kept.len() > STREAM_BYTES_MAX;
+    kept.truncate(STREAM_BYTES_MAX);
+    let mut text = String::from_utf8_lossy(&kept).into_owned();
+    if cut {
+        let end = text.floor_char_boundary(STREAM_BYTES_MAX);
+        text.truncate(end);
+    }
+    Ok((text, cut))
 }
 
 fn timed_out_after(timeout: Duration) -> String {
