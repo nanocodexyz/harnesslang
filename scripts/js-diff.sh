@@ -31,6 +31,9 @@ plant_expression() {
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
     grandchild_unscoped) echo 's/return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };/return { tag: "ok", value: key };/' ;;
     idle_early) echo 's/if (clock < due) return { ran: "not_due"/if (false \&\& clock < due) return { ran: "not_due"/' ;;
+    interrupt_ignored) echo 's/const interrupted = !ran.preempted\[0\] \&\& /const interrupted = false \&\& /' ;;
+    recover_reply_ignored) echo 's/if (recovered.kind !== "reply") return recovered;/return { kind: "unknown" };/' ;;
+    job_unopened) echo 's/if (jobStarted(record.output) !== null) session.jobs.set/if (false) session.jobs.set/' ;;
     *) echo "js-diff: unknown plant $1" >&2; return 1 ;;
   esac
 }
