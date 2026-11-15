@@ -17,10 +17,12 @@ const SUMMARIZED_RESULT: &str = "summarized";
 fn usage() -> ExitCode {
     eprintln!(
         "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
+       {deploy}
        {prove}",
         targets = Target::names(),
         mutations = Mutation::names(),
-        prove = harnesslang::prove::cli::usage()
+        prove = harnesslang::prove::cli::usage(),
+        deploy = harnesslang::deploy::usage()
     );
     ExitCode::from(USAGE_EXIT)
 }
@@ -112,6 +114,9 @@ fn main() -> ExitCode {
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
+        "deploy" | "status" | "logs" | "rollback" | "secrets" | "destroy" => {
+            deploy_command(command, rest)
+        }
         "gen" => harnesslang::generate::cli::gen_command(rest),
         "fuzz-parse" => harnesslang::generate::cli::fuzz_parse_command(rest),
         "fuzz-prove" => harnesslang::generate::cli::fuzz_prove_command(rest),
@@ -695,6 +700,64 @@ fn emit_command(args: &[String]) -> ExitCode {
         }
         Err(error) => {
             eprintln!("{file}: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
+fn deploy_command(verb: &str, args: &[String]) -> ExitCode {
+    use harnesslang::deploy;
+    let variable = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let poll_ms = match variable(deploy::POLL_VARIABLE).map(|text| text.parse::<u64>()) {
+        None => deploy::POLL_MS_DEFAULT,
+        Some(Ok(value)) if value > 0 => value,
+        Some(_) => {
+            eprintln!(
+                "hl {verb}: {} must be a positive whole number of milliseconds",
+                deploy::POLL_VARIABLE
+            );
+            return ExitCode::from(USAGE_EXIT);
+        }
+    };
+    let now_ms = match variable(deploy::NOW_VARIABLE).map(|text| text.parse::<u64>()) {
+        Some(Ok(value)) => value,
+        Some(Err(_)) => {
+            eprintln!(
+                "hl {verb}: {} must be a whole number of milliseconds since 1970",
+                deploy::NOW_VARIABLE
+            );
+            return ExitCode::from(USAGE_EXIT);
+        }
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| {
+                u64::try_from(elapsed.as_millis()).expect("milliseconds since 1970 fit u64")
+            })
+            .unwrap_or(0),
+    };
+    let environment = deploy::Environment {
+        cloudflare_token: variable(deploy::CLOUDFLARE_TOKEN_VARIABLE),
+        cloudflare_account: variable(deploy::CLOUDFLARE_ACCOUNT_VARIABLE),
+        cloudflare_api: variable(deploy::CLOUDFLARE_API_VARIABLE)
+            .unwrap_or_else(|| deploy::CLOUDFLARE_API_DEFAULT.to_owned()),
+        vercel_token: variable(deploy::VERCEL_TOKEN_VARIABLE),
+        vercel_team: variable(deploy::VERCEL_TEAM_VARIABLE),
+        vercel_api: variable(deploy::VERCEL_API_VARIABLE)
+            .unwrap_or_else(|| deploy::VERCEL_API_DEFAULT.to_owned()),
+        certificate: variable(deploy::CERTIFICATE_VARIABLE),
+        scratch: std::env::temp_dir().join(format!("hl-deploy-{}", std::process::id())),
+        now_ms,
+        poll_ms,
+    };
+    let code = deploy::command(verb, args, &environment, &load);
+    match std::fs::remove_dir_all(&environment.scratch) {
+        Ok(()) => code,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => code,
+        Err(error) => {
+            eprintln!(
+                "hl {verb}: cannot remove {}: {error}",
+                environment.scratch.display()
+            );
             ExitCode::from(FAILURE_EXIT)
         }
     }

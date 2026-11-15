@@ -736,3 +736,25 @@ fn expr(program: &Program, expression: &Expr) -> String {
         Expr::Cancelled => "rt.cancelled()".to_owned(),
     }
 }
+
+pub fn workflow_binding() -> String {
+    let start = VERCEL
+        .find("const WORKFLOW_BINDING = [\n")
+        .expect("vercel.js declares WORKFLOW_BINDING")
+        + "const WORKFLOW_BINDING = [\n".len();
+    let length = VERCEL[start..]
+        .find("].join(\"\\n\");")
+        .expect("WORKFLOW_BINDING ends with its join");
+    let mut out = String::new();
+    for line in VERCEL[start..start + length].lines() {
+        let literal = line
+            .trim()
+            .strip_suffix(',')
+            .expect("each binding line ends with a comma");
+        let value =
+            crate::deploy::json::decode(literal).expect("each binding line is a JSON string");
+        out.push_str(value.as_str().expect("each binding line is a string"));
+        out.push('\n');
+    }
+    out
+}

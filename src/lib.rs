@@ -1,4 +1,5 @@
 pub mod check;
+pub mod deploy;
 pub mod effect;
 pub mod emit;
 pub mod generate;

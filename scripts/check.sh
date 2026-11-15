@@ -409,6 +409,11 @@ done
 for plan in $(scripts/mutations.sh --diff-plans); do
   queue diff-plants scripts/mutations.sh --diff "$plan"
 done
+queue deploy scripts/deploy-drill.sh
+for plan in $(scripts/mutations.sh --deploy-plans); do
+  queue deploy-plants scripts/mutations.sh --deploy "$plan"
+done
+queue deploy-real scripts/deploy-real.sh
 queue exhaustive scripts/exhaustive.sh
 queue js-mutations scripts/js-mutations.sh
 queue prove scripts/prove-mutations.sh

@@ -699,6 +699,58 @@ an in-step one exactly one of them, and no call is open when its turn finishes.
 oracle to disagree with the journals of the mutations whose records nanocode's
 fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
 
+## Deploy
+
+`src/deploy/` reimplements what deploying needs from wrangler and the Vercel
+CLI, std only: a JSON codec, SHA-1, a multipart encoder, a WebSocket client,
+and curl as the transport (its configuration, token included, goes on stdin,
+never argv; request bodies are written mode 600 in a mode 700 directory and
+removed). Each provider is a list of endpoints, each named by its method,
+path and operation ID in a pinned spec (Cloudflare api-schemas 8b1a451, the
+`vercel-spec.json` of vercel/sdk fe01b47).
+
+- **Cloudflare**: one module upload with the `HARNESS` Durable Object binding
+  (class `HarnessObject`), the `LOADER` Worker Loader binding, `--var` values as
+  plain text bindings and `keep_bindings` for secrets. The first upload carries
+  migration `hl-v1` with the SQLite-backed class; later uploads carry none, and a
+  script at another tag is refused. Status reads deployments and versions;
+  rollback deploys an earlier version at 100%; logs query Workers
+  observability, and `--follow` opens a tail over WebSocket (`trace-v1`).
+- **Vercel**: the emitted harness, its workflow binding, a Next.js route and a
+  `package.json` are uploaded by SHA-1 (`x-vercel-digest`), the deployment is
+  created for production and polled until READY within the build limit;
+  `--var` values become plain environment variables and secrets encrypted ones;
+  rollback is Vercel's instant rollback; logs read build events, and
+  `--follow` streams runtime logs.
+- **native-jsonl, native-sqlite, server-postgres**: versioned copies of the
+  emitted Rust under the output directory, a `current` pointer replaced
+  atomically, secrets in a mode 600 file, and a history of installs.
+
+Every deploy writes a fingerprint of what it ships into the deployment (the
+bundle digest with the bindings or variables), reads the serving deployment in
+the same parallel round as its other lookups, and skips the upload when they
+match, so an unchanged redeploy is one round trip. Vercel uploads only the
+files it reports missing.
+
+A rollback moves code, never state: the journal stays as it is, so the older
+code must read what the newer one wrote.
+
+`scripts/deploy-drill.sh` runs deploy, secrets, redeploy, status, logs,
+rollback, secret delete and destroy on Cloudflare, Vercel and native-jsonl
+against `oracle/deploy/fake.mjs`. The fake keeps each provider's state
+(versions, deployments, migration tags, bindings, uploaded files), rejects a
+repeated class migration, a wrong file digest, a missing file or a module that
+does not parse or import, and validates every path, query, header, JSON body
+and multipart metadata against the pinned spec, and its own answers too
+(read-only fields stay out of requests, write-only ones out of answers). The
+drill fails on any violation and on any listed endpoint it never called.
+`scripts/mutations.sh` plans six deploy plants (a migration on every deploy,
+secrets dropped on redeploy, a wrong digest, a rollback to the serving
+version, an environment variable type the spec does not list, a fingerprint
+that leaves out variables), each caught by the drill. `scripts/deploy-real.sh` runs the same
+flow against the real APIs when the tokens are set, and destroys what it
+made.
+
 ## Layout
 
 - `src/`: the compiler, interpreter and simulator, one std-only crate
@@ -711,13 +763,16 @@ fold and ours read differently; `HL_ORACLE=1 scripts/check.sh` runs it.
   - `prove/`: `hl prove`: the plan per target, the durability, finishing and
     arithmetic proofs, and the linear constraint solver
   - `emit/`: Rust, JavaScript and SQL generation
+  - `deploy/`: `hl deploy`, `status`, `logs`, `rollback`, `secrets` and
+    `destroy` against the Cloudflare and Vercel APIs and local installs
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
 - `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
   subagent `examples/claude_code_child.hl` emitted as native-jsonl Rust and
   hosted against the Anthropic API, each spawned child a session with its own
   journal under the parent's (`children/T.S/`)
-- `oracle/`: the nanocode oracle, its own workspace
+- `oracle/`: the nanocode oracle, its own workspace, the Cloudflare
+  platform probes and the deploy fake (`oracle/deploy/fake.mjs`)
 - `scripts/`: the check, docs check, mutation, prover mutation, oracle,
   differential and crash drill scripts
 

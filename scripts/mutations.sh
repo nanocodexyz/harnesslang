@@ -295,6 +295,57 @@ diff_one() {
   echo "caught $backend plant $plant on $target by $invariant in seeds $diff_seeds"
 }
 
+deploy_plans="migration_every_deploy cloudflare Migration tag precondition failed
+secrets_dropped cloudflare,native-jsonl HL_TOKEN is gone after the second deploy
+digest_wrong vercel does not match the file's SHA-1
+rollback_current cloudflare,native-jsonl the rollback does not serve the first deploy's digest
+rollback_current vercel The deployment is already the production deployment
+environment_type_unknown vercel requests or fake answers broke the pinned specs
+fingerprint_partial cloudflare,vercel a changed variable deployed as unchanged"
+
+deploy_plants_of_hl() {
+  "$hl" deploy 2>&1 | sed -n 's/.*deploy plants: --plant //p' | tr '|' '\n' | grep -vx none | sort
+}
+
+deploy_census() {
+  local planted
+  planted=$(cut -d' ' -f1 <<< "$deploy_plans" | sort -u)
+  [ -n "$(deploy_plants_of_hl)" ] || census_fail "hl deploy lists no deploy plants"
+  if [ "$(deploy_plants_of_hl)" != "$planted" ]; then
+    census_fail "the deploy plants hl accepts and the deploy plans of scripts/mutations.sh differ"
+  fi
+  echo "mutations census: $(wc -l <<< "$planted") deploy plants planned"
+}
+
+deploy_one() {
+  local plant target expected output status
+  IFS=: read -r plant target <<< "$1"
+  expected=$(awk -v p="$plant" -v t="$target" '$1 == p && index("," $2 ",", "," t ",") { $1 = ""; $2 = ""; sub(/^  /, ""); print }' <<< "$deploy_plans")
+  [ -n "$expected" ] || { echo "mutations: deploy plant $plant plans no $target" >&2; exit 1; }
+  set +e
+  output=$(DEPLOY_DRILL_PLANT=$plant DEPLOY_DRILL_TARGETS=$target DEPLOY_DRILL_SCRATCH=output/deploy-drill/$plant-$target scripts/deploy-drill.sh 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ] || ! grep -qF -- "$expected" <<< "$output"; then
+    echo "deploy plant $plant on $target was not caught by the deploy drill ($expected):" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  echo "caught deploy plant $plant on $target: $expected"
+}
+
+if [ "${1:-}" = --deploy-plans ]; then
+  while read -r plant targets _; do
+    for target in ${targets//,/ }; do
+      echo "$plant:$target"
+    done
+  done <<< "$deploy_plans"
+  exit 0
+fi
+if [ "${1:-}" = --deploy ]; then
+  deploy_one "$2"
+  exit 0
+fi
 if [ "${1:-}" = --diff-plans ]; then
   while read -r backend plant _ targets _; do
     for target in ${targets//,/ }; do
@@ -314,6 +365,7 @@ fi
 census
 if [ "${1:-}" = --census ]; then
   diff_census
+  deploy_census
   exit 0
 fi
 selected="${MUTATIONS:-$(cut -d' ' -f1 <<< "$plans")}"
