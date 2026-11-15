@@ -54,7 +54,7 @@ def codex_tool_calls(path):
 
 
 def inner_tool_calls(row_dir, result):
-    if result["agent"] == "hl-agent":
+    if result["agent"].startswith("hl-agent"):
         return (result.get("self_reported_usage") or {}).get("tool_calls")
     if result["agent"] == "codex":
         return codex_tool_calls(os.path.join(row_dir, "journal", "agent.stdout"))
@@ -211,7 +211,9 @@ def paired_outcomes(rows, agents):
     only_first = sum(base["outcome"] == "passed" and other["outcome"] == "failed" for base, other in pairs)
     return [
         "Paired outcomes (%d pairs both scored): both passed %d, both failed %d, only %s passed %d, only %s passed %d; exact two-sided sign test on the discordant pairs p = %.3f"
-        % (len(pairs), both, neither, second, only_second, first, only_first, sign_test(only_second, only_first))
+        % (len(pairs), both, neither, second, only_second, first, only_first, sign_test(only_second, only_first)),
+        "Only %s passed: %s" % (first, ", ".join("%s.%d" % (base["task"], base["attempt"]) for base, other in pairs if base["outcome"] == "passed" and other["outcome"] == "failed") or "none"),
+        "Only %s passed: %s" % (second, ", ".join("%s.%d" % (base["task"], base["attempt"]) for base, other in pairs if base["outcome"] == "failed" and other["outcome"] == "passed") or "none"),
     ]
 
 
@@ -227,13 +229,14 @@ def main():
     print()
     print("\n".join(per_task(rows, agents)))
     print()
-    for other in agents[1:]:
-        pair = [agents[0], other]
-        print("\n".join(paired(rows, pair)))
-        print()
-        print("\n".join(differences(rows, pair)))
-        print("\n".join(paired_outcomes(rows, pair)))
-        print()
+    for index, first in enumerate(agents):
+        for other in agents[index + 1:]:
+            pair = [first, other]
+            print("\n".join(paired(rows, pair)))
+            print()
+            print("\n".join(differences(rows, pair)))
+            print("\n".join(paired_outcomes(rows, pair)))
+            print()
     for agent in agents:
         dropped = [row["id"] for row in rows if row["agent"] == agent and (row.get("meter") or {}).get("statuses", {}).get("0")]
         print("%s rows with a request the upstream connection dropped: %d %s" % (agent, len(dropped), " ".join(dropped)))

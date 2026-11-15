@@ -26,8 +26,10 @@ SETUP_TIMEOUT_SEC = 1800
 METER_READY_ATTEMPTS = 50
 METER_READY_SLEEP_SEC = 0.1
 RUN_SHELL = 'if command -v bash >/dev/null 2>&1; then exec bash "$1"; else exec sh "$1"; fi'
-AGENTS = ("nanocode", "hl-agent", "claude-code", "codex")
-AGENT_KEYS = {"nanocode": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "hl-agent": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "claude-code": ("ANTHROPIC_API_KEY",), "codex": ("OPENAI_API_KEY",)}
+AGENTS = ("nanocode", "hl-agent", "hl-agent-medium", "claude-code", "codex")
+AGENT_BINARIES = {"hl-agent-medium": "hl-agent"}
+AGENT_ARGS = {"hl-agent-medium": ["--effort", "medium"]}
+AGENT_KEYS = {"nanocode": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "hl-agent": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "hl-agent-medium": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "claude-code": ("ANTHROPIC_API_KEY",), "codex": ("OPENAI_API_KEY",)}
 METERED_KEY = "metered-by-host"
 CLAUDE_MODEL_PREFIX = "claude-"
 OPENAI_ROUTE = "/openai"
@@ -141,7 +143,7 @@ def agent_command(agent, model, workdir, run_url, instruction, max_turns, hl_age
     command = [AGENT_MOUNT + "/bin/hl-agent", "run", "--instruction", JOURNAL_MOUNT + "/instruction.md", "--cwd", workdir, "--model", model, "--journal", JOURNAL_MOUNT + "/hl"]
     if max_turns:
         command += ["--max-turns", str(max_turns)]
-    command += hl_agent_args
+    command += AGENT_ARGS.get(agent, []) + hl_agent_args
     return ({"ANTHROPIC_BASE_URL": run_url, "ANTHROPIC_API_KEY": "metered-by-host"} if claude else {"OPENAI_BASE_URL": openai_url, "OPENAI_API_KEY": METERED_KEY}, command)
 
 
@@ -358,7 +360,7 @@ def main():
     for agent in agents:
         if agent not in AGENTS:
             raise SystemExit("unknown agent " + agent)
-        binary = os.path.join(args.agent_root, "bin", agent)
+        binary = os.path.join(args.agent_root, "bin", AGENT_BINARIES.get(agent, agent))
         if not os.access(binary, os.X_OK):
             raise SystemExit(binary + " is missing; run evals/setup.sh")
     for agent in agents:
@@ -369,9 +371,10 @@ def main():
         tasks = [task for task in tasks if task["task"] in args.only]
     runs = os.path.abspath(os.path.join(args.out, "rows"))
     os.makedirs(runs, exist_ok=True)
+    tasks.sort(key=lambda task: -task_config(task["dir"])["agent_timeout"])
     rows = []
-    for attempt in range(1, args.attempts + 1):
-        for task in tasks:
+    for task in tasks:
+        for attempt in range(1, args.attempts + 1):
             for agent in agents:
                 row = dict(task, agent=agent, attempt=attempt)
                 row["id"] = task["source"] + "." + task["task"] + "." + agent + "." + str(attempt)
