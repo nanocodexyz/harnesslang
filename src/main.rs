@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+use harnesslang::emit;
 use harnesslang::ir::{self, Program, Type};
 use harnesslang::run::journal::{CRC32_CHECK, CRC32_CHECK_INPUT};
 use harnesslang::run::json;
@@ -8,15 +9,18 @@ use harnesslang::run::turn::TurnRequest;
 use harnesslang::run::value::{self, Value};
 use harnesslang::sim::{self, Options};
 use harnesslang::target::{self, Target};
-use harnesslang::{check, emit, syntax};
 
 const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
 const SUMMARIZED_RESULT: &str = "summarized";
 
+use harnesslang::load::{load, load_within};
+
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format wasm|mjs|wat|source] [--plant NAME] FILE
+       hl wasm-sim --target {targets} --module FILE.wasm --trace TRACE.jsonl
+       hl bundle --target {targets} --out DIR [--plant NAME] FILE
        {deploy}
        {prove}",
         targets = Target::names(),
@@ -39,56 +43,6 @@ fn print_report(report: &str) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         written => written,
     }
-}
-
-fn load(file: &str) -> Result<Program, String> {
-    load_within(file, &mut Vec::new(), Mutation::None)
-}
-
-fn load_within(
-    file: &str,
-    spawning: &mut Vec<(std::path::PathBuf, String)>,
-    mutation: Mutation,
-) -> Result<Program, String> {
-    let source = std::fs::read_to_string(file)
-        .map_err(|error| format!("{file}: error: cannot read: {error}"))?;
-    let identity = std::fs::canonicalize(file)
-        .map_err(|error| format!("{file}: error: cannot resolve: {error}"))?;
-    if let Some(start) = spawning.iter().position(|(path, _)| *path == identity) {
-        let chain: Vec<&str> = spawning[start..]
-            .iter()
-            .map(|(_, shown)| shown.as_str())
-            .chain([file])
-            .collect();
-        return Err(format!(
-            "{file}: error: the spawn tree returns to a harness it is inside, so its sessions have no bound: {}",
-            chain.join(" spawns ")
-        ));
-    }
-    let depth = u64::try_from(spawning.len()).expect("a spawn chain's length fits u64");
-    if depth > ir::SPAWN_DEPTH_MAX {
-        return Err(format!(
-            "{file}: error: the spawn tree is deeper than spawn_depth_max ({}) levels",
-            ir::SPAWN_DEPTH_MAX
-        ));
-    }
-    let parsed = syntax::parse(&source).map_err(|diagnostic| diagnostic.render(file))?;
-    let directory = std::path::Path::new(file)
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    spawning.push((identity, file.to_owned()));
-    let checked = check::check_mutated(
-        &parsed,
-        &mut |child: &str| {
-            let path = directory.join(child);
-            load_within(&path.to_string_lossy(), spawning, Mutation::None)
-        },
-        mutation,
-    )
-    .map_err(|diagnostic| diagnostic.render(file));
-    spawning.pop();
-    checked
 }
 
 fn parse_seeds(value: &str) -> Option<std::ops::Range<u64>> {
@@ -117,6 +71,9 @@ fn main() -> ExitCode {
         "run" => run_command(rest),
         "sim" => sim_command(rest),
         "emit" => emit_command(rest),
+        "assemble" => assemble_command(rest),
+        "bundle" => bundle_command(rest),
+        "wasm-sim" => wasm_sim_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
         "deploy" | "status" | "monitor" | "logs" | "rollback" | "secrets" | "destroy" => {
@@ -681,11 +638,107 @@ fn traced_sweep(program: &Program, options: &Options, path: &str) -> Result<sim:
     Ok(summary)
 }
 
+fn assemble_command(args: &[String]) -> ExitCode {
+    if !args.is_empty() {
+        return usage();
+    }
+    let mut text = String::new();
+    if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+        eprintln!("assemble: error: cannot read standard input: {error}");
+        return ExitCode::from(FAILURE_EXIT);
+    }
+    match harnesslang::emit::wasm::assemble::assemble(&text) {
+        Ok(module) => write_bytes(&module.encode()),
+        Err(error) => {
+            eprintln!("assemble: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
+fn wasm_sim_command(args: &[String]) -> ExitCode {
+    let (mut target, mut module, mut trace) = (None, None, None);
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        let slot = match arg.as_str() {
+            "--target" => &mut target,
+            "--module" => &mut module,
+            "--trace" => &mut trace,
+            _ => return usage(),
+        };
+        match words.next() {
+            Some(value) => *slot = Some(value.clone()),
+            None => return usage(),
+        }
+    }
+    let (Some(target), Some(module), Some(trace)) = (target, module, trace) else {
+        return usage();
+    };
+    let bytes = match std::fs::read(&module) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("wasm-sim: error: cannot read {module}: {error}");
+            return ExitCode::from(FAILURE_EXIT);
+        }
+    };
+    let text = match std::fs::read_to_string(&trace) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("wasm-sim: error: cannot read {trace}: {error}");
+            return ExitCode::from(FAILURE_EXIT);
+        }
+    };
+    let origin = std::time::Instant::now();
+    let clock = || origin.elapsed().as_secs_f64() * 1000.0;
+    match harnesslang::wasm::sim::replay(&target, &bytes, &text, &clock) {
+        harnesslang::wasm::sim::Outcome::Passed(summary) => {
+            println!("{summary}");
+            ExitCode::SUCCESS
+        }
+        harnesslang::wasm::sim::Outcome::Failed(line) => {
+            println!("{line}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+        harnesslang::wasm::sim::Outcome::Errored(message) => {
+            eprintln!("{message}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
+fn write_bytes(bytes: &[u8]) -> ExitCode {
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(bytes) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: cannot write standard output: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
 fn emit_command(args: &[String]) -> ExitCode {
     if args.iter().any(|arg| arg == "--sql") {
         return harnesslang::emit::sql::command::emit_listing(args);
     }
-    let Some(flags) = flags(args) else {
+    let mut format = "wasm";
+    let mut plant = "none";
+    let mut rest = Vec::new();
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--format" => match words.next() {
+                Some(value) => format = value.as_str(),
+                None => return usage(),
+            },
+            "--plant" => match words.next() {
+                Some(value) => plant = value.as_str(),
+                None => return usage(),
+            },
+            _ => rest.push(arg.clone()),
+        }
+    }
+    let Some(flags) = flags(&rest) else {
         return usage();
     };
     let (Some(file), Some(target)) = (flags.file, flags.target) else {
@@ -698,9 +751,70 @@ fn emit_command(args: &[String]) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
     };
-    match emit::emit(&program, target) {
-        Ok(code) => {
+    let emitted = match format {
+        "wasm" => {
+            emit::wasm::emit_planted(&program, target, plant).map(|bytes| write_bytes(&bytes))
+        }
+        "mjs" => emit::wasm::emit_planted(&program, target, plant).map(|bytes| {
+            print!("{}", emit::wasm::module_js(&bytes));
+            ExitCode::SUCCESS
+        }),
+        "wat" => emit::wasm::emit_text_planted(&program, target, plant).map(|text| {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }),
+        "source" if plant == "none" => emit::emit(&program, target).map(|code| {
             print!("{code}");
+            ExitCode::SUCCESS
+        }),
+        _ => return usage(),
+    };
+    match emitted {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{file}: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
+fn bundle_command(args: &[String]) -> ExitCode {
+    let mut out = None;
+    let mut plant = "none";
+    let mut rest = Vec::new();
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--out" => match words.next() {
+                Some(value) => out = Some(std::path::PathBuf::from(value)),
+                None => return usage(),
+            },
+            "--plant" => match words.next() {
+                Some(value) => plant = value.as_str(),
+                None => return usage(),
+            },
+            _ => rest.push(arg.clone()),
+        }
+    }
+    let Some(flags) = flags(&rest) else {
+        return usage();
+    };
+    let (Some(file), Some(target), Some(out)) = (flags.file, flags.target, out) else {
+        return usage();
+    };
+    let written = load(&file).and_then(|program| {
+        let bundle = harnesslang::deploy::bundle::emitted_planted(
+            &program,
+            target,
+            plant,
+            harnesslang::deploy::Plant::None,
+        )?;
+        bundle.write_with_manifest(&out)?;
+        Ok(bundle.describe())
+    });
+    match written {
+        Ok(described) => {
+            println!("{}: {described}", out.display());
             ExitCode::SUCCESS
         }
         Err(error) => {

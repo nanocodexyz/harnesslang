@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { journal } from "./journal.mjs";
 import { Failure } from "./platform.mjs";
 import { killSession } from "./kill.mjs";
 import { parseTrace, traceSeed } from "./trace.mjs";
@@ -20,16 +20,18 @@ const { values } = parseArgs({
     jobs: { type: "string", default: "4" },
     tools: { type: "string", default: "" },
     profile: { type: "string", default: "all" },
+    wasm: { type: "string" },
   },
 });
 if (!["kill", "trace"].includes(values.mode) || !values.module || !values.dir || !values.trace) {
-  console.error("usage: node drill.mjs --mode kill|trace --module WORKER.mjs --dir DIR --trace TRACE.jsonl [--tools a,b] [--sessions N] [--turns N] [--seed S] [--jobs N] [--seeds_max N]");
+  console.error("usage: node drill.mjs --mode kill|trace --module WORKER.mjs --dir DIR --trace TRACE.jsonl [--tools a,b] [--sessions N] [--turns N] [--seed S] [--jobs N] [--seeds_max N] [--wasm PROGRAM.wasm]");
   process.exit(2);
 }
 const module = resolve(values.module);
-const rt = (await import(pathToFileURL(module).href)).harness.runtime;
+const rt = journal;
 const options = {
   module,
+  wasm: values.wasm === undefined ? null : resolve(values.wasm),
   dir: resolve(values.dir),
   sessions: Number(values.sessions),
   turns: Number(values.turns),

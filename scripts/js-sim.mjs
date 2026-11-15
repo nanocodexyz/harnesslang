@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { register } from "node:module";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { CellChecks, DurableCells, TracedCells, engineDifferential } from "./js-sim-cell.mjs";
@@ -18,15 +19,26 @@ const { values } = parseArgs({
     module: { type: "string" },
     trace: { type: "string" },
     mutation: { type: "string", default: "none" },
+    runtime: { type: "string" },
   },
 });
 if (!values.target || !values.module || !values.trace) {
-  console.error("usage: node scripts/js-sim.mjs --target cloudflare|vercel --module FILE.mjs --trace TRACE.jsonl [--mutation NAME]");
+  console.error("usage: node scripts/js-sim.mjs --target cloudflare|vercel --module FILE.mjs --trace TRACE.jsonl [--mutation NAME] [--runtime GENERATED.mjs, with --module a fixed host beside its program.wasm]");
   process.exit(2);
 }
+const WASM_LOADER = [
+  "export async function load(url, context, next) {",
+  "  if (!url.endsWith('.wasm')) return next(url, context);",
+  "  const source = 'import { readFileSync } from \"node:fs\"; export default new WebAssembly.Module(readFileSync(new URL(' + JSON.stringify(url) + ')));';",
+  "  return { format: 'module', shortCircuit: true, source };",
+  "}",
+].join("\n");
+const hosted = values.runtime !== undefined;
+if (hosted) register("data:text/javascript," + encodeURIComponent(WASM_LOADER), import.meta.url);
 const loaded = await import(pathToFileURL(values.module).href);
 const harness = loaded.harness;
-const rt = harness.runtime;
+const rt = hosted ? (await import(pathToFileURL(values.runtime).href)).harness.runtime : harness.runtime;
+const hostRuntime = harness.runtime;
 if (harness.target !== values.target) {
   console.error(`${values.module} is built for ${harness.target}, not ${values.target}`);
   process.exit(2);
@@ -168,6 +180,7 @@ class Seed {
   side(turn, seq) {
     if (this.cursor.peek()?.event !== "side") return null;
     const event = this.sideQuestion(turn, seq);
+    if (hosted) return { arguments: event.arguments, handler: event.handler };
     return rt.sideRequestFromJson(rt.object([["arguments", event.arguments], ["handler", event.handler]]));
   }
 
@@ -418,7 +431,7 @@ class Seed {
       const body = rt.decodeJson(init.body);
       const side = Number(body.turn) === rt.SIDE_TURN;
       if (url === TOOLS_URL) {
-        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null, job: body.job, nested: body.nested === null ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
+        const request = { turn: body.turn, seq: body.seq, tool: body.tool, effect: body.effect, input: body.input, admitted: body.admitted ?? null, job: body.job ?? false, nested: body.nested === null || body.nested === undefined ? null : { id: Number(body.nested), cell: seed.nestedCell, code: seed.nestedCode } };
         if (request.nested !== null) seed.nestedTool(request);
         if (!side) fetchCheck(request);
         const output = seed.tool(request, fetchCheck.durable === undefined ? null : fetchCheck);
@@ -436,7 +449,7 @@ class Seed {
       }
       throw new Error(`unexpected fetch of ${url}`);
     };
-    const host = rt.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
+    const host = hostRuntime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
     const tool = host.tool;
     return {
       ...host,
@@ -583,7 +596,8 @@ async function cloudflareSeed(seed) {
     tools: (world, requests, limit) => seed.tools(world, requests, limit),
     gate: (records) => {
       const bytes = storage.pendingBytes();
-      if (rt.encodeLines(records, false) !== bytes) throw differ("rows inserted before the gate", rt.encodeLines(records, false), bytes);
+      const flushed = typeof records === "string" ? records : rt.encodeLines(records, false);
+      if (flushed !== bytes) throw differ("rows inserted before the gate", flushed, bytes);
       seed.flushed(bytes);
       storage.commit();
       seed.checks.flushed(storage.lines());

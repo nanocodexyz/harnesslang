@@ -456,11 +456,13 @@ $ hl run examples/agent.hl --handler prompt --arg hello | head -n 1
 {"crc":1413599148,"record":{"admitted":{"digest":"prompt","first":1,"hand":null,"metadata":{"handler":"prompt"},"prompt":{"input":"hello"},"turn":"1"}}}
 ```
 
-`hl emit` prints the program for a target. For `native-jsonl` it is one Rust
-file using only std, which a host drives through `run_jsonl`:
+`hl emit` prints the program for a target as a WebAssembly module (`--format
+wat` prints its text), which the platform's fixed host runs; `--format source`
+prints it as source instead. For `native-jsonl` that is one Rust file using
+only std, which a host drives through `run_jsonl`:
 
 ```console
-$ hl emit --target native-jsonl examples/agent.hl | grep -E -A 4 '^pub fn run_jsonl'
+$ hl emit --format source --target native-jsonl examples/agent.hl | grep -E -A 4 '^pub fn run_jsonl'
 pub fn run_jsonl<H: Host>(
     host: &mut H,
     disk: &mut dyn Disk,
@@ -1684,7 +1686,7 @@ on withdraw(change: text, reason: text) -> report
 ```
 
 ```console
-$ for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do hl emit --target $target docs/snippets/fn_inline.hl > output/fn_inline.out; hl emit --target $target docs/snippets/fn.hl | cmp - output/fn_inline.out && echo "$target: identical"; done
+$ for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do hl emit --format source --target $target docs/snippets/fn_inline.hl > output/fn_inline.out; hl emit --format source --target $target docs/snippets/fn.hl | cmp - output/fn_inline.out && echo "$target: identical"; done
 native-jsonl: identical
 native-sqlite: identical
 server-postgres: identical
@@ -5928,13 +5930,13 @@ What the proofs assume and leave out is in
 | `vercel` | a Function driving a Workflow run | the run's event log | one step | a retried step | in the step, by attempt number | none yet (duration is reported) | one ES module exporting `harness`, which holds the `"use workflow"` session and the `"use step"` step to bind |
 
 ```console
-$ hl emit --target server-postgres examples/agent.hl | grep -E '^pub fn run_sql|^pub trait Sql'
+$ hl emit --format source --target server-postgres examples/agent.hl | grep -E '^pub fn run_sql|^pub trait Sql'
 pub trait Sql {
 pub fn run_sql<H: Host>(host: &mut H, sql: &mut dyn Sql, journal: &mut SqlJournal, request: &TurnRequest) -> Result<Ran, RunError> {
-$ hl emit --target cloudflare examples/agent.hl | grep -E '^export'
+$ hl emit --format source --target cloudflare examples/agent.hl | grep -E '^export'
 export { HarnessObject, harness };
 export default worker;
-$ hl emit --target vercel examples/agent.hl | grep -E '^export'
+$ hl emit --format source --target vercel examples/agent.hl | grep -E '^export'
 export { harness };
 ```
 
@@ -5953,7 +5955,7 @@ and the kill -9 drill of generated code.
 | `hl sim --target T --seeds A..B [--twice] [--strict [--any-state]] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs; `--strict` also checks what the proofs promise (no trap but requires and model replies, invariants after every turn, the worst case within the target's limit), and `--any-state` starts each session from a drawn state that satisfies the invariants |
 | `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session, cell hooks included; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal`, and refuses `--mutation divergence_dispatches`, since it injects no engine divergence |
 | `hl run FILE --handler NAME [--arg VALUE]... [--seed S]` | run one turn in the interpreter and print the journal |
-| `hl emit --target T FILE` | print the generated program |
+| `hl emit --target T [--format wasm\|wat\|source] FILE` | print the program as a WebAssembly module (the default), its text, or source |
 
 `check`, `prove` and `sim` exit 1 when something fails and 2 on a usage error.
 

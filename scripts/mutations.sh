@@ -140,8 +140,59 @@ rust cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,s
 js cell_cancel_ignored docs/snippets/code_stop.hl cloudflare,vercel backend_equal
 rust payment_unset docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js payment_unset docs/snippets/payments.hl cloudflare,vercel backend_equal
-js paid_outcome_original docs/snippets/payments.hl cloudflare,vercel backend_equal"
-diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
+js paid_outcome_original docs/snippets/payments.hl cloudflare,vercel backend_equal
+wasm flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm crc_skipped examples/agent.hl native-jsonl backend_equal
+wasm recovery_skipped examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
+wasm recovery_unreported examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
+wasm mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm settings_dropped docs/snippets/settings.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm usage_unchecked docs/snippets/recovery.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm model_failure_decoded docs/snippets/settings.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm interrupted_undecoded docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm rewrite_kept_lost docs/snippets/rewrite.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm batch_flush_skipped docs/snippets/parallel.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm event_ack_early docs/snippets/events.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm event_redelivered examples/claude_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
+wasm cancel_read_unstamped docs/snippets/events.hl vercel backend_equal
+wasm suspend_before_flush docs/snippets/park.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm resume_unmatched docs/snippets/park.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm wait_unjournaled docs/snippets/park.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm side_live_state docs/snippets/side.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm batch_drain_skipped examples/claude_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
+wasm idle_early docs/snippets/keep.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm blobs_unevicted docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm blob_bound_unchecked docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm listing_unchecked docs/snippets/listing.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm discovery_unchecked docs/snippets/catalog.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm search_unchecked docs/snippets/catalog.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm listing_bound_unchecked docs/snippets/listing.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm interrupt_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm recover_reply_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm job_unopened docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm grandchild_unscoped docs/snippets/tree_planner.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal 1.1
+wasm cell_leaks docs/snippets/code_wait.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm nested_recovery_skipped examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
+wasm nested_result_unjournaled examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm fold_arms_flipped examples/minimal.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal"
+diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see
+wasm crc_skipped native-sqlite: only native-jsonl writes a checksum per line, so the planted change runs on no other target
+wasm crc_skipped server-postgres: only native-jsonl writes a checksum per line, so the planted change runs on no other target
+wasm crc_skipped cloudflare: only native-jsonl writes a checksum per line, so the planted change runs on no other target
+wasm crc_skipped vercel: only native-jsonl writes a checksum per line, so the planted change runs on no other target
+wasm nested_recovery_skipped vercel: Vercel recovers an open nested external call inside its step, by its attempt count, so the skipped recovery at load is never reached
+wasm recovery_skipped vercel: Vercel recovers an open external call inside its step, by its attempt count, so the skipped recovery record is never reached
+wasm recovery_unreported vercel: Vercel recovers an open external call inside its step, by its attempt count, so the unreported recovery record is never reached
+wasm event_redelivered vercel: a Vercel hook delivers each payload once, so no delivery repeats an id the turn recorded and the skipped duplicate check is never reached
+wasm batch_drain_skipped vercel: Vercel drains its inbox after a flush, not after a run, so the skipped drain after a batch runs on no Vercel turn
+wasm cancel_read_unstamped native-jsonl: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 118
+wasm cancel_read_unstamped native-sqlite: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 206
+wasm cancel_read_unstamped server-postgres: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 401
+wasm cancel_read_unstamped cloudflare: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 206"
 caught_elsewhere=scripts/strict.sh
 
 [ -x "$hl" ] || cargo build --release --locked
@@ -235,6 +286,7 @@ diff_script() {
   case $1 in
     rust) echo scripts/rust-diff.sh ;;
     js) echo scripts/js-diff.sh ;;
+    wasm) echo scripts/wasm-diff.sh ;;
   esac
 }
 
@@ -242,6 +294,7 @@ diff_targets() {
   case $1 in
     rust) echo "native-jsonl native-sqlite server-postgres" ;;
     js) echo "cloudflare vercel" ;;
+    wasm) echo "native-jsonl native-sqlite server-postgres cloudflare vercel" ;;
   esac
 }
 
@@ -252,12 +305,16 @@ diff_run() {
 }
 
 diff_plants_of() {
+  if [ "$1" = wasm ]; then
+    awk '/^pub const PLANTS/ { inside = 1 } inside && /^\];/ { inside = 0 } inside && previous ~ /^    \($/ { gsub(/[",[:space:]]/, ""); print } inside && /^    \("/ { split($0, parts, "\""); print parts[2] } { previous = $0 }' src/emit/wasm/mod.rs | sort
+    return
+  fi
   sed -n '/^plant_expression() {/,/^}/s/^    \([a-z_]*\)) echo .*/\1/p' "$(diff_script "$1")" | grep -vx none | sort
 }
 
 diff_census() {
   local backend planted plant file targets target output
-  for backend in rust js; do
+  for backend in rust js wasm; do
     planted=$(awk -v b="$backend" '$1 == b { print $2 }' <<< "$diff_plans" | sort)
     [ -n "$(diff_plants_of "$backend")" ] || census_fail "$(diff_script "$backend") lists no plants"
     if [ "$(diff_plants_of "$backend")" != "$planted" ]; then

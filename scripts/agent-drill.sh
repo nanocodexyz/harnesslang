@@ -39,8 +39,8 @@ report() {
 trap report EXIT
 
 case "$plant" in
-  none) plant_text= ;;
-  batch_flush_after_dispatch) plant_text='if external { ==> if false && external {' ;;
+  none) wasm_plant= ;;
+  batch_flush_after_dispatch) wasm_plant=batch_flush_skipped ;;
   *)
     echo "agent-drill: unknown AGENT_DRILL_PLANT $plant (none, batch_flush_after_dispatch)" >&2
     exit 2
@@ -48,7 +48,7 @@ case "$plant" in
 esac
 
 cargo build --release --locked -j2 --quiet
-HL_AGENT_PLANT="$plant_text" CARGO_TARGET_DIR="$(pwd)/$target" HL_BIN="$(pwd)/target/release/hl" cargo build --release --locked -j2 --quiet --manifest-path agent/Cargo.toml
+HL_AGENT_PLANT="$wasm_plant" CARGO_TARGET_DIR="$(pwd)/$target" cargo build --release --locked -j2 --quiet --manifest-path agent/Cargo.toml
 
 rm -rf "$out"
 mkdir -p "$out/ws"

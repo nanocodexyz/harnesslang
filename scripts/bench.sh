@@ -69,7 +69,7 @@ build_host() {
   local target=$1 store=$2
   local dir="$out/build/$target"
   mkdir -p "$dir"
-  "$hl" emit --target "$target" "$file" > "$dir/harness.rs.new"
+  "$hl" emit --format source --target "$target" "$file" > "$dir/harness.rs.new"
   if [ "$plant" = extra_fsync ] && [ "$target" = native-jsonl ]; then
     [ "$(grep -c "$jsonl_sync" "$dir/harness.rs.new")" -eq 1 ] ||
       fail "the generated native-jsonl code no longer has one sync per flush to plant a second after"

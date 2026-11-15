@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "harnesslang"
+version = "0.1.0"
+
+[[package]]
 name = "hl-agent"
 version = "0.1.0"
+dependencies = [
+ "harnesslang",
+]

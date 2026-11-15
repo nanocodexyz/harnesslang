@@ -12,6 +12,9 @@ const MUTATIONS = {
   unserialized: [["await this.serialized(() => this.drive(turn))", "await this.drive(turn)"]],
   stale_alarm_flag: [["      this.armed = false;\n      await Promise.allSettled(", "      await Promise.allSettled("]],
   no_sync: [["    await this.storage.sync();\n", ""]],
+  vercel_step_continues: [["    throw new StepEnd(linesOf(text));", "    linesOf(text);"]],
+  vercel_ack_unhooked: [["      if (live) await platform.hook(POINT_BEFORE_ACKNOWLEDGE);", ""]],
+  vercel_resumed_dropped: [["      await platform.resumed(suspensionFrom(answered.suspension), resumeFrom(answered.resume), true);", ""]],
 };
 
 const [name, from, to] = process.argv.slice(2);

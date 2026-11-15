@@ -56,7 +56,7 @@ fi
 build() {
   local name=$1 dir="$out/$1"
   mkdir -p "$dir"
-  "$hl" emit --target native-jsonl "$out/$name.hl" > "$dir/harness.rs"
+  "$hl" emit --format source --target native-jsonl "$out/$name.hl" > "$dir/harness.rs"
   cp scripts/rust/parallel_bench.rs "$dir/main.rs"
   rustc --edition 2024 -C opt-level=2 -o "$dir/bench" "$dir/main.rs"
 }

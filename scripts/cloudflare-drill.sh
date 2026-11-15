@@ -9,6 +9,7 @@ mutation_sessions="${CLOUDFLARE_MUTATION_SESSIONS:-8}"
 mutation_turns="${CLOUDFLARE_MUTATION_TURNS:-6}"
 jobs="${CLOUDFLARE_JOBS:-3}"
 seed="${CLOUDFLARE_SEED:-0}"
+examples="${CLOUDFLARE_EXAMPLES:-$(echo examples/*.hl)}"
 hl=target/release/hl
 oracle=oracle/cloudflare
 scratch=output/cloudflare-drill
@@ -68,20 +69,50 @@ tools_of() {
   grep -oE '^tool [a-z_]+' "$1" | cut -d' ' -f2 | paste -sd, -
 }
 
-for file in examples/*.hl; do
+module_of() {
+  local name=$1 plant=$2
+  local bundle="$scratch/bundle-$name-$plant"
+  rm -rf "$bundle"
+  "$hl" bundle --target cloudflare --plant "$plant" --out "$bundle" "examples/$name.hl" > /dev/null
+  echo --module "$bundle/worker.mjs" --wasm "$bundle/program.wasm"
+}
+
+drilled=0
+skipped=0
+for file in $examples; do
   name=$(basename "$file" .hl)
-  "$hl" emit --target cloudflare "$file" > "$scratch/$name.mjs"
+  if ! "$hl" bundle --target cloudflare --out "$scratch/bundle-$name-check" "$file" > /dev/null 2> "$scratch/$name.bundle.err"; then
+    echo "cloudflare drill: $name is not deployed: $(cut -c1-160 "$scratch/$name.bundle.err")"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  drilled=$((drilled + 1))
+  read -ra module <<< "$(module_of "$name" none)"
   "$hl" sim --target cloudflare --seeds "$trace_seeds" --trace "$scratch/$name.trace.jsonl" "$file" > /dev/null
-  drill --mode trace --module "$scratch/$name.mjs" --dir "$scratch/trace-$name" --trace "$scratch/$name.trace.jsonl" --jobs "$jobs" | tail -n 2
-  drill --mode kill --module "$scratch/$name.mjs" --dir "$scratch/kill-$name" --trace "$scratch/$name.trace.jsonl" --tools "$(tools_of "$file")" \
+  if grep -qE '"event":"(inbox|batch|resume)"' "$scratch/$name.trace.jsonl"; then
+    echo "cloudflare drill: $name runs in kill mode only: the trace drill delivers no events or resumes and cannot order a batch's concurrent dispatches as the trace does"
+  else
+    drill --mode trace "${module[@]}" --dir "$scratch/trace-$name" --trace "$scratch/$name.trace.jsonl" --jobs "$jobs" | tail -n 2
+  fi
+  drill --mode kill "${module[@]}" --dir "$scratch/kill-$name" --trace "$scratch/$name.trace.jsonl" --tools "$(tools_of "$file")" \
     --sessions "$sessions" --turns "$turns" --seed "$seed" --jobs "$jobs" | tail -n 2
 done
 
+echo "cloudflare drill: $drilled programs drilled from their deploy bundles, $skipped not deployed"
+
 expect_caught() {
   local mutation=$1 mode=$2 profile=$3 expected=$4
-  local module="$scratch/agent-$mutation.mjs" log="$scratch/mutation-$mutation.log"
-  node "$oracle/mutate.mjs" "$mutation" "$scratch/agent.mjs" "$module"
-  local args=(--mode "$mode" --module "$module" --dir "$scratch/mutation-$mutation" --trace "$scratch/agent.trace.jsonl" --jobs "$jobs")
+  if [ -n "${5:-}" ]; then expected=$5; fi
+  local log="$scratch/mutation-$mutation.log" module
+  local plant=${WASM_PLANTS[$mutation]:-none}
+  if [ "$plant" != none ]; then
+    read -ra module <<< "$(module_of agent "$plant")"
+  else
+    read -ra module <<< "$(module_of agent none)"
+    node "$oracle/mutate.mjs" "$mutation" "${module[1]}" "$scratch/host-$mutation.mjs"
+    module[1]="$scratch/host-$mutation.mjs"
+  fi
+  local args=(--mode "$mode" "${module[@]}" --dir "$scratch/mutation-$mutation" --trace "$scratch/agent.trace.jsonl" --jobs "$jobs")
   if [ "$mode" = kill ]; then
     args+=(--profile "$profile" --tools "$(tools_of examples/agent.hl)" --sessions "$mutation_sessions" --turns "$mutation_turns" --seed "$seed")
   fi
@@ -97,9 +128,11 @@ expect_caught() {
   echo "cloudflare drill: mutation $mutation caught: $(grep -m1 '^FAIL' "$log" | cut -c1-200)"
 }
 
+declare -A WASM_PLANTS=([recovery_redispatches]=recovery_skipped [recovery_unreported]=recovery_unreported)
+
 expect_caught dispatch_before_insert kill all 'FAIL invariant=external_once .*reached the tool host before its call row was committed'
 expect_caught no_alarm kill all 'FAIL invariant=liveness .*with no alarm committed'
-expect_caught recovery_redispatches kill all 'FAIL invariant=external_once .*was dispatched twice'
+expect_caught recovery_redispatches kill all 'FAIL invariant=external_once .*was dispatched twice' 'FAIL invariant=liveness .*recovery turns every open external call unknown before the turn runs again'
 expect_caught recovery_unreported kill all 'FAIL invariant=unknown_reported .*no recovery reports it unknown'
 expect_caught unserialized kill all 'FAIL invariant=liveness .*one turn runs at a time in an object'
 expect_caught stale_alarm_flag kill storage 'FAIL invariant=liveness .*with no alarm committed'

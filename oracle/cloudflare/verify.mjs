@@ -1,6 +1,7 @@
 import { Failure } from "./platform.mjs";
 
-const BUILTIN_TOOLS = ["now", "random"];
+const BUILTIN_TOOLS = ["now", "random", "deny", "suspend"];
+const INPUT_REFUSED_PREFIX = "input of ";
 
 function callKey(turn, seq) {
   return `${turn}/${seq}`;
@@ -26,7 +27,7 @@ function foldOrFail(rt, records) {
 }
 
 function journalFacts(records) {
-  const facts = { calls: new Map(), results: new Set(), recovered: new Map(), statuses: new Map(), seqs: new Map(), rowsPerTurn: new Map(), shapes: new Map(), recoveries: 0 };
+  const facts = { calls: new Map(), results: new Map(), recovered: new Map(), statuses: new Map(), seqs: new Map(), rowsPerTurn: new Map(), shapes: new Map(), recoveries: 0 };
   for (const record of records) {
     const turn = record.kind === "checkpoint" ? record.revision : record.turn;
     if (record.kind === "recovery") facts.recoveries += 1;
@@ -44,7 +45,7 @@ function journalFacts(records) {
       facts.seqs.set(record.turn, seqs);
     }
     if (record.kind === "call") facts.calls.set(callKey(record.turn, record.seq), record);
-    if (record.kind === "result") facts.results.add(callKey(record.turn, record.seq));
+    if (record.kind === "result") facts.results.set(callKey(record.turn, record.seq), record.output);
     if (record.kind === "recovery") {
       for (const seq of record.unknown) facts.recovered.set(callKey(record.turn, seq), record.attempt);
     }
@@ -68,7 +69,9 @@ function checkCalls(facts, ledger) {
     counts.other += 1;
     if (!done) throw new Failure("idempotent_known", `${call.effect} call ${id} (${call.tool}) has no result`);
     if (recovered) throw new Failure("unknown_reported", `${call.effect} call ${id} was reported unknown`);
-    if (!BUILTIN_TOOLS.includes(call.tool) && !(ledger.get(id) ?? []).some((dispatch) => dispatch.tool === call.tool)) {
+    const output = facts.results.get(id);
+    const refused = output.tag === "failed" && output.error.startsWith(INPUT_REFUSED_PREFIX + call.tool + ": ");
+    if (!BUILTIN_TOOLS.includes(call.tool) && !refused && !(ledger.get(id) ?? []).some((dispatch) => dispatch.tool === call.tool)) {
       throw new Failure("idempotent_known", `${call.effect} call ${id} (${call.tool}) has a result no dispatch produced`);
     }
   }

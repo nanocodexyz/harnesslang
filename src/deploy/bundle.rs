@@ -11,8 +11,14 @@ pub const BUNDLE_FILES_MAX: usize = 15_000;
 pub const BUNDLE_BYTES_MAX: u64 = 100 * 1024 * 1024;
 pub const MANIFEST_FILE: &str = "hl-bundle.json";
 pub const CLOUDFLARE_MAIN: &str = "worker.mjs";
+pub const CLOUDFLARE_PROGRAM: &str = "program.wasm";
+pub const CLOUDFLARE_HOST: &str = include_str!("../../hosts/cloudflare.mjs");
+pub const VERCEL_HOST_FILE: &str = "workflows/vercel.mjs";
+pub const VERCEL_PROGRAM: &str = "workflows/program.mjs";
+pub const VERCEL_HOST: &str = include_str!("../../hosts/vercel.mjs");
+pub const VERCEL_SESSION: &str = include_str!("../../hosts/vercel-session.mjs");
+pub const NATIVE_PROGRAM: &str = "program.wasm";
 pub const CLOUDFLARE_AUTH_MAIN: &str = "hl-auth.mjs";
-pub const VERCEL_HARNESS: &str = "workflows/harness.mjs";
 pub const VERCEL_WORKFLOW: &str = "workflows/session.mjs";
 pub const VERCEL_ROUTE: &str = "app/sessions/[session]/[kind]/route.mjs";
 pub const NEXT_VERSION: &str = "16.4.6";
@@ -102,6 +108,16 @@ impl Bundle {
 
 pub const DIGEST_SHOWN: usize = 12;
 
+impl Bundle {
+    pub fn write_with_manifest(&self, directory: &Path) -> Result<(), String> {
+        self.write(directory)?;
+        let manifest = super::json::Value::object([("main", super::json::Value::text(&self.main))]);
+        let path = directory.join(MANIFEST_FILE);
+        std::fs::write(&path, format!("{}\n", manifest.encode()))
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))
+    }
+}
+
 pub fn file(path: &str, bytes: Vec<u8>) -> File {
     File {
         path: path.to_owned(),
@@ -111,24 +127,52 @@ pub fn file(path: &str, bytes: Vec<u8>) -> File {
 }
 
 pub fn emitted(program: &Program, target: Target, plant: Plant) -> Result<Bundle, String> {
-    let code = crate::emit::emit(program, target)?;
+    emitted_planted(program, target, "none", plant)
+}
+
+pub fn emitted_planted(
+    program: &Program,
+    target: Target,
+    wasm_plant: &str,
+    plant: Plant,
+) -> Result<Bundle, String> {
+    let module = crate::emit::wasm::emit_planted(program, target, wasm_plant)?;
+    if matches!(target, Target::Cloudflare | Target::Vercel) && !program.codes.is_empty() {
+        return Err(format!(
+            "{} runs code cells, which the fixed {} host does not run",
+            program.name,
+            target.name()
+        ));
+    }
     match target {
         Target::Cloudflare => Bundle::new(
             CLOUDFLARE_AUTH_MAIN,
             vec![
-                file(CLOUDFLARE_MAIN, code.into_bytes()),
+                file(CLOUDFLARE_MAIN, CLOUDFLARE_HOST.as_bytes().to_vec()),
+                file(CLOUDFLARE_PROGRAM, module),
                 file(CLOUDFLARE_AUTH_MAIN, cloudflare_auth(plant).into_bytes()),
             ],
             Origin::Emitted,
         ),
-        Target::Vercel => Bundle::new(
-            VERCEL_ROUTE,
-            vercel_files(program, code, plant),
-            Origin::Emitted,
-        ),
+        Target::Vercel => {
+            if program.events.cancel
+                || program.events.steers.is_some()
+                || program.events.jobs.is_some()
+            {
+                return Err(format!(
+                    "{} takes events, which the fixed Vercel host does not deliver inside a step",
+                    program.name
+                ));
+            }
+            Bundle::new(
+                VERCEL_ROUTE,
+                vercel_files(program, &module, plant),
+                Origin::Emitted,
+            )
+        }
         _ => Bundle::new(
-            "harness.rs",
-            vec![file("harness.rs", code.into_bytes())],
+            NATIVE_PROGRAM,
+            vec![file(NATIVE_PROGRAM, module)],
             Origin::Emitted,
         ),
     }
@@ -154,7 +198,7 @@ fn cloudflare_auth(plant: Plant) -> String {
     )
 }
 
-fn vercel_files(program: &Program, harness: String, plant: Plant) -> Vec<File> {
+fn vercel_files(program: &Program, module: &[u8], plant: Plant) -> Vec<File> {
     let package = format!(
         "{{\n  \"name\": \"{}\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": {{ \"build\": \"next build\" }},\n  \"dependencies\": {{\n    \"next\": \"{NEXT_VERSION}\",\n    \"react\": \"{REACT_VERSION}\",\n    \"react-dom\": \"{REACT_VERSION}\",\n    \"workflow\": \"{WORKFLOW_VERSION}\"\n  }}\n}}\n",
         super::default_name(&program.name)
@@ -168,11 +212,12 @@ fn vercel_files(program: &Program, harness: String, plant: Plant) -> Vec<File> {
     vec![
         file("package.json", package.into_bytes()),
         file("next.config.mjs", config.as_bytes().to_vec()),
-        file(VERCEL_HARNESS, harness.into_bytes()),
+        file(VERCEL_HOST_FILE, VERCEL_HOST.as_bytes().to_vec()),
         file(
-            VERCEL_WORKFLOW,
-            crate::emit::js::workflow_binding().into_bytes(),
+            VERCEL_PROGRAM,
+            crate::emit::wasm::module_js(module).into_bytes(),
         ),
+        file(VERCEL_WORKFLOW, VERCEL_SESSION.as_bytes().to_vec()),
         file(VERCEL_ROUTE, route.into_bytes()),
     ]
 }
@@ -238,7 +283,7 @@ fn manifest_main(root: &Path, target: Target) -> Result<String, String> {
     let fallback = match target {
         Target::Vercel => VERCEL_ROUTE,
         Target::Cloudflare => CLOUDFLARE_MAIN,
-        _ => "harness.rs",
+        _ => NATIVE_PROGRAM,
     };
     let text = match std::fs::read_to_string(&manifest) {
         Ok(text) => text,

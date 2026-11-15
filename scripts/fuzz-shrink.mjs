@@ -22,7 +22,7 @@ const scratch = values.out + ".candidate.hl";
 let tries = 0;
 
 function checks(path) {
-  return spawnSync(HL, ["emit", "--target", "native-jsonl", path], { maxBuffer: OUTPUT_BYTES_MAX }).status === 0;
+  return spawnSync(HL, ["emit", "--format", "source", "--target", "native-jsonl", path], { maxBuffer: OUTPUT_BYTES_MAX }).status === 0;
 }
 
 function interesting(lines) {

@@ -2,7 +2,7 @@ pub const CRC32_POLYNOMIAL_REFLECTED: u32 = 0xedb8_8320;
 const BYTE_VALUES: usize = 256;
 const BITS_PER_BYTE: u32 = 8;
 
-const TABLE: [u32; BYTE_VALUES] = table();
+pub const TABLE: [u32; BYTE_VALUES] = table();
 
 const fn table() -> [u32; BYTE_VALUES] {
     let mut table = [0_u32; BYTE_VALUES];

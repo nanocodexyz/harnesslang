@@ -9,6 +9,7 @@ kills_per_session_max="${DRILL_KILLS_MAX:-400}"
 file="${DRILL_FILE:-examples/agent.hl}"
 seed_base="${DRILL_SEED:-0}"
 mutation="${DRILL_MUTATION:-none}"
+format="${DRILL_FORMAT:-wasm}"
 hl=target/release/hl
 out=output/rust-drill
 plants=()
@@ -42,6 +43,7 @@ case "$mutation" in
 esac
 out="$out-$(basename "$file" .hl)"
 [ "$mutation" = none ] || out="$out-$mutation"
+out="$out-$format"
 killed_status=137
 mkdir -p "$out"
 
@@ -57,32 +59,53 @@ report() {
 trap report EXIT
 
 cargo build --release --locked -j2 --quiet
+if [ "$format" = wasm ]; then
+  case "$mutation" in
+    none | flush_after_dispatch) plant=$mutation ;;
+    *)
+      echo "drill: DRILL_MUTATION $mutation plants the generated Rust; run it with DRILL_FORMAT=source" >&2
+      exit 2
+      ;;
+  esac
+  "$hl" emit --target native-jsonl --plant "$plant" "$file" > "$out/program.wasm"
+  cp scripts/rust/module_drill_host.rs scripts/rust/sql_drill_checks.rs "$out/"
+  key=$(cat "$out/module_drill_host.rs" "$out/sql_drill_checks.rs" target/release/libharnesslang.rlib | cksum | cut -d' ' -f1)
+  if [ ! -x "$out/module_drill_host" ] || [ "$(cat "$out/key" 2>/dev/null)" != "$key" ]; then
+    rustc --edition 2024 -O -o "$out/module_drill_host" "$out/module_drill_host.rs" --extern harnesslang=target/release/libharnesslang.rlib -L target/release/deps 2> "$out/rustc.log" || { cat "$out/rustc.log" >&2; exit 1; }
+    echo "$key" > "$out/key"
+  fi
+  host_run=("$out/module_drill_host" run "$out/program.wasm")
+  host_verify=("$out/module_drill_host" verify)
+else
 
-"$hl" emit --target native-jsonl "$file" > "$out/harness.rs.new"
-for plant in "${plants[@]}"; do
-  from=${plant%% ==> *}
-  to=${plant#* ==> }
-  if [ "$(grep -cF -- "$from" "$out/harness.rs.new")" -ne 1 ]; then
-    echo "drill: $mutation: the generated code no longer has exactly one '$from' to mutate" >&2
-    exit 1
+  "$hl" emit --format source --target native-jsonl "$file" > "$out/harness.rs.new"
+  for plant in "${plants[@]}"; do
+    from=${plant%% ==> *}
+    to=${plant#* ==> }
+    if [ "$(grep -cF -- "$from" "$out/harness.rs.new")" -ne 1 ]; then
+      echo "drill: $mutation: the generated code no longer has exactly one '$from' to mutate" >&2
+      exit 1
+    fi
+    pattern=$(printf '%s' "$from" | sed 's/[][\.*^$/]/\\&/g')
+    replacement=$(printf '%s' "$to" | sed 's/[\&/]/\\&/g')
+    sed -i "s/$pattern/$replacement/" "$out/harness.rs.new"
+    if grep -qF -- "$from" "$out/harness.rs.new" || ! grep -qF -- "$to" "$out/harness.rs.new"; then
+      echo "drill: $mutation: '$from' was not replaced by its plant" >&2
+      exit 1
+    fi
+  done
+  cp scripts/rust/drill_host.rs scripts/rust/drill_cells.rs "$out/"
+  cp scripts/rust/sql_drill_checks.rs "$out/sql_drill_checks.rs"
+  mv "$out/harness.rs.new" "$out/harness.rs"
+  key=$(cat "$out/harness.rs" "$out/drill_host.rs" "$out/drill_cells.rs" "$out/sql_drill_checks.rs" | cksum | cut -d' ' -f1)
+  if [ ! -x "$out/drill_host" ] || [ "$(cat "$out/key" 2>/dev/null)" != "$key" ]; then
+    rustc --edition 2024 -O -o "$out/drill_host" "$out/drill_host.rs"
+    echo "$key" > "$out/key"
   fi
-  pattern=$(printf '%s' "$from" | sed 's/[][\.*^$/]/\\&/g')
-  replacement=$(printf '%s' "$to" | sed 's/[\&/]/\\&/g')
-  sed -i "s/$pattern/$replacement/" "$out/harness.rs.new"
-  if grep -qF -- "$from" "$out/harness.rs.new" || ! grep -qF -- "$to" "$out/harness.rs.new"; then
-    echo "drill: $mutation: '$from' was not replaced by its plant" >&2
-    exit 1
-  fi
-done
-cp scripts/rust/drill_host.rs scripts/rust/drill_cells.rs "$out/"
-cp scripts/rust/sql_drill_checks.rs "$out/sql_drill_checks.rs"
-mv "$out/harness.rs.new" "$out/harness.rs"
-key=$(cat "$out/harness.rs" "$out/drill_host.rs" "$out/drill_cells.rs" "$out/sql_drill_checks.rs" | cksum | cut -d' ' -f1)
-if [ ! -x "$out/drill_host" ] || [ "$(cat "$out/key" 2>/dev/null)" != "$key" ]; then
-  rustc --edition 2024 -O -o "$out/drill_host" "$out/drill_host.rs"
-  echo "$key" > "$out/key"
+
+  host_run=("$out/drill_host" run)
+  host_verify=("$out/drill_host" verify)
 fi
-
 total_kills=0
 total_runs=0
 for session in $(seq 1 "$sessions"); do
@@ -95,7 +118,7 @@ for session in $(seq 1 "$sessions"); do
   runs=0
   while true; do
     runs=$((runs + 1))
-    "$out/drill_host" run "$dir/journal.jsonl" "$dir/ledger" "$dir/acks" "$seed" "$turns" 2>> "$dir/stderr" &
+    "${host_run[@]}" "$dir/journal.jsonl" "$dir/ledger" "$dir/acks" "$seed" "$turns" 2>> "$dir/stderr" &
     pid=$!
     delay_ms=$((RANDOM % (delay_ms_max + 1)))
     sleep "$(printf '0.%03d' "$delay_ms")"
@@ -116,7 +139,7 @@ for session in $(seq 1 "$sessions"); do
       exit 1
     fi
   done
-  verified=$("$out/drill_host" verify "$dir/journal.jsonl" "$dir/ledger" "$dir/acks" "$turns" 2>&1) || {
+  verified=$("${host_verify[@]}" "$dir/journal.jsonl" "$dir/ledger" "$dir/acks" "$turns" 2>&1) || {
     echo "drill: session $session failed verification after $kills kills:" >&2
     echo "$verified" >&2
     exit 1

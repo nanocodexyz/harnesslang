@@ -170,7 +170,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-const BASE64_ALPHABET: &[u8; 64] =
+pub const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const BASE64_PAD: u8 = b'=';
 const BASE64_GROUP_BYTES: usize = 3;

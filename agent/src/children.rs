@@ -5,13 +5,15 @@ use std::thread::JoinHandle;
 
 use crate::anthropic::Client;
 use crate::json::Value;
-use crate::{Agent, Ledger, child_harness, harness, now_ms, tools};
+use crate::{Agent, Ledger, child_harness, harness, host, now_ms, tools};
 
 pub const SPAWN_TOOL: &str = "spawn_agent";
 pub const LIST_TOOL: &str = "list_agents";
 pub const SUBMIT_TOOL: &str = "submit_result";
 pub const RUNNING_MAX: usize = 16;
-const LISTED_MAX: u64 = harness::program::ROUNDS_MAX * harness::program::CALLS_PER_ROUND_MAX;
+const LISTED_MAX: u64 = harness::ROUNDS_MAX * harness::CALLS_PER_ROUND_MAX;
+const CHILD_HANDLER: &str = "delegated";
+const CHILD_TURN: u64 = 1;
 const DIRECTORY: &str = "children";
 const SPAWN_FILE: &str = "spawn.json";
 const JOURNAL_FILE: &str = "journal.jsonl";
@@ -44,7 +46,7 @@ fn failed(message: &str) -> String {
 }
 
 fn is_key(key: &str) -> bool {
-    let Some((turn, seq)) = key.split_once(harness::SPAWN_KEY_SEPARATOR) else {
+    let Some((turn, seq)) = key.split_once(harnesslang::ir::SPAWN_KEY_SEPARATOR) else {
         return false;
     };
     [turn, seq]
@@ -109,7 +111,7 @@ impl Children {
     }
 
     pub fn spawn(&mut self, turn: u64, seq: u64, input: &Value) -> tools::Ran {
-        let key = format!("{turn}{}{seq}", harness::SPAWN_KEY_SEPARATOR);
+        let key = format!("{turn}{}{seq}", harnesslang::ir::SPAWN_KEY_SEPARATOR);
         assert!(
             is_key(&key),
             "a spawn's key is its call's turn and sequence number"
@@ -211,7 +213,7 @@ impl Children {
             ));
         }
         keys.sort_by_key(|key| {
-            key.split_once(harness::SPAWN_KEY_SEPARATOR)
+            key.split_once(harnesslang::ir::SPAWN_KEY_SEPARATOR)
                 .map(|(turn, seq)| (turn.parse::<u64>().ok(), seq.parse::<u64>().ok()))
         });
         let mut agents = Vec::new();
@@ -301,7 +303,7 @@ fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
         workspace: tools::Workspace {
             root: setup.cwd.clone(),
             state,
-            image_bytes_max: child_harness::program::blob_bound("Read").map(|(_, bytes)| bytes),
+            image_bytes_max: child_harness::READ_BYTES_MAX,
         },
         ledger: Ledger { file },
         children: None,
@@ -317,27 +319,28 @@ fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
     };
     mark(&mut agent, "start");
     let journal = directory.join(JOURNAL_FILE);
-    let mut disk = child_harness::FileDisk::open(&journal)
-        .map_err(|error| format!("{}: {error}", journal.display()))?;
-    let request = child_harness::TurnRequest {
-        turn: child_harness::FIRST_TURN,
-        arguments: child_harness::program::Arguments::Delegated(role, task),
-    };
-    let ran = child_harness::run_jsonl(&mut agent, &mut disk, &request);
+    let mut disk = harnesslang::wasm::native::Journal::open(&journal)?;
+    let loaded = host::load(child_harness::MODULE);
+    let request = host::request(
+        CHILD_HANDLER,
+        CHILD_TURN,
+        Value::object([("role", Value::text(&role)), ("task", Value::text(&task))]),
+    );
+    let ran = host::run(&loaded, &mut agent, &mut disk, &request);
     mark(&mut agent, "end");
     match ran {
-        Ok(child_harness::Ran::Finished(finish) | child_harness::Ran::AlreadyFinished(finish)) => {
+        Ok(host::Ran::Finished(finish)) => {
             eprintln!("{}: finished {}", agent.label, finish.result.encode());
             Ok(finish.result.encode())
         }
-        Ok(child_harness::Ran::Suspended(_)) => {
+        Ok(host::Ran::Suspended { .. }) => {
             panic!("the child harness declares no suspend, so its turn never waits")
         }
-        Ok(child_harness::Ran::NotDue(_)) => {
+        Ok(host::Ran::NotDue) => {
             panic!(
                 "the child harness declares no idle handler, so its prompt is never refused as not due"
             )
         }
-        Err(error) => Err(format!("{error:?}")),
+        Err(error) => Err(error),
     }
 }

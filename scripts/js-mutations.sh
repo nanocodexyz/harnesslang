@@ -30,7 +30,7 @@ mutations=(
 )
 
 for target in cloudflare vercel; do
-  "$hl" emit --target "$target" "$file" > "$out/$target.mjs"
+  "$hl" emit --format source --target "$target" "$file" > "$out/$target.mjs"
   "$hl" sim --target "$target" --seeds "$seeds" --trace "$out/$target-none.trace" "$file" > "$out/$target-none.sim.log"
 done
 

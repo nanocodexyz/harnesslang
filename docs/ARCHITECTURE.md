@@ -487,6 +487,55 @@ session's Durable Object (Cloudflare), the re-executed workflow function with
 every nested call a step (Vercel). A target whose platform cannot give that
 says `cells: unsupported` and `hl check` refuses `code` there.
 
+## WebAssembly
+
+`hl emit --target T --format wasm` writes a WebAssembly module instead of
+source code, and `--format wat` its text. The compiler writes the bytes
+itself: `src/emit/wasm/assemble.rs` reads a small text form (folded and flat
+instructions, globals, `(text $name "...")` and `(words $name ...)` data
+segments whose labels resolve to addresses) and `encode.rs` writes the binary
+module, so the build needs no other tool. A module is the shared runtime
+(`src/emit/wasm/runtime/*.wat`: allocation, text, JSON, values, the journal
+fold and encoder, the engine and every feature's runtime) followed by what the
+program adds: data tables that describe its types, sums, tools, sites, model,
+listings, events and target (`data.rs`), and one function per handler that
+`lower.rs` writes from the IR. Values are i64 words: numbers and booleans in
+place, texts, lists and sums as addresses into linear memory, which grows by
+pages and is never freed, since an instance lives for one run.
+
+Before it encodes, the assembler shakes the module for the program
+(`src/emit/wasm/shake.rs`): it reads the program's data tables as constants,
+learns which values reach each function's parameters and results, folds the
+branches those values decide, drops the code after a branch that never falls
+through, and keeps only the functions, globals and data an export still
+reaches. A program without cells, blobs, listings or jobs carries none of their
+runtime. It assumes the runtime never writes to a `words` table and reads a
+table at a computed index only within its bounds.
+
+A module's entry is `hl_run(request, journal, epoch)`: it folds the journal
+bytes, replays the turns after the last checkpoint, runs the requested turn and
+returns its exit as JSON (finished, already finished, suspended or corrupt);
+`hl_side(journal, epoch)` answers a side question between turns. It reaches the world through imports in the `hl` namespace: the
+durability points (`flush` with the encoded records, `hook`, `attempt`,
+`acknowledge`), the effects (`tool`, `model`, `now`, `random`) and one
+generic `world` import that takes a JSON request (a batch of a parallel for,
+an event drain, a wait, a listing, a side question) and returns the answer.
+So a platform keeps one host shared by every program: it stores the bytes
+`flush` hands it in the target's journal and answers the requests, while
+everything the program decides, from record encoding to recovery, is in the
+module. The target's model is data the module reads (`$target`: checksummed
+lines, the output gate, in-step recovery, the concurrent request limit), so
+the five targets share one runtime.
+
+`scripts/wasm-sim.mjs` (node) and `hl wasm-sim` (the std-only interpreter
+in `src/wasm/`) are hosts that answer every import from an `hl sim --trace`:
+each call the module makes must be the next event the interpreter made, with
+the same records flushed byte for byte, the same hook points, the same tool
+and model requests and the same exits. `scripts/wasm-diff.sh` runs that
+diff, and `WASM_DIFF_PLANT` plants a divergence listed in `PLANTS`
+(`src/emit/wasm/mod.rs`), a text substitution in the runtime that
+`scripts/mutations.sh --diff` requires to fail on every target it changes.
+
 ## Verification
 
 ### Checks at compile time
@@ -816,7 +865,9 @@ made.
   - `target/`: the target models
   - `prove/`: `hl prove`: the plan per target, the durability, finishing and
     arithmetic proofs, and the linear constraint solver
-  - `emit/`: Rust, JavaScript and SQL generation
+  - `emit/`: Rust, JavaScript and SQL generation, and WebAssembly modules
+    (`emit/wasm/`: assembler, encoder, data tables, lowering and runtime)
+  - `wasm/`: a WebAssembly interpreter and the `hl wasm-sim` trace host
   - `deploy/`: `hl deploy`, `status`, `logs`, `rollback`, `secrets` and
     `destroy` against the Cloudflare and Vercel APIs and local installs
   - `sim/`: the deterministic simulator, faults, invariants and mutations

@@ -51,8 +51,8 @@ diff_one() {
   local dir started ended
   dir="$out/$target-$(basename "$file" .hl)$suffix"
   mkdir -p "$dir"
-  "$hl" emit --target "$target" "$file" | sed "$(plant_expression "$plant")" > "$dir/harness.mjs"
-  if [ "$plant" != none ] && cmp -s <("$hl" emit --target "$target" "$file") "$dir/harness.mjs"; then
+  "$hl" emit --format source --target "$target" "$file" | sed "$(plant_expression "$plant")" > "$dir/harness.mjs"
+  if [ "$plant" != none ] && cmp -s <("$hl" emit --format source --target "$target" "$file") "$dir/harness.mjs"; then
     echo "js-diff: plant $plant changes nothing in $file for $target" >&2
     return 1
   fi

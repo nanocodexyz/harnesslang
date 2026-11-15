@@ -12,11 +12,14 @@ const ANSWER_PPM = 350_000;
 const UNDECLARED_TOOL_PPM = 250_000;
 const TOOL_FAILURE_PPM = 150_000;
 const UNDECLARED_TOOLS = ["web_fetch", "spawn_agent"];
+const LISTED_TOOLS = { alpha: "alpha-v1", beta: "beta-v1" };
 const HTTP_OK = 200;
 const ALARM_POLL_MS = 25;
 const ALARM_WAIT_MS_MAX = 20000;
 const ATTEMPTS_PER_TURN_MAX = 400;
 const INJECTED = "hl-drill injected";
+const RAN_HEADER = "hl-ran";
+const RAN_SUSPENDED = "suspended";
 const NO_FAULTS = {
   killBeforeRunPpm: 0,
   killAfterRunPpm: 0,
@@ -75,7 +78,8 @@ class KillWorld {
     this.ledger = new Map();
     this.failure = null;
     this.run = 0;
-    this.stats = { killsBeforeRun: 0, killsAfterRun: 0, killsTimer: 0, storageFaults: 0, injectedErrors: 0, alarmResumes: 0, duplicates: 0, gateChecks: 0, attempts: 0 };
+    this.stats = { killsBeforeRun: 0, killsAfterRun: 0, killsTimer: 0, storageFaults: 0, injectedErrors: 0, alarmResumes: 0, duplicates: 0, gateChecks: 0, attempts: 0, suspensions: 0 };
+    this.suspended = null;
   }
 
   fail(failure) {
@@ -114,6 +118,7 @@ class KillWorld {
       await this.platform.kill();
       return null;
     }
+    if (path === "/listing") return this.listing(request);
     const answer = path === "/tool" ? this.tool(request) : this.model(request);
     if (this.rng.chance(this.faults.killAfterRunPpm)) {
       this.stats.killsAfterRun += 1;
@@ -121,6 +126,12 @@ class KillWorld {
       return null;
     }
     return this.rt.encodeJson(answer);
+  }
+
+  listing(request) {
+    const id = callKey(Number(request.turn), Number(request.seq));
+    this.ledger.set(id, [...(this.ledger.get(id) ?? []), { tool: request.listing, effect: "none", run: this.run }]);
+    return this.rt.encodeJson({ ok: LISTED_TOOLS });
   }
 
   tool(request) {
@@ -165,11 +176,23 @@ function turnBody(rt, options, index, turn) {
   return rt.encodeJson(Object.assign(Object.create(null), { arguments: request.arguments, handler: request.handler, turn: BigInt(turn) }));
 }
 
+function parkedAt(rt, rows, turn) {
+  let parked = null;
+  for (const row of rows) {
+    const record = rt.decodeLine(row.record, false);
+    if (record.kind === "call" && record.turn === turn && record.tool === "suspend") parked = record.seq;
+    if (record.kind === "result" && record.turn === turn && record.seq === parked) parked = null;
+  }
+  return parked;
+}
+
 async function waitAlarm(world, turn) {
   const started = Date.now();
   for (;;) {
     if (world.failure !== null || !world.platform.alive()) return false;
-    if (statusOf(world.rt, world.platform.rows(), turn) !== null) return true;
+    const rows = world.platform.rows();
+    if (statusOf(world.rt, rows, turn) !== null) return true;
+    if (parkedAt(world.rt, rows, turn) !== null) return false;
     if (Date.now() - started > ALARM_WAIT_MS_MAX) {
       throw new Failure("liveness", `turn ${turn}: the committed alarm did not finish it within ALARM_WAIT_MS_MAX (${ALARM_WAIT_MS_MAX} ms)`);
     }
@@ -187,6 +210,17 @@ function settleResponse(world, turn, settled, acks) {
     }
     const uncaught = response.headers[UNCAUGHT_HEADER] === "1" ? " (uncaught in the object)" : "";
     throw new Failure("liveness", `turn ${turn}: the object answered ${response.status}${uncaught}: ${response.body}`);
+  }
+  if (response.headers[RAN_HEADER] === RAN_SUSPENDED) {
+    const suspension = world.rt.decodeJson(response.body);
+    const seq = Number(suspension.seq);
+    const parked = world.platform.rows().some((row) => {
+      const record = world.rt.decodeLine(row.record, false);
+      return record.kind === "call" && record.turn === turn && record.seq === seq && record.tool === "suspend";
+    });
+    if (!parked) throw new Failure("liveness", `turn ${turn} answered suspended at ${turn}/${seq} with no durable suspend call for it`);
+    world.suspended = { turn, key: suspension.key, seq };
+    return false;
   }
   const finish = world.rt.decodeJson(response.body);
   const ack = { turn: Number(finish.turn), outcome: finish.outcome, result: finish.result };
@@ -228,6 +262,13 @@ async function attempt(world, body, turn, acks, killed) {
   clearTimeout(timer);
   if (world.failure !== null) throw world.failure;
   const finished = settled.map((each) => settleResponse(world, turn, each, acks));
+  const suspended = world.suspended;
+  world.suspended = null;
+  if (suspended !== null && platform.alive()) {
+    world.stats.suspensions += 1;
+    const answer = "resumed-" + suspended.turn + "-" + suspended.seq;
+    await platform.resume(world.rt.encodeJson({ answer, key: suspended.key, turn: BigInt(suspended.turn) })).catch(() => null);
+  }
   return finished.some((each) => each);
 }
 
@@ -238,7 +279,7 @@ async function killSession(rt, options, index) {
   mkdirSync(dir, { recursive: true });
   const world = new KillWorld(rt, options, seed);
   const host = await startHost((path, body) => world.handle(path, body));
-  world.platform = new Platform(dir, options.module, host.port);
+  world.platform = new Platform(dir, options.module, host.port, options.wasm);
   const acks = [];
   try {
     for (let turn = 1; turn <= options.turns; turn++) {

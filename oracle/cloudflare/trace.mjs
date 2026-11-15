@@ -237,7 +237,7 @@ async function traceSeed(rt, options, seed) {
   mkdirSync(dir, { recursive: true });
   const world = new TraceWorld(rt, seed);
   const host = await startHost((path, body) => world.handle(path, body));
-  world.platform = new Platform(dir, options.module, host.port);
+  world.platform = new Platform(dir, options.module, host.port, options.wasm);
   try {
     world.take("seed", "start of seed");
     while (world.peek()?.event === "turn") await traceTurn(world, world.take("turn", "next turn"));

@@ -128,7 +128,7 @@ mutate() {
 build() {
   local target=$1 dir=$out/$1/build
   mkdir -p "$dir"
-  "$hl" emit --target "$target" "$file" > "$dir/harness.rs.new"
+  "$hl" emit --format source --target "$target" "$file" > "$dir/harness.rs.new"
   mutate "$target" "$dir/harness.rs.new"
   mv "$dir/harness.rs.new" "$dir/harness.rs"
   for source in sql_drill_host sql_drill_checks sqlite_store postgres_store; do

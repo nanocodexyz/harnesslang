@@ -28,7 +28,7 @@ trace() {
 
 emit() {
   local target=$1 out=$2
-  if ! "$hl" emit --target "$target" "$file" > "$out" 2> "$out.err"; then
+  if ! "$hl" emit --format source --target "$target" "$file" > "$out" 2> "$out.err"; then
     fail "emit-$target" "$(head -c 400 "$out.err")"
     return 1
   fi

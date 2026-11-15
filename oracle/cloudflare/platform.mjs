@@ -8,6 +8,7 @@ import { WORKERD, objectFile, readRows } from "./local.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OBJECT_MODULE = join(HERE, "object.mjs");
+const PROGRAM_WASM = "program.wasm";
 const COMPATIBILITY_DATE = "2026-11-01";
 const UNIQUE_KEY = "harnesslang-drill";
 const ALARM_METADATA_KEY = 1;
@@ -77,7 +78,7 @@ function post(port, path, body) {
 }
 
 class Platform {
-  constructor(dir, module, hostPort) {
+  constructor(dir, module, hostPort, wasm = null) {
     this.dir = dir;
     this.storage = join(dir, "storage");
     this.hostPort = hostPort;
@@ -91,6 +92,8 @@ class Platform {
     mkdirSync(this.storage, { recursive: true });
     copyFileSync(module, join(dir, "worker.mjs"));
     copyFileSync(OBJECT_MODULE, join(dir, "object.mjs"));
+    this.wasm = wasm;
+    if (wasm !== null) copyFileSync(wasm, join(dir, PROGRAM_WASM));
   }
 
   config(fault, trace) {
@@ -106,7 +109,7 @@ class Platform {
       `  sockets = [(name = "http", address = ${capnpText(`${LOOPBACK}:${this.port}`)}, http = (), service = "main")],`,
       ");",
       "const harness :Workerd.Worker = (",
-      '  modules = [(name = "object.mjs", esModule = embed "object.mjs"), (name = "worker.mjs", esModule = embed "worker.mjs")],',
+      `  modules = [(name = "object.mjs", esModule = embed "object.mjs"), (name = "worker.mjs", esModule = embed "worker.mjs")${this.wasm === null ? "" : `, (name = ${capnpText(PROGRAM_WASM)}, wasm = embed ${capnpText(PROGRAM_WASM)})`}],`,
       `  compatibilityDate = ${capnpText(COMPATIBILITY_DATE)},`,
       `  durableObjectNamespaces = [(className = "HarnessObject", uniqueKey = ${capnpText(UNIQUE_KEY)}, enableSql = true)],`,
       '  durableObjectStorage = (localDisk = "storage"),',
@@ -114,6 +117,7 @@ class Platform {
       '    (name = "HARNESS", durableObjectNamespace = "HarnessObject"),',
       `    (name = "HL_TOOLS_URL", text = ${capnpText(`${host}/tool`)}),`,
       `    (name = "HL_MODEL_URL", text = ${capnpText(`${host}/model`)}),`,
+      `    (name = "HL_LISTINGS_URL", text = ${capnpText(`${host}/listing`)}),`,
       `    (name = "HL_DRILL_CLOCK", text = ${capnpText(trace === null ? "" : trace.clock)}),`,
       `    (name = "HL_DRILL_CRASH_HOOK", text = ${capnpText(trace === null || trace.crashHook === null ? NO_CRASH : String(trace.crashHook))}),`,
       `    (name = "HL_DRILL_FAULT", text = ${capnpText(fault)}),`,
@@ -191,6 +195,11 @@ class Platform {
   turn(body) {
     assert(this.port !== null, "a turn is posted to a started workerd");
     return post(this.port, `/sessions/${SESSION_NAME}/turn`, body);
+  }
+
+  resume(body) {
+    assert(this.port !== null, "a resume is posted to a started workerd");
+    return post(this.port, `/sessions/${SESSION_NAME}/resume`, body);
   }
 }
 

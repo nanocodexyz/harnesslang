@@ -53,3 +53,7 @@ doctest = false
 bench = false
 
 [dependencies]
+harnesslang = { path = ".." }
+
+[build-dependencies]
+harnesslang = { path = ".." }

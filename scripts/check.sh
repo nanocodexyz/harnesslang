@@ -7,7 +7,11 @@ seeds="${SEEDS:-0..2000}"
 twice_seeds="${TWICE_SEEDS:-0..300}"
 rust_diff_seeds="${RUST_DIFF_SEEDS:-0..300}"
 js_diff_seeds="${JS_DIFF_SEEDS:-0..100}"
+wasm_diff_seeds="${WASM_DIFF_SEEDS:-0..100}"
+wasm_native_diff_seeds="${WASM_NATIVE_DIFF_SEEDS:-0..30}"
 if [ "${HL_LONG:-0}" = 1 ]; then
+  wasm_diff_seeds="${WASM_DIFF_SEEDS:-0..2000}"
+  wasm_native_diff_seeds="${WASM_NATIVE_DIFF_SEEDS:-0..2000}"
   rust_diff_seeds="${RUST_DIFF_SEEDS:-0..2000}"
   js_diff_seeds="${JS_DIFF_SEEDS:-0..2000}"
 fi
@@ -232,8 +236,8 @@ invalid_fail() {
 same_program() {
   local with_fn=$1 written_out=$2 target
   for target in $targets; do
-    "$hl" emit --target "$target" "$written_out" > "$scratch/written_out.emit"
-    if ! "$hl" emit --target "$target" "$with_fn" | cmp -s - "$scratch/written_out.emit"; then
+    "$hl" emit --format source --target "$target" "$written_out" > "$scratch/written_out.emit"
+    if ! "$hl" emit --format source --target "$target" "$with_fn" | cmp -s - "$scratch/written_out.emit"; then
       echo "fn: $with_fn and $written_out emit different code for $target" >&2
       return 1
     fi
@@ -275,6 +279,18 @@ js_diff_one() {
   JS_DIFF_SEEDS=$js_diff_seeds JS_DIFF_TARGETS=$1 JS_DIFF_FILES=$2 scripts/js-diff.sh
 }
 
+wasm_diff_one() {
+  WASM_DIFF_SEEDS=$wasm_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$2 scripts/wasm-diff.sh
+}
+
+wasm_native_diff_one() {
+  WASM_DIFF_HOST=native WASM_DIFF_SEEDS=$wasm_native_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$2 scripts/wasm-diff.sh
+}
+
+wasm_lowered() {
+  "$hl" emit --target "$1" --format wasm "$2" > /dev/null 2>&1
+}
+
 scoped_diff_one() {
   local file=docs/snippets/tree_planner.hl scope=1.1
   case $1 in
@@ -311,8 +327,24 @@ census_examples() {
       fi
     done
   done
+  local pending=0
+  for file in $examples; do
+    for target in $targets; do
+      grep -q "^ok backend=wasm host=node file=$file target=$target " "$scratch/sweeps.log" && continue
+      if wasm_lowered "$target" "$file"; then
+        echo "census: $file is lowered to wasm for $target but had no wasm differential run" >&2
+        missing=1
+      elif ! "$hl" emit --target "$target" --format wasm "$file" 2>&1 | grep -q 'not yet in wasm'; then
+        echo "census: $file fails to lower to wasm for $target for a reason other than a feature not yet lowered" >&2
+        missing=1
+      else
+        pending=$((pending + 1))
+      fi
+    done
+  done
   [ "$missing" -eq 0 ] || exit 1
   echo "census: all $(wc -w <<< "$examples") examples are swept by hl sim on every target and by the differential runs on every Rust and JavaScript target"
+  echo "census: every example lowered to wasm had a wasm differential run on every target; $pending example-target pairs use a feature not yet lowered"
 }
 
 drill_mutation_caught() {
@@ -423,6 +455,12 @@ for file in $examples docs/snippets/keep.hl docs/snippets/in_flight.hl; do
 done
 for target in $targets; do
   queue scoped-diff scoped_diff_one "$target"
+done
+for file in $examples docs/snippets/*.hl; do
+  for target in $targets; do
+    wasm_lowered "$target" "$file" && queue wasm-diff wasm_diff_one "$target" "$file"
+    wasm_lowered "$target" "$file" && queue wasm-diff-native wasm_native_diff_one "$target" "$file"
+  done
 done
 for target in $rust_targets; do
   queue rust-diff rust_diff_one "$target" docs/snippets/side.hl

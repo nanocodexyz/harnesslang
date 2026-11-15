@@ -63,8 +63,8 @@ store_of() {
 build() {
   local file=$1 target=$2 dir=$3
   mkdir -p "$dir"
-  "$hl" emit --target "$target" "$file" | sed "$(plant_expression "$plant")" > "$dir/harness.rs.new"
-  if [ "$plant" != none ] && cmp -s <("$hl" emit --target "$target" "$file") "$dir/harness.rs.new"; then
+  "$hl" emit --format source --target "$target" "$file" | sed "$(plant_expression "$plant")" > "$dir/harness.rs.new"
+  if [ "$plant" != none ] && cmp -s <("$hl" emit --format source --target "$target" "$file") "$dir/harness.rs.new"; then
     echo "rust-diff: plant $plant changes nothing in $file for $target" >&2
     return 1
   fi

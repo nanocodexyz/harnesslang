@@ -258,11 +258,9 @@ fn finished_tags(lines: &[Line]) -> BTreeSet<&str> {
 
 pub fn check_other(calls: &Calls, lines: &[Line]) {
     let finished = finished_tags(lines);
-    for dispatch in dispatches(lines)
-        .filter(|dispatch| {
-            !dispatch.external && !dispatch.nested() && finished.contains(dispatch.tag.as_str())
-        })
-    {
+    for dispatch in dispatches(lines).filter(|dispatch| {
+        !dispatch.external && !dispatch.nested() && finished.contains(dispatch.tag.as_str())
+    }) {
         let logged = calls.other.get(&dispatch.id);
         assert!(
             logged.is_some(),

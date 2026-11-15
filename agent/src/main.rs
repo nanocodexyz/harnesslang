@@ -10,8 +10,9 @@ mod stream;
 mod tools;
 mod transport;
 
-include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
-include!(concat!(env!("OUT_DIR"), "/child_mod.rs"));
+mod host;
+
+include!(concat!(env!("OUT_DIR"), "/constants.rs"));
 include!(concat!(env!("OUT_DIR"), "/mpp_mod.rs"));
 include!(concat!(env!("OUT_DIR"), "/codex_mod.rs"));
 
@@ -20,8 +21,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anthropic::{Client, Usage};
-use harness::program::{self, Arguments};
-use harness::{Exit, FileDisk, Finish, Json, Ran, RunError, TurnRequest};
+use harnesslang::run::journal::Record;
+use harnesslang::wasm::native::Journal;
+use harnesslang::wasm::sim::Loaded;
+use host::{Finish, Ran};
 use json::Value;
 
 pub const EXIT_HARNESS_ERROR: i32 = 1;
@@ -30,7 +33,7 @@ const FIRST_TURN: u64 = 1;
 const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
-const JOINS_PER_TURN_MAX: u64 = program::ROUNDS_MAX * program::CALLS_PER_ROUND_MAX;
+const JOINS_PER_TURN_MAX: u64 = harness::ROUNDS_MAX * harness::CALLS_PER_ROUND_MAX;
 const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort high|medium|low|xhigh] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]\n       hl-agent pay --instruction <file> --cwd <dir> --model <id> --journal <dir> [--turn N]\n       hl-agent steer --journal <dir> --text <message>\n       hl-agent cancel --journal <dir>";
 const PLAIN_MODEL_ATTEMPTS: u64 = 3;
 const PLAIN_MODEL_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
@@ -39,7 +42,12 @@ const MPP_TOOL_DEFINITIONS: &str = include_str!("../prompts/mpp-tools.json");
 const HARNESS_CLAUDE: &str = "claude";
 const HARNESS_CODEX: &str = "codex";
 const CLAUDE_MODEL_PREFIX: &str = "claude";
+const CLAUDE_EFFORT_LEVELS: [&str; 3] = ["high", "medium", "low"];
+const SET_EFFORT_HANDLER: &str = "set_effort";
 const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
+const PROMPT_HANDLER: &str = "prompt";
+const IDLE_HANDLER: &str = "refresh";
+const JOURNAL_CHECKSUMS: bool = true;
 
 pub struct Options {
     pub instruction: PathBuf,
@@ -51,7 +59,7 @@ pub struct Options {
     pub turn: u64,
     pub fork_from: Option<PathBuf>,
     pub at: Option<u64>,
-    pub effort: Option<program::SumEffortLevel>,
+    pub effort: Option<String>,
     pub effort_text: Option<String>,
     pub harness: String,
 }
@@ -91,10 +99,10 @@ fn options() -> Options {
                 let parsed: u64 = value.parse().unwrap_or_else(|_| {
                     fail_usage(&format!("--max-turns {value} is not a number"))
                 });
-                if parsed == 0 || parsed > program::ROUNDS_MAX {
+                if parsed == 0 || parsed > harness::ROUNDS_MAX {
                     fail_usage(&format!(
                         "--max-turns must be between 1 and the harness's rounds_max ({})",
-                        program::ROUNDS_MAX
+                        harness::ROUNDS_MAX
                     ));
                 }
                 rounds = Some(parsed);
@@ -103,10 +111,10 @@ fn options() -> Options {
                 keep_warm = value.parse().unwrap_or_else(|_| {
                     fail_usage(&format!("--keep-warm {value} is not a number"))
                 });
-                if keep_warm > program::CACHE_REFRESHES {
+                if keep_warm > harness::CACHE_REFRESHES {
                     fail_usage(&format!(
                         "--keep-warm must be at most the harness's cache_refreshes ({})",
-                        program::CACHE_REFRESHES
+                        harness::CACHE_REFRESHES
                     ));
                 }
             }
@@ -118,12 +126,9 @@ fn options() -> Options {
                     .unwrap_or_else(|| fail_usage(&format!("--turn {value} is not a turn number")));
             }
             "--effort" => {
-                effort = match value.as_str() {
-                    "high" => Some(program::SumEffortLevel::High),
-                    "medium" => Some(program::SumEffortLevel::Medium),
-                    "low" => Some(program::SumEffortLevel::Low),
-                    _ => None,
-                };
+                effort = CLAUDE_EFFORT_LEVELS
+                    .contains(&value.as_str())
+                    .then(|| value.clone());
                 effort_text = Some(value);
             }
             "--harness" => harness = Some(value),
@@ -162,7 +167,7 @@ fn options() -> Options {
         cwd: cwd.unwrap_or_else(|| fail_usage("--cwd is required")),
         model,
         journal: journal.unwrap_or_else(|| fail_usage("--journal is required")),
-        rounds: rounds.unwrap_or(program::ROUNDS_MAX),
+        rounds: rounds.unwrap_or(harness::ROUNDS_MAX),
         keep_warm,
         turn,
         fork_from,
@@ -203,27 +208,27 @@ fn send_event(command: &str, args: &[String]) -> ! {
     }
 }
 
-fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
+fn keep_warm(loaded: &Loaded, agent: &mut Agent, journal: &mut Journal, refreshes: u64) {
     let mut refreshed = 0;
     for _ in 0..refreshes * IDLE_REQUESTS_PER_REFRESH_MAX {
         if refreshed == refreshes {
             return;
         }
-        let journal = match harness::JsonlJournal::open(disk) {
-            Ok(journal) => journal,
+        let due = match host::idle_due(loaded, agent, journal) {
+            Ok(Some(due)) => due,
+            Ok(None) => {
+                eprintln!("hl-agent: no prompt cache refresh is armed");
+                return;
+            }
             Err(error) => {
                 eprintln!("hl-agent: journal: {error}");
                 return;
             }
         };
-        let (due, turn) = match (journal.idle_due(), journal.next_turn()) {
-            (Ok(Some(due)), Ok(turn)) => (due, turn),
-            (Ok(None), _) => {
-                eprintln!("hl-agent: no prompt cache refresh is armed");
-                return;
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                eprintln!("hl-agent: journal: {error:?}");
+        let turn = match host::next_turn(journal) {
+            Ok(turn) => turn,
+            Err(error) => {
+                eprintln!("hl-agent: journal: {error}");
                 return;
             }
         };
@@ -235,24 +240,19 @@ fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
             );
             std::thread::sleep(std::time::Duration::from_millis(due - now));
         }
-        let request = TurnRequest {
-            turn,
-            arguments: Arguments::Refresh,
-        };
-        match journal.run(agent, &request) {
-            Ok((_, Ran::Finished(finish))) => {
+        let request = host::request(IDLE_HANDLER, turn, Value::object([]));
+        match host::run(loaded, agent, journal, &request) {
+            Ok(Ran::Finished(finish)) => {
                 refreshed += 1;
                 eprintln!("hl-agent: idle turn {turn}: {}", finish.result.encode());
             }
-            Ok((_, Ran::NotDue(not_due))) => {
-                eprintln!("hl-agent: idle turn {turn} is not due: {not_due:?}")
-            }
-            Ok((_, other)) => {
-                eprintln!("hl-agent: idle turn {turn} ended {other:?}");
+            Ok(Ran::NotDue) => eprintln!("hl-agent: idle turn {turn} is not due"),
+            Ok(Ran::Suspended { seq, .. }) => {
+                eprintln!("hl-agent: idle turn {turn} suspended at {seq}");
                 return;
             }
             Err(error) => {
-                eprintln!("hl-agent: idle turn {turn}: {error:?}");
+                eprintln!("hl-agent: idle turn {turn}: {error}");
                 return;
             }
         }
@@ -291,10 +291,6 @@ struct Agent {
     payer: Option<mpp::Payer>,
 }
 
-fn to_value(json: &Json) -> Value {
-    Value::decode(&json.encode()).expect("the harness encodes valid JSON")
-}
-
 impl Agent {
     fn stream_file(&self, turn: u64, seq: u64) -> PathBuf {
         self.workspace
@@ -322,7 +318,7 @@ impl Agent {
         input: &Value,
         room: bool,
     ) -> tools::Ran {
-        let call = harness::call_id(turn, seq);
+        let call = harnesslang::run::journal::call_id(turn, seq);
         let translated;
         let (tool, input) = match self.payer.as_mut() {
             Some(payer) if payer.wallet == tool => return paid(payer.pay(&call, input)),
@@ -350,7 +346,10 @@ impl Agent {
             ("kind", Value::text("tool")),
             ("at_ms", Value::number(now_ms())),
             ("tool", Value::text(tool)),
-            ("call", Value::text(&harness::call_id(turn, seq))),
+            (
+                "call",
+                Value::text(&harnesslang::run::journal::call_id(turn, seq)),
+            ),
         ]));
         let shown = input
             .get("description")
@@ -361,7 +360,7 @@ impl Agent {
         eprintln!(
             "{}: {} {tool}: {shown}",
             self.label,
-            harness::call_id(turn, seq)
+            harnesslang::run::journal::call_id(turn, seq)
         );
         let ran = match &mut self.children {
             Some(children) if tool == children::SPAWN_TOOL => children.spawn(turn, seq, input),
@@ -404,7 +403,7 @@ impl Agent {
         context: &Value,
         attached: &anthropic::Attached<'_>,
     ) -> Value {
-        let call = harness::call_id(turn, seq);
+        let call = harnesslang::run::journal::call_id(turn, seq);
         let body = match self.client.body(context, mode, effort, attached) {
             Ok(body) => body,
             Err(error) => {
@@ -460,8 +459,8 @@ fn claude_code_call(tool: &str, input: &Value) -> Option<(&'static str, Value)> 
             "Read",
             Value::object([
                 ("file_path", input.get("path")?.clone()),
-                ("offset", Value::number(program::READ_OFFSET_FIRST)),
-                ("limit", Value::number(program::READ_LIMIT_WHOLE)),
+                ("offset", Value::number(harness::READ_OFFSET_FIRST)),
+                ("limit", Value::number(harness::READ_LIMIT_WHOLE)),
                 ("pages", Value::text("")),
                 ("allow_large", Value::Bool(false)),
             ]),
@@ -470,7 +469,7 @@ fn claude_code_call(tool: &str, input: &Value) -> Option<(&'static str, Value)> 
             "Bash",
             Value::object([
                 ("command", input.get("command")?.clone()),
-                ("timeout", Value::number(program::BASH_TIMEOUT_MS)),
+                ("timeout", Value::number(harness::BASH_TIMEOUT_MS)),
                 ("description", Value::text("")),
                 ("run_in_background", Value::Bool(false)),
                 ("dangerouslyDisableSandbox", Value::Bool(false)),
@@ -526,7 +525,7 @@ macro_rules! host_for {
                     Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
                 let recovered = match self.payer.as_ref() {
                     Some(payer) if payer.wallet == request.tool => {
-                        match payer.recover_pay(&harness::call_id(request.turn, request.seq)) {
+                        match payer.recover_pay(&$module::call_id(request.turn, request.seq)) {
                             Some(units) => tools::Recovered::Reply(tools::Ran::Units(units)),
                             None => tools::Recovered::NotDispatched,
                         }
@@ -548,7 +547,7 @@ macro_rules! host_for {
                 eprintln!(
                     "{}: {} recover {}: {}",
                     self.label,
-                    harness::call_id(request.turn, request.seq),
+                    $module::call_id(request.turn, request.seq),
                     request.tool,
                     match &recovered {
                         tools::Recovered::Reply(_) => "reply",
@@ -562,7 +561,7 @@ macro_rules! host_for {
                     ("tool", Value::text(request.tool)),
                     (
                         "call",
-                        Value::text(&harness::call_id(request.turn, request.seq)),
+                        Value::text(&$module::call_id(request.turn, request.seq)),
                     ),
                     (
                         "answer",
@@ -700,8 +699,6 @@ macro_rules! host_for {
     };
 }
 
-host_for!(harness);
-host_for!(child_harness);
 host_for!(mpp_harness);
 
 pub fn command_line(program: &str, args: &[&str]) -> Option<String> {
@@ -897,7 +894,7 @@ pub fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), Stri
 }
 
 fn outcome(finish: &Finish) -> (String, String) {
-    outcome_of(&to_value(&finish.result))
+    outcome_of(&finish.result)
 }
 
 pub fn outcome_of(result: &Value) -> (String, String) {
@@ -969,7 +966,7 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
     let workspace = tools::Workspace {
         root: cwd,
         state,
-        image_bytes_max: program::blob_bound("Read").map(|(_, bytes)| bytes),
+        image_bytes_max: harness::READ_BYTES_MAX,
     };
     Ok((
         Agent {
@@ -1004,48 +1001,35 @@ fn tool_definitions() -> (Value, Value) {
     (Value::Array(parent), Value::Array(child))
 }
 
-fn fork_into(parent: &Path, at: Option<u64>, disk: &mut FileDisk) -> Result<(), String> {
+fn fork_into(parent: &Path, at: Option<u64>, journal: &mut Journal) -> Result<(), String> {
     let parent = if parent.is_dir() {
         parent.join("journal.jsonl")
     } else {
         parent.to_path_buf()
     };
-    if harness::Disk::length(disk).map_err(|error| error.to_string())? > 0 {
-        let opened = harness::jsonl_open(disk).map_err(|error| error.to_string())?;
-        return match opened.records.first() {
-            Some(harness::Record::Host { key, .. }) if key == harness::FORKED_HOST_KEY => Ok(()),
+    if !journal.read()?.is_empty() {
+        return match host::records(journal.path())?.first() {
+            Some(Record::Host { key, .. }) if key == harnesslang::ir::FORKED_HOST_KEY => Ok(()),
             _ => Err("--fork-from names a parent, but the journal already holds a session that was not forked".to_owned()),
         };
     }
     if !parent.is_file() {
         return Err(format!("{}: no such journal", parent.display()));
     }
-    let mut source =
-        FileDisk::open(&parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    let opened = harness::jsonl_open(&mut source)
-        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let records = host::records(&parent)?;
+    let program = harnesslang::load::load(harness::PROGRAM)?;
     let origin = parent.display().to_string();
-    let records = harness::fork_entry(opened.start, &opened.records, at, &origin)
+    let model = harnesslang::target::model(harnesslang::target::Target::NativeJsonl);
+    let entry = harnesslang::run::fork::fork_entry(&program, &model, &records, at, &origin)
         .map_err(|refused| format!("{}: {}", parent.display(), refused.describe()))?;
-    if let harness::Record::Checkpoint { payload, .. } = &records[1] {
-        let state = Json::decode(payload)
-            .map_err(|error| format!("the forked state: {error:?}"))
-            .and_then(|json| program::state_from_json(&json))?;
-        let mut digests = Vec::new();
-        program::state_blobs(&state, &mut digests);
-        if !digests.is_empty() {
-            return Err(format!(
-                "the forked state holds {} image(s) whose bytes stay in the parent's journal; this host forks only a session without images",
-                digests.len()
-            ));
-        }
-    }
-    harness::jsonl_flush(disk, &records)
-        .map_err(|stop| format!("write the forked journal: {stop:?}"))?;
+    journal.append(&harnesslang::run::journal::encode_lines(
+        &entry,
+        JOURNAL_CHECKSUMS,
+    ))?;
     eprintln!(
         "hl-agent: forked from {origin} at {}",
-        match records[0] {
-            harness::Record::Host { ref value, .. } => value.encode(),
+        match &entry[0] {
+            Record::Host { value, .. } => value.encode(),
             _ => String::new(),
         }
     );
@@ -1053,21 +1037,22 @@ fn fork_into(parent: &Path, at: Option<u64>, disk: &mut FileDisk) -> Result<(), 
 }
 
 fn run_turn(
+    loaded: &Loaded,
     agent: &mut Agent,
-    disk: &mut FileDisk,
-    request: &TurnRequest,
-) -> Result<Ran, RunError> {
-    let mut ran = harness::run_jsonl(agent, disk, request);
+    journal: &mut Journal,
+    request: &harnesslang::wasm::js::Json,
+) -> Result<Ran, String> {
+    let mut ran = host::run(loaded, agent, journal, request);
     let mut waited = None;
     for _ in 0..JOINS_PER_TURN_MAX {
-        let Ok(Ran::Suspended(suspension)) = &ran else {
+        let Ok(Ran::Suspended { seq, .. }) = &ran else {
             return ran;
         };
-        if waited == Some(suspension.seq) {
+        if waited == Some(*seq) {
             return ran;
         }
-        waited = Some(suspension.seq);
-        ran = harness::run_jsonl(agent, disk, request);
+        waited = Some(*seq);
+        ran = host::run(loaded, agent, journal, request);
     }
     ran
 }
@@ -1154,10 +1139,7 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("pay") {
         pay_main(&options());
     }
-    harness::self_check();
-    harness::jsonl_self_check();
-    child_harness::self_check();
-    child_harness::jsonl_self_check();
+    let loaded = host::load(harness::MODULE);
     let options = options();
     if options.harness == HARNESS_CODEX {
         codex_host::main(&options);
@@ -1171,7 +1153,7 @@ fn main() {
         ("at_ms", Value::number(now_ms())),
     ]));
     let journal_path = options.journal.join("journal.jsonl");
-    let mut disk = FileDisk::open(&journal_path).unwrap_or_else(|error| {
+    let mut disk = Journal::open(&journal_path).unwrap_or_else(|error| {
         eprintln!("hl-agent: {}: {error}", journal_path.display());
         std::process::exit(EXIT_HARNESS_ERROR)
     });
@@ -1182,29 +1164,37 @@ fn main() {
         std::process::exit(EXIT_HARNESS_ERROR);
     }
     let mut turn = options.turn;
-    if let Some(level) = options.effort.clone() {
-        let setting = TurnRequest {
+    if let Some(level) = &options.effort {
+        let setting = host::request(
+            SET_EFFORT_HANDLER,
             turn,
-            arguments: Arguments::SetEffort(level),
+            Value::object([("level", Value::text(level))]),
+        );
+        let ended = match run_turn(&loaded, &mut agent, &mut disk, &setting) {
+            Ok(Ran::Finished(finish)) if finish.completed => None,
+            Ok(Ran::Finished(finish)) => Some(format!("in a trap: {}", finish.result.encode())),
+            Ok(Ran::Suspended { seq, .. }) => Some(format!("suspended at {seq}")),
+            Ok(Ran::NotDue) => Some("refused as an idle turn".to_owned()),
+            Err(error) => Some(error),
         };
-        match run_turn(&mut agent, &mut disk, &setting) {
-            Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish))
-                if finish.outcome == harness::Outcome::Completed => {}
-            other => {
-                eprintln!("hl-agent: --effort: the set_effort turn ended {other:?}");
-                std::process::exit(EXIT_HARNESS_ERROR);
-            }
+        if let Some(ended) = ended {
+            eprintln!("hl-agent: --effort: the set_effort turn ended {ended}");
+            std::process::exit(EXIT_HARNESS_ERROR);
         }
         turn += 1;
     }
-    let request = TurnRequest {
+    let request = host::request(
+        PROMPT_HANDLER,
         turn,
-        arguments: Arguments::Prompt(instruction, options.rounds),
-    };
-    let ran = run_turn(&mut agent, &mut disk, &request);
+        Value::object([
+            ("input", Value::text(&instruction)),
+            ("rounds", Value::number(options.rounds)),
+        ]),
+    );
+    let ran = run_turn(&loaded, &mut agent, &mut disk, &request);
     agent.jobs.stop_all();
-    if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
-        keep_warm(&mut agent, &mut disk, options.keep_warm);
+    if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_))) {
+        keep_warm(&loaded, &mut agent, &mut disk, options.keep_warm);
     }
     if let Some(children) = agent.children.as_mut() {
         children.finish();
@@ -1214,38 +1204,31 @@ fn main() {
         ("at_ms", Value::number(now_ms())),
     ]));
     let (finish, code) = match &ran {
-        Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish))
-            if finish.outcome == harness::Outcome::Completed =>
-        {
+        Ok(Ran::Finished(finish)) if finish.completed => {
             let (name, text) = outcome(finish);
             println!("{text}");
             (name, 0)
         }
-        Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish)) => {
-            eprintln!("hl-agent: the harness trapped: {}", finish.result.encode());
+        Ok(Ran::Finished(finish)) => {
+            eprintln!(
+                "hl-agent: the harness trapped in turn {}: {}",
+                finish.turn,
+                finish.result.encode()
+            );
             ("trap".to_owned(), EXIT_HARNESS_ERROR)
         }
-        Ok(Ran::Suspended(suspension)) => {
+        Ok(Ran::Suspended { turn, seq }) => {
             eprintln!(
-                "hl-agent: turn {} waits on suspend {} ({}), which this host could not resume",
-                suspension.turn, suspension.seq, suspension.key
+                "hl-agent: turn {turn} waits on suspend {seq}, which this host could not resume"
             );
             ("suspended".to_owned(), EXIT_HARNESS_ERROR)
         }
-        Ok(Ran::NotDue(not_due)) => {
-            eprintln!("hl-agent: the prompt turn was refused as an idle turn: {not_due:?}");
+        Ok(Ran::NotDue) => {
+            eprintln!("hl-agent: the prompt turn was refused as an idle turn");
             ("error".to_owned(), EXIT_HARNESS_ERROR)
         }
-        Err(RunError::Open(error)) => {
-            eprintln!("hl-agent: journal: {error}");
-            ("error".to_owned(), EXIT_HARNESS_ERROR)
-        }
-        Err(RunError::Exit(Exit::Corrupt(error))) => {
-            eprintln!("hl-agent: journal: {error}");
-            ("error".to_owned(), EXIT_HARNESS_ERROR)
-        }
-        Err(RunError::Exit(Exit::Stop(stop))) => {
-            eprintln!("hl-agent: stopped: {stop:?}");
+        Err(error) => {
+            eprintln!("hl-agent: {error}");
             ("error".to_owned(), EXIT_HARNESS_ERROR)
         }
     };
