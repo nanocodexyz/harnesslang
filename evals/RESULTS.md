@@ -116,6 +116,17 @@ The eval-head lane's rerun with 3 attempts per task in one pool (its `output/eva
 | --- | ---: | ---: | ---: | ---: |
 | hl-agent vs nanocode | 92 | 9 | 3 | 0.146 |
 
+## Effort low: hl-agent cost on 10 tasks x 3 (eval-cost lane)
+
+hl-agent with effort low (now the default) on regex-log, sqlite-db-truncate, vulnerable-secret, extract-elf, fix-code-vulnerability, headless-terminal, multi-source-data-merger, build-pmars, prove-plus-comm and pytorch-model-recovery, 3 attempts each, parallel 2, against the same tasks' rows of the three-attempt run above (effort high), 2026-11-15 (`output/eval/low` of the eval-cost lane).
+
+| Arm | Passed / scored | Cost/attempt | Requests/attempt | Output tokens/attempt |
+| --- | ---: | ---: | ---: | ---: |
+| hl-agent, effort high | 30 / 30 | $0.245 | 11.2 | 10,069 |
+| hl-agent, effort low | 29 / 30 | $0.090 | 8.8 | 2,961 |
+
+An 8-task regression sample at the default build passed 10 of 10 at $0.045 an attempt; three harder tasks passed 0 of 5 against 6 of 10 at high (DECISIONS.md, eval-cost). Rows metered after about 04:20 UTC 2026-11-15 by a meter without the eval-cost fix record no cache tokens; `evals/remeter.py` recomputes them from `responses.jsonl`.
+
 ## The closed gaps on the full suite (running)
 
 hl-agent at this branch (the Inputs and Finishing blocks, the `/bin/sh` fallback) against nanocode c7679e3 and Claude Code 2.1.325, 40 tasks x 2 attempts, parallel 3, started 2026-11-15 04:20 UTC under a $50 cap on metered spend, into `output/eval/r5`. Its table goes here when it finishes.

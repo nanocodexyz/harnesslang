@@ -17,7 +17,7 @@ pub const HTTP_CONFLICT: u16 = 409;
 pub const HTTP_TOO_LARGE: u16 = 413;
 pub const HTTP_TOO_MANY: u16 = 429;
 pub const HTTP_SERVER_ERROR_MIN: u16 = 500;
-pub const EFFORT: &str = "high";
+pub const EFFORT: &str = "low";
 pub const EFFORT_SETTING: &str = "effort";
 pub const PROMPT_TOO_LONG: &str = "prompt is too long";
 

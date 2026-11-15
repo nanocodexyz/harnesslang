@@ -199,7 +199,7 @@ def verify(name, row, config, out):
 
 
 def meter_totals(directory):
-    totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "tool_calls": 0, "statuses": {}}
+    totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "reasoning_tokens": 0, "tool_calls": 0, "statuses": {}}
     path = os.path.join(directory, "requests.jsonl")
     if not os.path.isfile(path):
         return totals
@@ -212,7 +212,7 @@ def meter_totals(directory):
         totals["statuses"][status] = totals["statuses"].get(status, 0) + 1
         if record.get("status") == 200:
             totals["ok_requests"] += 1
-        for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cache_write_1h_tokens"):
+        for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cache_write_1h_tokens", "reasoning_tokens"):
             totals[key] += record["usage"].get(key, 0)
         totals["tool_calls"] += len(record.get("tool_uses") or [])
     return totals
@@ -397,4 +397,5 @@ def main():
             os.killpg(process.pid, signal.SIGTERM)
 
 
-main()
+if __name__ == "__main__":
+    main()

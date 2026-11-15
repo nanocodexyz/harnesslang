@@ -34,7 +34,7 @@ const job_hold_ms: u64 = 600000
 type outcome = completed(text) | failed(text) | exhausted
 type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
 type kept = refreshed(u64) | lapsed(text)
-type effort_level = "high" | "medium" | "low"
+type effort_level = "low" | "medium" | "high"
 
 tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external recoverable jobs at most bash_jobs_max
 tool Read(file_path: text, offset: u64 = read_offset_first, limit: u64 = read_limit_whole, pages: text = "", allow_large: bool = false) -> text or blob<image_bytes_max> effect none
@@ -46,7 +46,7 @@ tool list_agents(include_completed: bool = false) -> text effect none
 tool wait_agent(agent_id: text) -> text effect none
 spawn spawn_agent runs delegated from "claude_code_child.hl"
 
-model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only, refresh settings(effort: effort_level = "high")
+model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only, refresh settings(effort: effort_level = "low")
 
 on resume
 on job(notice: text) bound job_notices_max

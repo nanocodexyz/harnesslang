@@ -149,6 +149,7 @@ def usage_of(message):
         "cache_read_tokens": usage.get("cache_read_input_tokens") or 0,
         "cache_write_tokens": usage.get("cache_creation_input_tokens") or 0,
         "cache_write_1h_tokens": (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0,
+        "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0,
     }
 
 
@@ -265,4 +266,5 @@ def main():
     server.serve_forever()
 
 
-main()
+if __name__ == "__main__":
+    main()
