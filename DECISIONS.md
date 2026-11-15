@@ -1162,3 +1162,39 @@ Merging master brought the interpreter, Rust and JS runtimes' rule that a varian
 Two wasm plants had drifted from the runtime they plant into, and no full check had reached the diff-plants stage to show it. `recovery_unreported` still searched for the `$record_recovery_nested` append that the host merge replaced with `$record_recovery_attested`, so it matched nothing; it now drops that record instead of appending it. `cell_cancel_ignored` zeroed only the final cancel count in `$cancel_seen`, which leaves the drain before it in place, and code_stop.hl matched the interpreter with it on seeds 0..1000; it now returns before the drain as the Rust and JavaScript plants do. Both are caught on every planned target in seeds 0..100 (`scripts/mutations.sh --diff wasm:P:T`), and the other wasm plants in `scripts/mutations.sh --diff-plans` all pass.
 
 Merging master's payments, climb, deploy auth and MPP host into the wasm branch: the wasm runtime now lowers `Expr::Outcome` lazily by its tag (ok, failed, unknown, else the original), runs the `_with_payment` text builtin on the module's own JSON parser and encoder (a non-object input is returned unchanged, an existing `payment` key is replaced, and the object is re-sorted), and reads the wallet's name from a `$wallet` data word: a model reply's call to the wallet keeps its raw input and is refused with the interpreter's text, and the wallet's dispatched and recovered replies are checked as u64. payments.hl, paid_lanes.hl, mpp_agent.hl, the three climb snippets and autoresearch.hl match the interpreter on all five targets with the node host in seeds 0..100. The Cloudflare bundle keeps its fixed host and module and adds master's `hl-auth.mjs` entry; the Vercel route takes master's auth check. hl-agent keeps the Claude harnesses on the wasm host and runs `hl-agent pay` on `mpp_agent.hl` emitted as Rust, as Codex is; agent-drill, codex-drill, mpp-drill (seeds 1..8) and the payer drill pass.
+
+## 2026-11-15: eval-clusters: why hl-agent fails, and a Finishing block that checks every stated behaviour
+
+Branch eval-clusters, from master 42f9a62. It establishes:
+
+- **The per-task diff over every finished confirmation row** (output/eval/c60 on the confirmation branch, 234 rows, and the suite-1 rerun's s1r, 240 rows; pass letters per attempt, hl-agent at effort low, claude-sonnet-4-6):
+
+| Task | hl-agent | nanocode | Claude Code |
+| --- | --- | --- | --- |
+| build-pmars | 2/3 | 3/3 | 2/3 |
+| build-pov-ray | 2/3 | 3/3 | 3/3 |
+| cancel-async-tasks | 2/3 | 1/3 | 0/3 |
+| chess-best-move | 0/3 | 0/2 | 0/3 |
+| fix-git | 2/3 | 1/3 | 3/3 |
+| polyglot-c-py | 2/3 | 3/3 | 2/3 |
+| adaptive-rejection-sampler | 3/3 | 0/3 | 0/1 (2 errored) |
+| largest-eigenval | 3/3 | 0/3 | 2/3 |
+| caffe-cifar-10 | 2/2 | 1/2 | 1/1 |
+
+  Every other finished task passed for hl-agent on every attempt. Where another agent passes and hl-agent fails: build-pmars, build-pov-ray, fix-git, polyglot-c-py. Where nanocode fails (the room for a lead over it): adaptive-rejection-sampler, largest-eigenval, caffe-cifar-10, cancel-async-tasks, fix-git and chess-best-move; hl-agent already passes the first three every time, so the lead depends on the last three.
+- **The failing traces fall into four clusters.**
+  1. A stated behaviour checked another way or not at all (cancel-async-tasks.3: the self-test cancelled the task inside its own event loop, while the verifier sends SIGINT to a separate process with more tasks than the limit; build-pmars.3: the task names the debugger, the agent never stepped through it). Also polyglot-c-py.3: python3 was missing, the agent ran only the C half and finished with "the file is correct" although the Finishing block already says to install the interpreter.
+  2. Scratch files in the deliverable's directory or a partial layout (build-pmars.3 wrote its own flashpaper.red and rave.red into /app, which shadowed the real warriors the verifier runs there; build-pov-ray.3 extracted the archives to /tmp and copied only some parts to /app/povray-2.2, so file_id.diz was missing).
+  3. Asking instead of finishing (fix-git.1 listed two commit chains and asked which to merge; the passing attempts read git reflog and cherry-picked the commit that was checked out last).
+  4. Reading a position from an image (chess-best-move, 0 of 3 for hl-agent and 0 for both other agents; one attempt timed out). Not addressed here.
+- **Fixes, both default, no added request.** The Finishing block (agent/prompts/claude-code-system.json) gains three sentences: check every requirement the task states and exercise each named behaviour for real (step through a named debugger, deliver a keyboard interrupt as SIGINT to a separate process, run above and below any limit); keep test inputs and scratch files out of the task's directories and extract an archive in full where the task says; finish instead of asking, taking the reading the task's files support (git reflog for lost work). examples/claude_code.hl appends a one-line system-reminder to a Bash result that contains `command not found` (install it and run the check again), through two small functions `shown` and `reported` that replace the four repeated result-pushing blocks. No new state or invariant.
+- **Measurement** (2026-11-15, 12:40 to 15:10 UTC, `--parallel 1`, `nice -n 10`, beside the 60-task confirmation run): the failing tasks x3 and a regression sample x2 (openssl-selfsigned-cert, git-leak-recovery, log-summary-date-ranges, largest-eigenval, sqlite-db-truncate, kv-store-grpc, extract-todos, adaptive-rejection-sampler, build-cython-ext, cobol-modernization), against the master rows of the same tasks and attempt numbers. Cost from raw usage in responses.jsonl with cache tokens (5-minute writes $3.75, reads $0.30, output $15 per million); no row had a cut jsonl record.
+
+| Set | This branch | Master, same attempts | nanocode, same attempts |
+| --- | --- | --- | --- |
+| failing tasks (15 attempts) | 14/15, $0.089 | 10/15, $0.079 | 11/15, $0.518 |
+| finished total (27 attempts) | 26/27, $0.086 | 22/27, $0.085 | 21/27, $0.397 |
+
+  Per task: build-pmars 3/3 (master 2/3), build-pov-ray 3/3 (2/3), fix-git 3/3 (2/3), polyglot-c-py 3/3 (2/3), cancel-async-tasks 2/3 (2/3; the failing attempt still tested cancellation inside its own loop). Regression rows all passed. Paired by attempt: 5 gained, 1 lost (the cancel-async-tasks attempt that master passed), sign test p = 0.22. Cost per attempt +1% on the 27 attempts; build-pov-ray costs more ($0.222 against $0.164) because it now checks the extracted layout. hl-agent's cost is 0.22x nanocode's on the same attempts. The regression run was stopped before its last rows (extract-todos, adaptive-rejection-sampler, build-cython-ext, cobol-modernization) to stay inside the session; spend $2.3 metered.
+
+Commands: `cargo build --release` at the root and in `agent/`, the binary patched with setup.sh's patchelf into output/eval/root with the confirmation root's lib; `nice -n 10 python3 evals/run.py --suite output/eval/fail.txt --tasks <confirmation tasks60> --agent-root output/eval/root --agents hl-agent --attempts 3 --model claude-sonnet-4-6 --parallel 1 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --meter-port 19440 --relay-port 14440 --out output/eval/fail`, the same with output/eval/reg.txt and `--attempts 2`; `CHECK_JOBS=2 nice -n 15 scripts/check.sh`.

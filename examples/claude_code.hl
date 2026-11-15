@@ -237,16 +237,8 @@ fn run_joining(requested: list<call, calls_per_round_max>) {
       push context result(call, cut)
     } else {
       match dispatch(call) {
-        ok(output) => {
-          let cut = truncate_middle(output, direct_result_tokens_max)
-          pending_units = pending_units + len(cut)
-          push context result(call, cut)
-        }
-        failed(error) => {
-          let cut = truncate_middle(error, direct_result_tokens_max)
-          pending_units = pending_units + len(cut)
-          push context error(call, cut)
-        }
+        ok(output) => { shown(call, output, true) }
+        failed(error) => { shown(call, error, false) }
         blob(image) => { push context attached(call, image) }
         unknown => { push context unknown(call) }
       }
@@ -263,19 +255,30 @@ fn run_parallel(requested: list<call, calls_per_round_max>) {
           pending_units = pending_units + len(cut)
           push context result(call, cut)
         } else {
-          let cut = truncate_middle(output, direct_result_tokens_max)
-          pending_units = pending_units + len(cut)
-          push context result(call, cut)
+          shown(call, output, true)
         }
       }
-      failed(error) => {
-        let cut = truncate_middle(error, direct_result_tokens_max)
-        pending_units = pending_units + len(cut)
-        push context error(call, cut)
-      }
+      failed(error) => { shown(call, error, false) }
       blob(image) => { push context attached(call, image) }
       unknown => { push context unknown(call) }
     }
+  }
+}
+
+fn shown(call: call, output: text, succeeded: bool) {
+  if call.tool == "Bash" and contains(output, "command not found") {
+    reported(call, truncate_middle(output ++ "\n<system-reminder>A command in this call was not found. If the task or your check needs it, install it (`apt-get update && apt-get install -y <package>`, or pip) and run the check again: a part you have not run is not done.</system-reminder>", direct_result_tokens_max), succeeded)
+  } else {
+    reported(call, truncate_middle(output, direct_result_tokens_max), succeeded)
+  }
+}
+
+fn reported(call: call, cut: text, succeeded: bool) {
+  pending_units = pending_units + len(cut)
+  if succeeded {
+    push context result(call, cut)
+  } else {
+    push context error(call, cut)
   }
 }
 
