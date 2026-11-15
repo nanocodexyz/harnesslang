@@ -209,6 +209,8 @@ children = sorted(os.listdir(children_dir)) if os.path.isdir(children_dir) else 
 journals = [f"{out}/journal"] + [f"{children_dir}/{key}" for key in children]
 dispatches = collections.Counter()
 for journal in journals:
+    if not os.path.exists(f"{journal}/usage.jsonl"):
+        continue
     for line in open(f"{journal}/usage.jsonl"):
         record = json.loads(line)
         if record.get("kind") == "tool" and record["tool"] in external:
@@ -242,6 +244,12 @@ for line in open(f"{out}/journal/journal.jsonl"):
         spawn_calls.add(record["call"]["call_id"])
 for journal in journals:
     replies = set()
+    orphaned = journal != journals[0] and os.path.basename(journal).replace(".", "/") in parent_unknown
+    missing = [name for name in ("journal.jsonl", "usage.jsonl") if not os.path.exists(f"{journal}/{name}")]
+    if missing and not orphaned:
+        sys.exit(f"agent-drill: {journal} lacks {missing} and its spawn was not left unknown by a kill")
+    if missing:
+        continue
     for line in open(f"{journal}/journal.jsonl"):
         record = json.loads(line)["record"]
         if "recovery" in record:
@@ -257,7 +265,6 @@ for journal in journals:
     if unanswered:
         sys.exit(f"agent-drill: streams cut by a kill in {journal} were not requested again to a journaled reply: {unanswered}")
     leftover = [name for name in os.listdir(f"{journal}/state") if name.endswith(".sse")]
-    orphaned = journal != journals[0] and os.path.basename(journal).replace(".", "/") in parent_unknown
     if leftover and not orphaned:
         sys.exit(f"agent-drill: partial streams left in {journal} after the turn finished: {leftover}")
 recovered = collections.Counter()

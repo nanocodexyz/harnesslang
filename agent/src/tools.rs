@@ -1,4 +1,4 @@
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -582,8 +582,8 @@ pub fn settled(
     status: std::process::ExitStatus,
     timed_out: bool,
 ) -> Result<Shell, String> {
-    let (stdout, stdout_cut) = captured(&started.stdout)?;
-    let (stderr, stderr_cut) = captured(&started.stderr)?;
+    let stdout = captured(&started.stdout, "stdout")?;
+    let stderr = captured(&started.stderr, "stderr")?;
     let _ = std::fs::remove_file(&started.stdout);
     let _ = std::fs::remove_file(&started.stderr);
     let code = match (timed_out, status.code()) {
@@ -596,9 +596,7 @@ pub fn settled(
     };
     Ok(Shell {
         stdout,
-        stdout_cut,
         stderr,
-        stderr_cut,
         code,
         message: None,
     })
@@ -619,27 +617,39 @@ use std::os::unix::process::CommandExt as _;
 
 pub struct Shell {
     stdout: String,
-    stdout_cut: bool,
     stderr: String,
-    stderr_cut: bool,
     code: i32,
     message: Option<String>,
 }
 
-fn captured(path: &Path) -> Result<(String, bool), String> {
-    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut kept = Vec::with_capacity(STREAM_BYTES_MAX + 1);
-    file.take(STREAM_BYTES_MAX as u64 + 1)
-        .read_to_end(&mut kept)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    let cut = kept.len() > STREAM_BYTES_MAX;
-    kept.truncate(STREAM_BYTES_MAX);
-    let mut text = String::from_utf8_lossy(&kept).into_owned();
-    if cut {
-        let end = text.floor_char_boundary(STREAM_BYTES_MAX);
-        text.truncate(end);
+fn captured(path: &Path, stream: &str) -> Result<String, String> {
+    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
+    let mut file = std::fs::File::open(path).map_err(failed)?;
+    let total = file.metadata().map_err(failed)?.len();
+    if total <= STREAM_BYTES_MAX as u64 {
+        let mut kept = Vec::with_capacity(total as usize);
+        file.read_to_end(&mut kept).map_err(failed)?;
+        return Ok(String::from_utf8_lossy(&kept).into_owned());
     }
-    Ok((text, cut))
+    let side = STREAM_BYTES_MAX / 2;
+    let mut head = vec![0; side];
+    file.read_exact(&mut head).map_err(failed)?;
+    file.seek(std::io::SeekFrom::Start(total - side as u64))
+        .map_err(failed)?;
+    let mut tail = vec![0; side];
+    file.read_exact(&mut tail).map_err(failed)?;
+    let elided = total - head.len() as u64 - tail.len() as u64;
+    assert!(elided > 0);
+    let head = String::from_utf8_lossy(&head);
+    let tail = String::from_utf8_lossy(&tail);
+    let line = if head.is_empty() || head.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    Ok(format!(
+        "{head}{line}[{stream}: {elided} of {total} bytes elided from the middle. To see them, rerun the command with its output sent to a file and read parts of it with grep -n, sed -n 'START,ENDp' or tail]\n{tail}"
+    ))
 }
 
 fn timed_out_after(timeout: Duration) -> String {
@@ -657,21 +667,6 @@ fn timed_out_after(timeout: Duration) -> String {
     }
 }
 
-fn with_cut_notice(stream: &str, text: &str, cut: bool) -> String {
-    if !cut {
-        return text.to_owned();
-    }
-    let line = if text.is_empty() || text.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    format!(
-        "{text}{line}[{stream} cut after its first {} bytes: the rest was not kept, so send the command's output to a file and read it in parts]\n",
-        text.len()
-    )
-}
-
 fn without_empty_lines(text: &str) -> String {
     let lines = text.split('\n').collect::<Vec<_>>();
     let start = lines
@@ -684,16 +679,8 @@ fn without_empty_lines(text: &str) -> String {
 fn rendered(shell: &Shell) -> Ran {
     let parts = [
         (shell.code != 0).then(|| format!("Exit code {}", shell.code)),
-        Some(without_empty_lines(&with_cut_notice(
-            "stdout",
-            &shell.stdout,
-            shell.stdout_cut,
-        ))),
-        Some(without_empty_lines(&with_cut_notice(
-            "stderr",
-            &shell.stderr,
-            shell.stderr_cut,
-        ))),
+        Some(without_empty_lines(&shell.stdout)),
+        Some(without_empty_lines(&shell.stderr)),
         shell.message.clone(),
     ];
     let text = parts
