@@ -61,6 +61,24 @@ nanocode and hl-agent interleaved in one pool (`output/eval/head`), Claude Code 
 | hl-agent vs claude-code | 38 | 3 | 5 | 0.727 |
 | claude-code vs nanocode | 38 | 5 | 2 | 0.453 |
 
+## Suite 1, three attempts: hl-agent, nanocode and stock Claude Code (heavy load)
+
+20 tasks x 3 attempts x 3 agents, 180 rows, in `output/eval/s1x3`, 2026-11-15 06:00 to 07:47 UTC, parallel 4 under `nice`, 1-minute load average 14 to 26. Attempts 1 and 2 of 59 rows come from the int-evals run `output/eval/r5` (same builds, same flags), copied in; `run.py` ran the other 121. Builds: hl-agent at 1672187 (claude_code.hl, effort high), nanocode c7679e3, Claude Code 2.1.325. Costs are recomputed from each row's raw `responses.jsonl` usage with the fixed `usage_of` (the meter on master recorded 0 cache tokens for every Claude reply; see DECISIONS.md), so they are higher than the meter fields in `result.json` and than the earlier tables in this file, which used the broken meter.
+
+| Agent | Passed / scored (errored) | Pass rate (95% Wilson) | Cost/attempt | Wall/attempt | Requests/attempt |
+| --- | ---: | --- | ---: | ---: | ---: |
+| hl-agent | 52 / 60 (0) | 86.7% (75.8-93.1%) | $0.224 | 183 s | 11.7 |
+| nanocode | 53 / 60 (0) | 88.3% (77.8-94.2%) | $0.227 | 171 s | 8.4 |
+| claude-code | 52 / 59 (1) | 88.1% (77.5-94.1%) | $0.201 | 158 s | 9.1 |
+
+| Pair | Pairs scored | Only the first passed | Only the second passed | Sign test p |
+| --- | ---: | ---: | ---: | ---: |
+| hl-agent vs nanocode | 60 | 1 | 2 | 1.000 |
+| hl-agent vs claude-code | 59 | 2 | 3 | 1.000 |
+| claude-code vs nanocode | 59 | 4 | 4 | 1.000 |
+
+Per task, the arms differ on 7 of 20 tasks: cancel-async-tasks (nanocode 1/3, Claude Code 0/3, hl-agent 0/3), fix-git (1/3, 3/3, 2/3), largest-eigenval (0/3, 2/3, 0/3, the hl-agent and nanocode failures are 900 s timeouts), polyglot-c-py (3/3, 2/3, 2/3), build-cython-ext and cobol-modernization (Claude Code 2/3, the others 3/3), regex-log (Claude Code 2/2 with one row errored: no model request succeeded). Paired by task and attempt, hl-agent minus nanocode: cost -$0.003 (-0.065 to 0.060), wall +12.6 s (-7.9 to 33.0), requests +3.3 (1.0 to 5.6).
+
 ## Three attempts: hl-agent and nanocode (heavy load, still running)
 
 The eval-head lane's rerun with 3 attempts per task in one pool (its `output/eval/r3`, started 2026-11-15 01:26 UTC, parallel 6), the same builds as the head-to-head. 191 of 240 rows had finished when this table was made; it is replaced when the run completes. Rows are paired by task and attempt number.

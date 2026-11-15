@@ -835,3 +835,17 @@ Scorecard:
 | nanocode rows erroring on the OpenAI route with a Claude model | 4/4 | 0/1 |
 
 Commands: `git merge eval-codex gap-mining openai-host`, `AGENTS=hl-agent AGENT_ROOT=R TASKS=T sh evals/codex-drill.sh`, `python3 evals/run.py --suite S --tasks T --agent-root R --agents nanocode,hl-agent,claude-code --attempts 2 --model claude-sonnet-4-6 --parallel 3 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --out output/eval/r5`, `python3 evals/report.py DIR DIR=LABEL`, `CHECK_JOBS=2 nice scripts/check.sh`.
+
+## 2026-11-15: eval-runner: run.py survives a row that raises and resumes; suite 1 three attempts against stock Claude Code
+
+Branch eval-runner, from master 90f1605. It establishes:
+
+- **A row that raises no longer ends the run** (`evals/run.py`). r5 (40 tasks x 2, three agents) died after 71 rows: `meter_totals` hit a `JSONDecodeError` in one row's `requests.jsonl`, `future.result()` re-raised it in `main`, and the pool shut down. `main` now catches any exception from a row's future and writes that row's `result.json` as `errored` with `crashed: true` and the exception's type and text in `note`; the other rows go on.
+- **A rerun into the same `--out` resumes.** `run_row` skips a row whose `result.json` parses and has an outcome of passed, failed or errored and is not `crashed`; a crashed, partial or unreadable result reruns from scratch. Copying finished rows of another run into `rows/` therefore reuses them.
+- **The meter fix from eval-context** (`evals/meter.py`, from 5c8a0a7): Claude replies now carry `output_tokens_details`, which sent `usage_of` down the OpenAI branch and recorded 0 cache read and write tokens on every Claude row. New rows meter correctly; rows already recorded are re-costed from `responses.jsonl`, which keeps the raw usage.
+- **Suite 1 at three attempts, hl-agent, nanocode and Claude Code are level.** hl-agent 52/60 (86.7%, 75.8-93.1%) at $0.224 an attempt, nanocode 53/60 (88.3%) at $0.227, Claude Code 52/59 (88.1%) at $0.201, one Claude Code row errored. Sign tests: hl-agent against nanocode 1 to 2 (p = 1.000), against Claude Code 2 to 3 (p = 1.000); Claude Code against nanocode 4 to 4. hl-agent makes 3.3 more requests an attempt than nanocode (1.0 to 5.6) at the same cost. The table is in evals/RESULTS.md.
+- **The spend watchdog read the broken meter.** It stopped the run at $25 of metered spend for the 121 new rows and read $12.78 at the end; re-costed from `responses.jsonl` the new rows cost $27.27 (the 59 copied r5 rows $11.81), so the cap was exceeded by $2.27 without tripping.
+
+Measurements: 180 rows, 59 from r5 attempts 1 and 2 and 121 new, 06:00 to 07:47 UTC on the shared 5-core Hand with eight other lanes (1-minute load average 14 to 26), parallel 4, `nice`. No row crashed in this run.
+
+Commands: `python3 evals/run.py --suite evals/suite.txt --tasks T --agent-root R --agents nanocode,hl-agent,claude-code --attempts 3 --model claude-sonnet-4-6 --parallel 4 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --meter-port 18830 --relay-port 13230 --out output/eval/s1x3` under `nice`, with the r5 suite 1 rows of attempts 1 and 2 copied into `output/eval/s1x3/rows` first; a copy of the run with each row's meter token fields recomputed from `responses.jsonl` through `usage_of` into `output/eval/s1x3r`; `python3 evals/report.py output/eval/s1x3r`.

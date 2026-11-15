@@ -132,7 +132,8 @@ class Assembler:
 
 def usage_of(message):
     usage = message.get("usage") or {}
-    if "input_tokens_details" in usage or "output_tokens_details" in usage:
+    anthropic = "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    if not anthropic and ("input_tokens_details" in usage or "output_tokens_details" in usage):
         cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
         return {
             "input_tokens": (usage.get("input_tokens") or 0) - cached,

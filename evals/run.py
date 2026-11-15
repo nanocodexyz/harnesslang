@@ -37,6 +37,7 @@ CLAUDE_CODE_SELECT = 'if [ -e ' + MUSL_LOADER + ' ]; then exec ' + AGENT_MOUNT +
 CONTAINER_RUN_DIGITS = 12
 PACKAGE_FILES = ("instruction.md", "README.md", "task.toml")
 PACKAGE_DIRECTORIES = ("environment", "solution", "steps", "tests")
+OUTCOMES = ("passed", "failed", "errored")
 
 
 def sh(args, timeout=SETUP_TIMEOUT_SEC, check=True, **kwargs):
@@ -235,10 +236,33 @@ def remove_tree(path, image):
     shutil.rmtree(path)
 
 
+def finished(out):
+    path = os.path.join(out, "result.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        result = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    if result.get("outcome") not in OUTCOMES or result.get("crashed"):
+        return None
+    return result
+
+
+def record_crash(row, args, runs, error):
+    out = os.path.join(runs, row["id"])
+    os.makedirs(out, exist_ok=True)
+    result = {"id": row["id"], "source": row["source"], "task": row["task"], "agent": row["agent"], "attempt": row["attempt"], "model": args.model, "outcome": "errored", "crashed": True, "note": "exception: " + type(error).__name__ + ": " + str(error)[-1500:]}
+    with open(os.path.join(out, "result.json"), "w") as handle:
+        json.dump(result, handle, indent=1)
+    return result
+
+
 def run_row(row, args, gateway, env, lock, agent_root, runs):
     out = os.path.join(runs, row["id"])
-    if os.path.isfile(os.path.join(out, "result.json")):
-        return json.load(open(os.path.join(out, "result.json")))
+    done = finished(out)
+    if done:
+        return done
     config = task_config(row["dir"])
     journal = os.path.join(out, "journal")
     name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
@@ -363,7 +387,10 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
             futures = {pool.submit(run_row, row, args, gateway, env, lock, os.path.abspath(args.agent_root), runs): row for row in rows}
             for future in concurrent.futures.as_completed(futures):
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as error:
+                    result = record_crash(futures[future], args, runs, error)
                 print(result["id"], result["outcome"], result.get("note") or "", flush=True)
     finally:
         for process in services:
