@@ -2861,8 +2861,7 @@ impl<'a> Engine<'a> {
             .expect("the checker admits model calls only with a model");
         match model.outcome() {
             ir::ModelOutcome::Attempt => {
-                let checked = self.mutation != Mutation::UsageUnchecked;
-                return Ok(value::attempt(self.program, response, checked));
+                return Ok(decode_attempt(self.program, response, self.mutation));
             }
             ir::ModelOutcome::Known => return Ok(value::model_outcome(self.program, response)),
             ir::ModelOutcome::Trap => {}
@@ -3221,6 +3220,19 @@ pub fn event_seq(records_max: u64, turn: u64, index: u64) -> Option<u64> {
     turn.checked_sub(1)?
         .checked_mul(records_max)?
         .checked_add(index)
+}
+
+pub fn decode_attempt(program: &Program, response: &Json, mutation: Mutation) -> Value {
+    if mutation == Mutation::InterruptedUndecoded && *response == interrupted_response() {
+        return Value::Variant(
+            ir::ATTEMPT_REJECTED,
+            vec![Value::Text(format!(
+                "model reply: variant '{}' has 0 field(s)",
+                ir::ATTEMPT_VARIANTS[ir::ATTEMPT_INTERRUPTED]
+            ))],
+        );
+    }
+    value::attempt(program, response, mutation != Mutation::UsageUnchecked)
 }
 
 pub fn interrupted_response() -> Json {

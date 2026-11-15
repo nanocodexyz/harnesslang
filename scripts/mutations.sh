@@ -23,7 +23,7 @@ batch_flush_after_dispatch examples/claude_agent.hl --twice external_once|unknow
 results_in_completion_order examples/claude_agent.hl --twice sequential_equal
 batch_pushes_reversed examples/claude_agent.hl --twice checkpoint_compacted
 listing_unchecked examples/codex_agent.hl --twice tool_admitted
-listed_class_dropped examples/codex_agent.hl --twice external_once
+listed_class_dropped examples/codex_agent.hl --twice external_once|unknown_reported
 input_unchecked examples/codex_agent.hl --twice tool_admitted
 retire_skipped docs/snippets/compaction.hl --twice checkpoint_compacted
 seal_skipped docs/snippets/compaction.hl --twice checkpoint_compacted
@@ -75,6 +75,7 @@ side_live_state docs/snippets/side.hl --twice side_isolated
 side_journaled docs/snippets/side.hl --twice side_isolated
 idle_early docs/snippets/keep.hl --twice idle_due
 interrupt_ignored docs/snippets/in_flight.hl --twice interrupt_honored
+interrupted_undecoded docs/snippets/in_flight.hl --twice interrupt_decoded
 interrupt_reruns docs/snippets/in_flight.hl --twice external_once
 recover_trusts_lost docs/snippets/in_flight.hl --twice external_once
 job_lost_dropped docs/snippets/in_flight.hl --twice job_reported 0..1000
@@ -114,9 +115,11 @@ js grandchild_unscoped docs/snippets/tree_planner.hl cloudflare,vercel backend_e
 rust idle_early docs/snippets/keep.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js idle_early docs/snippets/keep.hl cloudflare,vercel backend_equal
 rust interrupt_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
+rust interrupted_undecoded docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust recover_skipped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js interrupt_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
+js interrupted_undecoded docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 js recover_reply_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 js job_unopened docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal

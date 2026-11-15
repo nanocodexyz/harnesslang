@@ -3,23 +3,29 @@ use std::process::Command;
 
 const PROGRAM_DEFAULT: &str = "../examples/claude_code.hl";
 const CHILD_PROGRAM_DEFAULT: &str = "../examples/claude_code_child.hl";
+const CODEX_PROGRAM_DEFAULT: &str = "../examples/codex_agent.hl";
 const HL_DEFAULT: &str = "../target/release/hl";
 
 fn main() {
     let program = std::env::var("HL_AGENT_PROGRAM").unwrap_or_else(|_| PROGRAM_DEFAULT.to_owned());
     let child = std::env::var("HL_AGENT_CHILD_PROGRAM")
         .unwrap_or_else(|_| CHILD_PROGRAM_DEFAULT.to_owned());
+    let codex = std::env::var("HL_AGENT_CODEX_PROGRAM")
+        .unwrap_or_else(|_| CODEX_PROGRAM_DEFAULT.to_owned());
     let hl = std::env::var("HL_BIN").unwrap_or_else(|_| HL_DEFAULT.to_owned());
     println!("cargo::rerun-if-env-changed=HL_AGENT_PROGRAM");
     println!("cargo::rerun-if-env-changed=HL_AGENT_CHILD_PROGRAM");
+    println!("cargo::rerun-if-env-changed=HL_AGENT_CODEX_PROGRAM");
     println!("cargo::rerun-if-env-changed=HL_BIN");
     println!("cargo::rerun-if-env-changed=HL_AGENT_PLANT");
     println!("cargo::rerun-if-changed={program}");
     println!("cargo::rerun-if-changed={child}");
+    println!("cargo::rerun-if-changed={codex}");
     println!("cargo::rerun-if-changed={hl}");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     emit(&hl, &program, "harness", &out.join("harness_mod.rs"));
     emit(&hl, &child, "child_harness", &out.join("child_mod.rs"));
+    emit(&hl, &codex, "codex_harness", &out.join("codex_mod.rs"));
 }
 
 fn emit(hl: &str, program: &str, module: &str, path: &Path) {

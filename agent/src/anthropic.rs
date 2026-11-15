@@ -1,16 +1,13 @@
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::json::Value;
 use crate::stream::{self, Streamed};
 use crate::tools;
+use crate::transport;
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const BASE_URL_DEFAULT: &str = "https://api.anthropic.com";
-pub const STREAM_IDLE_SECONDS_MAX: u64 = 600;
-pub const STREAM_IDLE_BYTES_PER_SECOND: u64 = 1;
-pub const CURL_TIMED_OUT: i32 = 28;
+pub const MESSAGES_PATH: &str = "/v1/messages";
 pub const MODE_TEXT_ONLY: &str = "text_only";
 pub const MODE_REFRESH: &str = "refresh";
 pub const REFRESH_MAX_TOKENS: u64 = 0;
@@ -67,7 +64,6 @@ pub struct Usage {
     pub cache_write: u64,
 }
 
-pub const MILLISECONDS_PER_SECOND: u64 = 1000;
 pub const HTTP_OVERLOADED: u16 = 529;
 
 pub struct Client {
@@ -353,84 +349,27 @@ impl Client {
     }
 
     pub fn send(&self, body: &Value, partial: &Path) -> Result<(u16, String, u64), String> {
-        if let Some(rest) = self.base_url.strip_prefix("http://") {
-            let request = self.scratch.join("request.json");
-            let encoded = body.encode();
-            std::fs::write(&request, &encoded)
-                .map_err(|error| format!("write request: {error}"))?;
-            return plain::post(rest, &self.key, &encoded, partial);
+        let encoded = body.encode();
+        let headers = [
+            ("x-api-key", self.key.clone()),
+            ("anthropic-version", ANTHROPIC_VERSION.to_owned()),
+            ("content-type", "application/json".to_owned()),
+        ];
+        let sent = transport::post(&transport::Post {
+            base_url: &self.base_url,
+            path: MESSAGES_PATH,
+            headers: &headers,
+            body: &encoded,
+            scratch: &self.scratch,
+            partial,
+            stop: &|| false,
+        })?;
+        match sent {
+            transport::Sent::Done(status, text, retry_after_ms) => {
+                Ok((status, text, retry_after_ms))
+            }
+            transport::Sent::Stopped => Err("the request was stopped".to_owned()),
         }
-        let request = self.scratch.join("request.json");
-        let response = partial;
-        std::fs::write(&request, body.encode())
-            .map_err(|error| format!("write request: {error}"))?;
-        let headers = self.scratch.join("headers.txt");
-        let _ = std::fs::remove_file(&headers);
-        let config = format!(
-            "url = \"{}/v1/messages\"\nheader = \"x-api-key: {}\"\nheader = \"anthropic-version: {ANTHROPIC_VERSION}\"\nheader = \"content-type: application/json\"\ndata-binary = \"@{}\"\noutput = \"{}\"\ndump-header = \"{}\"\n",
-            self.base_url.trim_end_matches('/'),
-            self.key,
-            request.display(),
-            response.display(),
-            headers.display()
-        );
-        let mut child = Command::new("curl")
-            .args([
-                "-sS",
-                "--speed-limit",
-                &STREAM_IDLE_BYTES_PER_SECOND.to_string(),
-                "--speed-time",
-                &STREAM_IDLE_SECONDS_MAX.to_string(),
-                "-w",
-                "%{http_code}",
-                "-K",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("spawn curl: {error}"))?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(config.as_bytes())
-            .map_err(|error| format!("curl stdin: {error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("curl: {error}"))?;
-        if !output.status.success() {
-            let code = output.status.code().unwrap_or(-1);
-            let reason = if code == CURL_TIMED_OUT {
-                format!(
-                    " (the stream stalled for STREAM_IDLE_SECONDS_MAX, {STREAM_IDLE_SECONDS_MAX} s)"
-                )
-            } else {
-                String::new()
-            };
-            return Err(format!(
-                "curl exited {code}{reason}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let status: u16 = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .map_err(|_| "curl printed no HTTP status".to_owned())?;
-        let size = std::fs::metadata(response)
-            .map_err(|error| format!("read response: {error}"))?
-            .len();
-        if size > plain::RESPONSE_BYTES_MAX as u64 {
-            return Err(format!(
-                "response exceeds RESPONSE_BYTES_MAX ({} bytes)",
-                plain::RESPONSE_BYTES_MAX
-            ));
-        }
-        let text =
-            std::fs::read_to_string(response).map_err(|error| format!("read response: {error}"))?;
-        let head = std::fs::read_to_string(&headers).unwrap_or_default();
-        Ok((status, text, retry_after_ms(&head)))
     }
 }
 
@@ -468,23 +407,6 @@ fn error_text(status: u16, body: &str) -> (String, String) {
         }
         Err(_) => ("error".to_owned(), format!("HTTP {status}: {body}")),
     }
-}
-
-pub fn retry_after_ms(head: &str) -> u64 {
-    let header = |name: &str| {
-        head.lines().find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.trim()
-                .eq_ignore_ascii_case(name)
-                .then(|| value.trim().to_owned())
-        })
-    };
-    if let Some(ms) = header("retry-after-ms").and_then(|value| value.parse::<u64>().ok()) {
-        return ms;
-    }
-    header("retry-after")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(0, |seconds| seconds.saturating_mul(MILLISECONDS_PER_SECOND))
 }
 
 fn attempt(name: &str, fields: Vec<Value>) -> Value {
@@ -613,136 +535,4 @@ pub fn interpret(status: u16, body: &str, retry_after_ms: u64) -> (Value, Usage)
         )])
     };
     (ok(reply, stop, used), used)
-}
-
-mod plain {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
-    use std::path::Path;
-    use std::time::Duration;
-
-    pub const RESPONSE_BYTES_MAX: usize = 32 * 1024 * 1024;
-    pub const HTTP_PORT: u16 = 80;
-    pub const READ_CHUNK_BYTES: usize = 8192;
-    const HEADER_END: &[u8] = b"\r\n\r\n";
-
-    pub fn post(
-        rest: &str,
-        key: &str,
-        body: &str,
-        partial: &Path,
-    ) -> Result<(u16, String, u64), String> {
-        let (authority, prefix) = rest
-            .split_once('/')
-            .map_or((rest, ""), |(authority, path)| (authority, path));
-        let path = format!("/{}/v1/messages", prefix.trim_end_matches('/')).replace("//", "/");
-        let address = if authority.contains(':') {
-            authority.to_owned()
-        } else {
-            format!("{authority}:{HTTP_PORT}")
-        };
-        let mut stream =
-            TcpStream::connect(&address).map_err(|error| format!("connect {address}: {error}"))?;
-        let timeout = Some(Duration::from_secs(super::STREAM_IDLE_SECONDS_MAX));
-        stream
-            .set_read_timeout(timeout)
-            .map_err(|error| error.to_string())?;
-        stream
-            .set_write_timeout(timeout)
-            .map_err(|error| error.to_string())?;
-        let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nx-api-key: {key}\r\nanthropic-version: {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            super::ANTHROPIC_VERSION,
-            body.len()
-        );
-        stream
-            .write_all(head.as_bytes())
-            .map_err(|error| format!("send: {error}"))?;
-        stream
-            .write_all(body.as_bytes())
-            .map_err(|error| format!("send: {error}"))?;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(partial)
-            .map_err(|error| format!("{}: {error}", partial.display()))?;
-        let mut response = Vec::new();
-        let mut chunk = [0_u8; READ_CHUNK_BYTES];
-        loop {
-            let read = stream
-                .read(&mut chunk)
-                .map_err(|error| format!("receive: {error}"))?;
-            if read == 0 {
-                break;
-            }
-            if response.len() + read > RESPONSE_BYTES_MAX {
-                return Err(format!(
-                    "response exceeds RESPONSE_BYTES_MAX ({RESPONSE_BYTES_MAX} bytes)"
-                ));
-            }
-            response.extend_from_slice(&chunk[..read]);
-            file.write_all(&chunk[..read])
-                .map_err(|error| format!("{}: {error}", partial.display()))?;
-        }
-        parse(&response)
-    }
-
-    fn parse(response: &[u8]) -> Result<(u16, String, u64), String> {
-        let end = response
-            .windows(HEADER_END.len())
-            .position(|window| window == HEADER_END)
-            .ok_or("response has no header end")?;
-        let head = String::from_utf8_lossy(&response[..end]).into_owned();
-        let mut lines = head.split("\r\n");
-        let status: u16 = lines
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse().ok())
-            .ok_or_else(|| format!("bad status line in {head}"))?;
-        let header = |name: &str| {
-            head.split("\r\n").skip(1).find_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                key.trim()
-                    .eq_ignore_ascii_case(name)
-                    .then(|| value.trim().to_ascii_lowercase())
-            })
-        };
-        let raw = &response[end + HEADER_END.len()..];
-        let body = if header("transfer-encoding").is_some_and(|value| value.contains("chunked")) {
-            dechunk(raw)?
-        } else if let Some(length) = header("content-length") {
-            let length: usize = length
-                .parse()
-                .map_err(|_| format!("bad content-length {length}"))?;
-            raw.get(..length)
-                .ok_or("response shorter than its content-length")?
-                .to_vec()
-        } else {
-            raw.to_vec()
-        };
-        Ok((
-            status,
-            String::from_utf8(body).map_err(|error| format!("response body: {error}"))?,
-            super::retry_after_ms(&head),
-        ))
-    }
-
-    fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, String> {
-        let mut body = Vec::with_capacity(raw.len());
-        loop {
-            let line_end = raw
-                .windows(2)
-                .position(|window| window == b"\r\n")
-                .ok_or("chunk without a size line")?;
-            let size_text = String::from_utf8_lossy(&raw[..line_end]);
-            let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-                .map_err(|_| format!("bad chunk size {size_text}"))?;
-            raw = &raw[line_end + 2..];
-            if size == 0 {
-                return Ok(body);
-            }
-            let chunk = raw.get(..size).ok_or("chunk shorter than its size")?;
-            body.extend_from_slice(chunk);
-            raw = raw.get(size + 2..).ok_or("chunk without its line end")?;
-        }
-    }
 }

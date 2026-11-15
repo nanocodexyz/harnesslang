@@ -898,11 +898,11 @@ rerun sends it again:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=listing_unchecked: listed call 4/62 (mcp__theta) ran as Some("theta-v61") while listing mcp admitted None in turn 4: a tool that changed since admission must be refused
+FAIL invariant=tool_admitted seed=10 target=native-jsonl profile=async mutation=listing_unchecked: listed call 2/5 (mcp__delta) ran as None while listing mcp admitted Some("delta-v1") in turn 2: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=input_unchecked: call 1/48 (apply_patch) ran with input "zeta-7", which does not fit its declared input: not a JSON object
+FAIL invariant=tool_admitted seed=6 target=native-jsonl profile=clean mutation=input_unchecked: call 2/4 (write_stdin) ran with input "gamma-0", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
-FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 1/14 (mcp__eta) was dispatched 2 times
+FAIL invariant=external_once seed=1 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 2/9 (mcp__delta) was dispatched 3 times
 ```
 
 The checker's listing errors:
@@ -2592,10 +2592,12 @@ again, `model_context_window_exceeded` compacts once
 ([clear and keep](#clear-and-keep)), `refusal` stops the
 turn, and a failed call is asked again up to `throttled_attempts_max` times
 in a row. `examples/codex_agent.hl` ports the Codex turn's `end_turn`
-(`crates/backends/codex/src/model/run/turn.rs`): its reply is
-`message(text, bool) | calls(list<call, calls_per_round_max>)`, and a message
-whose `end_turn` is false sends the context again instead of finishing; its
-calls run with `parallel`, listed MCP tools included. Each
+(openai/codex `core/src/session/turn.rs`): its reply is
+`message(text, text, bool) | calls(list<call, calls_per_round_max>, text, text)`,
+the words, the output items to send back (encrypted reasoning included) and
+`end_turn`, and a message whose `end_turn` is false, or after which a steer
+waits, sends the context again instead of finishing; its calls run with
+`parallel`, listed MCP tools included. Each
 continuation spends one of `rounds_max` rounds, so the prover bounds it like
 any other round and the worst case counts it.
 
@@ -3274,9 +3276,13 @@ on note(line: text) -> u64 {
 }
 ```
 
-`examples/claude_agent.hl`, `codex_agent.hl`, `subagents.hl` and
+`examples/claude_agent.hl`, `subagents.hl` and
 `subagent_child.hl` compact this way before every model request, keeping
-`compact_kept` entries. `claude_agent.hl` writes compaction once as a
+`compact_kept` entries. `codex_agent.hl` compacts as Codex's local compaction
+does (`core/src/compact.rs`): when the last usage plus the results since
+reach nine tenths of the window, or when the provider reports the window
+exceeded, it asks for a handoff summary, drops every entry but the user's
+messages with a [rewrite](#rewrite) and pushes the summary after them. `claude_agent.hl` writes compaction once as a
 [fn](#fn) and also calls it when the model reports the context window
 exhausted, and `subagents.hl` also keeps the `agents_kept` most recent agents
 of its roster when a child completes.

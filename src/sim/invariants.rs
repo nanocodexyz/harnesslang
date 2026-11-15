@@ -60,10 +60,11 @@ pub enum Invariant {
     SettingsSent,
     ForkStateEqual,
     CellSettledAtTurnEnd,
+    InterruptDecoded,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -109,6 +110,7 @@ impl Invariant {
         Self::SettingsSent,
         Self::ForkStateEqual,
         Self::CellSettledAtTurnEnd,
+        Self::InterruptDecoded,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -158,6 +160,7 @@ impl Invariant {
             Self::SettingsSent => "settings_sent",
             Self::ForkStateEqual => "fork_state_equal",
             Self::CellSettledAtTurnEnd => "cell_settled_at_turn_end",
+            Self::InterruptDecoded => "interrupt_decoded",
         }
     }
 }
@@ -328,6 +331,43 @@ pub fn interrupted_count(program: &Program, records: &[Record]) -> u64 {
 struct Arrived {
     inbound: journal::Inbound,
     at: u64,
+}
+
+fn interrupt_decoded(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
+    let windowed = world
+        .program
+        .model
+        .as_ref()
+        .is_some_and(|model| model.outcome() == crate::ir::ModelOutcome::Attempt);
+    if !windowed {
+        return Ok(());
+    }
+    let interrupted = crate::run::engine::interrupted_response();
+    for record in records {
+        let Record::Model {
+            turn,
+            seq,
+            response,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        if *response != interrupted {
+            continue;
+        }
+        let decoded = crate::run::engine::decode_attempt(world.program, response, world.mutation);
+        if !matches!(decoded, crate::run::value::Value::Variant(index, _) if index == crate::ir::ATTEMPT_INTERRUPTED)
+        {
+            return violation(
+                Invariant::InterruptDecoded,
+                format!(
+                    "model call {turn}/{seq} is journaled interrupted but the program reads it as {decoded:?}"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn interrupt_honored(program: &Program, records: &[Record]) -> Result<(), Violation> {
@@ -849,6 +889,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     blob_journaled(world.program, records)?;
     search_listed(world.program, records)?;
     interrupt_honored(world.program, records)?;
+    interrupt_decoded(world, records)?;
     for (id, dispatched) in world
         .dispatched
         .iter()

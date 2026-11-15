@@ -59,7 +59,6 @@ Measurements (5-core Linux Hand, rustc 1.100.0):
 
 Commands: `scripts/check.sh`, `scripts/mutations.sh`, `target/release/hl sim --target T --seeds A..B [--twice] [--mutation M] FILE`, `target/release/hl check --target T FILE`, `target/release/hl run FILE --handler NAME --arg VALUE`.
 
-
 ## 2026-11-14: the nanocode oracle, the panic invariant and recovery_skipped
 
 `oracle/` is its own Cargo workspace (`oracle/target` ignored) and the one place with outside dependencies: `nanocode-turnlog` by git from https://github.com/nanocodexyz/nanocode at 395967ffd227ef2158ea824df6ee4c6054d30293 (the reference checkout's HEAD; GitHub's HEAD was 83489e4 the same day), `serde`, `serde_json` (raw_value) and `crc` (its CRC_32_ISO_HDLC catalog entry, so the checksum is computed by code that is not ours). `oracle/Cargo.lock` was seeded from nanocode's own `Cargo.lock`, so the oracle builds the versions nanocode pins (serde 1.0.228, serde_json 1.0.150, tokio 1.52.3), and `[patch.crates-io] serde_derive` points at nanocode's own derive crate as nanocode's workspace does: a git dependency's patches do not reach the depending workspace, and without the patch Cargo resolved serde 1.0.229 with crates.io's serde_derive, syn, quote and proc-macro2 (38 packages instead of 34). tokio, mio, socket2 and the futures crates arrive through nanocode-turnlog's own dependencies; the oracle uses none of them.
@@ -307,7 +306,6 @@ Losses and limits, kept:
 
 Commands: `NANOCODE_DIR=<nanocode checkout> HL_AGENT=<hl-agent binary> sh evals/setup.sh`, then `python3 evals/run.py --suite evals/suite.txt --tasks output/eval/tasks --agent-root output/eval/agent-root --out output/eval/main --agents nanocode,hl-agent --attempts 3 --model claude-sonnet-4-6 --parallel 3 --limits none` and `python3 evals/report.py output/eval/main`. A second runner at once needs its own `--meter-port` and `--relay-port`.
 
-
 ## 2026-11-14: before tool, after tool and lifecycle hooks; spawn and join
 
 GAPS.md's gaps 5 and 7 are closed and removed (branch gaps-5-7, from master 21d98c9, merged with master at 8549e8a, 7fa419b and 6dea898).
@@ -339,7 +337,6 @@ Measurements (5-core Hand shared with two other agents, `nice`, `CHECK_JOBS=2`):
 - `scripts/check.sh` on the merge (96df1dc) ran 906 s before failing in diff-plants: the `enum_unchecked` plant's anchored `sed` no longer matched the line `spawn_output` had wrapped; the checked output keeps its own line now.
 
 Commands: `hl check examples/hooks.hl`, `hl check --target cloudflare docs/snippets/spawn.hl`, `hl sim --target T --seeds 0..200 [--mutation deny_dispatches|spawn_key_unscoped] docs/snippets/{hooks,spawn}.hl`, `hl sim --target native-jsonl --seeds 0..6 --strict examples/subagents.hl`, `RUST_DIFF_FILES=examples/subagents.hl scripts/rust-diff.sh`, `JS_DIFF_FILES=examples/hooks.hl scripts/js-diff.sh`, `scripts/mutations.sh --census`, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
-
 
 ## 2026-11-14: spawn trees deeper than one level, and side questions answered from the last finished turn
 
@@ -603,7 +600,6 @@ Measurements (5-core Hand shared with other agents, `nice`, release builds):
 
 Commands: `hl sim --target T --seeds 0..2000 docs/snippets/in_flight.hl`, `MUTATIONS=M scripts/mutations.sh`, `hl prove --target T --mutation recover_trusts_lost docs/snippets/in_flight.hl`, `hl check examples/claude_code.hl`, `AGENT_DRILL_SEED=S scripts/agent-drill.sh`, `hl-agent run --instruction tasks/T/instruction.md --cwd SCRATCH --model claude-haiku-4-5 --journal J` then `tests/test.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
 
-
 ## 2026-11-14: gaps-2-5-8: the agent drill's seed-5 failure, model settings, rewrite and parallel lanes
 
 Branch gaps-2-5-8, from master 37df067. It establishes:
@@ -657,6 +653,47 @@ Measurements (5-core Hand shared with other agents, `nice`, release builds, clau
 
 Commands: `hl sim --target T --seeds 0..1000 --twice docs/snippets/{code_wait,code_stop}.hl`, `hl sim --target T --seeds 0..200 docs/snippets/fork.hl`, `MUTATIONS='cell_leaks cell_cancel_ignored fork_live_state fork_hook_skipped' scripts/mutations.sh`, `hl prove --target T --mutation cell_leaks docs/snippets/code_wait.hl`, `scripts/mutations.sh --diff {rust,js}:{cell_leaks,cell_cancel_ignored,fork_hook_skipped}:T`, `RUST_DIFF_FILES=F scripts/rust-diff.sh`, `JS_DIFF_FILES=F scripts/js-diff.sh`, `hl check examples/claude_code.hl`, `hl-agent run --instruction I --cwd ws --model claude-haiku-4-5 --journal J [--turn N] [--fork-from P [--at T]]`, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
 
+## 2026-11-14: hl-agent on 40 Terminal-Bench tasks against nanocode and stock Claude Code; --effort, the kill fix rerun, and what the drops cost
+
+What this establishes (branch eval-head, from master ca53d55):
+
+- **hl-agent --effort high|medium|low** runs claude_code.hl's `set_effort` handler as its own durable turn before the prompt turn (turn N, then the prompt at N+1), so the effort is journaled like any other setting; a rerun on the same journal finds the setting turn already finished. No new invariant: it calls an existing handler. `evals/run.py --hl-agent-arg` passes such flags through.
+- **System prompt, "# Finishing" block** (`agent/prompts/claude-code-system.json`): write each deliverable file as soon as a working version exists, then check the result the way it will be used (the exact command and paths the task names, a fresh shell, install a missing tool to check). Read from failures where hl-agent built the right thing but the check ran differently: sqlite-with-gcov exported PATH in its session only (the verifier found no `sqlite3`), polyglot-c-py never ran the Python half because the image has no python3 (nanocode installed it in 3 of 3 attempts, hl-agent in 1 of 3), and timeouts that left no output file (raman-fitting `results.json`, chess-best-move `move.txt`, db-wal-recovery `recovered.json`, pytorch-model-recovery `model.pt`).
+- **evals** run stock Claude Code as a third arm (`claude-code`, 2.1.325, `claude -p --dangerously-skip-permissions --output-format stream-json`, `IS_SANDBOX=1`, the same meter and containers). Its native binary is a Bun single-file executable whose patchelf'd copy segfaults (exit 139), so it runs unpatched on the image's own glibc, or the musl build where `/lib/ld-musl-x86_64.so.1` exists (the nanoeval Alpine tasks); it ran in all 40 images. `setup.sh` installs both with `CLAUDE_CODE_VERSION`. The meter counts `/v1/messages?beta=true`, which Claude Code sends. `report.py` takes `DIR=LABEL` to name an arm and pairs every arm with the first.
+- **The kill question.** Of the 37 Terminal-Bench images, 12 have a `kill` executable (adaptive-rejection-sampler, chess-best-move, configure-git-webserver, db-wal-recovery, extract-elf, git-leak-recovery, git-multibranch, polyglot-c-py, prove-plus-comm, query-optimize, regex-log, sqlite-with-gcov); the other 25 do not. The pre-fix binary enforced Bash timeouts only on those 12 (and there killed servers left running at turn end); on the rest a hung command held the attempt to the agent timeout, as pytorch-model-recovery attempt 2 of the second suite did (4 requests, then 740 s in one Bash call). With the fix, the 10-task rerun (`output/eval/fix`, 2 attempts) passed pytorch-model-recovery 2/2 (pre-fix 1/2), kv-store-grpc, pypi-server and headless-terminal 2/2, tune-mjcf 1/2 (pre-fix 0/2), gcode-to-text 1/2; cancel-async-tasks, polyglot-c-py, largest-eigenval and raman-fitting 0/2.
+- **adaptive-rejection-sampler** cannot be scored on this Hand at effort high: both agents' first request thinks for about 590 s (34,135 and 38,930 thinking characters) and the stream is dropped (`IncompleteRead`), every time, in both reruns. Its hl-agent rows are errors ("no model request succeeded"), not failures.
+- **Dropped streams.** Over the main and second suites 4,136 s of hl-agent's 22,966 s of agent time (18%) went to requests the egress dropped mid-stream (thinking deltas were arriving, so not idle timeouts); 66 of 2,453 requests. Both agents retry at once; the loss is the work in flight.
+
+Effort pilot (hl-agent with the Finishing block, 40 tasks x 1, run side by side): high 30/38 scored (78.9%), $0.226 per attempt, 305 s; medium 31/39 (79.5%), $0.285, 277 s. Medium sent more requests (15.2 against 12.5) and cost more; paired, 4 tasks went to medium and 3 to high (sign test p = 1.000). high stays the default.
+
+**The head-to-head** (`output/eval/head` for nanocode and hl-agent interleaved in one pool, `output/eval/cc` for Claude Code on the same 40 tasks, 1 attempt each, the same hour). nanocode c7679e3, hl-agent built at d6c75ed (the Finishing block, effort high), Claude Code 2.1.325, claude-sonnet-4-6, prices as in the eval entry. The Hand ran at load 20 to 33 on 5 cores during these runs (other lanes' builds and four eval runners), so wall times and the 900 s timeouts are not comparable with earlier entries.
+
+| Agent | Attempts | Passed | Failed | Errored | Pass rate (95% Wilson) | Cost | Cost/attempt | Wall/attempt | Requests/attempt | Prompt tokens/attempt | Output tokens/attempt |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| nanocode | 40 | 27 | 13 | 0 | 67.5% (52.0-79.9%) | $11.48 | $0.287 | 333 s | 12.5 | 280,729 | 9,710 |
+| claude-code | 40 | 29 | 9 | 2 | 76.3% (60.8-87.0%) | $11.63 | $0.291 | 258 s | 11.4 | 348,114 | 8,716 |
+| hl-agent | 40 | 28 | 11 | 1 | 71.8% (56.2-83.5%) | $11.03 | $0.276 | 293 s | 13.4 | 250,324 | 9,595 |
+
+Paired by task: hl-agent against nanocode 4 tasks to 3 (p = 1.000), cost -$0.011 (-$0.109 to $0.086), wall -40.5 s (-94.4 to 13.3); Claude Code against nanocode 5 to 2 (p = 0.453); hl-agent against Claude Code 3 to 5 (p = 0.727). No difference is outside its interval at 40 attempts. Over all of this lane's runs with nanocode in the same pool (the main and second suites, 100 attempts each, pre-fix binary), hl-agent 78.6% at $0.239 against nanocode 73.0% at $0.272, 11 tasks to 7 (p = 0.481).
+
+Scorecard:
+
+| Metric | Baseline | Current | Target |
+| --- | --- | --- | --- |
+| hl-agent pass rate, 40 tasks | 78.6% (100 attempts, pre-fix, nanocode 73.0%) | 71.8% (40 attempts; nanocode 67.5%, Claude Code 76.3%) | above every reference by 10 points at half their cost |
+| hl-agent cost per attempt | $0.239 (nanocode $0.272) | $0.276 (nanocode $0.287, Claude Code $0.291) | at most $0.145 |
+| Sign test against the best reference | none | p = 0.727 against Claude Code (3 to 5) | p < 0.05 |
+
+The target is not met: hl-agent ties nanocode and trails Claude Code by 2 tasks of 40, inside the noise. Bets not run, for the spend cap: Claude Code's own prompt and tool set inside claude_code.hl (it reached the same pass rate with fewer requests), a verifier-in-the-loop turn before the final answer, and runs on a larger machine with 2 attempts per arm so a 10-point difference is detectable.
+
+Losses and limits, kept:
+
+- One attempt per task per arm; at this size only a difference of about 8 discordant tasks to 1 would reach p < 0.05.
+- Claude Code runs on the image's glibc, the other two on the host's through the bind-mounted loader; Claude Code also sends its own system prompt (27,807 characters), tools and `max_tokens` 32,000.
+- Spend in this entry: the kill-fix rerun $6.56, the effort pilot $9.45 (high) and $11.57 (medium), the head-to-head $22.60 and Claude Code $11.77, smokes and the adaptive-rejection-sampler rerun under $0.30: about $62. Dropped streams are billed upstream but the meter cannot count them.
+
+Commands: `python3 evals/run.py --suite output/eval/suite-all.txt --tasks output/eval/tasks-all --agent-root R --agents nanocode,hl-agent --attempts 1 --model claude-sonnet-4-6 --parallel 4 --limits none --out output/eval/head` (and `--agents claude-code --out output/eval/cc`, `--agents hl-agent --hl-agent-arg=--effort --hl-agent-arg=medium`), `python3 evals/report.py output/eval/head output/eval/cc`, `python3 evals/report.py output/eval/p-high=high output/eval/p-medium=medium`, `AGENT_DRILL_SEED=1 scripts/agent-drill.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
+
 ## 2026-11-14: deploy: hl deploy, status, logs, rollback, secrets and destroy without wrangler or the Vercel CLI
 
 Branch deploy, from master ca53d55. It establishes:
@@ -703,3 +740,98 @@ Measurements (5-core Hand shared with other agents):
 - Bundles: `examples/agent.hl` on cloudflare one 348,531-byte module; on vercel 5 files, 236,080 bytes; on native-jsonl one 266,817-byte harness.rs.
 
 Commands: `scripts/deploy-drill.sh`, `scripts/deploy-drill.sh --demo`, `scripts/deploy-drill.sh --bench` (`DEPLOY_DRILL_HL` picks the binary; the baseline ran 13de204's), `DEPLOY_DRILL_PLANT=P DEPLOY_DRILL_TARGETS=T scripts/deploy-drill.sh`, `scripts/mutations.sh --census`, `scripts/mutations.sh --deploy P:T`, `scripts/deploy-real.sh`, `hl deploy --endpoints`, `scripts/docs-check.sh`, `nice scripts/check.sh`.
+
+## 2026-11-14: openai-host: an OpenAI Responses host for codex_agent.hl, and an interrupted model reply that every backend read as rejected
+
+Branch openai-host, from eval-head 972a3f2. It establishes:
+
+- **hl-agent hosts codex_agent.hl against the Responses API.** `agent/build.rs` emits `examples/codex_agent.hl` as a third module; `hl-agent run --harness codex` (the default for a model whose name does not start with `claude`) runs it with `OPENAI_API_KEY` and `OPENAI_BASE_URL`. `agent/src/transport.rs` is the curl and plain-HTTP transport both providers now share, with a stop check every 50 ms (`STOP_POLL`); `agent/src/openai.rs` builds the request, assembles the SSE stream (`response.output_item.done` items in output order, then `response.completed`, `response.incomplete` or `response.failed`; an `error` event or a stream that closes before its terminal event is transient) and maps it onto the harness's `attempt`; `agent/src/codex.rs` holds the tools and `agent/src/codex_host.rs` the `Host`.
+- **Stateless requests, decided.** Every request carries the whole input with `store: false` and `include: ["reasoning.encrypted_content"]`; the reply's text field keeps the output items (reasoning with its encrypted content, messages, function and custom tool calls), which the host sends back verbatim, without the item ids a stateless request may not name. `previous_response_id` was rejected: the journal is the session's source of truth, and a re-request after a crash, a compaction, a fork or a rewind must not depend on server-side responses that expired, were never stored (zero data retention) or belong to another branch of the session. Stock Codex makes the same choice over HTTPS (`core/src/client.rs`: `store: false`) and uses `previous_response_id` only on its WebSocket transport, as nanocode's Codex backend does. The cost of resending is met by prompt caching: `prompt_cache_key` is a per-session key kept in the journal's `state/cache_key`, and the instructions, tools and the AGENTS.md and `<environment_context>` preamble (kept in `state/preamble.json`) form a fixed prefix.
+- **Errors and retries.** HTTP 429 and the codes `rate_limit_exceeded`, `slow_down`, `server_is_overloaded` and `policy_capacity_unavailable` are throttled, 408, 409 and 5xx transient, both with the server's `retry-after-ms` or `retry-after`, else a "try again in Ns" hint in the message (`codex-api/src/sse/responses_error.rs`); quota, policy and invalid-prompt codes are rejected; `context_length_exceeded` is an empty reply that stopped with `context_exceeded`, which the harness compacts once. codex_agent.hl retries five times (`DEFAULT_STREAM_MAX_RETRIES`), from 200 ms doubling (`async-utils/src/backoff.rs`), honouring the server's delay up to 60 s (`MAX_CONNECTION_RETRY_DELAY`).
+- **Usage and cost.** The ledger records uncached input, cached input, output and reasoning tokens per request and, for a model the price table knows, `cost_nano_usd` from nanocode's standard and long-context rates (`crates/core/types-core/src/pricing/estimate.rs`: Sol, Terra, Luna and Astra, long context past 272,000 input tokens); `usage.json` adds `reasoning_tokens`, `cost_usd` and `priced_requests` when they are known, so Claude's file is unchanged.
+- **Tools.** `exec_command` and `write_stdin` follow Codex's unified exec (`core/src/unified_exec/mod.rs`): yields clamped to 250..30,000 ms, empty polls to 5,000..300,000 ms, at most 64 sessions, 10,000 output tokens by default with Codex's middle truncation marker and header lines (`core/src/tools/context.rs`); a `tty: true` session runs under `script` when the platform has it, so the program sees a terminal and stdin stays writable. `apply_patch` is the freeform Lark tool with Codex's parser and its four-pass line matching (`apply-patch/src/parser.rs`, `seek_sequence.rs`, `file_update.rs`). `exec_command` and `apply_patch` are `external recoverable`: a fsynced start receipt before they run and a result receipt after, and an `apply_patch` whose added and deleted files are already in place is answered with its success text.
+- **Steer and cancel.** `hl-agent steer --journal J --text T` and `hl-agent cancel --journal J` drop an event file into `J/control`, which `Host::inbox` delivers and `Host::answer` removes; a cancel stops the model's stream and kills a running command's process group. codex_agent.hl takes steers at every round, as Codex drains pending input before each sampling request, and answers a cancel with Codex's `<turn_aborted>` guidance.
+- **codex_agent.hl** follows codex-rs 81b995a (sources in GAPS.md 10): the reply is `message(text, text, bool) | calls(list<call, calls_per_round_max>, text, text)`, the model has a 272,000-token window, a reasoning-effort setting and is interruptible by cancel, compaction keeps the user's messages through a `rewrite`, and the MCP listing is kept. Proved on all five targets.
+- **An interrupted model reply was read as rejected on every backend.** The runtime journals an interrupted model as `{"interrupted":[]}`, but the interpreter, the generated Rust and the generated JavaScript decoded a zero-field variant only from a bare name, so the program's `interrupted` arm never ran: the turn took `rejected("model reply: variant 'interrupted' has 0 field(s)")`. The three backends agreed, so no differential run saw it, and `interrupt_honored` checks only the records; the fake API's cancel drill found it. All three decoders now accept an empty field list. New invariant `interrupt_decoded` (46 in all): every model reply journaled as interrupted decodes, through the engine's own decoder, as the interrupted variant. New mutation `interrupted_undecoded` (80 in all), planned on `docs/snippets/in_flight.hl` and failing `interrupt_decoded` at seed 5 on native-jsonl and vercel; differential plants rust and js `interrupted_undecoded`, each caught as `backend_equal`. Journals are unchanged.
+- **codex_agent.hl's new shape moves one plan.** With a listing read every round on a turn that now also retries and compacts, `listed_class_dropped` on native-sqlite, server-postgres and vercel is first caught at seed 1 by `unknown_reported` (the rerun dispatches the external listed call whose record was never durable) before `external_once` sees the second dispatch; its plan now names both.
+- **The fake Responses API** (`agent/src/bin/mock-responses`) serves scripted steps as the real stream does (`response.created`, `output_item.added`, text, argument and custom input deltas, `output_item.done`, `response.completed` with usage) and refuses, with the API's own messages, what the real API refuses: no bearer key, `store` not false, no encrypted reasoning included, an item id a stateless request cannot name, encrypted reasoning it did not issue, a call sent without its reasoning item, a call without its output or an output without its call, a custom call answered as a function call. Cached tokens follow the prompt cache's rules (the common prefix with the previous request of the same `prompt_cache_key`, at least 1,024 tokens, in steps of 128). Faults per step, each once: `throttle` (429 with a "try again in 1.2s" hint), `overloaded` (503 with `retry-after-ms`), `cut` (the connection closes mid-stream) and `failed` (`response.failed` mid-stream).
+
+Measurements (5-core Hand shared with other agents, `nice`, release builds):
+
+- `scripts/codex-drill.sh` (seed 1, in `scripts/check.sh`): 12 kill -9s (9 during a model stream, 3 during a tool), every throttle, overload, cut and failed stream retried, 3 cut streams requested again to a journaled reply, recovery answered 3 replies and 3 unknown, 9 external calls each dispatched once, every effect at most once, done.txt written, 15 requests, 70,016 cached against 1,076 uncached input tokens, $0.001008 at Luna's rates, 7.7 s of agent time; the control turns: a steer sent while a command ran reached the next request and the turn completed, a cancel stopped a 30 s command in 130 ms and killed its process group, a cancel stopped a 20 s model stream in 179 ms, both turns ending `cancelled_turn`. With `batch_flush_after_dispatch` planted, seeds 1, 2 and 3 fail with external calls dispatched 2 to 10 times. Before the decoder fix the model cancel ended the turn `failed` with the decode error above.
+- `hl check examples/codex_agent.hl`: proved on all five targets, 507,528 prover steps, worst case 19,459 journal records and 9,728 outbound requests per turn (Cloudflare's limit is 10,000).
+- `hl sim --twice --seeds 0..500 examples/codex_agent.hl`: native-jsonl 3,505 runs, 2,260 crashes, 76 interrupted; native-sqlite 2,858 runs; server-postgres 185 takeovers; cloudflare 100 interrupted; vercel 104 interrupted. `rust-diff` of `docs/snippets/in_flight.hl` over seeds 0..2000 matches the interpreter after the fix. The listing mutations planned on codex_agent.hl (`listing_unchecked`, `input_unchecked`, `listed_class_dropped`) are still caught.
+- `scripts/agent-drill.sh` (Claude, seed 1) passes on the shared transport: 9 kills, 5 cut streams requested again.
+
+Departures, kept: no real run yet (no OpenAI key on the Hand; evals/RESULTS.md says what to run); the gaps in GAPS.md 10.
+
+Scorecard (hill-climb metric: codex_agent.hl's pass rate on the OpenAI host against stock `codex exec` on the same model and suite):
+
+| metric | baseline | current | target |
+|---|---|---|---|
+| pass rate against stock codex, same model | not runnable (no host; no key) | not runnable (host done; no key on the Hand) | above stock codex at lower cost per task |
+| fake-API drill: kill -9s survived without a repeated external call | none (no host) | 12 of 12, plant caught on seeds 1, 2, 3 | every seed of 0..40 |
+| faults recovered (throttle, overload, cut stream, failed stream) | none | 4 of 4 | 4 of 4 plus a 5xx storm past five retries ending failed |
+| cancel latency, tool and model stream | none | 130 ms and 179 ms | under 100 ms (STOP_POLL is 50 ms) |
+| cached share of input tokens in the drill | none | 98.5% (70,016 of 71,092) | the same against the real API |
+
+Big bets, ranked: one harness core shared by the Claude and OpenAI hosts, so a gap fix (compaction, steers, cancels, retries) lands in both; a code-mode variant for the catalog's code_mode_only models (GAPS.md 10, item 1); concurrent external calls in a parallel batch (gap 2), which Codex has and which bounds wall time on multi-call replies.
+
+Commands: `scripts/codex-drill.sh`, `CODEX_DRILL_SEED=S CODEX_DRILL_PLANT=batch_flush_after_dispatch scripts/codex-drill.sh`, `AGENT_DRILL_SEED=1 scripts/agent-drill.sh`, `hl check examples/codex_agent.hl`, `hl sim --target T --seeds 0..500 --twice examples/codex_agent.hl`, `hl sim --target T --seeds 0..300 --twice --mutation interrupted_undecoded docs/snippets/in_flight.hl`, `scripts/mutations.sh --diff rust:interrupted_undecoded:native-jsonl`, `scripts/mutations.sh --diff js:interrupted_undecoded:vercel`, `RUST_DIFF_FILES=docs/snippets/in_flight.hl scripts/rust-diff.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
+
+## 2026-11-15: stock Codex as a reference agent in evals, the meter's OpenAI route and the codex wiring drill
+
+Branch eval-codex, from eval-head e378df9, master ce76f48 merged. It establishes:
+
+- **A `codex` arm.** `evals/run.py --agents codex` runs `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --json -m MODEL -C WORKDIR -c openai_base_url="<run>/openai/v1" INSTRUCTION` in the task's own container, with `HOME` in the row's journal, `CODEX_API_KEY=metered-by-host` (the variable `codex exec` reads; the meter puts the real key on) and `OPENAI_BASE_URL` set as well. Codex 0.169.0 reads the base URL only from `openai_base_url` in its configuration (codex-rs `core/src/config/mod.rs`), not from the environment, so the flag is what routes it. The same verifier scores it. The binary is the official static musl build, `codex-x86_64-unknown-linux-musl.tar.gz` from release rust-v0.169.0 (sha256 9af4d751…, 294 MB unpacked), so one file runs on glibc and musl images alike; `CODEX=1 evals/setup.sh` downloads it once, checks the hash and copies it into the agent root as `bin/codex`.
+- **The meter relays OpenAI too.** `/run/<id>/openai/<path>` goes to api.openai.com with `authorization: Bearer $OPENAI_API_KEY`; every other path still goes to api.anthropic.com with `x-api-key`. `NANOEVAL_OPENAI_UPSTREAM` and `NANOEVAL_ANTHROPIC_UPSTREAM` replace an origin (an `http://` origin skips the proxy), which is how the drill puts a fake behind it. It starts with either key and answers 503 on a route whose key it lacks. Responses streams are read from `response.output_item.done` and `response.completed`, `incomplete` or `failed`; usage maps to the same record fields as Anthropic's: `input_tokens` is input minus `input_tokens_details.cached_tokens`, `cache_read_tokens` the cached tokens, no cache writes (OpenAI bills none), `reasoning_tokens` beside them; function, custom, local shell and web search calls count as tool calls. `run.py` counts `/messages`, `/responses` and `/responses/compact` as model requests, and asks for the key each chosen agent needs rather than always the Anthropic one.
+- **WebSocket is refused, and Codex falls back.** Codex 0.169.0 opens the Responses API over WebSocket first (a GET with `upgrade: websocket` on `/v1/responses`). The meter answers 426, which Codex takes as the signal to switch the session to HTTPS streaming at once (codex-rs `core/src/client.rs`, `StatusCode::UPGRADE_REQUIRED`); measured: one refused upgrade per session and one error line on stderr. Request content is the same; each HTTPS request carries the whole input instead of a delta after `previous_response_id`, which the prompt cache absorbs. Relaying the WebSocket would mean decoding (and possibly inflating) frames to meter them; not done.
+- **The other two OpenAI arms reach the meter the same way.** nanocode gets `NANOCODE_OPENAI_BASE_URL=<run>/openai/v1` (its Codex backend, HTTPS transport, lists models from `/v1/models` first), and `hl-agent` gets `OPENAI_BASE_URL=<run>/openai` for its Codex host. With a Claude model nothing changes for either.
+- **`evals/codex-drill.sh` is the wiring check.** For each agent in `AGENTS` (default `codex`) and each nanoeval task it starts `evals/fake_openai.py` (a Responses API fake: the first request gets one shell call running the task's `solution/solve.sh` through whichever of `exec_command`, `shell_command` or `shell` the request offers, the next a final message; fixed usage of 1,000 input with 600 cached and 50 output tokens), runs `run.py` with only `OPENAI_API_KEY=fake-upstream-key` set, and `evals/codex_drill_check.py` requires: outcome passed by the task's verifier, exactly 2 requests at the fake carrying the meter's key and no `metered-by-host` anywhere upstream, no WebSocket upgrade reaching it, and the meter's totals equal to what the fake billed (2 requests, 1 tool call, 800 input, 1,200 cache-read, 100 output tokens). `report.py` prices gpt-5.5 (https://developers.openai.com/api/docs/models/gpt-5.5, prompts under 272K tokens: $5 input, $0.50 cached, $30 output per million) and counts a codex row's inner tool calls from the `item.completed` command, file change, MCP and web search events of its `--json` stream.
+
+Measurements (2026-11-15, hosted Hand, 5 cores, load 13 to 41 from other work, `--limits none` since Docker here cannot apply cgroup limits):
+
+- `AGENTS=codex,nanocode,hl-agent sh evals/codex-drill.sh`: codex 3/3 and nanocode (c7679e3) 3/3 rows pass every check; a codex row takes 2.6 to 2.9 s of agent wall time. hl-agent's Codex host (built from the openai-host branch on 2026-11-14) passes write-greeting and fails extract-todos and uppercase-message: their alpine images have no bash, and every `exec_command` answers "Failed to create unified exec process: No such file or directory (os error 2)", where Codex itself runs `/bin/sh -lc`. That is a host bug the drill found, not wiring, and the openai-host branch's to fix.
+- Planted faults, each in a copy of `evals/`, each caught on all 3 codex rows: the meter not putting its key on (upstream authorization null), the meter not subtracting cached tokens (input_tokens 2,000, expected 800), and the meter relaying WebSocket upgrades instead of refusing them (7 upgrades reach the fake, 9 metered requests instead of 2).
+- `python3 evals/report.py DIR=codex DIR=nanocode` on the write-greeting drill rows: both 1/1, $0.008 an attempt at the fake's usage, sign test p = 1.000.
+- Not measured: a real model. No OpenAI API key is on this Hand, and the owner's machine (where a Codex subscription login in `~/.codex/auth.json` might be) was not attached to this work, so neither real run happened. A subscription login talks to the ChatGPT backend (`chatgpt.com/backend-api/codex`), not api.openai.com; the meter needs a third route forwarding that token and its account header before such a run can be metered.
+
+Scorecard:
+
+| Metric | Baseline | Current | Target |
+| --- | ---: | ---: | ---: |
+| codex wiring drill rows passing | 0/3 (no codex arm, meter Anthropic only) | 3/3 | 3/3 |
+| OpenAI arms' drill rows passing (codex, nanocode, hl-agent; 3 tasks each) | 0/9 | 7/9 | 9/9 (needs the host's sh fallback) |
+| planted meter faults the drill catches | 0/3 | 3/3 | 3/3 |
+| codex pass rate and cost vs hl-agent and nanocode's Codex backend, 40 tasks, paired sign test | not run | not run (no key) | run once a key exists |
+
+Commands: `CODEX=1 evals/setup.sh`, `AGENTS=codex,nanocode,hl-agent AGENT_ROOT=R TASKS=output/eval/tasks sh evals/codex-drill.sh`, the same with `DRILL_OUT` and a planted copy of `evals/` per fault, `python3 evals/report.py output/codex-drill/codex/write-greeting/run=codex output/codex-drill/nanocode/write-greeting/run=nanocode`; with a key: `python3 evals/run.py --suite evals/suite.txt --tasks output/eval/tasks --agent-root output/eval/agent-root --out output/eval/codex --agents codex,nanocode,hl-agent --attempts 1 --model gpt-5.5 --parallel 3 --limits none`.
+
+## 2026-11-15: int-evals: the eval, Codex, OpenAI host and gap-mining lanes together; a /bin/sh fallback and a Claude-only route fix
+
+Branch int-evals, from master ce76f48, merging eval-codex (which contains eval-head), gap-mining and openai-host. It establishes:
+
+- **One branch carries the four lanes.** Conflicts were only in DECISIONS.md (entries kept in date order), docs/ARCHITECTURE.md (the agent line names codex_agent.hl's host, the evals line names stock Claude Code, stock Codex and `evals/gaps/`) and docs/GAPS.md (section 10, what codex_agent.hl leaves out of stock Codex, sits before the measured gaps against stock Claude Code).
+- **`exec_command` falls back to `/bin/sh`** (`agent/src/codex.rs`) when the image has no bash and the model names no shell, as Codex runs `/bin/sh -lc`; `tools::SHELL_FALLBACK` is the one constant both hosts use. The eval-codex lane's drill had found it: hl-agent's Codex host passed 1 of 3 nanoeval rows (the two alpine images have no bash). After: 3 of 3 (`AGENTS=hl-agent sh evals/codex-drill.sh`, fake Responses API, no spend); the old binary still fails the same 2 rows.
+- **The OpenAI route only for a non-Claude model** (`evals/run.py`, `CLAUDE_MODEL_PREFIX`). eval-codex gave nanocode `NANOCODE_OPENAI_BASE_URL` on every row; nanocode then lists OpenAI models first, the meter answers 503 without an OpenAI key, and every nanocode row with claude-sonnet-4-6 errored "no model request succeeded" (4 of 4 in the first minute of a run, stopped). After the fix a smoke row passed for nanocode and hl-agent.
+- **evals/RESULTS.md** holds the per-suite tables (pass rate with 95% Wilson interval, cost per attempt, the paired sign test for each pair of arms), the agent versions and the load the runs were made under; the Codex arms are drill-only (no OpenAI key on this Hand).
+- **docs/GAPS.md** gains the reruns of the closed gaps and their status.
+
+Measurements (claude-sonnet-4-6; every run on the shared 5-core Hand under heavy load):
+
+- Head-to-head, 40 tasks x 1 (eval-head lane): hl-agent 28/39 (71.8%, 56.2-83.5%) $0.276 an attempt; nanocode 27/40 (67.5%) $0.287; Claude Code 29/38 (76.3%) $0.291. Sign tests: hl-agent against nanocode 4 to 3 (p = 1.000), against Claude Code 3 to 5 (p = 0.727).
+- Three attempts, hl-agent and nanocode (eval-head lane's rerun, 191 of 240 rows when this was written, load average 21, peak 57): hl-agent 75/93 (80.6%, 71.5-87.4%) $0.255; nanocode 68/95 (71.6%, 61.8-79.7%) $0.266; 9 to 3 (p = 0.146).
+- Gap reruns (gap-mining lane, $7.42 in all): the five gap tasks 14 of 20 after the Inputs and Finishing blocks against 12 of 28 before; db-wal-recovery 4 of 4 (1 of 5 before), sqlite-with-gcov 2 of 4 (0 of 5); polyglot-c-py still 3 of 7.
+- Started: hl-agent at this branch against nanocode c7679e3 and Claude Code 2.1.325, 40 tasks x 2, parallel 3, from 04:20 UTC into `output/eval/r5`, with a watchdog that stops the run when metered spend reaches $50.
+
+Scorecard:
+
+| Metric | Baseline | Current |
+| --- | --- | --- |
+| hl-agent pass rate against nanocode, 40 tasks | 71.8% vs 67.5% (1 attempt, p = 1.000) | 80.6% vs 71.6% (3 attempts, partial, p = 0.146) |
+| hl-agent cost per attempt | $0.276 (nanocode $0.287, Claude Code $0.291) | $0.255 (nanocode $0.266) |
+| hl-agent against stock Claude Code | 3 to 5, p = 0.727 | the 40 x 2 run in `output/eval/r5` |
+| Codex-host drill rows | 1/3 | 3/3 |
+| nanocode rows erroring on the OpenAI route with a Claude model | 4/4 | 0/1 |
+
+Commands: `git merge eval-codex gap-mining openai-host`, `AGENTS=hl-agent AGENT_ROOT=R TASKS=T sh evals/codex-drill.sh`, `python3 evals/run.py --suite S --tasks T --agent-root R --agents nanocode,hl-agent,claude-code --attempts 2 --model claude-sonnet-4-6 --parallel 3 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --out output/eval/r5`, `python3 evals/report.py DIR DIR=LABEL`, `CHECK_JOBS=2 nice scripts/check.sh`.

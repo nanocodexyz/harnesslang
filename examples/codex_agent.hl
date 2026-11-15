@@ -1,80 +1,216 @@
 harness codex_agent
 
-const rounds_max: u64 = 64
+const rounds_max: u64 = 512
 const calls_per_round_max: u64 = 16
 const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
-const compact_kept: u64 = 32
+const context_window_tokens: u64 = 272000
+const auto_compact_tenths: u64 = 9
 const turns_max: u64 = 1000000
+const stream_retries_max: u64 = 5
+const retry_base_ms: u64 = 200
+const retry_after_max_ms: u64 = 60000
+const exec_yield_ms: u64 = 10000
+const stdin_yield_ms: u64 = 250
+const output_tokens_default: u64 = 10000
+const result_tokens_max: u64 = 10000
+const result_units_max: u64 = 40039
 const mcp_tools_max: u64 = 64
 
-type outcome = completed(text) | failed(text) | exhausted
-type turn_result = message(text, bool) | calls(list<call, calls_per_round_max>)
+type outcome = completed(text) | failed(text) | cancelled_turn | exhausted
+type codex_reply = message(text, text, bool) | calls(list<call, calls_per_round_max>, text, text)
+type effort_level = "medium" | "low" | "high" | "xhigh"
 
-tool shell(command: text) -> text effect external
-tool apply_patch(patch: text) -> text effect external
-tool update_plan(plan: text) -> text effect none
-tool view_image(path: text) -> text effect none
-tool web_search(query: text) -> text effect none
+tool exec_command(cmd: text, workdir: text = "", yield_time_ms: u64 = exec_yield_ms, max_output_tokens: u64 = output_tokens_default, shell: text = "", login: bool = true, tty: bool = false) -> text effect external recoverable interruptible by cancel
+tool write_stdin(session_id: u64, chars: text = "", yield_time_ms: u64 = stdin_yield_ms, max_output_tokens: u64 = output_tokens_default) -> text effect external interruptible by cancel
+tool apply_patch(input: text) -> text effect external recoverable
+tool update_plan(plan: text, explanation: text = "") -> text effect none
 tools from listing(mcp, mcp_tools_max) (arguments: text) effect external
 
-model responses calls calls_per_round_max reply turn_result
+model responses calls calls_per_round_max reply codex_reply window context_window_tokens settings(effort: effort_level = "medium") interruptible by cancel
 
+on cancel
 on steer(message: text) bound steers_per_turn_max
 
 state {
   context: list<entry, context_entries_max>
   turns: u64
+  retries: u64
+  backoff_ms: u64
+  context_tokens: u64
+  pending_units: u64
+  compact_pending: bool
+  context_recovered: bool
+  effort: effort_level
+  pinned: effort_level
 }
 
 invariant turns_bounded: turns <= turns_max
 invariant context_room: len(context) < context_entries_max
+invariant retries_bounded: retries <= stream_retries_max
+invariant backoff_bounded: backoff_ms <= retry_after_max_ms
+invariant tokens_bounded: context_tokens <= 4 * context_window_tokens
+invariant pending_bounded: pending_units <= calls_per_round_max * result_units_max
 
-on prompt(input: text) -> outcome
-  requires turns < turns_max
-{
-  push context user(input)
-  turns = turns + 1
-  loop round below rounds_max {
-    match mcp() {
-      ok(_) => {}
-      failed(_) => {}
-    }
-    if len(context) + 1 + (1 + calls_per_round_max) > context_entries_max {
-      keep context last context_entries_max - 2
-      push context user("Summarize the conversation so far for a fresh start: the task, what was done, what is left.")
-      match responses(context) {
-        failed(error) => { return failed("compaction failed: " ++ error) }
-        ok(summary) => {
-          keep context last compact_kept
-          match summary {
-            message(_, _) => { push context assistant(summary) }
-            calls(_) => { return failed("compaction answered with tool calls") }
-          }
-        }
+fn back_off(error: text, after_ms: u64) {
+  if retries >= stream_retries_max {
+    return failed("stream disconnected after every retry: " ++ error)
+  }
+  if after_ms > retry_after_max_ms {
+    return failed("the provider asked to wait longer than a retry waits: " ++ error)
+  }
+  retries = retries + 1
+  if after_ms > 0 {
+    let woke = wait(after_ms) at most retry_after_max_ms
+  } else {
+    let woke = wait(backoff_ms) at most retry_after_max_ms
+  }
+  if backoff_ms * 2 > retry_after_max_ms { backoff_ms = retry_after_max_ms } else { backoff_ms = backoff_ms * 2 }
+}
+
+fn aborted() {
+  push context user("<turn_aborted>\nThe user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.\n</turn_aborted>")
+  return cancelled_turn
+}
+
+fn compact() {
+  keep context last context_entries_max - 2
+  match responses(context with user("You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.\n")) with {effort: pinned} {
+    interrupted => { aborted() }
+    throttled(error, after_ms) => { back_off("compaction: " ++ error, after_ms) }
+    transient(error, after_ms) => { back_off("compaction: " ++ error, after_ms) }
+    rejected(error) => { return failed("provider rejected compaction: " ++ error) }
+    ok(summary, stop, _, _, _, _) => {
+      match stop {
+        "end" => {}
+        "tool_use" => {}
+        "pause" => {}
+        "max_tokens" => { return failed("compaction summary did not end normally") }
+        "refusal" => { return failed("provider refused compaction") }
+        "context_exceeded" => { return failed("compaction exhausted the context window") }
+      }
+      match summary {
+        message(words, _, _) => { summarized(words) }
+        calls(_, _, _) => { return failed("compaction answered with tool calls") }
       }
     }
-    match responses(context) {
-      failed(error) => { return failed("model call failed: " ++ error) }
-      ok(reply) => {
-        push context assistant(reply)
-        match reply {
-          message(words, end_turn) => {
-            if end_turn {
-              let steers = take steers
-              if len(steers) == 0 { return completed(words) }
-              for steer in steers {
-                push context user(steer)
+  }
+}
+
+fn summarized(words: text) {
+  rewrite context {
+    assistant(_) => drop
+    result(_, _) => drop
+    error(_, _) => drop
+    unknown(_) => drop
+  }
+  push context user("Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n" ++ words)
+  context_tokens = 0
+  pending_units = 0
+  compact_pending = false
+}
+
+fn run_calls(requested: list<call, calls_per_round_max>) {
+  pending_units = 0
+  for call in requested parallel {
+    match dispatch(call) {
+      ok(output) => {
+        let cut = truncate_middle(output, result_tokens_max)
+        pending_units = pending_units + len(cut)
+        push context result(call, cut)
+      }
+      failed(error) => {
+        let cut = truncate_middle(error, result_tokens_max)
+        pending_units = pending_units + len(cut)
+        push context error(call, cut)
+      }
+      unknown => { push context unknown(call) }
+    }
+  }
+  if cancelled { aborted() }
+}
+
+fn ended(words: text) {
+  let steers = take steers
+  if len(steers) == 0 { return completed(words) }
+  for steer in steers {
+    push context user(steer)
+  }
+}
+
+fn stopped(stop: stop) {
+  match stop {
+    "end" => {}
+    "tool_use" => {}
+    "pause" => {}
+    "max_tokens" => { return failed("response incomplete: max_output_tokens") }
+    "refusal" => { return failed("the model refused the request") }
+    "context_exceeded" => {
+      if context_recovered { return failed("context window exceeded after compaction") }
+      context_recovered = true
+      compact_pending = true
+    }
+  }
+}
+
+on set_effort(level: effort_level) -> outcome {
+  effort = level
+  return completed("")
+}
+
+on prompt(input: text, rounds: u64) -> outcome
+  requires turns < turns_max
+{
+  if len(context) + 1 >= context_entries_max {
+    keep context last context_entries_max - 2
+  }
+  push context user(input)
+  turns = turns + 1
+  pinned = effort
+  retries = 0
+  backoff_ms = retry_base_ms
+  compact_pending = false
+  context_recovered = false
+  loop round below rounds_max {
+    if round >= rounds { return exhausted }
+    if len(context) + 3 + calls_per_round_max + steers_per_turn_max > context_entries_max {
+      compact_pending = true
+    }
+    if context_tokens * 40 + pending_units * 10 >= context_window_tokens * auto_compact_tenths * 4 {
+      compact_pending = true
+    }
+    if compact_pending {
+      compact()
+    }
+    if len(context) + 3 + calls_per_round_max + steers_per_turn_max > context_entries_max {
+      return failed("the context has no room for a round after compaction")
+    }
+    if not compact_pending {
+      for steer in take steers {
+        push context user(steer)
+      }
+      match mcp() {
+        ok(_) => {}
+        failed(_) => {}
+      }
+      match responses(context) with {effort: pinned} {
+        interrupted => { aborted() }
+        throttled(error, after_ms) => { back_off(error, after_ms) }
+        transient(error, after_ms) => { back_off(error, after_ms) }
+        rejected(error) => { return failed("provider rejected the request: " ++ error) }
+        ok(reply, stop, input_tokens, output_tokens, cache_read, cache_write) => {
+          retries = 0
+          backoff_ms = retry_base_ms
+          context_tokens = input_tokens + output_tokens + cache_read + cache_write
+          pending_units = 0
+          stopped(stop)
+          if not compact_pending {
+            push context assistant(reply)
+            match reply {
+              message(words, _, end_turn) => {
+                if end_turn { ended(words) }
               }
-            }
-          }
-          calls(requested) => {
-            for call in requested parallel {
-              match dispatch(call) {
-                ok(output) => { push context result(call, output) }
-                failed(error) => { push context error(call, error) }
-                unknown => { push context unknown(call) }
-              }
+              calls(requested, _, _) => { run_calls(requested) }
             }
           }
         }

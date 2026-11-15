@@ -1,12 +1,17 @@
 mod anthropic;
 mod children;
+mod codex;
+mod codex_host;
 mod jobs;
 mod json;
+mod openai;
 mod stream;
 mod tools;
+mod transport;
 
 include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
 include!(concat!(env!("OUT_DIR"), "/child_mod.rs"));
+include!(concat!(env!("OUT_DIR"), "/codex_mod.rs"));
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -17,26 +22,32 @@ use harness::program::{self, Arguments};
 use harness::{Exit, FileDisk, Finish, Json, Ran, RunError, TurnRequest};
 use json::Value;
 
-const EXIT_HARNESS_ERROR: i32 = 1;
-const EXIT_USAGE: i32 = 2;
+pub const EXIT_HARNESS_ERROR: i32 = 1;
+pub const EXIT_USAGE: i32 = 2;
 const FIRST_TURN: u64 = 1;
 const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
 const JOINS_PER_TURN_MAX: u64 = program::ROUNDS_MAX * program::CALLS_PER_ROUND_MAX;
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--max-turns N] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]";
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort high|medium|low|xhigh] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]\n       hl-agent steer --journal <dir> --text <message>\n       hl-agent cancel --journal <dir>";
+const HARNESS_CLAUDE: &str = "claude";
+const HARNESS_CODEX: &str = "codex";
+const CLAUDE_MODEL_PREFIX: &str = "claude";
 const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 
-struct Options {
-    instruction: PathBuf,
-    cwd: PathBuf,
-    model: String,
-    journal: PathBuf,
-    rounds: u64,
-    keep_warm: u64,
-    turn: u64,
-    fork_from: Option<PathBuf>,
-    at: Option<u64>,
+pub struct Options {
+    pub instruction: PathBuf,
+    pub cwd: PathBuf,
+    pub model: String,
+    pub journal: PathBuf,
+    pub rounds: u64,
+    pub keep_warm: u64,
+    pub turn: u64,
+    pub fork_from: Option<PathBuf>,
+    pub at: Option<u64>,
+    pub effort: Option<program::SumEffortLevel>,
+    pub effort_text: Option<String>,
+    pub harness: String,
 }
 
 fn fail_usage(message: &str) -> ! {
@@ -46,14 +57,19 @@ fn fail_usage(message: &str) -> ! {
 
 fn options() -> Options {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("run") {
-        fail_usage("the only command is run");
+    match args.first().map(String::as_str) {
+        Some("run") => {}
+        Some(command @ ("steer" | "cancel")) => send_event(command, &args[1..]),
+        _ => fail_usage("the commands are run, steer and cancel"),
     }
     let (mut instruction, mut cwd, mut model, mut journal, mut rounds) =
         (None, None, None, None, None);
     let mut keep_warm = 0;
     let mut turn = FIRST_TURN;
     let (mut fork_from, mut at) = (None, None);
+    let mut effort = None;
+    let mut effort_text = None;
+    let mut harness = None;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let value = rest
@@ -95,6 +111,16 @@ fn options() -> Options {
                     .filter(|turn| *turn >= FIRST_TURN)
                     .unwrap_or_else(|| fail_usage(&format!("--turn {value} is not a turn number")));
             }
+            "--effort" => {
+                effort = match value.as_str() {
+                    "high" => Some(program::SumEffortLevel::High),
+                    "medium" => Some(program::SumEffortLevel::Medium),
+                    "low" => Some(program::SumEffortLevel::Low),
+                    _ => None,
+                };
+                effort_text = Some(value);
+            }
+            "--harness" => harness = Some(value),
             "--fork-from" => fork_from = Some(PathBuf::from(value)),
             "--at" => {
                 at =
@@ -108,16 +134,66 @@ fn options() -> Options {
     if at.is_some() && fork_from.is_none() {
         fail_usage("--at needs --fork-from");
     }
+    let model = model.unwrap_or_else(|| fail_usage("--model is required"));
+    let harness = harness.unwrap_or_else(|| {
+        if model.starts_with(CLAUDE_MODEL_PREFIX) {
+            HARNESS_CLAUDE.to_owned()
+        } else {
+            HARNESS_CODEX.to_owned()
+        }
+    });
+    if harness != HARNESS_CLAUDE && harness != HARNESS_CODEX {
+        fail_usage(&format!("--harness {harness} is not claude or codex"));
+    }
+    if harness == HARNESS_CLAUDE && effort_text.is_some() && effort.is_none() {
+        fail_usage("--effort for the Claude harness is high, medium or low");
+    }
+    if harness == HARNESS_CODEX && (keep_warm > 0 || fork_from.is_some()) {
+        fail_usage("--keep-warm and --fork-from are for the Claude harness");
+    }
     Options {
         instruction: instruction.unwrap_or_else(|| fail_usage("--instruction is required")),
         cwd: cwd.unwrap_or_else(|| fail_usage("--cwd is required")),
-        model: model.unwrap_or_else(|| fail_usage("--model is required")),
+        model,
         journal: journal.unwrap_or_else(|| fail_usage("--journal is required")),
         rounds: rounds.unwrap_or(program::ROUNDS_MAX),
         keep_warm,
         turn,
         fork_from,
         at,
+        effort,
+        effort_text,
+        harness,
+    }
+}
+
+fn send_event(command: &str, args: &[String]) -> ! {
+    let (mut journal, mut text) = (None, None);
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let value = rest
+            .next()
+            .unwrap_or_else(|| fail_usage(&format!("{flag} needs a value")))
+            .clone();
+        match flag.as_str() {
+            "--journal" => journal = Some(PathBuf::from(value)),
+            "--text" if command == "steer" => text = Some(value),
+            other => fail_usage(&format!("unknown flag {other}")),
+        }
+    }
+    let journal = journal.unwrap_or_else(|| fail_usage("--journal is required"));
+    if command == "steer" && text.is_none() {
+        fail_usage("steer needs --text");
+    }
+    match codex_host::send_event(&journal, text.as_deref()) {
+        Ok(name) => {
+            println!("{name}");
+            std::process::exit(0)
+        }
+        Err(error) => {
+            eprintln!("hl-agent: {error}");
+            std::process::exit(EXIT_HARNESS_ERROR)
+        }
     }
 }
 
@@ -177,19 +253,19 @@ fn keep_warm(agent: &mut Agent, disk: &mut FileDisk, refreshes: u64) {
     }
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after 1970");
     u64::try_from(elapsed.as_millis()).expect("milliseconds since 1970 fit in u64")
 }
 
-struct Ledger {
-    file: std::fs::File,
+pub struct Ledger {
+    pub file: std::fs::File,
 }
 
 impl Ledger {
-    fn append(&mut self, line: Value) {
+    pub fn append(&mut self, line: Value) {
         let mut text = line.encode();
         text.push('\n');
         self.file
@@ -353,7 +429,7 @@ impl Agent {
     }
 }
 
-fn random() -> u64 {
+pub fn random() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after 1970")
@@ -532,7 +608,7 @@ macro_rules! host_for {
 host_for!(harness);
 host_for!(child_harness);
 
-fn command_line(program: &str, args: &[&str]) -> Option<String> {
+pub fn command_line(program: &str, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new(program)
         .args(args)
         .output()
@@ -616,6 +692,9 @@ fn system_prompt(cwd: &Path, state: &Path) -> Result<Value, String> {
 #[derive(Default)]
 struct Totals {
     usage: Usage,
+    reasoning: u64,
+    cost_nano_usd: u64,
+    priced: u64,
     requests: u64,
     tool_calls: u64,
     wall_ms: u64,
@@ -628,6 +707,9 @@ impl Totals {
         self.usage.output += child.usage.output;
         self.usage.cache_read += child.usage.cache_read;
         self.usage.cache_write += child.usage.cache_write;
+        self.reasoning += child.reasoning;
+        self.cost_nano_usd += child.cost_nano_usd;
+        self.priced += child.priced;
         self.requests += child.requests;
         self.tool_calls += child.tool_calls;
         self.children += 1;
@@ -659,6 +741,11 @@ fn totals(ledger: &Path) -> Result<Totals, String> {
                 totals.usage.output += field("output_tokens");
                 totals.usage.cache_read += field("cache_read_tokens");
                 totals.usage.cache_write += field("cache_write_tokens");
+                totals.reasoning += field("reasoning_tokens");
+                if value.get("cost_nano_usd").is_some() {
+                    totals.priced += 1;
+                    totals.cost_nano_usd += field("cost_nano_usd");
+                }
             }
             Some("tool") => totals.tool_calls += 1,
             _ => {}
@@ -673,12 +760,12 @@ fn totals(ledger: &Path) -> Result<Totals, String> {
     Ok(totals)
 }
 
-fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), String> {
+pub fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), String> {
     let mut totals = totals(&journal.join("usage.jsonl"))?;
     for ledger in children::ledgers(journal)? {
         totals.add_child(&self::totals(&ledger)?);
     }
-    let usage = Value::object([
+    let mut usage = Value::object([
         ("model", Value::text(model)),
         ("input_tokens", Value::number(totals.usage.input)),
         ("output_tokens", Value::number(totals.usage.output)),
@@ -693,6 +780,19 @@ fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), String> 
         ("children", Value::number(totals.children)),
         ("finish", Value::text(finish)),
     ]);
+    if totals.reasoning > 0 {
+        usage.insert("reasoning_tokens", Value::number(totals.reasoning));
+    }
+    if totals.priced > 0 {
+        usage.insert(
+            "cost_usd",
+            Value::Number(format!(
+                "{:.6}",
+                totals.cost_nano_usd as f64 / openai::NANO_USD_PER_USD
+            )),
+        );
+        usage.insert("priced_requests", Value::number(totals.priced));
+    }
     let temporary = journal.join("usage.json.new");
     std::fs::write(&temporary, usage.encode() + "\n")
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
@@ -701,8 +801,11 @@ fn write_usage(journal: &Path, model: &str, finish: &str) -> Result<(), String> 
 }
 
 fn outcome(finish: &Finish) -> (String, String) {
-    let result = to_value(&finish.result);
-    match &result {
+    outcome_of(&to_value(&finish.result))
+}
+
+pub fn outcome_of(result: &Value) -> (String, String) {
+    match result {
         Value::String(name) => (name.clone(), String::new()),
         Value::Object(entries) if entries.len() == 1 => {
             let (name, payload) = &entries[0];
@@ -771,7 +874,6 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
         root: cwd,
         state,
         image_bytes_max: program::blob_bound("Read").map(|(_, bytes)| bytes),
-        left: std::sync::Mutex::new(Vec::new()),
     };
     Ok((
         Agent {
@@ -879,6 +981,9 @@ fn main() {
     child_harness::self_check();
     child_harness::jsonl_self_check();
     let options = options();
+    if options.harness == HARNESS_CODEX {
+        codex_host::main(&options);
+    }
     let (mut agent, instruction) = setup(&options).unwrap_or_else(|error| {
         eprintln!("hl-agent: {error}");
         std::process::exit(EXIT_HARNESS_ERROR)
@@ -898,13 +1003,28 @@ fn main() {
         eprintln!("hl-agent: --fork-from: {error}");
         std::process::exit(EXIT_HARNESS_ERROR);
     }
+    let mut turn = options.turn;
+    if let Some(level) = options.effort.clone() {
+        let setting = TurnRequest {
+            turn,
+            arguments: Arguments::SetEffort(level),
+        };
+        match run_turn(&mut agent, &mut disk, &setting) {
+            Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish))
+                if finish.outcome == harness::Outcome::Completed => {}
+            other => {
+                eprintln!("hl-agent: --effort: the set_effort turn ended {other:?}");
+                std::process::exit(EXIT_HARNESS_ERROR);
+            }
+        }
+        turn += 1;
+    }
     let request = TurnRequest {
-        turn: options.turn,
+        turn,
         arguments: Arguments::Prompt(instruction, options.rounds),
     };
     let ran = run_turn(&mut agent, &mut disk, &request);
     agent.jobs.stop_all();
-    agent.workspace.stop_left();
     if options.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_) | Ran::AlreadyFinished(_))) {
         keep_warm(&mut agent, &mut disk, options.keep_warm);
     }

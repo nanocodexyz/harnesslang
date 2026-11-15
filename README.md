@@ -119,7 +119,9 @@ targets; an oracle that folds harnesslang journals with nanocode's own
 `nanocode-turnlog`; a kill -9 drill of the generated `native-jsonl` code;
 `hl-agent` (`agent/`), nanocode's Claude harness written in harnesslang
 (`examples/claude_code.hl`) and run as a coding agent against the Anthropic
-API, starting subagents (`examples/claude_code_child.hl`) as child sessions.
+API, starting subagents (`examples/claude_code_child.hl`) as child sessions;
+with an OpenAI model it runs Codex's harness (`examples/codex_agent.hl`)
+against the Responses API.
 Not built yet: splitting a handler over
 Cloudflare's request limit (`hl check` refuses it instead). The platform
 limits in `src/target/` come from summaries of vendor documentation and are

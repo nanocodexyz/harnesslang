@@ -770,9 +770,16 @@ made.
 - `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
   subagent `examples/claude_code_child.hl` emitted as native-jsonl Rust and
   hosted against the Anthropic API, each spawned child a session with its own
-  journal under the parent's (`children/T.S/`)
+  journal under the parent's (`children/T.S/`), and `examples/codex_agent.hl`
+  hosted against the OpenAI Responses API, with steers and cancels dropped
+  into the journal's `control/` by `hl-agent steer` and `hl-agent cancel`
 - `oracle/`: the nanocode oracle, its own workspace, the Cloudflare
   platform probes and the deploy fake (`oracle/deploy/fake.mjs`)
+- `evals/`: runs `hl-agent`, nanocode, stock Claude Code and stock Codex on
+  Terminal-Bench and nanoeval tasks in the tasks' containers, through one meter
+  that relays the Anthropic and OpenAI APIs and records every model request,
+  and reports pass rates, cost and paired differences;
+  `evals/gaps/` mines those records per agent and prints one attempt's exchange
 - `scripts/`: the check, docs check, mutation, prover mutation, oracle,
   differential and crash drill scripts
 

@@ -1280,6 +1280,7 @@ function variantFromJson(type, json) {
   if (index < 0) throw new DecodeError(`'${name}' is not a variant of ${typeName(type)}`);
   const fields = variants[index].fields;
   if (fields.length === 0 && payload === undefined) return variant(index, []);
+  if (fields.length === 0 && Array.isArray(payload) && payload.length === 0) return variant(index, []);
   if (fields.length === 1 && payload !== undefined) return variant(index, [fromJson(fields[0], payload)]);
   if (fields.length > 1 && Array.isArray(payload) && payload.length === fields.length) {
     return variant(index, fields.map((field, position) => fromJson(field, payload[position])));

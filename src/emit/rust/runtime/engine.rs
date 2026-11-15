@@ -2546,6 +2546,7 @@ pub fn variant_of<'j>(json: &'j Json, type_name: &str, variants: &[&str]) -> Res
 pub fn variant_fields<'j>(payload: Option<&'j Json>, name: &str, count: usize) -> Result<Vec<&'j Json>, String> {
     match (count, payload) {
         (0, None) => Ok(Vec::new()),
+        (0, Some(Json::Array(items))) if items.is_empty() => Ok(Vec::new()),
         (1, Some(payload)) => Ok(vec![payload]),
         (count, Some(Json::Array(items))) if count > 1 && items.len() == count => Ok(items.iter().collect()),
         _ => Err(format!("variant '{name}' has {count} field(s)")),

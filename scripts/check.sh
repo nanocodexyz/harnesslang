@@ -363,7 +363,18 @@ agent() {
     cat "$scratch/agent-drill-plant.log" >&2
     exit 1
   fi
+  CODEX_DRILL_SEED=1 scripts/codex-drill.sh
+  if CODEX_DRILL_SEED=1 CODEX_DRILL_PLANT=batch_flush_after_dispatch scripts/codex-drill.sh > "$scratch/codex-drill-plant.log" 2>&1; then
+    echo "agent: batch_flush_after_dispatch survived the codex_agent.hl kill -9 drill" >&2
+    exit 1
+  fi
+  if ! grep -q 'external calls dispatched more than once' "$scratch/codex-drill-plant.log"; then
+    echo "agent: the planted codex drill failed for another reason:" >&2
+    cat "$scratch/codex-drill-plant.log" >&2
+    exit 1
+  fi
   echo "agent: hl-agent survives kill -9 against the local mock without repeating an external call, and batch_flush_after_dispatch is caught"
+  echo "agent: codex_agent.hl on hl-agent survives kill -9 against the fake Responses API, steers and cancels, and batch_flush_after_dispatch is caught"
 }
 
 stage build build

@@ -70,6 +70,7 @@ pub enum Mutation {
     SideJournaled,
     IdleEarly,
     InterruptIgnored,
+    InterruptedUndecoded,
     InterruptReruns,
     RecoverTrustsLost,
     JobLostDropped,
@@ -84,7 +85,7 @@ pub enum Mutation {
 }
 
 impl Mutation {
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 80] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -153,6 +154,7 @@ impl Mutation {
         Self::SideJournaled,
         Self::IdleEarly,
         Self::InterruptIgnored,
+        Self::InterruptedUndecoded,
         Self::InterruptReruns,
         Self::RecoverTrustsLost,
         Self::JobLostDropped,
@@ -236,6 +238,7 @@ impl Mutation {
             Self::SideJournaled => "side_journaled",
             Self::IdleEarly => "idle_early",
             Self::InterruptIgnored => "interrupt_ignored",
+            Self::InterruptedUndecoded => "interrupted_undecoded",
             Self::InterruptReruns => "interrupt_reruns",
             Self::RecoverTrustsLost => "recover_trusts_lost",
             Self::JobLostDropped => "job_lost_dropped",
@@ -330,6 +333,7 @@ impl Mutation {
             | Self::SideJournaled
             | Self::IdleEarly
             | Self::InterruptIgnored
+            | Self::InterruptedUndecoded
             | Self::InterruptReruns
             | Self::RecoverTrustsLost
             | Self::JobLostDropped

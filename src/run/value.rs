@@ -185,6 +185,7 @@ fn variant_from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value,
     let fields = &variants[index].fields;
     let values = match (fields.len(), payload) {
         (0, None) => Vec::new(),
+        (0, Some(Json::Array(items))) if items.is_empty() => Vec::new(),
         (1, Some(payload)) => vec![from_json(program, &fields[0], payload)?],
         (count, Some(Json::Array(items))) if count > 1 && items.len() == count => {
             let mut values = Vec::new();

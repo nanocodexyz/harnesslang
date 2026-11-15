@@ -224,8 +224,10 @@ impl Jobs {
     }
 
     pub fn stop_all(&mut self) {
-        for (_, mut job) in std::mem::take(&mut self.running) {
-            tools::kill_group(&job.started.child);
+        for (key, mut job) in std::mem::take(&mut self.running) {
+            if let Err(error) = tools::kill_group(&mut job.started.child) {
+                eprintln!("hl-agent: stopping job {key}: {error}");
+            }
             let _ = job.started.child.wait();
         }
     }

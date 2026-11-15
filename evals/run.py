@@ -16,6 +16,8 @@ import urllib.parse
 ROOT = os.path.dirname(os.path.abspath(__file__))
 AGENT_MOUNT = "/opt/nanoeval-agent"
 JOURNAL_MOUNT = "/opt/nanoeval-journal"
+CA_MOUNT = "/opt/nanoeval-ca.crt"
+CA_ENV = ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS")
 METER_PORT = 18777
 RELAY_PORT = 13128
 DOCKER_BRIDGE = "bridge"
@@ -24,7 +26,14 @@ SETUP_TIMEOUT_SEC = 1800
 METER_READY_ATTEMPTS = 50
 METER_READY_SLEEP_SEC = 0.1
 RUN_SHELL = 'if command -v bash >/dev/null 2>&1; then exec bash "$1"; else exec sh "$1"; fi'
-AGENTS = ("nanocode", "hl-agent")
+AGENTS = ("nanocode", "hl-agent", "claude-code", "codex")
+AGENT_KEYS = {"nanocode": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "hl-agent": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "claude-code": ("ANTHROPIC_API_KEY",), "codex": ("OPENAI_API_KEY",)}
+METERED_KEY = "metered-by-host"
+CLAUDE_MODEL_PREFIX = "claude-"
+OPENAI_ROUTE = "/openai"
+MODEL_ENDPOINTS = ("/messages", "/responses", "/responses/compact")
+MUSL_LOADER = "/lib/ld-musl-x86_64.so.1"
+CLAUDE_CODE_SELECT = 'if [ -e ' + MUSL_LOADER + ' ]; then exec ' + AGENT_MOUNT + '/bin/claude-code-musl "$@"; else exec ' + AGENT_MOUNT + '/bin/claude-code "$@"; fi'
 CONTAINER_RUN_DIGITS = 12
 PACKAGE_FILES = ("instruction.md", "README.md", "task.toml")
 PACKAGE_DIRECTORIES = ("environment", "solution", "steps", "tests")
@@ -110,16 +119,29 @@ def image_for(task, config, env, lock):
     return tag
 
 
-def agent_command(agent, model, workdir, run_url, instruction, max_turns):
+def agent_command(agent, model, workdir, run_url, instruction, max_turns, hl_agent_args):
+    openai_url = run_url + OPENAI_ROUTE
+    if agent == "codex":
+        return (
+            {"CODEX_API_KEY": METERED_KEY, "OPENAI_BASE_URL": openai_url + "/v1", "HOME": JOURNAL_MOUNT + "/home"},
+            [AGENT_MOUNT + "/bin/codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-m", model, "-C", workdir, "-c", 'openai_base_url="' + openai_url + '/v1"', instruction],
+        )
+    claude = model.startswith(CLAUDE_MODEL_PREFIX)
     if agent == "nanocode":
         return (
-            {"NANOCODE_ANTHROPIC_BASE_URL": run_url + "/v1", "ANTHROPIC_API_KEY": "metered-by-host"},
+            {"NANOCODE_ANTHROPIC_BASE_URL": run_url + "/v1", "ANTHROPIC_API_KEY": "metered-by-host"} if claude else {"NANOCODE_OPENAI_BASE_URL": openai_url + "/v1", "OPENAI_API_KEY": METERED_KEY},
             [AGENT_MOUNT + "/bin/nanocode", "exec", "--model", model, "--home", JOURNAL_MOUNT + "/home", "--no-tempo-tools", "-C", workdir, instruction],
+        )
+    if agent == "claude-code":
+        return (
+            {"ANTHROPIC_BASE_URL": run_url, "ANTHROPIC_API_KEY": "metered-by-host", "HOME": JOURNAL_MOUNT + "/home", "IS_SANDBOX": "1", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+            ["sh", "-c", CLAUDE_CODE_SELECT, "sh", "-p", instruction, "--model", model, "--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
         )
     command = [AGENT_MOUNT + "/bin/hl-agent", "run", "--instruction", JOURNAL_MOUNT + "/instruction.md", "--cwd", workdir, "--model", model, "--journal", JOURNAL_MOUNT + "/hl"]
     if max_turns:
         command += ["--max-turns", str(max_turns)]
-    return ({"ANTHROPIC_BASE_URL": run_url, "ANTHROPIC_API_KEY": "metered-by-host"}, command)
+    command += hl_agent_args
+    return ({"ANTHROPIC_BASE_URL": run_url, "ANTHROPIC_API_KEY": "metered-by-host"} if claude else {"OPENAI_BASE_URL": openai_url, "OPENAI_API_KEY": METERED_KEY}, command)
 
 
 def run_agent(name, row, env, argv, timeout, journal):
@@ -182,7 +204,7 @@ def meter_totals(directory):
         return totals
     for line in open(path):
         record = json.loads(line)
-        if not record["path"].endswith("/messages"):
+        if not record["path"].split("?")[0].endswith(MODEL_ENDPOINTS):
             continue
         totals["requests"] += 1
         status = str(record.get("status"))
@@ -203,20 +225,30 @@ def outcome(agent_result, verifier, totals):
     return ("passed" if verifier["reward"] == 1 else "failed"), ("agent timed out" if agent_result["timed_out"] else None)
 
 
+def remove_tree(path, image):
+    try:
+        shutil.rmtree(path)
+        return
+    except PermissionError:
+        pass
+    sh(["docker", "run", "--rm", "-u", "0", "-v", os.path.abspath(path) + ":/stale", "--entrypoint", "", image, "find", "/stale", "-mindepth", "1", "-delete"])
+    shutil.rmtree(path)
+
+
 def run_row(row, args, gateway, env, lock, agent_root, runs):
     out = os.path.join(runs, row["id"])
     if os.path.isfile(os.path.join(out, "result.json")):
         return json.load(open(os.path.join(out, "result.json")))
-    if os.path.isdir(out):
-        shutil.rmtree(out)
-    journal = os.path.join(out, "journal")
-    os.makedirs(journal)
-    os.chmod(journal, 0o777)
     config = task_config(row["dir"])
+    journal = os.path.join(out, "journal")
     name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
     result = {"id": row["id"], "source": row["source"], "task": row["task"], "agent": row["agent"], "attempt": row["attempt"], "model": args.model}
     try:
         image = image_for(row, config, env, lock)
+        if os.path.isdir(out):
+            remove_tree(out, image)
+        os.makedirs(journal)
+        os.chmod(journal, 0o777)
         workdir = sh(["docker", "image", "inspect", "-f", "{{.Config.WorkingDir}}", image]).stdout.strip() or "/"
         row["workdir"] = workdir
         sh(["docker", "rm", "-f", name], check=False)
@@ -225,13 +257,17 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
             run += ["--cpus", str(config["cpus"]), "--memory", str(config["memory_mb"] + args.agent_memory_mb) + "m"]
         for key, value in env.items():
             run += ["-e", key + "=" + value]
+        if args.ca_bundle:
+            run += ["-v", os.path.abspath(args.ca_bundle) + ":" + CA_MOUNT + ":ro"]
+            for key in CA_ENV:
+                run += ["-e", key + "=" + CA_MOUNT]
         run += ["-v", agent_root + ":" + AGENT_MOUNT + ":ro", "-v", journal + ":" + JOURNAL_MOUNT, "--entrypoint", "", image, "tail", "-f", "/dev/null"]
         sh(run)
         instruction = open(os.path.join(row["dir"], "instruction.md")).read()
         with open(os.path.join(journal, "instruction.md"), "w") as handle:
             handle.write(instruction)
         run_url = "http://" + gateway + ":" + str(args.meter_port) + "/run/" + row["id"]
-        agent_env, argv = agent_command(row["agent"], args.model, workdir, run_url, instruction, args.max_turns)
+        agent_env, argv = agent_command(row["agent"], args.model, workdir, run_url, instruction, args.max_turns, args.hl_agent_arg or [])
         agent_result = run_agent(name, row, agent_env, argv, config["agent_timeout"], journal)
         peak = sh(["docker", "exec", name, "cat", "/sys/fs/cgroup/memory.peak"], check=False).stdout.strip()
         verifier = verify(name, row, config, out)
@@ -246,6 +282,7 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
     finally:
         sh(["docker", "exec", "-u", "0", name, "chown", "-R", str(os.getuid()) + ":" + str(os.getgid()), JOURNAL_MOUNT], check=False)
         sh(["docker", "rm", "-f", name], check=False)
+    os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "result.json"), "w") as handle:
         json.dump(result, handle, indent=1)
     return result
@@ -290,6 +327,8 @@ def main():
     parser.add_argument("--meter-port", type=int, default=METER_PORT)
     parser.add_argument("--relay-port", type=int, default=RELAY_PORT)
     parser.add_argument("--only", action="append")
+    parser.add_argument("--ca-bundle")
+    parser.add_argument("--hl-agent-arg", action="append")
     args = parser.parse_args()
     agents = args.agents.split(",")
     for agent in agents:
@@ -298,8 +337,9 @@ def main():
         binary = os.path.join(args.agent_root, "bin", agent)
         if not os.access(binary, os.X_OK):
             raise SystemExit(binary + " is missing; run evals/setup.sh")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit("ANTHROPIC_API_KEY is not set")
+    for agent in agents:
+        if not any(os.environ.get(key) for key in AGENT_KEYS[agent]):
+            raise SystemExit(agent + " needs " + " or ".join(AGENT_KEYS[agent]) + " set for the meter")
     tasks = load_suite(args.suite, args.tasks)
     if args.only:
         tasks = [task for task in tasks if task["task"] in args.only]

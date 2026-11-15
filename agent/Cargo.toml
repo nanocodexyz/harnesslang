@@ -24,4 +24,11 @@ test = false
 doctest = false
 bench = false
 
+[[bin]]
+name = "mock-responses"
+path = "src/bin/mock_responses.rs"
+test = false
+doctest = false
+bench = false
+
 [dependencies]
