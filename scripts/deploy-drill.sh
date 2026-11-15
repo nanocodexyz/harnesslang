@@ -50,7 +50,7 @@ trap stop_fake EXIT
 
 start_fake() {
   rm -f "$scratch/port" "$scratch/report.json"
-  node oracle/deploy/fake.mjs --cloudflare-spec "$specs/cloudflare.json" --vercel-spec "$specs/vercel.json" \
+  node --experimental-vm-modules --disable-warning=ExperimentalWarning oracle/deploy/fake.mjs --cloudflare-spec "$specs/cloudflare.json" --vercel-spec "$specs/vercel.json" \
     --port-file "$scratch/port" --token "$token" --report "$scratch/report.json" --latency-ms "$fake_latency_ms" > "$scratch/fake.log" 2>&1 &
   fake_pid=$!
   local waited
@@ -63,7 +63,7 @@ start_fake() {
   port=$(cat "$scratch/port")
   export CLOUDFLARE_API_TOKEN=$token CLOUDFLARE_ACCOUNT_ID=drillaccount VERCEL_TOKEN=$token
   export HL_CLOUDFLARE_API=http://127.0.0.1:$port/cloudflare/client/v4 HL_VERCEL_API=http://127.0.0.1:$port/vercel
-  export HL_DEPLOY_POLL_MS=1 HL_DEPLOY_NOW_MS=1794614400000
+  export HL_DEPLOY_POLL_MS=1 HL_DEPLOY_NOW_MS=1794616200000
 }
 
 field() {
@@ -99,6 +99,42 @@ deployed_digest() {
   fi
 }
 
+auth_check() {
+  local target=$1 name=$2 out=$3 probe=$scratch/auth-$1 token expected got entry
+  [ -s "$out/auth-token" ] || { echo "the first deploy wrote no auth token" >> "$scratch/$target.log"; return 1; }
+  token=$(tr -d '\n' < "$out/auth-token")
+  expected=$(printf %s "$token" | sha256sum | cut -d' ' -f1)
+  [ "$(fake_state "$target" "$name" auth_sha256)" = "$expected" ] || { echo "the provisioned HL_AUTH_TOKEN is not the token in $out/auth-token" >> "$scratch/$target.log"; return 1; }
+  rm -rf "$probe"
+  if [ "$target" = cloudflare ]; then
+    mkdir -p "$probe"
+    cp "$out/files/hl-auth.mjs" "$probe/entry.mjs"
+    printf 'export default { fetch() { return new Response("served"); } };\nexport class HarnessObject {}\n' > "$probe/worker.mjs"
+    entry=$probe/entry.mjs
+  else
+    entry="$probe/app/sessions/[session]/[kind]/route.mjs"
+    mkdir -p "$(dirname "$entry")" "$probe/workflows" "$probe/node_modules/workflow"
+    cp "$out/files/app/sessions/[session]/[kind]/route.mjs" "$entry"
+    printf 'export const harnessSession = () => null;\n' > "$probe/workflows/session.mjs"
+    printf '{"name": "workflow", "type": "module", "exports": {"./api": "./api.mjs"}}\n' > "$probe/node_modules/workflow/package.json"
+    printf 'export async function start() { return { runId: "run-1" }; }\nexport async function resumeHook() {}\n' > "$probe/node_modules/workflow/api.mjs"
+  fi
+  got=$(node --input-type=module -e '
+    import { pathToFileURL } from "node:url";
+    const [entry, token, target] = process.argv.slice(1);
+    const loaded = await import(pathToFileURL(entry));
+    const call = async (header, secret) => {
+      const request = new Request("http://harness.invalid/sessions/s1/start", { method: "POST", headers: header ? { authorization: header } : {}, body: JSON.stringify({ turnsMax: 1 }) });
+      if (target === "cloudflare") return (await loaded.default.fetch(request, secret ? { HL_AUTH_TOKEN: secret } : {}, {})).status;
+      if (secret) process.env.HL_AUTH_TOKEN = secret;
+      else delete process.env.HL_AUTH_TOKEN;
+      return (await loaded.POST(request, { params: Promise.resolve({ session: "s1", kind: "start" }) })).status;
+    };
+    console.log([await call(null, token), await call("Bearer wrong", token), await call("Bearer " + token, token), await call("Bearer " + token, null)].join(" "));
+  ' "$entry" "$token" "$target" 2>&1)
+  [ "$got" = "401 401 200 503" ] || { echo "an unauthenticated request was served: no token, a wrong token, the token, no secret answered $got, not 401 401 200 503" >> "$scratch/$target.log"; return 1; }
+}
+
 run() {
   local log=$1
   shift
@@ -112,6 +148,9 @@ flow() {
   : > "$log"
   run "$log" deploy "${common[@]}" --var HL_MODEL_URL=http://model.invalid "$first_file" || return 1
   first=$(deployed_digest "$target" "$out")
+  if [ "$(provider_of "$target")" != local ]; then
+    auth_check "$target" "$name" "$out" || return 1
+  fi
   echo drill-secret-value | run "$log" secrets set HL_TOKEN "${common[@]}" || return 1
   run "$log" deploy "${common[@]}" "$second_file" || return 1
   second=$(deployed_digest "$target" "$out")
@@ -126,8 +165,12 @@ flow() {
     run "$log" logs "${common[@]}" || return 1
     run "$log" logs "${common[@]}" --follow --events 2 || return 1
     grep -q "turn 2 answered" "$log" || { echo "the followed logs miss the second event" >> "$log"; return 1; }
+    curl -sSf -X POST --data "turn 3 failed" "http://127.0.0.1:$port/__fake/$target/$name/invoke?level=error" > /dev/null
+    run "$log" monitor "${common[@]}" || return 1
+    grep -q "3 events, 1 errors (33.3% failed)" "$log" || { echo "the monitor does not count the failed turn" >> "$log"; return 1; }
   else
     run "$log" logs "${common[@]}" || return 1
+    run "$log" monitor "${common[@]}" || return 1
   fi
   run "$log" rollback "${common[@]}" || return 1
   [ "$(serving_digest "$target" "$name" "$out")" = "$first" ] || { echo "the rollback does not serve the first deploy's digest $first" >> "$log"; return 1; }
@@ -176,14 +219,25 @@ if [ "${1:-}" = --bench ]; then
   rm -rf "$scratch"
   mkdir -p "$scratch"
   fake_latency_ms=${DEPLOY_BENCH_LATENCY_MS:-100}
+  runs=${DEPLOY_BENCH_RUNS:-1}
   start_fake
   for target in cloudflare vercel; do
     for step in cold:examples/minimal.hl unchanged:examples/minimal.hl changed:examples/agent.hl; do
-      started=$(date +%s%N)
-      "$hl" deploy --target "$target" --name "bench-$target" --out "$scratch/$target" "${step#*:}" > "$scratch/$target-${step%%:*}.log" 2>&1 || { cat "$scratch/$target-${step%%:*}.log" >&2; fail "bench deploy failed"; }
-      ended=$(date +%s%N)
-      counted=$(curl -sSf "http://127.0.0.1:$port/__fake/traffic")
-      echo "deploy bench: $target ${step%%:*} $(( (ended - started) / 1000000 )) ms, $(field requests <<< "$counted") requests in $(field rounds <<< "$counted") round trips (latency $fake_latency_ms ms)"
+      best=
+      for run in $(seq 1 "$runs"); do
+        log=$scratch/$target-${step%%:*}-$run.log
+        TIMEFORMAT='%3U %3S'
+        started=$(date +%s%N)
+        { time "$hl" deploy --target "$target" --name "bench-$target-$run" --out "$scratch/$target-$run" "${step#*:}" > "$log" 2>&1; } 2> "$log.cpu" || { cat "$log" >&2; fail "bench deploy failed"; }
+        ended=$(date +%s%N)
+        counted=$(curl -sSf "http://127.0.0.1:$port/__fake/traffic")
+        wall=$(( (ended - started) / 1000000 ))
+        cpu=$(awk '{ printf "%d", ($1 + $2) * 1000 }' "$log.cpu")
+        if [ -z "$best" ] || [ "$wall" -lt "${best%% *}" ]; then
+          best="$wall ms (hl cpu $cpu ms), $(field requests <<< "$counted") requests in $(field rounds <<< "$counted") round trips"
+        fi
+      done
+      echo "deploy bench: $target ${step%%:*} $best (latency $fake_latency_ms ms, best of $runs, load $(cut -d' ' -f1 /proc/loadavg))"
     done
   done
   stop_fake
@@ -207,6 +261,7 @@ if [ "${1:-}" = --demo ]; then
   curl -sSf -X POST --data "turn 1 answered" "http://127.0.0.1:$port/__fake/cloudflare/demo/invoke" > /dev/null
   show hl status "${common[@]}"
   show hl logs "${common[@]}" --follow --events 1
+  show hl monitor "${common[@]}"
   show hl rollback "${common[@]}"
   show hl destroy "${common[@]}" --yes
   stop_fake

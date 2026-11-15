@@ -2354,6 +2354,16 @@ pub fn text_after(subject: String, separator: String) -> String {
     }
 }
 
+pub fn text__with_payment(input: String, payment: String) -> String {
+    match Json::decode(&input) {
+        Ok(Json::Object(mut fields)) => {
+            fields.insert(String::from("payment"), Json::String(payment));
+            Json::Object(fields).encode()
+        }
+        _ => input,
+    }
+}
+
 pub fn text_trim(subject: String) -> String {
     const WHITESPACE: [char; 5] = [' ', '\t', '\n', '\x0c', '\r'];
     subject.trim_matches(WHITESPACE.as_slice()).to_owned()
@@ -2661,6 +2671,17 @@ fn recover(world: &mut dyn World, turn: u64, log: &mut TurnLog) -> Recovering {
     recovering
 }
 
+pub fn wallet_refusal(wallet: &str) -> String {
+    format!("input of {wallet}: {wallet} is the harness's wallet; only a paid call's payment reaches it")
+}
+
+fn recovered_returns(tool: &str) -> Returns {
+    if program::WALLET == Some(tool) {
+        return Returns::U64;
+    }
+    Returns::Text
+}
+
 fn ask_recover(world: &mut dyn World, turn: u64, seq: u64, call: &Call) -> Recovered {
     let recovered = world.recover(&ToolRequest {
         turn,
@@ -2668,7 +2689,7 @@ fn ask_recover(world: &mut dyn World, turn: u64, seq: u64, call: &Call) -> Recov
         tool: &call.tool,
         effect: call.effect,
         input: &call.input,
-        returns: Returns::Text,
+        returns: recovered_returns(&call.tool),
         nested: None,
         admitted: None,
         job: false,
@@ -2676,7 +2697,7 @@ fn ask_recover(world: &mut dyn World, turn: u64, seq: u64, call: &Call) -> Recov
     });
     match recovered {
         Recovered::Reply(output) if job_started(&output).is_some() && program::jobs_of(&call.tool).is_some() => Recovered::Reply(output),
-        Recovered::Reply(output) => Recovered::Reply(checked_output(&call.tool, Returns::Text, output)),
+        Recovered::Reply(output) => Recovered::Reply(checked_output(&call.tool, recovered_returns(&call.tool), output)),
         other => other,
     }
 }

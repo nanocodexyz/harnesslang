@@ -1,0 +1,46 @@
+harness gated
+
+const cycles_max: u64 = 8
+const trials_max: u64 = 1
+const wins_needed: u64 = 1
+const ledger_max: u64 = 16
+const nanos_max: u64 = 60000000000
+const failing_max: u64 = 1000000
+
+tool suggest(base: text) -> text effect idempotent
+tool bench(subject: text) -> u64 effect idempotent
+tool failing(subject: text) -> u64 effect idempotent
+
+state {
+  config: text
+  log: list<cycle, ledger_max>
+}
+
+on prompt(start: text) -> text {
+  climb speed over config from start ledger log
+    cycles cycles_max trials trials_max
+    metric nanos lower at most nanos_max
+    metric broken lower at most failing_max
+    gate broken == 0
+    accept sign at least wins_needed
+  {
+    propose(base) {
+      match suggest(base) {
+        ok(change) => { yield candidate(change, "try " ++ change) }
+        failed(_) => {}
+      }
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(nanos) => {
+          match failing(subject) {
+            ok(count) => { yield score(nanos, count) }
+            failed(_) => {}
+          }
+        }
+        failed(_) => {}
+      }
+    }
+  }
+  return config
+}

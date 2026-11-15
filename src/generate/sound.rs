@@ -34,7 +34,7 @@ fn pure(program: &Program, state: &[Value], expr: &Expr) -> Option<Value> {
         Expr::Text(text) => Value::Text(text.clone()),
         Expr::Constant(constant) => Value::U64(program.constants[*constant].value),
         Expr::Field(field) => state[*field].clone(),
-        Expr::Cancelled | Expr::ListingNotice(_) => return None,
+        Expr::Cancelled | Expr::ListingNotice(_) | Expr::Outcome { .. } => return None,
         Expr::Not(operand) => Value::Bool(!pure(program, state, operand)?.as_bool()),
         Expr::Len(operand) => Value::U64(pure(program, state, operand)?.as_list().len() as u64),
         Expr::TextBuiltin { op, args } => {

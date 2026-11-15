@@ -9,6 +9,8 @@ pub const REQUEST_SECONDS_MAX: u64 = 600;
 pub const STREAM_LINE_BYTES_MAX: usize = 1 << 20;
 pub const RESPONSE_HEADER_BLOCKS_MAX: usize = 8;
 const SCRATCH_MODE: u32 = 0o700;
+const CURL_TIMED_OUT: i32 = 28;
+const NO_ANSWER: u16 = 0;
 const BODY_MODE: u32 = 0o600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +153,7 @@ impl Client {
         Ok((named("request"), named("headers"), named("response")))
     }
 
-    pub fn send(&self, request: &Request) -> Result<Response, String> {
+    fn prepare(&self, request: &Request) -> Result<(String, [PathBuf; 3]), String> {
         let (body_path, headers_path, response_path) = self.files()?;
         let mut config = self.config(request)?;
         if let Some(body) = &request.body {
@@ -169,35 +171,89 @@ impl Client {
         )?;
         line(&mut config, "output", &response_path.display().to_string())?;
         line(&mut config, "max-time", &REQUEST_SECONDS_MAX.to_string())?;
-        line(&mut config, "write-out", "%{http_code}")?;
-        let output = run_curl(&config)?;
-        let read = (|| {
-            let status_text = String::from_utf8_lossy(&output).trim().to_owned();
-            let status: u16 = status_text
-                .parse()
-                .map_err(|_| format!("curl wrote no HTTP status: {status_text}"))?;
-            let headers_text = std::fs::read_to_string(&headers_path).unwrap_or_default();
-            let body = std::fs::read(&response_path).unwrap_or_default();
-            Ok(Response {
-                status,
-                headers: parse_headers(&headers_text)?,
-                body,
-            })
-        })();
-        for path in [&body_path, &headers_path, &response_path] {
-            remove_scratch(path)?;
+        line(&mut config, "write-out", "%{urlnum} %{http_code}\\n")?;
+        Ok((config, [body_path, headers_path, response_path]))
+    }
+
+    pub fn send(&self, request: &Request) -> Result<Response, String> {
+        self.send_all(std::slice::from_ref(request))
+            .pop()
+            .expect("one answer per request")
+    }
+
+    pub fn send_all(&self, requests: &[Request]) -> Vec<Result<Response, String>> {
+        assert!(
+            !requests.is_empty() && requests.len() <= super::REQUESTS_IN_FLIGHT_MAX,
+            "one curl run sends one to requests_in_flight_max requests"
+        );
+        let mut prepared = Vec::new();
+        for request in requests {
+            match self.prepare(request) {
+                Ok(one) => prepared.push(one),
+                Err(error) => {
+                    for (_, paths) in &prepared {
+                        if let Err(removing) = remove_all(paths) {
+                            return requests.iter().map(|_| Err(removing.clone())).collect();
+                        }
+                    }
+                    return requests.iter().map(|_| Err(error.clone())).collect();
+                }
+            }
         }
-        read
+        let mut config = String::new();
+        if requests.len() > 1 {
+            config.push_str("parallel\nparallel-immediate\n");
+            config.push_str(&format!("parallel-max = \"{}\"\n", requests.len()));
+        }
+        for (index, (part, _)) in prepared.iter().enumerate() {
+            if index > 0 {
+                config.push_str("next\n");
+            }
+            config.push_str(part);
+        }
+        let ran = run_curl(&config);
+        let answers = requests
+            .iter()
+            .zip(&prepared)
+            .enumerate()
+            .map(|(index, (request, (_, paths)))| {
+                let (stdout, failure) = ran.as_ref().map_err(Clone::clone)?;
+                let status = status_of(stdout, index).ok_or_else(|| {
+                    format!(
+                        "curl got no answer from {} {}: {failure}",
+                        request.method.name(),
+                        request.url
+                    )
+                })?;
+                let headers_text = std::fs::read_to_string(&paths[1]).unwrap_or_default();
+                let body = std::fs::read(&paths[2]).unwrap_or_default();
+                Ok(Response {
+                    status,
+                    headers: parse_headers(&headers_text)?,
+                    body,
+                })
+            })
+            .collect();
+        let removed: Result<(), String> =
+            prepared.iter().try_for_each(|(_, paths)| remove_all(paths));
+        match removed {
+            Ok(()) => answers,
+            Err(error) => requests.iter().map(|_| Err(error.clone())).collect(),
+        }
     }
 
     pub fn stream(
         &self,
         request: &Request,
         lines_max: u64,
+        seconds_max: Option<u64>,
         on_line: &mut dyn FnMut(&str) -> Flow,
     ) -> Result<u64, String> {
         let mut config = self.config(request)?;
         config.push_str("no-buffer\nfail-with-body\n");
+        if let Some(seconds) = seconds_max {
+            line(&mut config, "max-time", &seconds.to_string())?;
+        }
         let mut child = curl()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -254,7 +310,7 @@ impl Client {
         let status = child
             .wait()
             .map_err(|error| format!("cannot wait for curl: {error}"))?;
-        if status.success() {
+        if status.success() || (seconds_max.is_some() && status.code() == Some(CURL_TIMED_OUT)) {
             Ok(lines)
         } else {
             Err(format!("curl failed ({status}): {}", stderr.trim()))
@@ -286,7 +342,7 @@ fn curl() -> Command {
     command
 }
 
-fn run_curl(config: &str) -> Result<Vec<u8>, String> {
+fn run_curl(config: &str) -> Result<(String, String), String> {
     let mut child = curl()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -302,14 +358,31 @@ fn run_curl(config: &str) -> Result<Vec<u8>, String> {
     let output = child
         .wait_with_output()
         .map_err(|error| format!("cannot wait for curl: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
+    let failure = if output.status.success() {
+        String::new()
+    } else {
+        format!(
             "curl failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(output.stdout)
+        )
+    };
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        failure,
+    ))
+}
+
+fn status_of(stdout: &str, index: usize) -> Option<u16> {
+    stdout.lines().find_map(|line| {
+        let (number, code) = line.trim().split_once(' ')?;
+        let status: u16 = code.parse().ok()?;
+        (number.parse::<usize>().ok()? == index && status != NO_ANSWER).then_some(status)
+    })
+}
+
+fn remove_all(paths: &[PathBuf; 3]) -> Result<(), String> {
+    paths.iter().try_for_each(remove_scratch)
 }
 
 fn line(config: &mut String, option: &str, value: &str) -> Result<(), String> {

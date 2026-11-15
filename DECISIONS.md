@@ -836,6 +836,195 @@ Scorecard:
 
 Commands: `git merge eval-codex gap-mining openai-host`, `AGENTS=hl-agent AGENT_ROOT=R TASKS=T sh evals/codex-drill.sh`, `python3 evals/run.py --suite S --tasks T --agent-root R --agents nanocode,hl-agent,claude-code --attempts 2 --model claude-sonnet-4-6 --parallel 3 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --out output/eval/r5`, `python3 evals/report.py DIR DIR=LABEL`, `CHECK_JOBS=2 nice scripts/check.sh`.
 
+## 2026-11-14: mpp: Machine Payments Protocol payments as journaled, proved, simulated effects
+
+What it establishes. A harness pays for HTTP 402 answers with MPP: `wallet NAME spend at most C charge at most M payments at most K` and `paid by NAME` on a tool or a `tools from listing` (LANGUAGE.md, Payments). The plan, refined after reading nanocode d83b08f (`crates/integrations/mpp`: flow.rs's 402 loop, provider.rs's `PaymentProvider` and `PendingPayment`, protocol.rs's challenge, credential and receipt, mcp.rs's -32042, `bin/nanocode-sim/src/mpp.rs`) and nanocode-ts d5b21f1 (`src/machines/Payments.ts`, `Payment.ts`, `Wallet.ts`): in nanocode the 402 loop lives inside the HTTP client and no payment reaches the turn log, so a crash after a payment and before the call's result re-runs an idempotent call and can pay again. Here a payment is a journaled effect of its own. Decisions:
+
+- The checker desugars every paid call (and every `dispatch` of a harness with a paid tool or listing) into existing IR: the first call; up to `K` rounds of a call of the wallet, a synthesized `external recoverable` tool `NAME(required: text, max: u64) -> u64`, and a retry with `payment` set to the 402's challenge text; the outcome rebuilt by one new pure expression, `Expr::Outcome`, from hidden state fields (`_paid_tag`, `_paid_text`, `_paid_value_T`, or the first call's own result when no round ran). The program's match arms appear once. One new hidden text builtin, `_with_payment`, sets the field in a dispatched call's input. So the prover, the oracle's class check, every backend and the differential runs see ordinary tool calls: the Rust and JavaScript backends needed only `Expr::Outcome`, `_with_payment`, the wallet's refusal in `tool_input` and the wallet's u64 reply at recovery.
+- Recovery is structural: the wallet call is external and recoverable, so durable_before_external flushes its call record before money moves, recovery asks the wallet (`replied` with the units, `not_dispatched`, `unknown`) and external_once forbids a second dispatch on every target, including Vercel's retried steps and Postgres takeovers. An unknown payment reserves the whole room. This is the reserve/settle shape with the payment's call id as the idempotency key.
+- The cap is proved, not trusted: the room is `min(M, C - spent)`, a wallet amount above the room is refused, `_spent` is checkpointed state and the checker adds `_spend_within_cap` (`_spent <= C`), which the arithmetic prover proves at every return and trap. `hl prove --mutation drop_pay_guard` removes the amount check and the proof fails on payments.hl, paid_lanes.hl and mpp_agent.hl on every target, while programs without a wallet still prove.
+- Paid calls run in parallel lanes: the batch makes the first call and the lane runs the rounds after it (`ir::validate` admits a lane dispatch only when its input is `_with_payment`).
+- The model cannot pay: the wallet's name refused as input that does not fit (`input of NAME: NAME is the harness's wallet; only a paid call's payment reaches it`) in the interpreter, the generated Rust and JavaScript. A model-supplied `payment` is passed through; a host attaches only a credential its wallet made for exactly that challenge text, so a model can at most re-present a spent credential.
+- Session challenges are paid like charges (the voucher per 402); channels, settlement, receipts and paid model calls are GAPS.md's MPP list, ranked.
+- No real funds: the owner's rule is that no MACH, Tempo gateway wallet or mainnet funds are spent, and no Tempo testnet path needs no one's input, so the end-to-end runs are the simulator, the differential runs and a kill -9 drill whose host plays a 402 server and a wallet.
+
+Departures, kept: a recovered wallet reply is checked as u64 (every other recovered reply stays text, as before); hl-agent has no wallet (signing a Tempo payment needs secp256k1 and Keccak, which zero-dependency hl-agent would carry itself) and claude_code.hl and codex_agent.hl stay unpaid: nanocode pays inside the HTTP client of the model and of MCP, which here needs paid model calls (GAPS.md MPP 1) and a wallet host first; `hl emit` output changes for every program (a `WALLET` constant in the generated Rust and two runtime functions), no journal of a program without a wallet moves.
+
+Scorecard (MPP parity items a program can write and run against the simulator; baseline 0): charge yes, session voucher yes, MCP listing yes, HTTP fetch tool yes, parallel lanes yes, cap proved yes, no re-pay across crashes, takeovers and retried steps yes (simulator, exhaustive crash enumeration, kill -9 drill), fork (`_spent` is checkpointed state, so a fork carries it) yes; paid model calls no, settlement/receipts no, channels no: 9 of 12. Raised target: 12 of 12 with settlement journaling the receipt once, and a family-wide cap.
+
+Measurements (5-core Hand shared with other agents, `nice`, release build 9 min):
+
+- `hl sim --seeds 0..1000 examples/mpp_agent.hl`: ok on all five targets (native-jsonl 8,991 crashes, server-postgres 635 takeovers and 402 fenced writes); `docs/snippets/payments.hl` 0..500: native-jsonl 908 payment-required answers, 478 payments, 11,683,227 units, 522 presentations; `--twice 0..200` ok on native-jsonl and cloudflare; `docs/snippets/paid_lanes.hl` 0..300 ok on all five.
+- Mutations, every target, seeds 0..300: `cap_unchecked` caught (spend_within_cap at seed 11, or payment_presented), `spent_unaccounted` (spend_accounted, seed 0 or 1), `credential_dropped` (payment_presented, seed 0 or 1). Differential plants: rust and js `payment_unset`, js `paid_outcome_original`.
+- `hl sim --exhaustive --depth 2 --seeds 0..30 docs/snippets/payments.hl`: native-jsonl 31,360 crash points (93,203 torn tails) and vercel 32,434, no violation.
+- Kill -9 drill of the generated native-jsonl Rust for `examples/mpp_agent.hl` (`DRILL_FILE=examples/mpp_agent.hl DRILL_SESSIONS=150 DRILL_SEED=1000 scripts/rust-crash-drill.sh`): 150 sessions, 543 kill -9s over 693 runs, 1,016 payments in the ledger, none dispatched twice; 8 sessions of seeds 1..8: 65 kills.
+- `RUST_DIFF_SEEDS=0..200` and `JS_DIFF_SEEDS=0..100` on mpp_agent, payments and paid_lanes: generated Rust (three targets) and JavaScript (cloudflare, vercel) match the interpreter.
+- `hl check examples/mpp_agent.hl`: worst case 465 effects, 917 records (each round counted), 1,002,516 prover steps (debug build).
+
+Commands: `hl sim --target T --seeds A..B [--twice] [--mutation M] F`, `hl sim --exhaustive --depth 2 --target T --seeds 0..30 docs/snippets/payments.hl`, `hl prove --target T --mutation drop_pay_guard F`, `DRILL_FILE=examples/mpp_agent.hl scripts/rust-crash-drill.sh`, `RUST_DIFF_FILES=F scripts/rust-diff.sh`, `JS_DIFF_FILES=F scripts/js-diff.sh`, `scripts/docs-check.sh`, `scripts/check.sh`.
+
+## 2026-11-15: deploy-next: route auth, hl monitor, speculative first deploys, one curl run per round
+
+Branch deploy-next, from master ce76f48. It establishes:
+
+- **Routes are authenticated.** `hl deploy FILE` on cloudflare ships `hl-auth.mjs` as the main module: it re-exports `worker.mjs` (so `HarnessObject` stays exported from the main module) and answers 401 unless `Authorization: Bearer` matches the `HL_AUTH_TOKEN` secret binding, 503 when the secret is missing, before the harness's `fetch`. The Vercel route runs the same check against `process.env.HL_AUTH_TOKEN`. The comparison loops over the expected token's bytes only. The token is `auth_token_bytes` (32, 256 bits, read from `/dev/urandom`) as hex, created in the same request that creates the script (a `secret_text` binding in the first upload; `keep_bindings` keeps it) or the project (`environmentVariables`, type `encrypted`), and written to `OUT/auth-token` mode 600. A `--bundle` deploy ships as it is. New plant `auth_unchecked` (the check always passes) is caught on both platforms: the drill imports the shipped `hl-auth.mjs` and the Vercel route against stubs and expects 401, 401, 200, 503 for no token, a wrong one, the token in `OUT/auth-token` and no secret, and checks that the fake's provisioned secret hashes to the token in `OUT/auth-token`.
+- **`hl monitor`** prints the serving version, the events of the last `--minutes`, how many failed (Cloudflare: level `error` or a `$workers.outcome` other than ok; Vercel: level `error` or status 500 and up) with the rate, and the latest `monitor_recent_shown` (10, a screen) turns, in one round on Cloudflare (subdomain, deployments and the telemetry query together). Vercel reads runtime logs for at most `monitor_follow_seconds` (5 s, caller policy: the endpoint only streams); curl's timeout exit (28) ends that read normally. On the native targets it prints status and the history. The drill checks `3 events, 1 errors (33.3% failed)` after a failed invocation on both clouds, and the README demo quotes it.
+- **First deploys skip the lookups.** With no `deploy.json` in the output directory, Cloudflare uploads at once with migration `hl-v1` alongside the account subdomain read, then enables workers.dev and reads the new version in one more round: 2 rounds, was 3. A refused upload (the script exists at a tag) says so and falls back to the lookup path, which only an existing hl-v1 script reaches; a script without a tag is uploaded with the migration on either path, as before. Vercel creates the project with its variables and the token while uploading the files in the same round (5 files and the project in the 6 requests in flight), creates the deployment, follows its build events (`follow=1`) to their end, and reads it once: 4 rounds, was 6. A project that exists (409) falls back to the lookup path; a follow that fails or passes `build_events_followed_max` (2,000, the log events limit) says so and polls.
+- **One curl run per round.** `Client::send_all` writes every request of a round into one curl config (`--parallel --parallel-immediate`, `next` between transfers, `%{urlnum} %{http_code}` per transfer), so a round starts one process instead of one per request; without `--parallel-immediate` curl waited to multiplex and ran the fake's HTTP/1.1 transfers one after another (4 rounds for 4 requests, measured). Threads are gone from `src/deploy/`. On HTTPS this also shares a process, its TLS setup and its DNS cache within a round; whether it multiplexes on the real APIs is untested.
+- **The fake parses modules in process.** It checked every uploaded module with a spawned `node --check`, about 170 ms each at load 30, which the bench counted as deploy time; it now builds a `vm.SourceTextModule` (3 ms for the 348 KB module, same syntax errors; the drill starts node with `--experimental-vm-modules`). It also answers `follow=1` build events as a stream that ends once the build does, takes `environmentVariables` on project creation, exposes the hash of the provisioned `HL_AUTH_TOKEN` and takes `?level=` on invoke. The drill's clock moved to 00:30 so the telemetry window holds the drill's events (logs found 0 before).
+- **The bench** takes `DEPLOY_BENCH_RUNS` (best of N, each run its own names), reports hl's own CPU time (bash `time`) and the load average.
+
+Scorecard (`DEPLOY_BENCH_RUNS=5 scripts/deploy-drill.sh --bench`, 100 ms added to every answer; 5-core Hand shared with about 15 agents):
+
+| metric | baseline | current | target |
+| --- | --- | --- | --- |
+| cloudflare cold deploy | 1,292 ms (load 23 to 27), 1,507 ms rerun at load 28; 3 rounds, 6 requests | 653 ms best of 5 at load 38; 2 rounds, 4 requests; hl cpu 38 ms | under 600 ms |
+| vercel cold deploy (to READY) | 2,519 ms (load 23 to 27), 3,001 ms rerun at load 28; 6 rounds, 10 requests | 914 ms best of 5 at load 41; 4 rounds, 9 requests; hl cpu 59 ms | under 600 ms |
+| cloudflare unchanged / changed | 370 ms, 1 round / 1,371 ms, 3 rounds | 384 ms, 1 round / 1,007 ms, 3 rounds | |
+| vercel unchanged / changed | 243 ms, 1 round / 3,044 ms, 6 rounds | 366 ms, 1 round / 1,202 ms, 4 rounds (blobs already uploaded) | |
+| cold round trips (cloudflare, vercel) | 3, 6 | 2, 4 | 2, 4 |
+| routes needing a token | 0 of 2 platforms | 2 of 2 | 2 of 2 |
+| deploy plants caught | 6 plants, 10 plan rows | 7 plants, 12 plan rows | every plant |
+
+At zero latency a cold deploy still took 600 to 900 ms of wall time at load 30 to 40 while hl used 40 to 60 ms of CPU and the fake 10 to 70 ms: the rest is waiting for a core on an oversubscribed Hand (a bare `curl` took 95 ms there). The round count says what an unloaded machine reaches: 2 x 100 ms plus about 100 ms for Cloudflare, 4 x 100 ms plus about 120 ms for Vercel. The target is met in round trips and hl CPU, not in wall time on this Hand.
+
+Not done: a fixed host uploaded once per Cloudflare account. The emitted `worker.mjs` is runtime and program in one module (348 KB for `minimal.hl`, almost all of it runtime), and splitting it means `src/emit/` writing the program as a module the host loads (through the `LOADER` Worker Loader binding it already has) or a host Worker behind a service binding that owns `HarnessObject`; neither is in `src/deploy/`. With that split the program upload becomes a few KB and the host is skipped by its fingerprint like any unchanged deploy.
+
+Departures, kept:
+
+- The speculative paths and `follow=1` are unverified against the real APIs (no tokens on this Hand): in particular whether Cloudflare refuses a first-deploy upload to an existing hl script in a way the fallback reads, and whether Vercel's event stream ends with the build. Both fall back loudly. `scripts/deploy-real.sh` is the check.
+- `hl-auth.mjs` spreads the harness's default export and replaces `fetch`; other handlers keep their own `this`. It is checked under node against a stub, not workerd.
+- A project or script hl did not create gets no token; its routes answer 503 until `hl secrets set HL_AUTH_TOKEN`.
+
+Measurements: `scripts/deploy-drill.sh` ok on cloudflare, vercel and native-jsonl (13, 13 and 9 commands, 27 of 27 operations called, no violations); `scripts/mutations.sh --deploy auth_unchecked:cloudflare` and `:vercel` caught ("an unauthenticated request was served").
+
+Commands: `DEPLOY_BENCH_RUNS=5 scripts/deploy-drill.sh --bench`, `DEPLOY_BENCH_LATENCY_MS=0 scripts/deploy-drill.sh --bench`, `scripts/deploy-drill.sh`, `scripts/deploy-drill.sh --demo`, `scripts/mutations.sh --deploy auth_unchecked:cloudflare`, `scripts/mutations.sh --census`, `scripts/docs-check.sh`, `nice scripts/check.sh`.
+
+## 2026-11-15: fuzz-swarm: a generator that reaches the newer language, a rotated swarm and a regression corpus
+
+Branch fuzz-swarm, from master ce76f48. The program generator (`hl gen`, `src/generate/`) only wrote the core language, so the differential runs of generated code never met the features added since. It now also writes `wait(c)` and `wait(e) at most c`, `truncate_middle`, `len` of a text, `contains`, `before`, `after` and `trim`, `clear` and `keep ... last`, `rewrite` with drop arms, tool parameter defaults, `on session start` and `on stop`, `before tool` and `after tool` hooks with `deny` and `allow`, and walks a reply's calls with a `match dispatch`, plain or `parallel`. Each feature has a named percentage in its module; wait durations come from Vercel's Function limit (`VERCEL_FUNCTION_DURATION_SECONDS_MAX`), so every program emits for every target. In 301 programs (seeds 0..301): rewrite 191, keep 213, clear 208, contains 102, truncate_middle 79, session start 79, stop 70, wait 60, after tool 56, before tool 40, parallel 21, bounded wait 12, a default in 300.
+
+- **`scripts/fuzz-swarm.sh A..B`** generates the programs, runs `scripts/fuzz-one.sh` on each with `FUZZ_JOBS` at once, then `hl sim --exhaustive --depth 1` on every target (crash points), and prints programs, failures and programs per hour; failing programs keep their run directory. By default it rotates the Rust target by program number (one of native-jsonl, native-sqlite, server-postgres per program, all three across the population) and runs both JavaScript targets on every program (`FUZZ_ROTATE=0` runs all five). A Rust compile took 1.8 s of CPU but 6 to 40 s of wall time on this shared Hand, three per program, and was the bottleneck.
+- **`scripts/fuzz-regress.sh`**, a check.sh stage: every program in `scripts/fuzz-regressions/` through `fuzz-one.sh` on all five targets, seeds 0..20; `hl gen --seeds 0..400` (every generated program parses and checks); `hl fuzz-prove --seeds 0..400 --sim-seeds 5`. About 35 s.
+
+Bugs found and fixed, one commit each:
+
+- **Generated Rust did not compile for `keep L last E` when `E` reads `L`** (`keep items last len(items) - 1`): `keep_last(&mut state.items, ... state.items.len() ...)` borrows the list mutably and immutably at once (E0502). The emitter now binds the count, and `keep ... after`'s first entry, before borrowing the list. Found by the swarm in 5 of its first 23 programs (all on native-sqlite and native-jsonl rotations); regression `scripts/fuzz-regressions/keep_reads_list.hl`, which covers both forms. A compile error needs no simulator mutation: removing the binding makes fuzz-regress fail at rustc.
+- **The generator wrote statements after a `match dispatch` whose arms all return** (`statement is unreachable after a return`, a panic in `hl gen` at seed 1272). A walk's match now ends its block when every arm returns.
+
+No divergence between the interpreter and generated Rust or JavaScript, and no simulator invariant failure, was found in the rest of the runs below.
+
+Measurements (5-core Hand, load 30 to 57 from other agents throughout):
+
+- Baseline, old generator, all five backends per program, `FUZZ_JOBS=2 FUZZ_ROTATE=0`: 15 programs in 15.8 min, 57 programs per hour, 0 failures.
+- Rotated, `FUZZ_JOBS=3`, seeds 2000..: 84 programs in 22.3 min, 226 per hour; 5 failures, all the keep bug.
+- Rotated, newest generator, `FUZZ_JOBS=2`, seeds 3000..: 33 programs in 12.8 min, 155 per hour, 0 failures.
+- Interpreter only (`hl sim --seeds 0..20 --twice` and `--exhaustive --depth 1 --seeds 0..2` on all five targets): 300 programs of the newest generator in 478 s, about 2,250 programs per hour, 0 failures; 100 programs with 31 seeds in 130 s.
+- `hl fuzz-prove --seeds 0..3000 --sim-seeds 10`: 3,000 programs, 1,514 proved, 150,000 runs, 375,000 turns, 37,015 checkpointed states checked, no unsound proof, 304 s.
+
+| metric | baseline | current | target |
+| --- | --- | --- | --- |
+| differential programs per hour, all backends covered | 57 | 226 (jobs 3), 155 (jobs 2) | 500 |
+| language features the generator writes beyond the core | 0 | 17 | every checked feature |
+| bugs found and fixed | 0 | 2 (1 compiler, 1 generator) | |
+| interpreter and crash-point programs per hour | not measured | 2,250 | |
+
+Not done: `dev-georgios` was not attached to this thread, so every shard ran on the shared hosted Hand. The generator still leaves out spawn and join, suspend, idle turns, side questions, fork, code cells, blobs, listings, model modes and settings, jobs and interruptible effects, `fn`, and the compaction hooks; those reach the differential runs only through the examples and snippets.
+
+Commands: `hl gen --seeds A..B --out DIR`, `FUZZ_JOBS=N scripts/fuzz-swarm.sh A..B`, `FUZZ_ROTATE=0 FUZZ_JOBS=2 scripts/fuzz-swarm.sh 0..40`, `scripts/fuzz-regress.sh`, `hl fuzz-prove --seeds 0..3000 --sim-seeds 10`, `nice scripts/check.sh`.
+
+## 2026-11-14: climb: hill climbing as a construct, a prover that proves it, and a real autoresearch run
+
+Branch climb, from master ca53d55. It establishes:
+
+- **The climb construct.** `climb NAME over FIELD from E ledger L end V cycles N [candidates N] trials N [cost B propose P trial T] [wall W] [failures N] metric ... [gate e] accept RULE { propose(base) { } measure(subject) { } }` (LANGUAGE.md, Hill climbing). The checker lowers it into ordinary statements over hidden `_climb_` state fields, so the interpreter, both generated backends, the simulator and the prover need nothing climb-specific; `yield candidate/score/cost` are checked per block. Every evaluated candidate is a `cycle` row in the ledger (14 fields, the last the candidate's gate failures), so a resumed run goes on from the ledger.
+- **Five replay invariants and six mutations.** `climb_kept_valid` (a kept row ran all trials, failed no gate and beats its baseline under the rule, recomputed from the row), `climb_state_follows`, `climb_ledger_complete`, `climb_cost_balanced` (each row's running total is its run's costs and never passes the budget). Mutations `climb_accept_any`, `climb_revert_skipped`, `climb_ledger_drops_losses`, `climb_budget_unchecked`, `climb_cost_double_counted` and `climb_gate_ignored` are caught on all five targets in seeds 0..200 (`climb_gate_ignored` first fails at seeds 12, 12, 101, 124, 12; it needed `docs/snippets/climb_gate.hl`, since in `climb.hl` a gated candidate that would otherwise be kept never occurred in 300 seeds). The gate failure count is recorded whatever the climb then does, so a lowering that ignores the gate still writes the evidence the oracle reads.
+- **The prover summarizes nested loops in one pass per level.** `examples/autoresearch.hl` and both climb snippets ran out of the 8M-step budget. A loop was analysed by an inductive pass per invariant round, a summarizing pass and the reporting pass, and an inner loop repeated all three inside each outer pass, so cost grew as about 3 to the nesting depth. Profiling showed joins at `if` and `match` took 99.9% of the steps. Five changes, all sound (each either drops facts or skips work whose result is discarded): (1) the inductive round that keeps every invariant is reused as the loop's summary; (2) under a quiet pass (inductive or summarizing) a loop skips its reporting pass, whose state was always discarded, and an obligation pushes its goal without trying to prove it, as it already did after a failed proof; (3) a join of branches that changed no quantity returns the state before the branch; (4) a join keeps facts both sides hold syntactically without an implication check, and hulls a joined variable only against variables it shares a fact with on some side, and each joined pair once; (5) a loop's per-iteration delta bound of magnitude U64_MAX is dropped as uninformative: such facts carried coefficients of 2^64 into Fourier-Motzkin and overflowed i128, which emptied a join's facts. With unlimited steps and only (1) to (4), `climb_noise.hl` still failed 10 obligations through that overflow; with (5) it proves.
+- **Cost bookkeeping without hidden invariants.** The first lowering declared three invariants (each spent counter at most its cap) and charged a yielded cost as `if y <= max - spent`. Invariants make the prover run inductive rounds on every loop that touches the fields and check them at every trap point; dropping the `cost` clause took `examples/autoresearch.hl` from 1,917,052 to 311,783 steps. Now a charge is `if y > max { breach } else { if spent > max - y { breach } else { spent = spent + y } }` and the per-cycle check is `if C > B { stop } else { if spent > B - C { stop } else { ... } }` with `C` the cycle's cost at its caps, so every subtraction is of a constant by something proved smaller and no invariant is needed; `climb_budget_unchecked` is now caught by `climb_cost_balanced`'s budget check. The yielded cost became a `let` local and `propose_cost` folded into `propose_spent` (two fewer hidden fields per climb). The prover's join also stopped hulling a joined variable against the anchors of other quantities' loops (a loop's summary needs only its own quantity's anchor).
+- **hl-climb, a real autoresearch host.** `agent/` builds `hl-climb` around `examples/autoresearch.hl`: `hl-climb run --goal FILE --cwd REPO --bench CMD --test CMD --model ID --journal DIR`. Claude edits the working tree with Bash, Read and Edit; its final answer is the commit message; `bench` checks a revision out in a separate worktree and parses the last line as microseconds; `failing` is 0 when the test command passes, gated to zero.
+
+Departures, kept:
+
+- Candidates of a cycle are evaluated one after another, not in parallel: a measure block benchmarks on one machine, and concurrent benchmarks perturb each other, and a parallel for's lanes cannot dispatch. Parallel candidates would need isolated measurement, not a language change.
+- The join's related-pairs filter loses relations between variables that share no fact on either side; every program in examples/ and docs/snippets still proves with it.
+- The climb oracle treats the ledger rows of the session's entry state as given and checks the rows the session appends: `--any-state` starts `examples/autoresearch.hl` from a ledger of arbitrary rows (evaluation 482011494 at seed 2), which no history produced, and the checker keeps the ledger append-only, so the entry rows stay a prefix.
+- The climb's counters are state fields, since harnesslang has no mutable locals; the prover therefore carries them across turns, which is what the cost invariants are for.
+
+Measurements (5-core Hand shared with other agents, `nice`, release builds):
+
+- Prover steps per handler, `hl prove --target native-jsonl`, master ca53d55 then this branch: examples/claude_code.hl prompt 4,445,350 to 261,607 (17x), refresh 26,086 to 4,782; claude_code_child.hl delegated 1,560,948 to 143,122; docs/snippets/recovery.hl 347,033 to 43,389; reviewer.hl review_change 71,549 to 13,780; subagents.hl prompt 75,690 to 14,341; claude_agent.hl prompt 70,339 to 11,337; agent.hl prompt 4,202 to 1,632. All 49 programs of examples/ and docs/snippets/ prove, none that proved before fails. Climb programs, over budget (8M) before: examples/autoresearch.hl 1,917,052 after the prover changes, 1,218,062 with the invariant-free cost bookkeeping, 939,308 without the two fields, 824,587 with the anchor filter; docs/snippets/climb.hl 3,040,356, then 1,386,870; climb_noise.hl 963,914, then 664,601; climb_gate.hl 228,759; a minimal climb 828,134 to 133,341. `hl check examples/claude_code.hl` wall time 20.9 s to 17.8 s (the rest is outside the arithmetic prover).
+- `rust-diff` seeds 0..60 and `js-diff` seeds 0..40 of climb_gate.hl and autoresearch.hl match the interpreter on all five targets.
+- Real run, `output/climb-host/make-target.sh` (a trial-division prime counter, `count_primes(15000)`, 5 repetitions, median microseconds), claude-sonnet-4-6, cycles 6, trials 5, cost 120: exit 0 in 1,532 s, 81 requests, 135 tool calls, 51 input, 58,428 output, 280,741 cache-read and 68,741 cache-write tokens; the budget ended it after 5 cycles. Kept: a bytearray sieve (harness trial means 2,057,471 to 61 µs under `nice` and load), an odd-only sieve (64 to 33), `sum(sieve)` to `sieve.count(1)` (31 to 15); one cycle offered no candidate. Standalone afterwards: the baseline 345,014 to 514,688 µs, revision 4bb9f16 15 to 16 µs with the tests passing, about 23,000x.
+- The fifth kept candidate added `lru_cache` to `count_primes`, which turns the benchmark's repeated identical calls into cache hits and reads 0 µs; its commit message says so. The climb kept it correctly under its rule: the benchmark measured what it was told to. A benchmark that runs each repetition in a fresh process or on varied inputs, or a gate on a cold-cache measurement, is what keeps a climb from gaming it; the language cannot tell.
+
+Commands: `hl prove --target native-jsonl F` over examples/*.hl and docs/snippets/*.hl with master's and this branch's binaries; `hl check F`; `hl sim --target T --seeds 0..300 --strict [--mutation M] docs/snippets/{climb,climb_noise,climb_gate}.hl`; `MUTATIONS='climb_accept_any climb_revert_skipped climb_ledger_drops_losses climb_budget_unchecked climb_cost_double_counted climb_gate_ignored' scripts/mutations.sh`; `RUST_DIFF_FILES=... RUST_DIFF_SEEDS=0..60 scripts/rust-diff.sh`; `JS_DIFF_FILES=... JS_DIFF_SEEDS=0..40 scripts/js-diff.sh`; `hl-climb run --goal goal.txt --cwd real-repo --bench "python3 bench.py" --test "python3 test.py" --model claude-sonnet-4-6 --journal real-journal`; `scripts/docs-check.sh`; `CHECK_JOBS=2 nice scripts/check.sh`.
+
+Scorecard:
+
+| Metric | Baseline | Current | Target |
+| --- | --- | --- | --- |
+| `examples/autoresearch.hl` prover steps | over 8,000,000 (fails) | 824,587 (proves on all targets) | under 1,000,000 met; raised to under 100,000, not met |
+| `examples/claude_code.hl` prover steps (prompt) | 4,445,350 | 261,607 | none set |
+| Real hl-climb gain on the primes target | 345,014 to 514,688 µs | 15 to 16 µs at 4bb9f16, tests passing (about 23,000x) | at least 20%, raised to 2x: met |
+| Model spend of that run | n/a | about $1.22 at list prices (58,428 output, 68,741 cache-write, 280,741 cache-read tokens) | under $5: met |
+| Candidates evaluated in parallel | sequential | sequential | parallel lanes: not done |
+
+Big bets: (1) one quiet pass per loop and joins that skip shared facts and unrelated pairs (an order of magnitude on every multi-loop handler: 16.5x on claude_code.hl); (2) cost bookkeeping that needs no invariants (autoresearch 1.92M to 1.22M); (3) not tried: summarizing a whole climb as a closed-form bound per cycle, and parallel candidate lanes, which need isolated measurement and lanes that may dispatch.
+
+## 2026-11-15: prover-loops: the arithmetic prover asks each question once, of only the facts it can touch
+
+Branch prover-loops, from master ce76f48, with the prover part of branch climb (one quiet pass per loop, no proofs or main pass under quiet, joins that skip shared facts and unrelated pairs, no hulls against other quantities' anchors) cherry-picked first so the two merge. Every change is in `src/prove/arith` and `src/prove/linear.rs`; what `hl prove` and `hl check` print is byte-identical to master on every examples/*.hl and docs/snippets/*.hl file except the step counts.
+
+Where the steps went, measured by tagging every Fourier-Motzkin step with its caller (scratch instrumentation, not committed): on master, `examples/claude_code.hl`'s prompt handler spent 3.47 M of its 4.45 M steps measuring hull bounds in joins and 0.86 M checking which facts of one side of a join the other side implies. Three changes:
+
+- **A range is one projection.** `linear::range` pins a fresh variable to the measure and eliminates everything else once, reading the upper bound from the rows where the variable's coefficient is positive and the lower from the rest; before, `lower` was `upper` of the negated measure, a second full elimination. Joins, loop summaries, slopes and opaque operands take ranges.
+- **A question sees only the facts connected to it.** `linear::connected` keeps the facts reachable from the goal's variables through shared variables (and constant rows). Dropping facts only weakens the system, so every bound or implication derived from the kept facts holds for the full state: sound always, and exact whenever the dropped facts are satisfiable on their own, since they share no variable with the rest. Ranges always ask the connected facts. A join's implication checks ask them alone (`implies_feasible`): both sides were checked feasible before the join, so the answer is exact. Every other implication (`implies_split`) asks the connected facts first and the full state when that fails, so a state made infeasible by facts elsewhere still proves its obligations as before. The product rule's single-sided `extent` still asks the full state, since there an infeasible state must read as a zero bound.
+- **An if's branch reuses assume's answer.** `assume_settled` returns whether the alternative it kept was found feasible (or none was); `branch` checks feasibility again only when that is unknown (several alternatives, a condition the prover does not read, a budget that ran out, or a match arm).
+
+Scorecard (`hl prove` over the 46 files of examples/ and docs/snippets/, steps summed over handlers):
+
+| metric | baseline (master ce76f48) | climb's prover part alone | current | target |
+| --- | --- | --- | --- | --- |
+| total prover steps | 6,878,201 | 572,300 | 231,494 | 687,820 (10x), raised to 68,782 (100x) after it was met |
+| largest file (examples/claude_code.hl) | 4,473,516 | 267,059 | 91,801 | |
+| examples/claude_code_child.hl | 1,560,948 | 137,836 | 54,493 | |
+| docs/snippets/recovery.hl | 347,033 | 43,215 | 16,844 | |
+| files whose proof output changed beyond step counts | | 0 | 0 | 0 |
+
+The 10x target is met (29.7x total, 48.7x on the largest file); the raised 100x target is not. claude_code.hl's prompt handler now spends about a third of its steps in joins' hulls (28 k), a fifth in projecting each side of a join onto the kept variables (19.5 k), and the rest in join implications, feasibility checks before branches and assumptions, and obligations.
+
+Wall time did not follow: `hl prove examples/claude_code.hl` took 27.7 s with master's binary and 25.8 s with this one, back to back on the shared Hand at load 46. The arithmetic prover is no longer what `hl prove` waits for; the next lever for wall time is outside the step count (the per-target durability and plan proofs), which this branch did not measure.
+
+Not done: a convex-hull join that reuses the projected sides for all of a joined variable's measures (each measure still eliminates its side again), and feasibility that carries a known-feasible flag through states (it would touch every `State` constructor, which climb's branch also edits).
+
+Commands: `output/steps.sh BIN` (scratch: runs `BIN prove` on each file and sums the `(N prover steps)` it prints), a per-file diff of `hl prove` output with step counts removed between master's binary and this one, `scripts/prove-mutations.sh` (every mutation caught), `scripts/docs-check.sh` (LANGUAGE.md's quoted step counts updated from rerun output: agent.hl 4,202 to 1,002, model_reply.hl 17,036 to 2,085, fork.hl's hook 96 to 40), `nice scripts/check.sh`.
+
+## 2026-11-15: int-core: deploy-next, fuzz-swarm, mpp and mpp-host, climb and prover-loops on one branch
+
+Branch int-core, from master ce76f48, merges deploy-next, fuzz-swarm, mpp-host (which contains mpp), climb (climb-exp is the same tree as climb's 560dad6) and prover-loops. prover-loops-climbonly's uncommitted change, no hulls against other quantities' anchors, is prover-loops' 3b2176d, so nothing of it was added. Conflicts were additive: payments and hill climbing each added IR fields, mutations, invariants, contextual words and a LANGUAGE.md section, and hl-agent's build emits both the paying and the climbing harness. In the prover, prover-loops' side was kept: it is climb's prover part plus its own changes.
+
+Two faults appeared only once the branches met, each fixed in its own commit:
+
+- **`linear::connected` panicked on climb's snippet** ("every reached variable is visited once"). Its loop allowed one visit per variable that a fact holds, but a goal can name a variable no fact holds; such a variable is visited too. The bound is now the fact variables plus the goal's variables, the most the frontier can ever hold.
+- **hl-climb did not compile**: mpp-host added `Ran::Units`, a wallet's reply, which climb's host did not match. It answers a number, as hl-agent does.
+
+The agent drill failed once at load 40 with no fault in hl: a kill landed on the `spawn_agent` call before the child's journal existed, recovery answered it unknown, and the drill accepted an unknown spawn only when an orphaned child journal was left behind. It now also treats a `spawn_agent` call the parent recovered as unknown as an unknown spawn and skips the child checks, as it already did for orphans; the next run (`AGENT_DRILL_SEED=1 scripts/agent-drill.sh`) passed with 12 kills, one child and one join.
+
+Master moved to 90f1605 (the evals, Codex host and gap-mining lanes) and was merged in: hl-agent's build emits the paying, climbing and Codex harnesses together, `hl-agent` takes run, pay, steer and cancel, the Codex host answers a wallet's units as a number, and the pay path and hl-climb no longer stop leftover process groups at the end of a turn, since master's hl-agent lets them outlive it as nanocode does (`Workspace::stop_left` is gone). Mutations 89, invariants 53.
+
+Measurements (`hl prove` on every file of examples/ and docs/snippets/, steps summed over handlers, the (N prover steps) each prints; 5-core Hand shared with other agents):
+
+| metric | before | after |
+| --- | --- | --- |
+| examples/autoresearch.hl prover steps | 824,587 (climb's binary) | 261,650 |
+| docs/snippets/climb.hl, climb_noise.hl, climb_gate.hl | 1,386,870, 664,601, 228,759 | 474,309, 303,419, 60,078 |
+| total over the files master proves | 6,878,201 (master) | 231,494 |
+| total over every file, payments and climbing included | 3,677,117 (climb's binary, which cannot read the payment files) | 1,356,091 |
+
+The merged prover answers what each branch's prover answered: every file proves on every target, and LANGUAGE.md's quoted step counts for climb.hl and autoresearch.hl were rerun and requoted.
+
+Commands: `output/steps.sh BIN` (scratch: `BIN prove` on each file, steps summed), `hl check docs/snippets/climb.hl` with each binary, `scripts/docs-check.sh`, `CHECK_JOBS=2 nice scripts/check.sh`.
+
 ## 2026-11-15: eval-runner: run.py survives a row that raises and resumes; suite 1 three attempts against stock Claude Code
 
 Branch eval-runner, from master 90f1605. It establishes:

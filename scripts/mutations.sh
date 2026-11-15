@@ -79,11 +79,20 @@ interrupted_undecoded docs/snippets/in_flight.hl --twice interrupt_decoded
 interrupt_reruns docs/snippets/in_flight.hl --twice external_once
 recover_trusts_lost docs/snippets/in_flight.hl --twice external_once
 job_lost_dropped docs/snippets/in_flight.hl --twice job_reported 0..1000
+cap_unchecked docs/snippets/payments.hl --twice spend_within_cap|payment_presented
+spent_unaccounted docs/snippets/payments.hl --twice spend_accounted
+credential_dropped docs/snippets/payments.hl --twice payment_presented
 job_lost_all docs/snippets/in_flight.hl --twice job_once
 fork_live_state docs/snippets/fork.hl --twice fork_state_equal
 fork_hook_skipped docs/snippets/fork.hl --twice fork_state_equal
 cell_leaks docs/snippets/code_wait.hl --twice cell_settled_at_turn_end
-cell_cancel_ignored docs/snippets/code_stop.hl --twice interrupt_honored"
+cell_cancel_ignored docs/snippets/code_stop.hl --twice interrupt_honored
+climb_accept_any docs/snippets/climb_noise.hl --strict climb_kept_valid
+climb_revert_skipped docs/snippets/climb_noise.hl --strict climb_state_follows
+climb_ledger_drops_losses docs/snippets/climb_noise.hl --strict climb_ledger_complete
+climb_budget_unchecked docs/snippets/climb_noise.hl --strict climb_cost_balanced
+climb_cost_double_counted docs/snippets/climb_noise.hl --strict climb_cost_balanced
+climb_gate_ignored docs/snippets/climb_gate.hl --strict climb_kept_valid"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
@@ -128,7 +137,10 @@ js fork_hook_skipped docs/snippets/fork.hl cloudflare,vercel backend_equal
 rust cell_leaks docs/snippets/code_wait.hl native-jsonl,native-sqlite,server-postgres backend_equal
 js cell_leaks docs/snippets/code_wait.hl cloudflare,vercel backend_equal
 rust cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js cell_cancel_ignored docs/snippets/code_stop.hl cloudflare,vercel backend_equal"
+js cell_cancel_ignored docs/snippets/code_stop.hl cloudflare,vercel backend_equal
+rust payment_unset docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres backend_equal
+js payment_unset docs/snippets/payments.hl cloudflare,vercel backend_equal
+js paid_outcome_original docs/snippets/payments.hl cloudflare,vercel backend_equal"
 diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see"
 caught_elsewhere=scripts/strict.sh
 
@@ -304,7 +316,8 @@ digest_wrong vercel does not match the file's SHA-1
 rollback_current cloudflare,native-jsonl the rollback does not serve the first deploy's digest
 rollback_current vercel The deployment is already the production deployment
 environment_type_unknown vercel requests or fake answers broke the pinned specs
-fingerprint_partial cloudflare,vercel a changed variable deployed as unchanged"
+fingerprint_partial cloudflare,vercel a changed variable deployed as unchanged
+auth_unchecked cloudflare,vercel an unauthenticated request was served"
 
 deploy_plants_of_hl() {
   "$hl" deploy 2>&1 | sed -n 's/.*deploy plants: --plant //p' | tr '|' '\n' | grep -vx none | sort

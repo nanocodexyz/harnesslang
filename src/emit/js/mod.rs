@@ -369,6 +369,10 @@ fn program_literal(program: &Program) -> String {
         )
         .expect("writing to a string succeeds");
     }
+    if let Some(wallet) = &program.wallet {
+        writeln!(out, "  wallet: {},", js_string(&wallet.name))
+            .expect("writing to a string succeeds");
+    }
     out.push_str("};\n");
     out
 }
@@ -734,6 +738,19 @@ fn expr(program: &Program, expression: &Expr) -> String {
             format!("text_{}({})", op.name(), args.join(", "))
         }
         Expr::Cancelled => "rt.cancelled()".to_owned(),
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => format!(
+            "paidOutcome({}, () => {}, () => {}, () => {})",
+            expr(program, tag),
+            expr(program, value),
+            expr(program, reason),
+            expr(program, original)
+        ),
     }
 }
 

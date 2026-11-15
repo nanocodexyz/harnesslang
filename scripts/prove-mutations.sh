@@ -9,6 +9,7 @@ cell_files="examples/code_agent.hl"
 park_files="examples/hooks.hl"
 recover_files="docs/snippets/in_flight.hl"
 wait_files="docs/snippets/code_wait.hl"
+pay_files="docs/snippets/payments.hl docs/snippets/paid_lanes.hl examples/mpp_agent.hl"
 plain_files="examples/agent.hl examples/reviewer.hl"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 usage_exit=2
@@ -41,6 +42,7 @@ property_of() {
     resume_replays_suspend) echo seq_unique ;;
     recover_trusts_lost) echo external_once ;;
     cell_leaks) echo cell_settled_at_turn_end ;;
+    drop_pay_guard) echo invariant_preserved ;;
     *) return 1 ;;
   esac
 }
@@ -107,6 +109,10 @@ check_mutation() {
   fi
   if [ "$mutation" = cell_leaks ]; then
     mutated=$wait_files
+  fi
+  if [ "$mutation" = drop_pay_guard ]; then
+    mutated=$pay_files
+    check_untouched "$mutation" || return 1
   fi
   if [ "$mutation" = recover_trusts_lost ]; then
     mutated=$recover_files

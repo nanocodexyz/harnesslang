@@ -160,6 +160,10 @@ pub struct Stats {
     pub idle_turns: u64,
     pub idle_refused: u64,
     pub yields: u64,
+    pub payment_required: u64,
+    pub pays: u64,
+    pub paid_units: u64,
+    pub presented: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +245,7 @@ pub struct SimWorld<'a> {
     pub(crate) sides: crate::sim::side::Sides,
     pub jobs: crate::sim::jobs::Jobs,
     yielded: BTreeSet<u64>,
+    pub mpp: crate::sim::mpp::Ledger,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,6 +318,7 @@ impl<'a> SimWorld<'a> {
             sides: crate::sim::side::Sides::default(),
             jobs: crate::sim::jobs::Jobs::default(),
             yielded: BTreeSet::new(),
+            mpp: crate::sim::mpp::Ledger::default(),
         };
         world.change_listings(LISTED_PRESENT_PPM);
         world
@@ -1370,6 +1376,9 @@ impl SimWorld<'_> {
         let count = entry.external + entry.other;
         self.stats.dispatches += 1;
         if let Some(refused) = self.host_refusal(request) {
+            self.mpp
+                .refused
+                .insert(journal::call_id(request.turn, request.seq));
             if external {
                 self.dispatched
                     .get_mut(&journal::call_id(request.turn, request.seq))
@@ -1380,7 +1389,10 @@ impl SimWorld<'_> {
             return refused;
         }
         let mut rng = Rng::derive_keyed(self.seed, "tool", &[request.turn, request.seq, count]);
-        let output = if rng.chance(TOOL_FAILURE_PPM) {
+        let paid = crate::sim::mpp::answer(self, request, &mut rng);
+        let output = if let Some(paid) = paid {
+            paid
+        } else if rng.chance(TOOL_FAILURE_PPM) {
             Output::Failed(format!(
                 "{} failed: {}",
                 request.tool,

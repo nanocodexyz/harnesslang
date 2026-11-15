@@ -174,12 +174,44 @@ impl Transcript {
                     self.content(content)?;
                 }
             }
+            ("calls", Some(Value::Array(calls)))
+                if calls.iter().all(|call| matches!(call, Value::Object(_))) =>
+            {
+                for call in calls {
+                    let input = call
+                        .get("input")
+                        .and_then(Value::as_str)
+                        .ok_or("a plain call has no input")?;
+                    self.push(
+                        "assistant",
+                        Value::object([
+                            ("type", Value::text("tool_use")),
+                            (
+                                "id",
+                                call.get("id").cloned().ok_or("a plain call has no id")?,
+                            ),
+                            (
+                                "name",
+                                call.get("tool")
+                                    .cloned()
+                                    .ok_or("a plain call has no tool")?,
+                            ),
+                            (
+                                "input",
+                                Value::decode(input)
+                                    .map_err(|error| format!("a plain call's input: {error}"))?,
+                            ),
+                        ]),
+                    );
+                }
+            }
             ("calls", Some(Value::Array(fields))) => self.content(
                 fields
                     .get(2)
                     .and_then(Value::as_str)
                     .ok_or("calls have no content")?,
             )?,
+            ("answer", Some(Value::String(text))) => self.text("assistant", text),
             (other, _) => return Err(format!("context holds an unknown reply {other}")),
         }
         Ok(())

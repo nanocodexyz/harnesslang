@@ -285,6 +285,102 @@ pub fn implies(facts: &[Linear], goal: &Linear, budget: &mut Budget) -> Result<b
     Ok(contradiction(&projected))
 }
 
+pub fn connected(facts: &[Linear], seeds: &Linear) -> Vec<Linear> {
+    let mut holding: BTreeMap<Var, Vec<usize>> = BTreeMap::new();
+    for (index, fact) in facts.iter().enumerate() {
+        for var in fact.terms.keys() {
+            holding.entry(*var).or_default().push(index);
+        }
+    }
+    let mut taken = vec![false; facts.len()];
+    let mut reached: BTreeSet<Var> = seeds.terms.keys().copied().collect();
+    let mut frontier: Vec<Var> = reached.iter().copied().collect();
+    let visits_max = holding.len() + reached.len();
+    for _ in 0..=visits_max {
+        let Some(var) = frontier.pop() else {
+            break;
+        };
+        for index in holding.get(&var).into_iter().flatten() {
+            if std::mem::replace(&mut taken[*index], true) {
+                continue;
+            }
+            for other in facts[*index].terms.keys() {
+                if reached.insert(*other) {
+                    frontier.push(*other);
+                }
+            }
+        }
+    }
+    assert!(
+        frontier.is_empty(),
+        "every reached variable is visited once"
+    );
+    facts
+        .iter()
+        .zip(&taken)
+        .filter(|(fact, taken)| **taken || fact.terms.is_empty())
+        .map(|(fact, _)| fact.clone())
+        .collect()
+}
+
+pub fn implies_split(facts: &[Linear], goal: &Linear, budget: &mut Budget) -> Result<bool, Unsure> {
+    let near = connected(facts, goal);
+    if near.len() < facts.len() && implies(&near, goal, budget)? {
+        return Ok(true);
+    }
+    implies(facts, goal, budget)
+}
+
+pub fn implies_feasible(
+    facts: &[Linear],
+    goal: &Linear,
+    budget: &mut Budget,
+) -> Result<bool, Unsure> {
+    implies(&connected(facts, goal), goal, budget)
+}
+
+pub fn range(
+    facts: &[Linear],
+    expression: &Linear,
+    fresh: Var,
+    budget: &mut Budget,
+) -> Result<(Extent, Extent), Unsure> {
+    assert!(
+        !expression.terms.contains_key(&fresh),
+        "the measuring variable is fresh in the expression"
+    );
+    let near = connected(facts, expression);
+    assert!(
+        near.iter().all(|fact| !fact.terms.contains_key(&fresh)),
+        "the measuring variable is fresh in the facts"
+    );
+    let pinned = equal(&Linear::var(fresh), expression).ok_or(Unsure::Overflow)?;
+    let projected = projected_rows(&near, &pinned, &BTreeSet::from([fresh]), budget)?;
+    let mut low: Option<i128> = None;
+    let mut high: Option<i128> = None;
+    for row in &projected {
+        if row.terms.is_empty() {
+            if row.constant > 0 {
+                return Ok((Extent::Infeasible, Extent::Infeasible));
+            }
+            continue;
+        }
+        let coefficient = row.coefficient(fresh).expect("only the measure is left");
+        if coefficient > 0 {
+            let bound = floor_div(
+                row.constant.checked_neg().ok_or(Unsure::Overflow)?,
+                coefficient,
+            );
+            high = Some(high.map_or(bound, |current| current.min(bound)));
+        } else {
+            let bound = ceil_div(row.constant, -coefficient).ok_or(Unsure::Overflow)?;
+            low = Some(low.map_or(bound, |current| current.max(bound)));
+        }
+    }
+    let shown = |bound: Option<i128>| bound.map_or(Extent::Unbounded, Extent::At);
+    Ok((shown(low), shown(high)))
+}
+
 pub fn upper(
     facts: &[Linear],
     expression: &Linear,

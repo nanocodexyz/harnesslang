@@ -4,6 +4,7 @@ mod compare;
 mod djs;
 mod golden;
 mod journal;
+mod mpp;
 mod summary;
 mod synthetic;
 
@@ -19,6 +20,7 @@ const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
 const GOLDEN_FLAG: &str = "--golden";
 const SYNTHETIC_FLAG: &str = "--synthetic";
+const MPP_FLAG: &str = "--mpp";
 
 fn pairs(directory: &Path) -> Result<Vec<(String, PathBuf, PathBuf)>, String> {
     let entries = std::fs::read_dir(directory)
@@ -96,6 +98,20 @@ fn write_synthetic(directory: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let directories: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, journal, ledger] = directories.as_slice()
+        && flag == MPP_FLAG
+    {
+        return match mpp::check(Path::new(journal), Path::new(ledger)) {
+            Ok(counts) => {
+                println!("ok {counts}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                println!("FAIL mpp {error}");
+                ExitCode::from(FAILURE_EXIT)
+            }
+        };
+    }
     if let [flag, directory] = directories.as_slice() {
         if flag == GOLDEN_FLAG {
             return write_golden(directory);
@@ -105,7 +121,7 @@ fn main() -> ExitCode {
         }
     }
     if directories.is_empty() {
-        eprintln!("usage: hl-oracle DIR... | hl-oracle --golden DIR | hl-oracle --synthetic DIR");
+        eprintln!("usage: hl-oracle DIR... | hl-oracle --golden DIR | hl-oracle --synthetic DIR | hl-oracle --mpp JOURNAL PAYER_LEDGER");
         return ExitCode::from(USAGE_EXIT);
     }
     let mut tally = Tally::default();

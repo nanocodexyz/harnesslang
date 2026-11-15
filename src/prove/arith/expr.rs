@@ -43,6 +43,18 @@ impl Prover<'_> {
                 }
                 None
             }
+            Expr::Outcome {
+                tag,
+                value: paid,
+                reason,
+                original,
+                ..
+            } => {
+                for part in [tag, paid, reason, original] {
+                    self.value(state, part);
+                }
+                None
+            }
             Expr::Len(list) => {
                 self.value(state, list);
                 self.linear_of(state, value)
@@ -73,8 +85,7 @@ impl Prover<'_> {
     }
 
     fn opaque(&mut self, state: &mut State, value: &Linear) -> Linear {
-        let low = self.extent(state, value, false);
-        let high = self.extent(state, value, true);
+        let (low, high) = self.range(state, value);
         let var = Linear::var(self.fresh(state, &format!("{TEMPORARY}operand"), U64_MAX));
         if let Extent::At(low) = low {
             state.facts.extend(Linear::constant(low).subtract(&var));
@@ -265,32 +276,52 @@ impl Prover<'_> {
         }
     }
 
-    pub(super) fn assume(&mut self, mut state: State, condition: &Expr, truth: bool) -> State {
+    pub(super) fn assume(&mut self, state: State, condition: &Expr, truth: bool) -> State {
+        self.assume_settled(state, condition, truth).0
+    }
+
+    pub(super) fn assume_settled(
+        &mut self,
+        mut state: State,
+        condition: &Expr,
+        truth: bool,
+    ) -> (State, Option<bool>) {
         let Some(alternatives) = self.goals(&state, condition, truth) else {
             return match condition {
                 Expr::Binary {
                     op, left, right, ..
                 } if (*op == BinaryOp::And && truth) || (*op == BinaryOp::Or && !truth) => {
                     let state = self.assume(state, left, truth);
-                    self.assume(state, right, truth)
+                    self.assume_settled(state, right, truth)
                 }
-                _ => state,
+                _ => (state, None),
             };
         };
         let mut possible = Vec::new();
+        let mut certain = true;
         for alternative in alternatives {
             let mut system = state.facts.clone();
             system.extend(alternative.iter().cloned());
-            if linear::feasible(&system, &mut self.budget).unwrap_or(true) {
-                possible.push(alternative);
+            match linear::feasible(&system, &mut self.budget) {
+                Ok(true) => possible.push(alternative),
+                Ok(false) => {}
+                Err(_) => {
+                    certain = false;
+                    possible.push(alternative);
+                }
             }
         }
         match possible.len() {
-            0 => state.facts.push(Linear::constant(1)),
-            1 => state.facts.extend(possible.remove(0)),
-            _ => {}
+            0 => {
+                state.facts.push(Linear::constant(1));
+                (state, Some(false))
+            }
+            1 => {
+                state.facts.extend(possible.remove(0));
+                (state, certain.then_some(true))
+            }
+            _ => (state, None),
         }
-        state
     }
 
     pub(super) fn implied(&mut self, state: &State, condition: &Expr) -> bool {

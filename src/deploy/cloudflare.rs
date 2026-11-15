@@ -1,4 +1,4 @@
-use super::bundle::{self, Bundle};
+use super::bundle::{self, Bundle, Origin};
 use super::http::{Method, Request};
 use super::json::Value;
 use super::multipart::{self, Part};
@@ -166,22 +166,39 @@ impl<'a> Api<'a> {
         query: &str,
         body: Body,
     ) -> Result<(u16, Value), String> {
+        let request = self.prepare(endpoint, slots, query, body);
+        read(endpoint, self.context.client.send(&request))
+    }
+
+    fn send_all(&self, calls: Vec<(Endpoint, Request)>) -> Vec<Result<(u16, Value), String>> {
+        let (endpoints, requests): (Vec<Endpoint>, Vec<Request>) = calls.into_iter().unzip();
+        self.context
+            .client
+            .send_all(&requests)
+            .into_iter()
+            .zip(endpoints)
+            .map(|(response, endpoint)| read(endpoint, response))
+            .collect()
+    }
+
+    fn prepare(
+        &self,
+        endpoint: Endpoint,
+        slots: &[(&str, &str)],
+        query: &str,
+        body: Body,
+    ) -> Request {
         let request = Request::new(endpoint.method, self.url(endpoint, slots, query))
             .header("Authorization", &format!("Bearer {}", self.token))
             .header("User-Agent", super::USER_AGENT);
-        let request = match body {
+        match body {
             Body::Empty => request,
             Body::Json(value) => request.json(&value),
             Body::Form(form) => request.bytes(
                 &format!("multipart/form-data; boundary={}", form.boundary),
                 form.body,
             ),
-        };
-        let response = self.context.client.send(&request)?;
-        let value = response
-            .json()
-            .map_err(|error| format!("{} {}: {error}", endpoint.method.name(), endpoint.source))?;
-        Ok((response.status, value))
+        }
     }
 
     fn call(
@@ -194,20 +211,22 @@ impl<'a> Api<'a> {
         let (status, value) = self.send(endpoint, slots, query, body)?;
         envelope(endpoint, status, &value)
     }
+}
 
-    fn call_found(
-        &self,
-        endpoint: Endpoint,
-        slots: &[(&str, &str)],
-        query: &str,
-        body: Body,
-    ) -> Result<Option<Value>, String> {
-        let (status, value) = self.send(endpoint, slots, query, body)?;
-        if status == NOT_FOUND {
-            return Ok(None);
-        }
-        envelope(endpoint, status, &value).map(Some)
-    }
+fn read(
+    endpoint: Endpoint,
+    response: Result<super::http::Response, String>,
+) -> Result<(u16, Value), String> {
+    let response = response?;
+    let value = response
+        .json()
+        .map_err(|error| format!("{} {}: {error}", endpoint.method.name(), endpoint.source))?;
+    Ok((response.status, value))
+}
+
+fn answered(endpoint: Endpoint, answer: Result<(u16, Value), String>) -> Result<Value, String> {
+    let (status, value) = answer?;
+    envelope(endpoint, status, &value)
 }
 
 fn envelope(endpoint: Endpoint, status: u16, value: &Value) -> Result<Value, String> {
@@ -257,6 +276,7 @@ pub fn run(context: &Context, action: Action) -> Result<(), String> {
         Action::Rollback { to } => rollback(&api, to.as_deref()),
         Action::Secrets(secret) => secrets(&api, secret),
         Action::Destroy => destroy(&api),
+        Action::Monitor { events, minutes } => monitor(&api, events, minutes),
     }
 }
 
@@ -339,9 +359,15 @@ struct Serving {
 }
 
 fn serving(api: &Api) -> Result<Option<Serving>, String> {
-    let Some(listed) = api.call_found(DEPLOYMENTS, &[], "", Body::Empty)? else {
+    serving_from(api.send(DEPLOYMENTS, &[], "", Body::Empty))
+}
+
+fn serving_from(answer: Result<(u16, Value), String>) -> Result<Option<Serving>, String> {
+    let (status, value) = answer?;
+    if status == NOT_FOUND {
         return Ok(None);
-    };
+    }
+    let listed = envelope(DEPLOYMENTS, status, &value)?;
     let deployments = listed
         .get("deployments")
         .map(Value::items)
@@ -402,14 +428,115 @@ fn deploy(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<
         context.name,
         bundle.describe()
     ));
-    let (scripts, (serving_now, subdomain)) = super::join(
-        || api.call(SCRIPTS, &[], "", Body::Empty),
-        || {
-            super::join(
-                || serving(api),
-                || api.call(ACCOUNT_SUBDOMAIN, &[], "", Body::Empty),
-            )
-        },
+    if super::first_from(context) && deploy_new(api, bundle, variables)? {
+        return Ok(());
+    }
+    deploy_known(api, bundle, variables)
+}
+
+fn annotate(metadata: &mut Value, message: &str) {
+    if let Value::Object(fields) = metadata {
+        fields.insert(
+            "annotations".to_owned(),
+            Value::object([("workers/message", Value::text(message))]),
+        );
+    }
+}
+
+fn with_auth(bundle: &Bundle, metadata: &mut Value) -> Result<Option<String>, String> {
+    if !matches!(bundle.origin, Origin::Emitted) {
+        return Ok(None);
+    }
+    let token = super::auth_token()?;
+    let Value::Object(fields) = metadata else {
+        unreachable!("the upload metadata is an object");
+    };
+    let Some(Value::Array(bindings)) = fields.get_mut("bindings") else {
+        unreachable!("the upload metadata lists its bindings");
+    };
+    bindings.push(Value::object([
+        ("type", Value::text("secret_text")),
+        ("name", Value::text(super::AUTH_VARIABLE)),
+        ("text", Value::text(&token)),
+    ]));
+    Ok(Some(token))
+}
+
+fn form(bundle: &Bundle, metadata: &Value) -> multipart::Form {
+    let mut parts = vec![Part {
+        name: "metadata".to_owned(),
+        file_name: None,
+        content_type: "application/json".to_owned(),
+        bytes: metadata.encode().into_bytes(),
+    }];
+    for file in &bundle.files {
+        parts.push(Part {
+            name: file.path.clone(),
+            file_name: Some(file.path.clone()),
+            content_type: bundle::cloudflare_type(&file.path).to_owned(),
+            bytes: file.bytes.clone(),
+        });
+    }
+    multipart::encode(&parts)
+}
+
+fn deploy_new(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<bool, String> {
+    let context = api.context;
+    let (mut metadata, migration) = metadata(api, bundle, variables, None)?;
+    let fingerprint = fingerprint(context.plant, bundle, &metadata);
+    annotate(&mut metadata, &format!("{DEPLOY_MESSAGE} {fingerprint}"));
+    let token = with_auth(bundle, &mut metadata)?;
+    let mut answers = api
+        .send_all(vec![
+            (
+                UPLOAD,
+                api.prepare(UPLOAD, &[], "", Body::Form(form(bundle, &metadata))),
+            ),
+            (
+                ACCOUNT_SUBDOMAIN,
+                api.prepare(ACCOUNT_SUBDOMAIN, &[], "", Body::Empty),
+            ),
+        ])
+        .into_iter();
+    let (status, value) = answers.next().expect("the upload's answer")?;
+    let subdomain = answered(
+        ACCOUNT_SUBDOMAIN,
+        answers.next().expect("the subdomain's answer"),
+    );
+    let uploaded = match envelope(UPLOAD, status, &value) {
+        Ok(uploaded) => uploaded,
+        Err(error) => {
+            context.say(&format!(
+                "  the upload as a new script was refused ({error}); reading the script first"
+            ));
+            return Ok(false);
+        }
+    };
+    if let Some(token) = &token {
+        super::save_auth_token(context, token)?;
+    }
+    let url = url_of(api, &subdomain?)?;
+    finish(api, bundle, &uploaded, &migration, true, &url)?;
+    Ok(true)
+}
+
+fn deploy_known(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<(), String> {
+    let context = api.context;
+    let mut answers = api
+        .send_all(vec![
+            (SCRIPTS, api.prepare(SCRIPTS, &[], "", Body::Empty)),
+            (DEPLOYMENTS, api.prepare(DEPLOYMENTS, &[], "", Body::Empty)),
+            (
+                ACCOUNT_SUBDOMAIN,
+                api.prepare(ACCOUNT_SUBDOMAIN, &[], "", Body::Empty),
+            ),
+        ])
+        .into_iter();
+    let scripts = answered(SCRIPTS, answers.next().expect("the script list"));
+    let serving_now = serving_from(answers.next().expect("the deployments"));
+    let subdomain = answered(
+        ACCOUNT_SUBDOMAIN,
+        answers.next().expect("the subdomain's answer"),
     );
     let tag = migration_tag(api, &scripts?);
     let url = url_of(api, &subdomain?)?;
@@ -428,27 +555,29 @@ fn deploy(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<
             return super::record(context, bundle, &serving.version, &url);
         }
     }
-    if let Value::Object(fields) = &mut metadata {
-        fields.insert(
-            "annotations".to_owned(),
-            Value::object([("workers/message", Value::text(&message))]),
-        );
+    annotate(&mut metadata, &message);
+    let first = tag.is_none();
+    let token = if first {
+        with_auth(bundle, &mut metadata)?
+    } else {
+        None
+    };
+    let uploaded = api.call(UPLOAD, &[], "", Body::Form(form(bundle, &metadata)))?;
+    if let Some(token) = &token {
+        super::save_auth_token(context, token)?;
     }
-    let mut parts = vec![Part {
-        name: "metadata".to_owned(),
-        file_name: None,
-        content_type: "application/json".to_owned(),
-        bytes: metadata.encode().into_bytes(),
-    }];
-    for file in &bundle.files {
-        parts.push(Part {
-            name: file.path.clone(),
-            file_name: Some(file.path.clone()),
-            content_type: bundle::cloudflare_type(&file.path).to_owned(),
-            bytes: file.bytes.clone(),
-        });
-    }
-    let uploaded = api.call(UPLOAD, &[], "", Body::Form(multipart::encode(&parts)))?;
+    finish(api, bundle, &uploaded, &migration, first, &url)
+}
+
+fn finish(
+    api: &Api,
+    bundle: &Bundle,
+    uploaded: &Value,
+    migration: &str,
+    first: bool,
+    url: &str,
+) -> Result<(), String> {
+    let context = api.context;
     context.say(&format!("  {migration}"));
     if let Some(answered) = uploaded.str_at(&["migration_tag"]) {
         if answered != MIGRATION_TAG {
@@ -457,13 +586,11 @@ fn deploy(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<
             ));
         }
     }
-    let first = tag.is_none();
-    let (enabled, now) = super::join(
-        || {
-            if !first {
-                return Ok(());
-            }
-            api.call(
+    let mut calls = vec![(DEPLOYMENTS, api.prepare(DEPLOYMENTS, &[], "", Body::Empty))];
+    if first {
+        calls.push((
+            SCRIPT_SUBDOMAIN,
+            api.prepare(
                 SCRIPT_SUBDOMAIN,
                 &[],
                 "",
@@ -471,12 +598,14 @@ fn deploy(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<
                     ("enabled", Value::Bool(true)),
                     ("previews_enabled", Value::Bool(false)),
                 ])),
-            )
-            .map(drop)
-        },
-        || serving(api),
-    );
-    enabled?;
+            ),
+        ));
+    }
+    let mut answers = api.send_all(calls).into_iter();
+    let now = serving_from(answers.next().expect("the deployments"));
+    if let Some(enabled) = answers.next() {
+        answered(SCRIPT_SUBDOMAIN, enabled)?;
+    }
     let now =
         now?.ok_or_else(|| format!("script {} has no deployment after its upload", context.name))?;
     context.say(&format!(
@@ -484,7 +613,7 @@ fn deploy(api: &Api, bundle: &Bundle, variables: &[(String, String)]) -> Result<
         now.version, now.deployment
     ));
     context.say(&format!("  url {url}"));
-    super::record(context, bundle, &now.version, &url)
+    super::record(context, bundle, &now.version, url)
 }
 
 fn url(api: &Api) -> Result<String, String> {
@@ -661,7 +790,16 @@ fn destroy(api: &Api) -> Result<(), String> {
     Ok(())
 }
 
-fn logs(api: &Api, events: u64, minutes: u64) -> Result<(), String> {
+fn telemetry(api: &Api, events: u64, minutes: u64) -> Result<Vec<super::Seen>, String> {
+    telemetry_events(api.call(
+        TELEMETRY,
+        &[],
+        "",
+        Body::Json(telemetry_body(api, events, minutes)),
+    )?)
+}
+
+fn telemetry_body(api: &Api, events: u64, minutes: u64) -> Value {
     let context = api.context;
     let to = context.environment.now_ms;
     let from = to.saturating_sub(minutes * MILLISECONDS_PER_MINUTE);
@@ -686,8 +824,11 @@ fn logs(api: &Api, events: u64, minutes: u64) -> Result<(), String> {
             )]),
         ),
     ]);
-    let result = api.call(TELEMETRY, &[], "", Body::Json(body))?;
-    let mut lines: Vec<(u64, String)> = result
+    body
+}
+
+fn telemetry_events(result: Value) -> Result<Vec<super::Seen>, String> {
+    let mut seen: Vec<super::Seen> = result
         .path(&["events", "events"])
         .map(Value::items)
         .unwrap_or_default()
@@ -700,18 +841,64 @@ fn logs(api: &Api, events: u64, minutes: u64) -> Result<(), String> {
                 .map(str::to_owned)
                 .or_else(|| event.get("source").map(Value::shown))
                 .unwrap_or_default();
-            (at, format!("{} {level} {message}", super::iso_time(at)))
+            let outcome = event.str_at(&["$workers", "outcome"]).unwrap_or("ok");
+            super::Seen {
+                at,
+                line: format!("{} {level} {message}", super::iso_time(at)),
+                failed: level == "error" || outcome != "ok",
+            }
         })
         .collect();
-    lines.sort();
+    seen.sort_by(|left, right| left.at.cmp(&right.at).then(left.line.cmp(&right.line)));
+    Ok(seen)
+}
+
+fn logs(api: &Api, events: u64, minutes: u64) -> Result<(), String> {
+    let context = api.context;
+    let seen = telemetry(api, events, minutes)?;
     context.say(&format!(
         "logs cloudflare {}: {} events in the last {minutes} minutes",
         context.name,
-        lines.len()
+        seen.len()
     ));
-    for (_, line) in lines {
-        context.say(&line);
+    for event in seen {
+        context.say(&event.line);
     }
+    Ok(())
+}
+
+fn monitor(api: &Api, events: u64, minutes: u64) -> Result<(), String> {
+    let context = api.context;
+    let mut answers = api
+        .send_all(vec![
+            (
+                ACCOUNT_SUBDOMAIN,
+                api.prepare(ACCOUNT_SUBDOMAIN, &[], "", Body::Empty),
+            ),
+            (DEPLOYMENTS, api.prepare(DEPLOYMENTS, &[], "", Body::Empty)),
+            (
+                TELEMETRY,
+                api.prepare(
+                    TELEMETRY,
+                    &[],
+                    "",
+                    Body::Json(telemetry_body(api, events, minutes)),
+                ),
+            ),
+        ])
+        .into_iter();
+    let subdomain = answered(ACCOUNT_SUBDOMAIN, answers.next().expect("the subdomain"));
+    let now = serving_from(answers.next().expect("the deployments"));
+    let seen =
+        answered(TELEMETRY, answers.next().expect("the telemetry")).and_then(telemetry_events);
+    context.say(&format!("monitor cloudflare {}", context.name));
+    context.say(&format!("  url {}", url_of(api, &subdomain?)?));
+    let now = now?.ok_or_else(|| format!("script {} has no deployment", context.name))?;
+    context.say(&format!(
+        "  version {} serves 100% (deployment {})",
+        now.version, now.deployment
+    ));
+    super::traffic(context, minutes, &seen?);
     Ok(())
 }
 

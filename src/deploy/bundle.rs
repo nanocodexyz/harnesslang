@@ -5,10 +5,13 @@ use crate::ir::Program;
 use crate::run::blob::sha256_hex;
 use crate::target::Target;
 
+use super::{AUTH_VARIABLE, Plant};
+
 pub const BUNDLE_FILES_MAX: usize = 15_000;
 pub const BUNDLE_BYTES_MAX: u64 = 100 * 1024 * 1024;
 pub const MANIFEST_FILE: &str = "hl-bundle.json";
 pub const CLOUDFLARE_MAIN: &str = "worker.mjs";
+pub const CLOUDFLARE_AUTH_MAIN: &str = "hl-auth.mjs";
 pub const VERCEL_HARNESS: &str = "workflows/harness.mjs";
 pub const VERCEL_WORKFLOW: &str = "workflows/session.mjs";
 pub const VERCEL_ROUTE: &str = "app/sessions/[session]/[kind]/route.mjs";
@@ -107,15 +110,22 @@ pub fn file(path: &str, bytes: Vec<u8>) -> File {
     }
 }
 
-pub fn emitted(program: &Program, target: Target) -> Result<Bundle, String> {
+pub fn emitted(program: &Program, target: Target, plant: Plant) -> Result<Bundle, String> {
     let code = crate::emit::emit(program, target)?;
     match target {
         Target::Cloudflare => Bundle::new(
-            CLOUDFLARE_MAIN,
-            vec![file(CLOUDFLARE_MAIN, code.into_bytes())],
+            CLOUDFLARE_AUTH_MAIN,
+            vec![
+                file(CLOUDFLARE_MAIN, code.into_bytes()),
+                file(CLOUDFLARE_AUTH_MAIN, cloudflare_auth(plant).into_bytes()),
+            ],
             Origin::Emitted,
         ),
-        Target::Vercel => Bundle::new(VERCEL_ROUTE, vercel_files(program, code), Origin::Emitted),
+        Target::Vercel => Bundle::new(
+            VERCEL_ROUTE,
+            vercel_files(program, code, plant),
+            Origin::Emitted,
+        ),
         _ => Bundle::new(
             "harness.rs",
             vec![file("harness.rs", code.into_bytes())],
@@ -124,14 +134,37 @@ pub fn emitted(program: &Program, target: Target) -> Result<Bundle, String> {
     }
 }
 
-fn vercel_files(program: &Program, harness: String) -> Vec<File> {
+fn auth_check(plant: Plant) -> String {
+    let refused = if plant == Plant::AuthUnchecked {
+        "function refused(token, request) {\n  return null;\n}\n".to_owned()
+    } else {
+        format!(
+            "function refused(token, request) {{\n  if (typeof token !== \"string\" || token.length === 0) {{\n    return new Response(\"{AUTH_VARIABLE} is not set: hl secrets set {AUTH_VARIABLE}\", {{ status: 503 }});\n  }}\n  if (!sameText(request.headers.get(\"authorization\") ?? \"\", \"Bearer \" + token)) {{\n    return new Response(\"unauthorized\", {{ status: 401, headers: {{ \"www-authenticate\": \"Bearer\" }} }});\n  }}\n  return null;\n}}\n"
+        )
+    };
+    format!(
+        "const authEncoder = new TextEncoder();\n\nfunction sameText(given, expected) {{\n  const left = authEncoder.encode(given);\n  const right = authEncoder.encode(expected);\n  let differ = left.length ^ right.length;\n  for (let index = 0; index < right.length; index += 1) differ |= (left[index] ?? 0) ^ right[index];\n  return differ === 0;\n}}\n\n{refused}"
+    )
+}
+
+fn cloudflare_auth(plant: Plant) -> String {
+    format!(
+        "import worker from \"./{CLOUDFLARE_MAIN}\";\nexport * from \"./{CLOUDFLARE_MAIN}\";\n\n{}\nexport default {{\n  ...worker,\n  async fetch(request, env, context) {{\n    return refused(env.{AUTH_VARIABLE}, request) ?? worker.fetch(request, env, context);\n  }},\n}};\n",
+        auth_check(plant)
+    )
+}
+
+fn vercel_files(program: &Program, harness: String, plant: Plant) -> Vec<File> {
     let package = format!(
         "{{\n  \"name\": \"{}\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"scripts\": {{ \"build\": \"next build\" }},\n  \"dependencies\": {{\n    \"next\": \"{NEXT_VERSION}\",\n    \"react\": \"{REACT_VERSION}\",\n    \"react-dom\": \"{REACT_VERSION}\",\n    \"workflow\": \"{WORKFLOW_VERSION}\"\n  }}\n}}\n",
         super::default_name(&program.name)
     );
     let config =
         "import { withWorkflow } from \"workflow/next\";\n\nexport default withWorkflow({});\n";
-    let route = "import { start, resumeHook } from \"workflow/api\";\nimport { harnessSession } from \"../../../../workflows/session.mjs\";\n\nexport async function POST(request, { params }) {\n  const { session, kind } = await params;\n  const body = await request.json();\n  if (kind === \"start\") {\n    const run = await start(harnessSession, [session, body.turnsMax, body.entry ?? null]);\n    return Response.json({ runId: run.runId });\n  }\n  if (kind === \"hook\") {\n    await resumeHook(body.token, body.payload);\n    return Response.json({ resumed: body.token });\n  }\n  return new Response(\"not found\", { status: 404 });\n}\n";
+    let route = format!(
+        "import {{ start, resumeHook }} from \"workflow/api\";\nimport {{ harnessSession }} from \"../../../../workflows/session.mjs\";\n\n{}\nexport async function POST(request, {{ params }}) {{\n  const denied = refused(process.env.{AUTH_VARIABLE}, request);\n  if (denied) return denied;\n  const {{ session, kind }} = await params;\n  const body = await request.json();\n  if (kind === \"start\") {{\n    const run = await start(harnessSession, [session, body.turnsMax, body.entry ?? null]);\n    return Response.json({{ runId: run.runId }});\n  }}\n  if (kind === \"hook\") {{\n    await resumeHook(body.token, body.payload);\n    return Response.json({{ resumed: body.token }});\n  }}\n  return new Response(\"not found\", {{ status: 404 }});\n}}\n",
+        auth_check(plant)
+    );
     vec![
         file("package.json", package.into_bytes()),
         file("next.config.mjs", config.as_bytes().to_vec()),
@@ -140,7 +173,7 @@ fn vercel_files(program: &Program, harness: String) -> Vec<File> {
             VERCEL_WORKFLOW,
             crate::emit::js::workflow_binding().into_bytes(),
         ),
-        file(VERCEL_ROUTE, route.as_bytes().to_vec()),
+        file(VERCEL_ROUTE, route.into_bytes()),
     ]
 }
 

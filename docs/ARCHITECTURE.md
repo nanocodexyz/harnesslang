@@ -276,6 +276,41 @@ writes the finished update of each cell still running
 cell when a cancel arrives during a nested call or timer, with nanocode's
 STOPPED or STOPPED_UNKNOWN.
 
+### Payments
+
+`wallet NAME spend at most C charge at most M payments at most K` and `paid by
+NAME` on a tool or a listing let a harness pay for HTTP 402 answers with the
+Machine Payments Protocol, as nanocode's `nanocode-mpp` does. The checker
+desugars every paid call into ordinary journaled sites: the first call; a
+failure whose text starts `payment required: ` (the challenges) starts up to
+`K` rounds of a call of the wallet, a synthesized `external recoverable` tool
+`NAME(required, max)` returning the units it paid, and a retry of the call
+with `payment` set to the challenges it paid; the outcome is rebuilt from
+hidden state fields. The room `max` is `min(M, C - spent)`, so the hidden
+`_spent` field, checkpointed with the state, never passes `C`: the checker adds
+the invariant `_spend_within_cap` and the arithmetic prover proves it at every
+return and trap. A payment is durable before the wallet runs, recovery asks the
+wallet what became of an open one, and an unknown one reserves the whole room,
+so no target re-pays on replay; LANGUAGE.md's Payments has the simulator's
+`spend_within_cap`, `spend_accounted` and `payment_presented`.
+
+The host side is `hl-agent pay`, which runs `examples/mpp_agent.hl` emitted as
+native-jsonl Rust: its payer (`agent/src/mpp.rs`) holds a wallet identity
+(`did:pkh:eip155:42431:0x...`, Tempo's testnet chain id) and a balance in
+`state/wallet.json`, reads a 402's `WWW-Authenticate: Payment` challenges into
+nanocode's wire fields, pays the first payable one by appending a credential to
+the fsynced `state/payments.jsonl` (the wallet call's recovery reads it), sends
+the credential with the retry, and settles it the way nanocode's
+`PendingPayment` does: commit on success or a receipt, roll back a refusal
+without one, abandon a 5xx or a lost connection without one, once per
+challenge, with nanocode's `PaymentResponse` event on success. The payer only
+simulates signing: a real Tempo transaction needs secp256k1 and Keccak, which
+the zero-dependency host does not carry. `scripts/mpp-drill.sh` runs it
+through kill -9 against `mpp-server`, a port of nanocode-sim's MPP scenario
+(its offers, fates and judge) as an HTTP server, and `hl-oracle --mpp` reads
+the journal with nanocode-turnlog and the challenges, credentials and receipts
+with nanocode-mpp's own types.
+
 ### Fork and rewind
 
 `fork NAME at latest|turn` starts a session of the same harness from this
@@ -730,7 +765,23 @@ Every deploy writes a fingerprint of what it ships into the deployment (the
 bundle digest with the bindings or variables), reads the serving deployment in
 the same parallel round as its other lookups, and skips the upload when they
 match, so an unchanged redeploy is one round trip. Vercel uploads only the
-files it reports missing.
+files it reports missing. Each round is one curl run (`--parallel
+--parallel-immediate`), so a round costs one process start whatever its
+request count. A first deploy from an output directory (no `deploy.json`)
+skips the lookups: Cloudflare uploads with the migration and the account
+subdomain read in one round, then enables workers.dev and reads the new
+version in a second; Vercel creates the project (with its variables) and
+uploads the files in one round, then creates the deployment, follows its
+build events (`follow=1`) to the end and reads it once. A refused speculative
+upload, or a project that exists, falls back to the lookups.
+
+An emitted deploy authenticates its routes: Cloudflare's main module becomes
+`hl-auth.mjs`, which re-exports `worker.mjs` and checks `Authorization: Bearer`
+against the `HL_AUTH_TOKEN` secret binding before the harness's `fetch`; the
+Vercel route checks `process.env.HL_AUTH_TOKEN` first. The comparison runs
+over the expected token's bytes whatever the given one is, and a missing
+secret answers 503. The token is created with the script or project, in the
+same request, and written to `OUT/auth-token`.
 
 A rollback moves code, never state: the journal stays as it is, so the older
 code must read what the newer one wrote.
@@ -744,10 +795,13 @@ does not parse or import, and validates every path, query, header, JSON body
 and multipart metadata against the pinned spec, and its own answers too
 (read-only fields stay out of requests, write-only ones out of answers). The
 drill fails on any violation and on any listed endpoint it never called.
-`scripts/mutations.sh` plans six deploy plants (a migration on every deploy,
+`scripts/mutations.sh` plans seven deploy plants (a migration on every deploy,
 secrets dropped on redeploy, a wrong digest, a rollback to the serving
 version, an environment variable type the spec does not list, a fingerprint
-that leaves out variables), each caught by the drill. `scripts/deploy-real.sh` runs the same
+that leaves out variables, routes that skip the token check), each caught by
+the drill, which imports the shipped `hl-auth.mjs` and Vercel route against
+stubs and expects 401, 401, 200 and 503 for no token, a wrong one, the one in
+`OUT/auth-token` and no secret. `scripts/deploy-real.sh` runs the same
 flow against the real APIs when the tokens are set, and destroys what it
 made.
 
@@ -770,7 +824,9 @@ made.
 - `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
   subagent `examples/claude_code_child.hl` emitted as native-jsonl Rust and
   hosted against the Anthropic API, each spawned child a session with its own
-  journal under the parent's (`children/T.S/`), and `examples/codex_agent.hl`
+  journal under the parent's (`children/T.S/`); `hl-agent pay` hosts
+  `examples/mpp_agent.hl` with an MPP payer, and `mpp-server` is the simulated
+  paying server of `scripts/mpp-drill.sh`; and `examples/codex_agent.hl`
   hosted against the OpenAI Responses API, with steers and cancels dropped
   into the journal's `control/` by `hl-agent steer` and `hl-agent cancel`
 - `oracle/`: the nanocode oracle, its own workspace, the Cloudflare

@@ -393,7 +393,7 @@ examples/agent.hl: harness agent: 3 tool(s), 2 state field(s), 1 handler(s)
     plus one recovery record per restart
   proved handler prompt: finish_once: every path ends in exactly one of 2 return(s)
   proved zero state: invariant_initial: 2 invariant(s) hold
-  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (4202 prover steps)
+  proved handler prompt: no_overflow: 5 arithmetic operation(s) proved in range; invariant_preserved: 6 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (1002 prover steps)
   proved handler prompt on cloudflare: durability: 1 external effect site(s) run only after a flush of their call and every record before it; 10 acknowledgement point(s) follow their status flush
   proved handler prompt on cloudflare: worst_case: 2115 journal records per run on the plan's longest path, as hl check counts (step below turn_steps_max (64) x call below calls_per_step_max (16))
   proved handler prompt on cloudflare: worst_case: 1088 outbound requests <= 10000 outbound requests per invocation (step below turn_steps_max (64) x call below calls_per_step_max (16))
@@ -494,7 +494,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `after` `at` `before` `below` `blob` `blobs` `bound` `by` `calls` `compact` `drop` `end` `finds` `fn` `fork` `forked` `from` `idle` `in` `interruptible` `jobs` `known` `last` `listing` `maybe` `mode` `modes` `most` `parallel` `post` `pre` `prompt` `recoverable` `reply` `rewrite` `runs` `session` `sessions` `settings` `side` `spawn` `start` `stop` `subagent` `submit` `take` `tools` `window` `with`
+Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `with` `within` `yield`
 
 Builtin functions, whose names declarations may not take:
 
@@ -540,17 +540,19 @@ the tokens above.
 
 ```ebnf
 program    = "harness" name { item } ;
-item       = const | type | tool | listing | code | spawn | fork | model | state | invariant | function | hook | lifecycle | handler | side | event ;
+item       = const | type | tool | listing | code | wallet | spawn | fork | model | state | invariant | function | hook | lifecycle | handler | side | event ;
 const      = "const" name ":" type_expr "=" number ;
 type       = "type" name "=" ( variant { "|" variant } | text { "|" text } ) ;
 variant    = name [ "(" type_expr { "," type_expr } ")" ] ;
 tool       = "tool" name tool_params "->" type_expr "effect" effect_class [ "recoverable" ] [ interrupts ]
-             [ "jobs" "at" "most" bound ] [ "finds" name ] ;
+             [ "jobs" "at" "most" bound ] [ "finds" name ] [ paid ] ;
+paid       = "paid" "by" name ;
+wallet     = "wallet" name "spend" "at" "most" bound "charge" "at" "most" bound "payments" "at" "most" bound ;
 interrupts = "interruptible" "by" name { "," name } ;
 tool_params = "(" [ tool_param { "," tool_param } ] ")" ;
 tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
-listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class ;
+listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class [ paid ] ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
 model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
@@ -586,9 +588,19 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | "loop" name "below" bound block
            | "for" name "in" expr [ "parallel" ] block
            | "return" expr
+           | climb
+           | "yield" ( "candidate" "(" expr "," expr ")" | "score" "(" expr { "," expr } ")" | "cost" expr )
            | name "=" expr
            | name "(" [ expr { "," expr } ] ")" ;
 if         = "if" expr block [ "else" ( if | block ) ] ;
+climb      = "climb" name "over" name { climb_clause } "{" "propose" "(" name ")" block "measure" "(" name ")" block "}" ;
+climb_clause = "from" expr | "ledger" name | "end" name
+           | ( "cycles" | "candidates" | "trials" | "wall" | "failures" ) bound
+           | "cost" bound "propose" bound "trial" bound
+           | "metric" name ( "lower" | "higher" ) "at" "most" bound [ "within" bound ]
+           | "gate" expr
+           | "accept" ( ( "mean" | "best" ) "by" bound | "sign" "at" "least" bound
+                      | "when" "(" name { "," name } ")" expr ) ;
 arm        = ( name [ "(" name { "," name } ")" ] | text ) "=>" block ;
 expr       = or [ "with" or ] ;
 or         = and { "or" and } ;
@@ -2569,7 +2581,7 @@ case is the same as without them:
 ```console
 $ hl check docs/snippets/model_reply.hl | grep -E 'worst case|no_overflow'
   handler ask: worst case 80 effects, 147 journal records, 80 outbound requests
-  proved handler ask: no_overflow: 7 arithmetic operation(s) proved in range; invariant_preserved: 10 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (17036 prover steps)
+  proved handler ask: no_overflow: 7 arithmetic operation(s) proved in range; invariant_preserved: 10 invariant check(s) at returns and trap points; push_bound: 5 push(es) proved below capacity (2085 prover steps)
 ```
 
 The journal is unchanged. A `model` record holds the reply as the host
@@ -4633,7 +4645,7 @@ durable before it runs:
 $ hl check --target cloudflare docs/snippets/fork.hl | grep -E 'child sessions|hook forked'
     child sessions: 4, step below steps_max (2) x call below calls_max (2)
     with its child sessions: 6 effects, 13 journal records, 6 outbound requests
-  proved hook forked: no_overflow: 0 arithmetic operation(s) proved in range; invariant_preserved: 1 invariant check(s) at returns and trap points; push_bound: 1 push(es) proved below capacity (96 prover steps)
+  proved hook forked: no_overflow: 0 arithmetic operation(s) proved in range; invariant_preserved: 1 invariant check(s) at returns and trap points; push_bound: 1 push(es) proved below capacity (40 prover steps)
 $ hl check docs/snippets/errors/forked-effect.hl
 docs/snippets/errors/forked-effect.hl:16:9: error: 'on forked' cannot call tool 'Bash': it runs inside the fork's call, before the call is journaled, so it runs no effect
 ```
@@ -5226,6 +5238,501 @@ replay: hl sim --target native-jsonl --seeds 19..20 --mutation job_lost_all docs
 $ hl sim --target native-jsonl --seeds 0..100 --mutation job_lost_dropped docs/snippets/in_flight.hl
 FAIL invariant=job_reported seed=29 target=native-jsonl profile=async mutation=job_lost_dropped: job 1.4 died in a crash and its host reported it lost, yet a later run took events without recording its lost notice
 replay: hl sim --target native-jsonl --seeds 29..30 --mutation job_lost_dropped docs/snippets/in_flight.hl
+```
+
+### Payments
+
+A harness pays for HTTP 402 Payment Required answers with the Machine Payments
+Protocol (MPP), as nanocode's `nanocode-mpp` does: a tool, an MCP listing or an
+HTTP fetch whose server asks for payment is paid from a wallet, and the call is
+sent again with the payment. `wallet NAME spend at most C charge at most M
+payments at most K` declares the wallet: the session spends at most `C`
+units, one payment charges at most `M` and one paid call makes at most `K`
+payments (nanocode's `DEFAULT_MAX_PAYMENT_RETRIES` is 3). `paid by NAME`
+after a tool's or a listing's effect class makes its calls paid, and `spent()`
+reads what the session has spent:
+
+```hl docs/snippets/payments.hl
+harness payments
+
+const rounds_max: u64 = 4
+const calls_max: u64 = 3
+const context_max: u64 = 64
+const spend_cap: u64 = 120000
+const charge_max: u64 = 50000
+const payments_max: u64 = 3
+
+type outcome = done(text, u64) | exhausted(u64)
+
+wallet tempo spend at most spend_cap charge at most charge_max payments at most payments_max
+
+tool fetch(url: text) -> text effect idempotent paid by tempo
+tool search(query: text) -> text effect external paid by tempo
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words, spent()) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted(spent())
+}
+```
+
+A paid tool gains a `payment` parameter, empty on the first call, and a direct
+call of it has type `maybe<T>` whatever its class, since a payment's outcome can
+be unknown. The host of a paid tool answers a 402 as the call's failure, its
+text `payment required: ` followed by the challenges as JSON
+(`{"challenges":[{"id","realm","method","intent","amount",...}]}`). The checker
+desugars each paid call, and every `dispatch` of a harness with a paid tool or
+listing, into ordinary sites:
+
+1. the call; a failure that starts with `payment required: ` for a paid tool
+   starts a payment round, anything else is the outcome;
+2. a round computes the room, `min(M, C - spent)`, and fails the call with
+   "payment required, but the wallet has reached its spend cap" when it is 0;
+   otherwise it calls the wallet, a synthesized tool `NAME(required: text, max:
+   u64) -> u64 effect external recoverable`, which chooses a challenge it
+   supports, pays at most `max` and returns the units it paid;
+3. a paid amount within the room is added to the hidden state field `_spent`
+   and the call runs again with `payment` set to the challenges paid, so the
+   host presents the credential the wallet made for them; another 402 starts
+   the next of the `K` rounds;
+4. a wallet failure fails the call with the wallet's text, and an unknown wallet
+   outcome makes the call unknown and adds the whole room to `_spent`.
+
+The outcome is rebuilt from hidden state fields, so the arms of the program's
+`match` appear once and push once per call whatever the rounds did. A run of
+the snippet journals a paid search as three calls: the 402, the payment of 42524
+units and the presentation, which this server refused:
+
+```console
+$ hl run docs/snippets/payments.hl --handler ask --arg hi --seed 0 | grep -o '"call_id":"1/[3-5]","[a-z]*":.\{0,48\}'
+"call_id":"1/3","effect":"external","input":{"payment":"","query":"alpha-
+"call_id":"1/3","output":{"failed":"payment required: {\"challenges\":[{\
+"call_id":"1/4","effect":"external","input":{"max":50000,"required":"paym
+"call_id":"1/4","output":{"ok":42524},"seq":4}}}
+"call_id":"1/5","effect":"external","input":{"payment":"payment required:
+"call_id":"1/5","output":{"failed":"HTTP 400: the server refused the paym
+```
+
+Each payment is a journaled external call, durable before the wallet runs:
+recovery asks the wallet about an open one (`replied` with the units it paid,
+or `not_dispatched`), and a replayed turn takes a recorded payment from the
+journal, so no target pays twice for one call. The model cannot reach the wallet:
+`dispatch` refuses its name as input that does not fit. The checker adds the
+invariant `_spend_within_cap` (`_spent <= C`), which the prover proves at every
+return and trap, and counts each round in the worst case:
+
+```console
+$ hl check docs/snippets/payments.hl | sed -n 2,3p
+  handler ask: worst case 88 effects, 175 journal records, 88 outbound requests
+    effects: round below rounds_max (4) x call below calls_max (3) x payment below payments_max (3)
+```
+
+```console
+$ hl check docs/snippets/errors/wallet-charge.hl
+docs/snippets/errors/wallet-charge.hl:7:47: error: wallet 'tempo' charges at most charge_max (5000) a payment, over its spend cap cap (1000)
+$ hl check docs/snippets/errors/paid-undeclared.hl
+docs/snippets/errors/paid-undeclared.hl:3:57: error: 'fetch' is paid by 'tempo', which is not a declared wallet
+```
+
+```hl docs/snippets/errors/wallet-charge.hl
+harness shop
+
+const cap: u64 = 1000
+const charge_max: u64 = 5000
+const payments_max: u64 = 2
+
+wallet tempo spend at most cap charge at most charge_max payments at most payments_max
+
+tool fetch(url: text) -> text effect idempotent paid by tempo
+
+on ping() -> u64 { return 1 }
+```
+
+```hl docs/snippets/errors/paid-undeclared.hl
+harness shop
+
+tool fetch(url: text) -> text effect idempotent paid by tempo
+
+on ping() -> u64 { return 1 }
+```
+
+A paid call in a parallel for pays in its lane, after the batch, as
+`docs/snippets/paid_lanes.hl` does:
+
+```hl docs/snippets/paid_lanes.hl
+harness paid_lanes
+
+const rounds_max: u64 = 4
+const calls_max: u64 = 3
+const context_max: u64 = 64
+const spend_cap: u64 = 120000
+const charge_max: u64 = 50000
+const payments_max: u64 = 3
+
+type outcome = done(text, u64) | exhausted(u64)
+
+wallet tempo spend at most spend_cap charge at most charge_max payments at most payments_max
+
+tool fetch(url: text) -> text effect idempotent paid by tempo
+tool search(query: text) -> text effect external paid by tempo
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words, spent()) }
+      calls(requested) => {
+        for call in requested parallel {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted(spent())
+}
+```
+
+The simulator plays an MPP server for every paid tool, a port of nanocode-sim's
+`mpp` scenario: one to three challenges a 402, some of another method, expired,
+a zero-amount proof for another realm, over the charge cap, of the `session`
+intent or reused; and for a presented payment a success, another 402, a refusal,
+a server error or a lost connection. Its wallet pays the first challenge it
+supports within `max` and refuses one it already paid. Its invariants:
+
+| Invariant | Holds | Planted bug |
+| --- | --- | --- |
+| `spend_within_cap` | the wallet never paid a session more than `C` | `cap_unchecked` (the wallet is given `M` as its max) |
+| `spend_accounted` | every checkpoint's `_spent` covers what the wallet charged in the turns before it | `spent_unaccounted` |
+| `payment_presented` | every payment was presented by the retry, unless the retry was refused before it left, or the payment or the retry is reported unknown | `credential_dropped` |
+| `external_once` | no payment is made twice, across crashes, takeovers and retried steps | `recover_trusts_lost` |
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 docs/snippets/payments.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=2128 crashes=1624 power_losses=160 torn_writes=258 takeovers=0 fenced=0 dispatches=1488 unknown=353 recovered=48 not_dispatched=356 recover_unknown=171 payment_required=365 pays=189 paid_units=4396624 presented=201
+$ hl sim --target native-jsonl --seeds 0..200 --mutation cap_unchecked docs/snippets/payments.hl | head -n 1
+FAIL invariant=payment_presented seed=0 target=native-jsonl profile=errors mutation=cap_unchecked: wallet tempo paid 24379 for c5 at 3/3, yet no request presented that payment and the journal does not report it unknown
+$ hl sim --target native-jsonl --seeds 0..200 --mutation spent_unaccounted docs/snippets/payments.hl | head -n 1
+FAIL invariant=spend_accounted seed=0 target=native-jsonl profile=errors mutation=spent_unaccounted: the checkpoint after turn 3 holds _spent = 0, yet wallet tempo charged 24379 by then
+$ hl sim --target native-jsonl --seeds 0..200 --mutation credential_dropped docs/snippets/payments.hl | head -n 1
+FAIL invariant=payment_presented seed=0 target=native-jsonl profile=errors mutation=credential_dropped: wallet tempo paid 9736 for c8 at 4/5, yet no request presented that payment and the journal does not report it unknown
+```
+
+The prover's `drop_pay_guard` drops the check that a wallet's amount fits the
+room, and the cap no longer proves:
+
+```console
+$ hl prove --target native-jsonl --mutation drop_pay_guard docs/snippets/payments.hl 2>&1 | grep -m 1 -o 'invariant_preserved: [^;]*'
+invariant_preserved: invariant '_spend_within_cap' (_spent <= spend_cap) may not hold when the reply of think(context) fails to decode and the turn traps
+```
+
+### Hill climbing
+
+`climb NAME over FIELD ... { propose(base) { } measure(subject) { } }` is a
+statement that improves a state field by trial: an autoresearch loop. Each cycle
+the propose block offers candidates for the field's current value, the measure
+block scores the baseline and each candidate in paired trials, an accept rule
+decides, and a kept candidate becomes the field's value. Every evaluated
+candidate, kept or not, is a row of a ledger the harness keeps in state, so a
+run resumed after a crash, or a later turn, goes on from the ledger instead of
+starting over.
+
+The clauses:
+
+| Clause | Meaning |
+| --- | --- |
+| `over field` | the text state field being improved; the propose block gets its value as `base` |
+| `from e` | the field's value when the ledger is empty; with rows already there the climb goes on from the field |
+| `ledger field` | a `list<cycle, N>` state field; one row per evaluated candidate |
+| `end field` | a `climb_end` state field that says why the climb stopped |
+| `cycles N` | at most N cycles |
+| `candidates N` | at most N candidates per cycle (1 without the clause); one more is a breach |
+| `trials N` | paired trials per candidate: each measures the baseline, then the candidate |
+| `cost B propose P trial T` | a budget B over the costs the blocks yield, at most P per proposal and T per trial |
+| `wall W` | stop once `now()` has moved W past the climb's start |
+| `failures N` | stop after N cycles in a row keep nothing |
+| `metric m lower at most MAX`, `higher`, `within S` | a score a trial yields, in declaration order; the first decides, a later one with `within` may not get worse than S per trial |
+| `gate e` | a pure condition over the metric names that every trial must meet |
+| `accept mean by M`, `best by M`, `sign at least W`, `when (b, c, w) e` | the accept rule over the first metric: the sums of the trials beat by M per trial, the best trial beats by M, at least W paired wins, or a pure condition over the baseline's sum, the candidate's sum and the wins |
+
+Inside the blocks, `yield candidate(value, hypothesis)` offers a candidate,
+`yield score(v, ...)` gives one trial's metrics and `yield cost c` charges the
+budget. A block may run effects; the measure block's parameter is the revision
+being measured, the baseline or a candidate. A trial that yields no score, a
+value over its metric's maximum, or a candidate that fails a gate ends that
+candidate's evaluation; a baseline that fails a gate, a cost over its cap or more
+candidates than the cap end the climb with `breach`.
+
+A ledger row is `cycle(round, evaluation, hypothesis, baseline, candidate,
+baseline score, candidate score, wins, trials, cost, spent, verdict, reason,
+gate failures)` with the verdict one of `failed` `kept` `worse` `gated`
+`regressed` `cancelled`; `end` is one of `running` `cycles` `budget`
+`wall` `failures` `breach` `cancelled` `full` (the ledger has no room
+for another cycle's rows). Before each cycle the climb stops unless the budget
+still covers a whole cycle at its caps, so `spent` never passes `cost`. With
+`on cancel` a recorded cancel stops the climb between trials.
+
+The checker lowers a climb into ordinary statements over hidden state fields
+(names starting with `_climb_`), so the interpreter, the generated Rust and
+JavaScript and every proof see plain loops: `cycles x candidates x trials`
+bounds the worst case, and the prover shows the climb's counters stay in range
+and its pushes fit:
+
+```hl docs/snippets/climb.hl
+harness tune
+
+const cycles_max: u64 = 4
+const candidates_max: u64 = 2
+const trials_max: u64 = 3
+const failures_max: u64 = 3
+const cost_max: u64 = 30
+const propose_cost_max: u64 = 2
+const trial_cost_max: u64 = 1
+const nanos_max: u64 = 1000000
+const bytes_max: u64 = 100000
+const bytes_slack: u64 = 64
+const failing_max: u64 = 100
+const margin_nanos: u64 = 50
+const ledger_max: u64 = 64
+
+tool suggest(base: text) -> text effect idempotent
+tool bench(subject: text) -> u64 effect idempotent
+tool size(subject: text) -> u64 effect none
+tool failing(subject: text) -> u64 effect idempotent
+
+on cancel
+
+state {
+  config: text
+  log: list<cycle, ledger_max>
+  ended: climb_end
+}
+
+on prompt(start: text) -> text {
+  climb speed over config from start ledger log end ended
+    cycles cycles_max candidates candidates_max trials trials_max
+    cost cost_max propose propose_cost_max trial trial_cost_max
+    failures failures_max
+    metric nanos lower at most nanos_max
+    metric bytes lower at most bytes_max within bytes_slack
+    metric broken lower at most failing_max
+    gate broken == 0
+    accept mean by margin_nanos
+  {
+    propose(base) {
+      loop pick below candidates_max {
+        match suggest(base) {
+          ok(change) => { yield candidate(change, "try " ++ change) }
+          failed(_) => {}
+        }
+        yield cost 1
+      }
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(nanos) => {
+          match failing(subject) {
+            ok(count) => {
+              match size(subject) {
+                ok(bytes) => { yield score(nanos, bytes, count) }
+                failed(_) => {}
+              }
+            }
+            failed(_) => {}
+          }
+        }
+        failed(_) => {}
+      }
+      yield cost trial_cost_max
+    }
+  }
+  return config
+}
+```
+
+```console
+$ hl check docs/snippets/climb.hl | grep -E 'handler prompt: no_overflow|proved for'
+  proved handler prompt: no_overflow: 40 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 3 push(es) proved below capacity (474309 prover steps)
+docs/snippets/climb.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
+```
+
+A noisy benchmark wants a rule that counts paired wins rather than one that
+compares two numbers:
+
+```hl docs/snippets/climb_noise.hl
+harness noisy
+
+const cycles_max: u64 = 6
+const trials_max: u64 = 5
+const wins_needed: u64 = 4
+const cost_max: u64 = 16
+const propose_cost_max: u64 = 1
+const trial_cost_max: u64 = 1
+const ledger_max: u64 = 16
+const nanos_max: u64 = 60000000000
+
+tool suggest(base: text) -> text effect idempotent
+tool bench(subject: text) -> u64 effect idempotent
+
+state {
+  config: text
+  log: list<cycle, ledger_max>
+}
+
+on prompt(start: text) -> text {
+  climb speed over config from start ledger log
+    cycles cycles_max trials trials_max
+    cost cost_max propose propose_cost_max trial trial_cost_max
+    metric nanos lower at most nanos_max
+    accept sign at least wins_needed
+  {
+    propose(base) {
+      match suggest(base) {
+        ok(change) => { yield candidate(change, "try " ++ change) }
+        failed(_) => {}
+      }
+      yield cost propose_cost_max
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(nanos) => { yield score(nanos) }
+        failed(_) => {}
+      }
+      yield cost trial_cost_max
+    }
+  }
+  return config
+}
+```
+
+The simulator replays every journal it writes and checks the ledger against
+four invariants: `climb_kept_valid` (a kept row ran all its trials, failed no
+gate and beats its baseline under the accept rule, recomputed from the row's
+scores), `climb_state_follows` (each row starts where the row before it left
+the field, and the field holds what the last row left), `climb_ledger_complete`
+(no evaluated candidate is missing) and `climb_cost_balanced` (each row's
+running total is the sum of its run's costs). Mutations of the lowering show
+each one catching what it is for:
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --strict docs/snippets/climb_noise.hl
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds, strict): turns=1315 runs=5930 crashes=4615 power_losses=81 torn_writes=129 takeovers=0 fenced=0 dispatches=16194 unknown=0
+$ hl sim --target native-jsonl --seeds 0..200 --strict --mutation climb_accept_any docs/snippets/climb_noise.hl | head -n 1
+FAIL invariant=climb_kept_valid seed=39 target=native-jsonl profile=errors mutation=climb_accept_any: climb 'speed': ledger row 2 is kept although candidate 5317 does not beat baseline 1811 under the accept rule
+$ hl sim --target native-jsonl --seeds 0..200 --strict --mutation climb_revert_skipped docs/snippets/climb_noise.hl | head -n 1
+FAIL invariant=climb_state_follows seed=0 target=native-jsonl profile=errors mutation=climb_revert_skipped: climb 'speed': ledger row 1 starts from Text("eta-19"), but the row before it left Text("theta-59")
+$ hl sim --target native-jsonl --seeds 0..200 --strict --mutation climb_ledger_drops_losses docs/snippets/climb_noise.hl | head -n 1
+FAIL invariant=climb_ledger_complete seed=0 target=native-jsonl profile=errors mutation=climb_ledger_drops_losses: climb 'speed': 3 candidate(s) were evaluated but the ledger's last row is evaluation 2
+$ hl sim --target native-jsonl --seeds 0..200 --strict --mutation climb_cost_double_counted docs/snippets/climb_noise.hl | head -n 1
+FAIL invariant=climb_cost_balanced seed=0 target=native-jsonl profile=errors mutation=climb_cost_double_counted: climb 'speed': ledger row 0 says 3 was spent, but its run's rows cost 2
+```
+
+A gate keeps a faster candidate that breaks something from being kept. The row
+counts the candidate's trials that failed a gate whatever the climb then does,
+so a lowering that ignored the gate is caught:
+
+```hl docs/snippets/climb_gate.hl
+harness gated
+
+const cycles_max: u64 = 8
+const trials_max: u64 = 1
+const wins_needed: u64 = 1
+const ledger_max: u64 = 16
+const nanos_max: u64 = 60000000000
+const failing_max: u64 = 1000000
+
+tool suggest(base: text) -> text effect idempotent
+tool bench(subject: text) -> u64 effect idempotent
+tool failing(subject: text) -> u64 effect idempotent
+
+state {
+  config: text
+  log: list<cycle, ledger_max>
+}
+
+on prompt(start: text) -> text {
+  climb speed over config from start ledger log
+    cycles cycles_max trials trials_max
+    metric nanos lower at most nanos_max
+    metric broken lower at most failing_max
+    gate broken == 0
+    accept sign at least wins_needed
+  {
+    propose(base) {
+      match suggest(base) {
+        ok(change) => { yield candidate(change, "try " ++ change) }
+        failed(_) => {}
+      }
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(nanos) => {
+          match failing(subject) {
+            ok(count) => { yield score(nanos, count) }
+            failed(_) => {}
+          }
+        }
+        failed(_) => {}
+      }
+    }
+  }
+  return config
+}
+```
+
+```console
+$ hl sim --target native-jsonl --seeds 0..200 --strict --mutation climb_gate_ignored docs/snippets/climb_gate.hl | head -n 1
+FAIL invariant=climb_kept_valid seed=12 target=native-jsonl profile=async mutation=climb_gate_ignored: climb 'speed': ledger row 0 is kept although 1 candidate trial(s) failed a gate
+```
+
+`examples/autoresearch.hl` is a whole autoresearch harness: a baseline commit,
+a propose block in which Claude edits a git working tree with Bash, Read and
+Edit for up to `rounds_max` model calls and its final answer becomes the
+candidate's commit message, and a measure block that benchmarks a revision and
+counts failing tests, gated to zero. `agent/`'s `hl-climb` hosts it:
+`hl-climb run --goal FILE --cwd REPO --bench CMD --test CMD --model ID --journal DIR`,
+where the benchmark's last output line is microseconds.
+
+```console
+$ hl check examples/autoresearch.hl | grep -E 'handler prompt: no_overflow|proved for'
+  proved handler prompt: no_overflow: 38 arithmetic operation(s) proved in range; invariant_preserved: 0 invariant check(s) at returns and trap points; push_bound: 8 push(es) proved below capacity (261650 prover steps)
+examples/autoresearch.hl: proved for native-jsonl, native-sqlite, server-postgres, cloudflare, vercel
 ```
 
 ### Traps

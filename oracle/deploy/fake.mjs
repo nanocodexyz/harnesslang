@@ -1,8 +1,7 @@
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
+import { SourceTextModule } from "node:vm";
 import { join, dirname, normalize } from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, word, index, words) => (word.startsWith("--") ? [...pairs, [word.slice(2), words[index + 1]]] : pairs), []));
@@ -13,6 +12,7 @@ const EPOCH_MS = Date.parse("2026-11-14T00:00:00Z");
 const BODY_BYTES_MAX = 200 * 1024 * 1024;
 const LATENCY_MS = Number(args["latency-ms"] ?? 0);
 const UNDECLARED_BODY = new Set(["worker-tail-logs-start-tail"]);
+const AUTH_SECRET = "HL_AUTH_TOKEN";
 
 const specs = {
   cloudflare: JSON.parse(readFileSync(args["cloudflare-spec"], "utf8")),
@@ -297,27 +297,23 @@ function importsOf(text) {
   return found;
 }
 
+if (typeof SourceTextModule !== "function") throw new Error("run the fake with node --experimental-vm-modules: it parses every uploaded module in process");
+
 function buildCheck(files) {
   const problems = [];
   const names = new Set(files.map((file) => file.path));
-  const directory = mkdtempSync(join(tmpdir(), "hl-fake-build-"));
-  try {
-    for (const file of files) {
-      const path = join(directory, file.path);
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, file.bytes);
+  for (const file of files.filter((file) => /\.m?js$/.test(file.path))) {
+    const text = file.bytes.toString();
+    for (const specifier of importsOf(text)) {
+      if (!specifier.startsWith(".")) continue;
+      const resolved = normalize(join(dirname(file.path), specifier));
+      if (!names.has(resolved)) problems.push(file.path + " imports " + specifier + ", which the upload lacks");
     }
-    for (const file of files.filter((file) => /\.m?js$/.test(file.path))) {
-      for (const specifier of importsOf(file.bytes.toString())) {
-        if (!specifier.startsWith(".")) continue;
-        const resolved = normalize(join(dirname(file.path), specifier));
-        if (!names.has(resolved)) problems.push(file.path + " imports " + specifier + ", which the upload lacks");
-      }
-      const checked = spawnSync(process.execPath, ["--check", join(directory, file.path)], { encoding: "utf8" });
-      if (checked.status !== 0) problems.push(file.path + " does not parse: " + checked.stderr.split("\n").find((line) => /Error/.test(line)));
+    try {
+      new SourceTextModule(text, { identifier: file.path });
+    } catch (error) {
+      problems.push(file.path + " does not parse: " + error.name + ": " + error.message);
     }
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
   }
   return problems;
 }
@@ -508,6 +504,8 @@ function projectValue(value) {
   return out;
 }
 
+const BUILD_STEPS = 2;
+
 function advance(deployment) {
   const steps = ["QUEUED", "BUILDING"];
   const index = steps.indexOf(deployment.readyState);
@@ -545,7 +543,8 @@ function handleVercel(route, request, body, url, raw) {
     }
     case "createProject": {
       if (project(body.json.name)) return vercelError(409, "conflict", "Project already exists");
-      const created = { id: "prj_" + next(), name: body.json.name, framework: body.json.framework, createdAt: now(), env: [], events: [] };
+      const env = (body.json.environmentVariables ?? []).map((variable) => ({ id: "env_" + next(), key: variable.key, value: variable.value, type: variable.type ?? "encrypted", target: [variable.target].flat(), createdAt: now() }));
+      const created = { id: "prj_" + next(), name: body.json.name, framework: body.json.framework, createdAt: now(), env, events: [] };
       vercel.projects.set(created.name, created);
       return { status: 200, value: projectValue(created) };
     }
@@ -599,6 +598,10 @@ function handleVercel(route, request, body, url, raw) {
       if (!deployment) return vercelError(404, "not_found", "Deployment not found");
       const lines = ["Cloning " + deployment.files.length + " files", "Running \"npm run build\"", "Build completed"];
       const events = lines.map((text, index) => ({ type: "stdout", created: deployment.createdAt + index, payload: { id: deployment.id + "-" + index, date: deployment.createdAt + index, created: deployment.createdAt + index, deploymentId: deployment.id, serial: String(index), text, info: { type: "build", name: "bld_" + deployment.id } } }));
+      if (url.searchParams.get("follow") === "1") {
+        for (let step = 0; step < BUILD_STEPS && ["QUEUED", "BUILDING"].includes(deployment.readyState); step += 1) advance(deployment);
+        return { status: 200, stream: events.map((event) => JSON.stringify(event)), type: "application/stream+json" };
+      }
       return { status: 200, value: events.slice(-Number(url.searchParams.get("limit") ?? events.length)) };
     }
     case "getRuntimeLogs": {
@@ -660,21 +663,23 @@ function fakeControl(request, url, raw) {
     const script = cloudflare.scripts.get(parts[2]);
     if (!script) return { exists: false };
     if (parts[3] === "invoke") {
-      script.events.push({ at: now(), level: "log", message: raw.toString() || "invoked" });
+      script.events.push({ at: now(), level: url.searchParams.get("level") ?? "log", message: raw.toString() || "invoked" });
       return { events: script.events.length };
     }
     const version = serving(script);
-    return { exists: true, digest: version.digest, version: version.id, versions: script.versions.length, secrets: version.bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort(), migration_tag: script.migration_tag };
+    const auth = version.bindings.find((binding) => binding.type === "secret_text" && binding.name === AUTH_SECRET);
+    return { exists: true, digest: version.digest, version: version.id, versions: script.versions.length, secrets: version.bindings.filter((binding) => binding.type === "secret_text").map((binding) => binding.name).sort(), migration_tag: script.migration_tag, auth_sha256: auth ? sha256(auth.text) : null };
   }
   if (parts[1] === "vercel") {
     const owner = project(parts[2]);
     if (!owner) return { exists: false };
     if (parts[3] === "invoke") {
-      owner.events.push({ at: now(), level: "info", message: raw.toString() || "invoked" });
+      owner.events.push({ at: now(), level: url.searchParams.get("level") ?? "info", message: raw.toString() || "invoked" });
       return { events: owner.events.length };
     }
     const deployment = owner.production ? vercel.deployments.get(owner.production) : null;
-    return { exists: true, digest: deployment?.digest ?? null, version: owner.production ?? null, versions: [...vercel.deployments.values()].filter((other) => other.projectId === owner.id).length, secrets: owner.env.filter((variable) => variable.type !== "plain").map((variable) => variable.key).sort() };
+    const auth = owner.env.find((variable) => variable.key === AUTH_SECRET && variable.type !== "plain");
+    return { exists: true, digest: deployment?.digest ?? null, version: owner.production ?? null, versions: [...vercel.deployments.values()].filter((other) => other.projectId === owner.id).length, secrets: owner.env.filter((variable) => variable.type !== "plain").map((variable) => variable.key).sort(), auth_sha256: auth ? sha256(auth.value) : null };
   }
   return { error: "unknown control " + url.pathname };
 }

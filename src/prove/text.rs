@@ -104,6 +104,7 @@ impl<'a> Names<'a> {
                 let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
                 format!("{}({})", op.name(), args.join(", "))
             }
+            Expr::Outcome { original, .. } => format!("paid {}", self.expr(original)),
             Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
             Expr::ListingNotice(listing) => {
                 format!("notice of {}", self.program.listings[*listing].name)

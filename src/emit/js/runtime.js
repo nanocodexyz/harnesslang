@@ -1431,7 +1431,12 @@ function inputFits(params, input) {
   return extra === undefined ? null : `'${extra}' is not a parameter`;
 }
 
+function walletRefusal(wallet) {
+  return `input of ${wallet}: ${wallet} is the harness's wallet; only a paid call's payment reaches it`;
+}
+
 function toolInput(tool, raw) {
+  if (PROGRAM.wallet === tool) return { kind: "invalid", error: walletRefusal(tool) };
   const params = inputParams(tool);
   if (params === null) return { kind: "untyped" };
   let input = null;
@@ -1528,6 +1533,26 @@ function text_before(subject, separator) {
 function text_after(subject, separator) {
   const at = subject.indexOf(separator);
   return at < 0 ? "" : subject.slice(at + separator.length);
+}
+
+function text__with_payment(input, payment) {
+  let decoded = null;
+  try {
+    decoded = decodeJson(input);
+  } catch (error) {
+    if (!(error instanceof DecodeError)) throw error;
+    return input;
+  }
+  if (!isObject(decoded)) return input;
+  decoded.payment = payment;
+  return encodeJson(decoded);
+}
+
+function paidOutcome(tag, value, reason, original) {
+  if (tag === 0n) return variant(0, [value()]);
+  if (tag === 1n) return variant(1, [reason()]);
+  if (tag === 2n) return variant(2, []);
+  return original();
 }
 
 function text_trim(subject) {

@@ -33,6 +33,16 @@ pub const SECRET_BYTES_MAX: usize = 5 * 1024;
 pub const LOG_EVENTS_DEFAULT: u64 = 50;
 pub const LOG_EVENTS_MAX: u64 = 2000;
 pub const LOG_MINUTES_DEFAULT: u64 = 60;
+pub const AUTH_VARIABLE: &str = "HL_AUTH_TOKEN";
+pub const AUTH_TOKEN_BYTES: usize = 32;
+pub const AUTH_FILE: &str = "auth-token";
+const AUTH_FILE_MODE: u32 = 0o600;
+const RANDOM_SOURCE: &str = "/dev/urandom";
+pub const RECORD_FILE: &str = "deploy.json";
+pub const MONITOR_RECENT_SHOWN: usize = 10;
+pub const MONITOR_FOLLOW_SECONDS: u64 = 5;
+const PER_MILLE: usize = 1000;
+const PER_MILLE_PER_PERCENT: usize = 10;
 const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
 
@@ -65,10 +75,11 @@ pub enum Plant {
     RollbackCurrent,
     EnvironmentTypeUnknown,
     FingerprintPartial,
+    AuthUnchecked,
 }
 
 impl Plant {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         (Self::None, "none"),
         (Self::MigrationEveryDeploy, "migration_every_deploy"),
         (Self::SecretsDropped, "secrets_dropped"),
@@ -76,6 +87,7 @@ impl Plant {
         (Self::RollbackCurrent, "rollback_current"),
         (Self::EnvironmentTypeUnknown, "environment_type_unknown"),
         (Self::FingerprintPartial, "fingerprint_partial"),
+        (Self::AuthUnchecked, "auth_unchecked"),
     ];
 
     fn parse(name: &str) -> Option<Self> {
@@ -116,6 +128,10 @@ pub enum Action {
     },
     Secrets(Secret),
     Destroy,
+    Monitor {
+        events: u64,
+        minutes: u64,
+    },
 }
 
 pub struct Context<'a> {
@@ -142,7 +158,7 @@ impl Context<'_> {
 
 pub fn usage() -> String {
     format!(
-        "hl deploy --target {targets} [--name NAME] [--var KEY=VALUE]... [--out DIR] (FILE | --bundle DIR --name NAME)\n       hl status|logs|rollback|destroy|secrets --target {targets} (--name NAME | FILE) ...\n       hl logs ... [--follow] [--events N] [--minutes M]\n       hl rollback ... [--to VERSION]\n       hl secrets set KEY|list|delete KEY ... (set reads the value from stdin)\n       hl destroy ... --yes\n       hl deploy --endpoints\n       deploy plants: --plant {plants}",
+        "hl deploy --target {targets} [--name NAME] [--var KEY=VALUE]... [--out DIR] (FILE | --bundle DIR --name NAME)\n       hl status|monitor|logs|rollback|destroy|secrets --target {targets} (--name NAME | FILE) ...\n       hl logs ... [--follow] [--events N] [--minutes M]\n       hl monitor ... [--events N] [--minutes M]\n       hl rollback ... [--to VERSION]\n       hl secrets set KEY|list|delete KEY ... (set reads the value from stdin)\n       hl destroy ... --yes\n       hl deploy --endpoints\n       deploy plants: --plant {plants}",
         targets = Target::names(),
         plants = Plant::names()
     )
@@ -370,7 +386,7 @@ fn action(
         "deploy" => {
             let bundle = match (&parsed.bundle, program) {
                 (Some(directory), _) => bundle::directory(std::path::Path::new(directory), target)?,
-                (None, Some(program)) => bundle::emitted(&program, target)?,
+                (None, Some(program)) => bundle::emitted(&program, target, parsed.plant)?,
                 (None, None) => return Err("hl deploy needs FILE or --bundle DIR".to_owned()),
             };
             plain(Action::Deploy {
@@ -379,6 +395,10 @@ fn action(
             })
         }
         "status" => plain(Action::Status),
+        "monitor" => plain(Action::Monitor {
+            events: parsed.events,
+            minutes: parsed.minutes,
+        }),
         "logs" => plain(Action::Logs {
             follow: parsed.follow,
             events: parsed.events,
@@ -473,10 +493,74 @@ pub fn record(
             json::Value::number(context.environment.now_ms),
         ),
     ]);
-    let path = context.out.join("deploy.json");
+    let path = context.out.join(RECORD_FILE);
     std::fs::write(&path, format!("{}\n", record.encode()))
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     context.say(&format!("  wrote {}", context.out.display()));
+    Ok(())
+}
+
+pub struct Seen {
+    pub at: u64,
+    pub line: String,
+    pub failed: bool,
+}
+
+pub fn traffic(context: &Context, minutes: u64, seen: &[Seen]) {
+    let failed = seen.iter().filter(|event| event.failed).count();
+    let rate = if seen.is_empty() {
+        "no traffic".to_owned()
+    } else {
+        let per_mille = failed * PER_MILLE / seen.len();
+        format!(
+            "{}.{}% failed",
+            per_mille / PER_MILLE_PER_PERCENT,
+            per_mille % PER_MILLE_PER_PERCENT
+        )
+    };
+    context.say(&format!(
+        "  last {minutes} minutes: {} events, {failed} errors ({rate})",
+        seen.len()
+    ));
+    let shown = seen.len().min(MONITOR_RECENT_SHOWN);
+    context.say(&format!("  recent {shown}:"));
+    for event in &seen[seen.len() - shown..] {
+        let mark = if event.failed { "!" } else { " " };
+        context.say(&format!("  {mark} {}", event.line));
+    }
+}
+
+pub fn first_from(context: &Context) -> bool {
+    !context.out.join(RECORD_FILE).exists()
+}
+
+pub fn auth_token() -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = [0u8; AUTH_TOKEN_BYTES];
+    std::fs::File::open(RANDOM_SOURCE)
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|error| format!("cannot read {RANDOM_SOURCE}: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub fn save_auth_token(context: &Context, token: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(&context.out)
+        .map_err(|error| format!("cannot create {}: {error}", context.out.display()))?;
+    let path = context.out.join(AUTH_FILE);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(AUTH_FILE_MODE)
+        .open(&path)
+        .and_then(|mut file| file.write_all(format!("{token}\n").as_bytes()))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    context.say(&format!(
+        "  auth: every route needs Authorization: Bearer <the token in {}>, also the {AUTH_VARIABLE} secret",
+        path.display()
+    ));
     Ok(())
 }
 
@@ -525,33 +609,3 @@ pub fn iso_time(ms: u64) -> String {
 }
 
 pub const REQUESTS_IN_FLIGHT_MAX: usize = 6;
-
-pub fn join<A: Send, B: Send>(
-    left: impl FnOnce() -> A + Send,
-    right: impl FnOnce() -> B + Send,
-) -> (A, B) {
-    std::thread::scope(|scope| {
-        let handle = scope.spawn(right);
-        let left = left();
-        (left, handle.join().expect("a request thread finishes"))
-    })
-}
-
-pub fn parallel<T: Sync>(
-    items: &[T],
-    run: impl Fn(&T) -> Result<(), String> + Sync,
-) -> Result<(), String> {
-    for batch in items.chunks(REQUESTS_IN_FLIGHT_MAX) {
-        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = batch.iter().map(|item| scope.spawn(|| run(item))).collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("a request thread finishes"))
-                .collect()
-        });
-        for result in results {
-            result?;
-        }
-    }
-    Ok(())
-}

@@ -306,7 +306,11 @@ fn ask_recover(
     seq: u64,
     call: &crate::run::session::Call,
 ) -> Recovered {
-    let returns = Type::Text;
+    let returns = if program.is_wallet(&call.tool) {
+        Type::U64
+    } else {
+        Type::Text
+    };
     let recovered = world.recover(&ToolRequest {
         turn,
         seq,

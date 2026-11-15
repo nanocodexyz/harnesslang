@@ -314,6 +314,9 @@ pub enum Input {
 }
 
 pub fn tool_input(program: &Program, tool: &str, raw: &str) -> Input {
+    if program.is_wallet(tool) {
+        return Input::Invalid(ir::wallet_refusal(tool));
+    }
     let (Some(params), Some(defaults)) = (program.input_params(tool), program.input_defaults(tool))
     else {
         return Input::Untyped;

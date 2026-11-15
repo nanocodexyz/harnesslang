@@ -182,6 +182,74 @@ pub struct Program {
     pub blobs: Option<Blobs>,
     pub idle: Option<Idle>,
     pub forked: Option<Handler>,
+    pub wallet: Option<Wallet>,
+    pub climbs: Vec<Climb>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wallet {
+    pub name: String,
+    pub spend: Bound,
+    pub charge: Bound,
+    pub payments: Bound,
+    pub tool: ToolId,
+    pub spent: FieldId,
+}
+
+pub const PAYMENT_REQUIRED_PREFIX: &str = "payment required: ";
+pub const PAYMENT_PARAM: &str = "payment";
+pub const WALLET_REQUIRED_PARAM: &str = "required";
+pub const WALLET_MAX_PARAM: &str = "max";
+pub const SPENT_FIELD: &str = "_spent";
+pub const PAID_TAG_FIELD: &str = "_paid_tag";
+pub const PAID_MORE_FIELD: &str = "_paid_more";
+pub const PAID_REF_FIELD: &str = "_paid_ref";
+pub const PAID_TEXT_FIELD: &str = "_paid_text";
+pub const PAID_VALUE_FIELD: &str = "_paid_value_";
+pub const SPEND_INVARIANT: &str = "_spend_within_cap";
+pub const SPENT_BUILTIN: &str = "spent";
+pub const PAYMENT_OVERCHARGED: &str = "the wallet charged more than the payment's max";
+pub const OUTCOME_TAG_UNKNOWN: u64 = 2;
+
+pub fn wallet_refusal(wallet: &str) -> String {
+    format!(
+        "input of {wallet}: {wallet} is the harness's wallet; only a paid call's payment reaches it"
+    )
+}
+
+pub fn with_payment(input: &str, payment: &str) -> String {
+    match crate::run::json::decode(input) {
+        Ok(crate::run::json::Json::Object(mut fields)) => {
+            fields.insert(
+                PAYMENT_PARAM.to_owned(),
+                crate::run::json::Json::String(payment.to_owned()),
+            );
+            crate::run::json::Json::Object(fields).encode()
+        }
+        _ => input.to_owned(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Climb {
+    pub name: String,
+    pub over: FieldId,
+    pub ledger: FieldId,
+    pub evaluated: FieldId,
+    pub cycles: u64,
+    pub candidates: u64,
+    pub trials: u64,
+    pub budget: Option<u64>,
+    pub higher: bool,
+    pub rule: ClimbRule,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClimbRule {
+    Mean(u64),
+    Sign(u64),
+    Best(u64),
+    When,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -288,6 +356,20 @@ impl Program {
             }
             _ => Interrupts::default(),
         }
+    }
+
+    pub fn paid(&self, tool: &str) -> bool {
+        if let Some((_, declared)) = self.tool(tool) {
+            return declared.paid;
+        }
+        self.listed(tool)
+            .is_some_and(|(id, _)| self.listings[id].paid)
+    }
+
+    pub fn is_wallet(&self, tool: &str) -> bool {
+        self.wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.name == tool)
     }
 
     pub fn recoverable(&self, tool: &str) -> bool {
@@ -579,6 +661,7 @@ pub struct Tool {
     pub spawn: Option<Spawn>,
     pub fork: Option<ForkAt>,
     pub finds: Option<ListingId>,
+    pub paid: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -671,6 +754,7 @@ pub struct Listing {
     pub params: Vec<Field>,
     pub defaults: Vec<Option<Literal>>,
     pub effect: EffectClass,
+    pub paid: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1171,6 +1255,15 @@ fn expr_cuts(value: &Expr, constants: &[Constant], out: &mut Vec<u64>) {
         Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => fields
             .iter()
             .for_each(|field| expr_cuts(field, constants, out)),
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .for_each(|part| expr_cuts(part, constants, out)),
         Expr::Binary { left, right, .. }
         | Expr::With {
             list: left,
@@ -1347,6 +1440,13 @@ pub enum Expr {
     },
     ListingNotice(ListingId),
     Cancelled,
+    Outcome {
+        ty: Type,
+        tag: Box<Expr>,
+        value: Box<Expr>,
+        reason: Box<Expr>,
+        original: Box<Expr>,
+    },
 }
 
 pub const UTF16_UNITS_PER_TOKEN: u64 = 4;
@@ -1415,6 +1515,7 @@ pub enum TextOp {
     Before,
     After,
     Trim,
+    WithPayment,
 }
 
 pub const TEXT_WHITESPACE: [char; 5] = [' ', '\t', '\n', '\x0c', '\r'];
@@ -1428,12 +1529,13 @@ impl TextOp {
             Self::Before => "before",
             Self::After => "after",
             Self::Trim => "trim",
+            Self::WithPayment => "_with_payment",
         }
     }
 
     pub const fn arity(self) -> usize {
         match self {
-            Self::Contains | Self::Before | Self::After => 2,
+            Self::Contains | Self::Before | Self::After | Self::WithPayment => 2,
             Self::Trim => 1,
         }
     }
@@ -1441,7 +1543,7 @@ impl TextOp {
     pub fn result(self) -> Type {
         match self {
             Self::Contains => Type::Bool,
-            Self::Before | Self::After | Self::Trim => Type::Text,
+            Self::Before | Self::After | Self::Trim | Self::WithPayment => Type::Text,
         }
     }
 
@@ -1470,6 +1572,7 @@ pub fn text_op(op: TextOp, subject: &str, separator: Option<&str>) -> TextValue 
                 .map_or("", |(_, after)| after)
                 .to_owned(),
         ),
+        (TextOp::WithPayment, Some(payment)) => TextValue::Text(with_payment(subject, payment)),
         (TextOp::Trim, None) => {
             TextValue::Text(subject.trim_matches(TEXT_WHITESPACE.as_slice()).to_owned())
         }

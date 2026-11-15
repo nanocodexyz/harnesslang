@@ -22,6 +22,18 @@ const MODEL_PERCENT: u64 = 80;
 const PROVABLE_PERCENT: u64 = 40;
 const UNDERSCORE_NUMBER_PERCENT: u64 = 20;
 const ARITHMETIC_VALUES: [u64; 6] = [0, 1, 7, 1 << 32, u64::MAX - 1, u64::MAX];
+const WAIT_PERCENT: u64 = 30;
+const MILLISECONDS_PER_SECOND: u64 = 1000;
+const WAIT_MS_VALUES: [u64; 4] = [
+    0,
+    1,
+    MILLISECONDS_PER_SECOND,
+    crate::target::VERCEL_FUNCTION_DURATION_SECONDS_MAX * MILLISECONDS_PER_SECOND,
+];
+const CUT_PERCENT: u64 = 30;
+const CUT_TOKENS_VALUES: [u64; 5] = [0, 1, 2, 10, 25000];
+const DEFAULT_PERCENT: u64 = 30;
+const DISPATCH_HOOKS_PERCENT: u64 = 25;
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -128,6 +140,7 @@ pub fn generate(rng: &mut Rng) -> Decls {
     }
     tools(rng, &mut decls);
     fields(rng, &mut decls);
+    decls.dispatch_hooks = chance(rng, DISPATCH_HOOKS_PERCENT);
     decls
 }
 
@@ -154,6 +167,14 @@ fn constants(rng: &mut Rng, decls: &mut Decls) {
     for index in 0..rng.below(ARITHMETIC_CONSTANTS_MAX + 1) {
         let value = ARITHMETIC_VALUES[rng.pick(ARITHMETIC_VALUES.len())];
         constant(rng, decls, format!("k{index}"), value);
+    }
+    if chance(rng, WAIT_PERCENT) {
+        let value = WAIT_MS_VALUES[rng.pick(WAIT_MS_VALUES.len())];
+        decls.wait_ms = Some(constant(rng, decls, "wait_ms".to_owned(), value));
+    }
+    if chance(rng, CUT_PERCENT) {
+        let value = CUT_TOKENS_VALUES[rng.pick(CUT_TOKENS_VALUES.len())];
+        decls.cut_tokens = Some(constant(rng, decls, "tokens_max".to_owned(), value));
     }
 }
 
@@ -193,10 +214,12 @@ fn builtin_sums(decls: &mut Decls) {
 fn tools(rng: &mut Rng, decls: &mut Decls) {
     for index in 0..rng.below(TOOLS_MAX + 1) {
         let params = rng.below(PARAMS_PER_TOOL_MAX + 1);
-        let params = (0..params)
+        let params: Vec<Ty> = (0..params)
             .map(|_| field_type(rng, decls, decls.sums.len()))
             .collect();
         let name = fresh(rng, &mut decls.names, format!("t{index}"));
+        let defaults = default_values(rng, decls, &params);
+        decls.defaults.push(defaults);
         let tool = ToolDef {
             name,
             params,
@@ -205,6 +228,26 @@ fn tools(rng: &mut Rng, decls: &mut Decls) {
         };
         decls.tools.push(tool);
     }
+}
+
+fn default_values(rng: &mut Rng, decls: &Decls, params: &[Ty]) -> Vec<Option<String>> {
+    let mut defaults = vec![None; params.len()];
+    for index in 0..params.len() {
+        if !chance(rng, DEFAULT_PERCENT) {
+            continue;
+        }
+        defaults[index] = match &params[index] {
+            Ty::U64 => Some(decls.constants[rng.pick(decls.constants.len())].0.clone()),
+            Ty::Bool => Some(["true", "false"][rng.pick(2)].to_owned()),
+            Ty::Text => {
+                let literal = crate::generate::expr::TEXT_LITERALS
+                    [rng.pick(crate::generate::expr::TEXT_LITERALS.len())];
+                Some(crate::generate::expr::text_literal(literal))
+            }
+            _ => None,
+        };
+    }
+    defaults
 }
 
 fn fields(rng: &mut Rng, decls: &mut Decls) {
@@ -248,12 +291,16 @@ pub fn render(rng: &mut Rng, decls: &Decls) -> Vec<String> {
             variants.join(" | ")
         )]);
     }
-    for tool in &decls.tools {
+    for (tool, defaults) in decls.tools.iter().zip(&decls.defaults) {
         let params: Vec<String> = tool
             .params
             .iter()
+            .zip(defaults)
             .enumerate()
-            .map(|(index, ty)| format!("a{index}: {}", decls.render_type(ty)))
+            .map(|(index, (ty, default))| match default {
+                Some(value) => format!("a{index}: {} = {value}", decls.render_type(ty)),
+                None => format!("a{index}: {}", decls.render_type(ty)),
+            })
             .collect();
         items.push(vec![format!(
             "tool {}({}) -> {} effect {}",

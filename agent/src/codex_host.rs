@@ -224,6 +224,7 @@ fn output_of(ran: tools::Ran) -> codex_harness::Output {
             codex_harness::Output::Failed("this host returns no images".to_owned())
         }
         tools::Ran::Failed(text) => codex_harness::Output::Failed(text),
+        tools::Ran::Units(units) => codex_harness::Output::Ok(Json::Number(units)),
     }
 }
 

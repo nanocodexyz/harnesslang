@@ -12,6 +12,9 @@ use crate::syntax::ast;
 
 mod forked;
 mod hooks;
+mod paid;
+
+pub use paid::value_field_name;
 
 pub use forked::forked;
 
@@ -28,6 +31,7 @@ struct Checker<'a> {
     side: Option<String>,
     forked: bool,
     used: std::collections::BTreeSet<ast::HookKind>,
+    paid_sites: std::collections::BTreeSet<usize>,
 }
 
 pub fn check(
@@ -49,6 +53,7 @@ pub fn check(
         side: definition.side.then(|| definition.name.text.clone()),
         forked: false,
         used: std::collections::BTreeSet::new(),
+        paid_sites: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::new();
     for param in &definition.params {
@@ -134,6 +139,7 @@ pub fn invariant(
         side: None,
         forked: false,
         used: std::collections::BTreeSet::new(),
+        paid_sites: std::collections::BTreeSet::new(),
     };
     let condition = checker.condition(
         &definition.condition,
@@ -171,7 +177,7 @@ impl Checker<'_> {
     }
 
     fn declare(&mut self, name: &ast::Name, ty: Type) -> Checked<LocalId> {
-        if name.text.starts_with(WILDCARD) {
+        if name.text.starts_with(WILDCARD) && !name.text.starts_with(crate::check::climb::PREFIX) {
             return error(
                 name.at,
                 format!("'{}': names starting with '_' are reserved", name.text),
@@ -538,8 +544,14 @@ impl Checker<'_> {
                 Ok(true)
             }
             ast::Stmt::Inlined {
-                arguments, body, ..
-            } => self.inlined(arguments, body, out),
+                arguments,
+                body,
+                sees_caller,
+                ..
+            } => self.inlined(arguments, body, *sees_caller, out),
+            ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
+                panic!("climbs are expanded before handlers are lowered")
+            }
             ast::Stmt::Call { callee, .. } if callee.text == DENY || callee.text == ALLOW => error(
                 callee.at,
                 format!(
@@ -560,8 +572,12 @@ impl Checker<'_> {
         &mut self,
         arguments: &[(ast::Param, ast::Expr)],
         body: &ast::Block,
+        sees_caller: bool,
         out: &mut Vec<Stmt>,
     ) -> Checked<bool> {
+        if sees_caller {
+            return self.scoped_block(arguments, body, out);
+        }
         let mut parameters = Vec::with_capacity(arguments.len());
         for (param, argument) in arguments {
             let wanted = resolve(self.program, self.globals, &param.ty)?;
@@ -582,6 +598,40 @@ impl Checker<'_> {
         let checked = self.block(body);
         let own = std::mem::replace(&mut self.scopes, caller);
         assert_eq!(own.len(), 1, "a fn body leaves only its parameters' scope");
+        let (statements, returned) = checked?;
+        out.extend(statements);
+        Ok(returned)
+    }
+
+    fn scoped_block(
+        &mut self,
+        arguments: &[(ast::Param, ast::Expr)],
+        body: &ast::Block,
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let mut values = Vec::with_capacity(arguments.len());
+        for (param, argument) in arguments {
+            let wanted = resolve(self.program, self.globals, &param.ty)?;
+            let at = argument.at();
+            let (value, ty) = self.expr(argument, Some(&wanted), out)?;
+            self.expect(at, &wanted, &ty)?;
+            values.push((param, value, ty));
+        }
+        let depth = self.scopes.len();
+        self.scopes.push(Vec::new());
+        let mut declared = Ok(());
+        for (param, value, ty) in values {
+            match self.declare(&param.name, ty) {
+                Ok(local) => out.push(Stmt::Let { local, value }),
+                Err(failure) => {
+                    declared = Err(failure);
+                    break;
+                }
+            }
+        }
+        let checked = declared.and_then(|()| self.block(body));
+        self.scopes.pop().expect("the scoped block's own scope is popped");
+        assert_eq!(self.scopes.len(), depth, "a scoped block leaves its caller's scopes");
         let (statements, returned) = checked?;
         out.extend(statements);
         Ok(returned)
@@ -782,7 +832,10 @@ impl Checker<'_> {
                 Stmt::Finish { .. } => Some("return"),
                 Stmt::Parallel(_) => Some("run another parallel for"),
                 Stmt::Take { .. } => Some("read events: read them before or after the batch"),
-                Stmt::Effect { site, .. } if self.sites[*site].kind == SiteKind::Dispatch => {
+                Stmt::Effect { site, .. }
+                    if self.sites[*site].kind == SiteKind::Dispatch
+                        && !self.paid_sites.contains(site) =>
+                {
                     Some("dispatch again")
                 }
                 Stmt::If {
@@ -1116,6 +1169,25 @@ impl Checker<'_> {
             result: local,
         });
         (Expr::Local(local), result)
+    }
+
+    fn dispatch_site(
+        &mut self,
+        result: Type,
+        args: Vec<Expr>,
+        out: &mut Vec<Stmt>,
+    ) -> (Expr, Type) {
+        if self.dispatch_pays() {
+            return self.paid_site(
+                SiteKind::Dispatch,
+                SiteClass::Dispatched,
+                result,
+                args,
+                paid::Paid::Dispatch,
+                out,
+            );
+        }
+        self.site(SiteKind::Dispatch, SiteClass::Dispatched, result, args, out)
     }
 
     fn listing_read(
@@ -1474,9 +1546,24 @@ impl Checker<'_> {
             if tool.spawn.is_some() {
                 self.plain_spawn(callee)?;
             }
-            let wanted: Vec<Type> = tool.params.iter().map(|param| param.ty.clone()).collect();
-            let args = self.args(at, &format!("tool '{}'", callee.text), args, &wanted, out)?;
+            let mut wanted: Vec<Type> = tool.params.iter().map(|param| param.ty.clone()).collect();
+            if tool.paid {
+                wanted.pop();
+            }
+            let mut args = self.args(at, &format!("tool '{}'", callee.text), args, &wanted, out)?;
             let inner = Box::new(tool.returns.clone());
+            if tool.paid {
+                let payment = args.len();
+                args.push(Expr::Text(String::new()));
+                return Ok(self.paid_site(
+                    SiteKind::Tool(tool_id),
+                    SiteClass::Fixed(tool.effect),
+                    Type::Maybe(inner),
+                    args,
+                    paid::Paid::Tool { payment },
+                    out,
+                ));
+            }
             let result = if tool.effect.may_be_unknown() {
                 Type::Maybe(inner)
             } else {
@@ -1577,11 +1664,15 @@ impl Checker<'_> {
                 }
             }
             "truncate_middle" => self.truncate(at, args, out),
+            ir::SPENT_BUILTIN if self.program.wallet.is_some() => {
+                self.args(at, ir::SPENT_BUILTIN, args, &[], out)?;
+                Ok((Expr::Field(self.globals.fields[ir::SPENT_FIELD]), Type::U64))
+            }
             "dispatch" => {
                 self.plain_dispatch(at)?;
                 let args = self.args(at, "dispatch", args, &[Type::Sum(ir::CALL)], out)?;
                 let result = self.program.dispatch_result();
-                Ok(self.site(SiteKind::Dispatch, SiteClass::Dispatched, result, args, out))
+                Ok(self.dispatch_site(result, args, out))
             }
             "wait" => self.wait(at, args, false, out),
             "hold" => {
@@ -1961,6 +2052,9 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
         | ast::Stmt::Inlined {
             function: callee, ..
         } => format!("a call of fn '{}'", callee.text),
+        ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
+            panic!("climbs are expanded before handlers are lowered")
+        }
     };
     error(at, format!("{shape}: found {found}"))
 }
@@ -1969,7 +2063,8 @@ pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
     match statement {
         ast::Stmt::Let { name, .. } | ast::Stmt::Assign { name, .. } => name.at,
         ast::Stmt::Call { callee, .. } => callee.at,
-        ast::Stmt::Inlined { at, .. } => *at,
+        ast::Stmt::Inlined { at, .. } | ast::Stmt::Yield { at, .. } => *at,
+        ast::Stmt::Climb(climb) => climb.at,
         ast::Stmt::Push { at, .. }
         | ast::Stmt::Clear { at, .. }
         | ast::Stmt::Keep { at, .. }

@@ -1273,10 +1273,11 @@ function assumeNestedFailed(log, ids) {
 
 async function recoverLoaded(world, turn, seq, call) {
   if (!recoverable(call.tool)) return { kind: "unknown" };
-  const recovered = await world.recover({ turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns: "text", admitted: null, job: false, interrupts: interruptsOf("dispatch", call.tool) });
+  const returns = PROGRAM.wallet === call.tool ? "u64" : "text";
+  const recovered = await world.recover({ turn, seq, tool: call.tool, effect: call.effect, input: call.input, returns, admitted: null, job: false, interrupts: interruptsOf("dispatch", call.tool) });
   if (recovered.kind !== "reply") return recovered;
   if (jobStarted(recovered.output) !== null && jobsOf(call.tool) !== null) return recovered;
-  return { kind: "reply", output: checkedOutput(call.tool, "text", recovered.output) };
+  return { kind: "reply", output: checkedOutput(call.tool, returns, recovered.output) };
 }
 
 async function recoverAtLoad(world, turn, log, mutation) {

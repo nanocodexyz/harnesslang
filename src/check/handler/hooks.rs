@@ -448,13 +448,7 @@ impl Checker<'_> {
         arms: &[ast::Arm],
         out: &mut Vec<Stmt>,
     ) -> Checked<bool> {
-        let (result, ty) = self.site(
-            SiteKind::Dispatch,
-            SiteClass::Dispatched,
-            outcome_type(),
-            vec![sent],
-            out,
-        );
+        let (result, ty) = self.dispatch_site(outcome_type(), vec![sent], out);
         let spawned = Some(Spawned::Dispatched(original));
         let Some(hook) = self.globals.hooks.get(&HookKind::AfterTool) else {
             return self.outcome(at, (result, ty), spawned, arms, out);
@@ -742,6 +736,9 @@ fn decides(statement: &ast::Stmt) -> Checked<bool> {
             Ok(false)
         }
         ast::Stmt::Inlined { body, .. } => any(&body.statements),
+        ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
+            panic!("climbs are expanded before hooks are read")
+        }
         ast::Stmt::Let { .. }
         | ast::Stmt::Assign { .. }
         | ast::Stmt::Push { .. }

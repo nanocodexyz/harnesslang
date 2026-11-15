@@ -4,6 +4,7 @@ mod codex;
 mod codex_host;
 mod jobs;
 mod json;
+mod mpp;
 mod openai;
 mod stream;
 mod tools;
@@ -11,6 +12,7 @@ mod transport;
 
 include!(concat!(env!("OUT_DIR"), "/harness_mod.rs"));
 include!(concat!(env!("OUT_DIR"), "/child_mod.rs"));
+include!(concat!(env!("OUT_DIR"), "/mpp_mod.rs"));
 include!(concat!(env!("OUT_DIR"), "/codex_mod.rs"));
 
 use std::io::Write as _;
@@ -29,7 +31,11 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
 const JOINS_PER_TURN_MAX: u64 = program::ROUNDS_MAX * program::CALLS_PER_ROUND_MAX;
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort high|medium|low|xhigh] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]\n       hl-agent steer --journal <dir> --text <message>\n       hl-agent cancel --journal <dir>";
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort high|medium|low|xhigh] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]\n       hl-agent pay --instruction <file> --cwd <dir> --model <id> --journal <dir> [--turn N]\n       hl-agent steer --journal <dir> --text <message>\n       hl-agent cancel --journal <dir>";
+const PLAIN_MODEL_ATTEMPTS: u64 = 3;
+const PLAIN_MODEL_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const MPP_SYSTEM_PROMPT: &str = include_str!("../prompts/mpp-system.json");
+const MPP_TOOL_DEFINITIONS: &str = include_str!("../prompts/mpp-tools.json");
 const HARNESS_CLAUDE: &str = "claude";
 const HARNESS_CODEX: &str = "codex";
 const CLAUDE_MODEL_PREFIX: &str = "claude";
@@ -58,9 +64,9 @@ fn fail_usage(message: &str) -> ! {
 fn options() -> Options {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("run") => {}
+        Some("run" | "pay") => {}
         Some(command @ ("steer" | "cancel")) => send_event(command, &args[1..]),
-        _ => fail_usage("the commands are run, steer and cancel"),
+        _ => fail_usage("the commands are run, pay, steer and cancel"),
     }
     let (mut instruction, mut cwd, mut model, mut journal, mut rounds) =
         (None, None, None, None, None);
@@ -282,6 +288,7 @@ struct Agent {
     children: Option<children::Children>,
     label: String,
     jobs: jobs::Jobs,
+    payer: Option<mpp::Payer>,
 }
 
 fn to_value(json: &Json) -> Value {
@@ -315,7 +322,25 @@ impl Agent {
         input: &Value,
         room: bool,
     ) -> tools::Ran {
-        let receipted = matches!(tool, "Bash" | "Write") && self.children.is_some();
+        let call = harness::call_id(turn, seq);
+        let translated;
+        let (tool, input) = match self.payer.as_mut() {
+            Some(payer) if payer.wallet == tool => return paid(payer.pay(&call, input)),
+            Some(payer) if tool == mpp::FETCH_TOOL => {
+                eprintln!("{}: {call} fetch", self.label);
+                return paid(payer.fetch(&call, input));
+            }
+            Some(_) => match claude_code_call(tool, input) {
+                Some((name, renamed)) => {
+                    translated = renamed;
+                    (name, &translated)
+                }
+                None => (tool, input),
+            },
+            None => (tool, input),
+        };
+        let receipted =
+            matches!(tool, "Bash" | "Write") && (self.children.is_some() || self.payer.is_some());
         if receipted && let Err(error) = self.workspace.dispatching(turn, seq) {
             return tools::Ran::Failed(format!(
                 "<tool_use_error>receipt: {error}</tool_use_error>"
@@ -429,6 +454,40 @@ impl Agent {
     }
 }
 
+fn claude_code_call(tool: &str, input: &Value) -> Option<(&'static str, Value)> {
+    match tool {
+        "read" => Some((
+            "Read",
+            Value::object([
+                ("file_path", input.get("path")?.clone()),
+                ("offset", Value::number(program::READ_OFFSET_FIRST)),
+                ("limit", Value::number(program::READ_LIMIT_WHOLE)),
+                ("pages", Value::text("")),
+                ("allow_large", Value::Bool(false)),
+            ]),
+        )),
+        "bash" => Some((
+            "Bash",
+            Value::object([
+                ("command", input.get("command")?.clone()),
+                ("timeout", Value::number(program::BASH_TIMEOUT_MS)),
+                ("description", Value::text("")),
+                ("run_in_background", Value::Bool(false)),
+                ("dangerouslyDisableSandbox", Value::Bool(false)),
+            ]),
+        )),
+        _ => None,
+    }
+}
+
+fn paid(ran: mpp::Ran) -> tools::Ran {
+    match ran {
+        mpp::Ran::Ok(text) => tools::Ran::Ok(text),
+        mpp::Ran::Failed(text) => tools::Ran::Failed(text),
+        mpp::Ran::Units(units) => tools::Ran::Units(units),
+    }
+}
+
 pub fn random() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -446,6 +505,7 @@ macro_rules! output_of {
             tools::Ran::Job(text) => $module::Output::Ok($module::Json::Object(
                 std::collections::BTreeMap::from([("job".to_owned(), $module::Json::String(text))]),
             )),
+            tools::Ran::Units(units) => $module::Output::Ok($module::Json::Number(units)),
         }
     };
 }
@@ -464,9 +524,27 @@ macro_rules! host_for {
             fn recover(&mut self, request: &$module::ToolRequest<'_>) -> $module::Recovered {
                 let input =
                     Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
-                let recovered =
-                    self.workspace
-                        .recover(request.turn, request.seq, request.tool, &input);
+                let recovered = match self.payer.as_ref() {
+                    Some(payer) if payer.wallet == request.tool => {
+                        match payer.recover_pay(&harness::call_id(request.turn, request.seq)) {
+                            Some(units) => tools::Recovered::Reply(tools::Ran::Units(units)),
+                            None => tools::Recovered::NotDispatched,
+                        }
+                    }
+                    Some(_) => match claude_code_call(request.tool, &input) {
+                        Some((tool, input)) => {
+                            self.workspace
+                                .recover(request.turn, request.seq, tool, &input)
+                        }
+                        None => {
+                            self.workspace
+                                .recover(request.turn, request.seq, request.tool, &input)
+                        }
+                    },
+                    None => self
+                        .workspace
+                        .recover(request.turn, request.seq, request.tool, &input),
+                };
                 eprintln!(
                     "{}: {} recover {}: {}",
                     self.label,
@@ -572,7 +650,7 @@ macro_rules! host_for {
                     .settings
                     .and_then(|settings| settings.get(anthropic::EFFORT_SETTING))
                     .and_then(|effort| effort.as_str());
-                let reply = self.run_model(
+                let mut reply = self.run_model(
                     request.turn,
                     request.seq,
                     request.mode,
@@ -580,6 +658,23 @@ macro_rules! host_for {
                     &context,
                     &attached,
                 );
+                if self.payer.is_some() {
+                    for _ in 1..PLAIN_MODEL_ATTEMPTS {
+                        if mpp::plain_reply(&reply).is_some() {
+                            break;
+                        }
+                        std::thread::sleep(PLAIN_MODEL_RETRY);
+                        reply = self.run_model(
+                            request.turn,
+                            request.seq,
+                            request.mode,
+                            effort,
+                            &context,
+                            &attached,
+                        );
+                    }
+                    reply = mpp::plain_reply(&reply).unwrap_or(reply);
+                }
                 $module::Json::decode(&reply.encode())
                     .expect("a reply the host built decodes as harness JSON")
             }
@@ -607,6 +702,7 @@ macro_rules! host_for {
 
 host_for!(harness);
 host_for!(child_harness);
+host_for!(mpp_harness);
 
 pub fn command_line(program: &str, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new(program)
@@ -883,6 +979,7 @@ fn setup(options: &Options) -> Result<(Agent, String), String> {
             children: Some(children),
             label: "hl-agent".to_owned(),
             jobs: jobs::Jobs::default(),
+            payer: None,
         },
         instruction,
     ))
@@ -975,7 +1072,88 @@ fn run_turn(
     ran
 }
 
+fn paying_setup(options: &Options) -> Result<(Agent, String), String> {
+    let (mut agent, instruction) = setup(options)?;
+    let wallet = mpp_harness::program::WALLET.ok_or("examples/mpp_agent.hl declares no wallet")?;
+    agent.client.tools = Value::decode(MPP_TOOL_DEFINITIONS)
+        .map_err(|error| format!("the bundled MPP tool definitions: {error}"))?;
+    let Value::Array(mut system) = Value::decode(MPP_SYSTEM_PROMPT)
+        .map_err(|error| format!("the bundled MPP system prompt: {error}"))?
+    else {
+        return Err("the bundled MPP system prompt is not a list of blocks".to_owned());
+    };
+    system.push(Value::object([
+        ("type", Value::text("text")),
+        (
+            "text",
+            Value::String(format!(
+                "Make at most {} tool calls in one reply; the harness refuses a reply with more.",
+                mpp_harness::program::CALLS_PER_STEP_MAX
+            )),
+        ),
+    ]));
+    agent.client.system = Value::Array(system);
+    agent.children = None;
+    agent.payer = Some(mpp::Payer::open(wallet, &agent.workspace.state, random())?);
+    Ok((agent, instruction))
+}
+
+fn pay_main(options: &Options) -> ! {
+    mpp_harness::self_check();
+    mpp_harness::jsonl_self_check();
+    let (mut agent, instruction) = paying_setup(options).unwrap_or_else(|error| {
+        eprintln!("hl-agent: {error}");
+        std::process::exit(EXIT_HARNESS_ERROR)
+    });
+    agent.ledger.append(Value::object([
+        ("kind", Value::text("start")),
+        ("at_ms", Value::number(now_ms())),
+    ]));
+    let journal_path = options.journal.join("journal.jsonl");
+    let mut disk = mpp_harness::FileDisk::open(&journal_path).unwrap_or_else(|error| {
+        eprintln!("hl-agent: {}: {error}", journal_path.display());
+        std::process::exit(EXIT_HARNESS_ERROR)
+    });
+    let request = mpp_harness::TurnRequest {
+        turn: options.turn,
+        arguments: mpp_harness::program::Arguments::Prompt(instruction),
+    };
+    let ran = mpp_harness::run_jsonl(&mut agent, &mut disk, &request);
+    agent.ledger.append(Value::object([
+        ("kind", Value::text("end")),
+        ("at_ms", Value::number(now_ms())),
+    ]));
+    let (finish, code) = match &ran {
+        Ok(mpp_harness::Ran::Finished(finish) | mpp_harness::Ran::AlreadyFinished(finish))
+            if finish.outcome == mpp_harness::Outcome::Completed =>
+        {
+            println!("{}", finish.result.encode());
+            ("completed".to_owned(), 0)
+        }
+        Ok(mpp_harness::Ran::Finished(finish) | mpp_harness::Ran::AlreadyFinished(finish)) => {
+            eprintln!("hl-agent: the harness trapped: {}", finish.result.encode());
+            ("trap".to_owned(), EXIT_HARNESS_ERROR)
+        }
+        Ok(other) => {
+            eprintln!("hl-agent: the paying turn did not finish: {other:?}");
+            ("error".to_owned(), EXIT_HARNESS_ERROR)
+        }
+        Err(error) => {
+            eprintln!("hl-agent: {error:?}");
+            ("error".to_owned(), EXIT_HARNESS_ERROR)
+        }
+    };
+    if let Err(error) = write_usage(&options.journal, &options.model, &finish) {
+        eprintln!("hl-agent: {error}");
+        std::process::exit(EXIT_HARNESS_ERROR);
+    }
+    std::process::exit(code)
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("pay") {
+        pay_main(&options());
+    }
     harness::self_check();
     harness::jsonl_self_check();
     child_harness::self_check();

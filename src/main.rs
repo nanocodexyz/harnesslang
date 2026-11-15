@@ -42,12 +42,13 @@ fn print_report(report: &str) -> std::io::Result<()> {
 }
 
 fn load(file: &str) -> Result<Program, String> {
-    load_within(file, &mut Vec::new())
+    load_within(file, &mut Vec::new(), Mutation::None)
 }
 
 fn load_within(
     file: &str,
     spawning: &mut Vec<(std::path::PathBuf, String)>,
+    mutation: Mutation,
 ) -> Result<Program, String> {
     let source = std::fs::read_to_string(file)
         .map_err(|error| format!("{file}: error: cannot read: {error}"))?;
@@ -77,10 +78,14 @@ fn load_within(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
     spawning.push((identity, file.to_owned()));
-    let checked = check::check_with(&parsed, &mut |child: &str| {
-        let path = directory.join(child);
-        load_within(&path.to_string_lossy(), spawning)
-    })
+    let checked = check::check_mutated(
+        &parsed,
+        &mut |child: &str| {
+            let path = directory.join(child);
+            load_within(&path.to_string_lossy(), spawning, Mutation::None)
+        },
+        mutation,
+    )
     .map_err(|diagnostic| diagnostic.render(file));
     spawning.pop();
     checked
@@ -114,7 +119,7 @@ fn main() -> ExitCode {
         "emit" => emit_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
-        "deploy" | "status" | "logs" | "rollback" | "secrets" | "destroy" => {
+        "deploy" | "status" | "monitor" | "logs" | "rollback" | "secrets" | "destroy" => {
             deploy_command(command, rest)
         }
         "gen" => harnesslang::generate::cli::gen_command(rest),
@@ -525,7 +530,7 @@ fn sim_command(args: &[String]) -> ExitCode {
     let (Some(file), Some(target), Some(seeds)) = (flags.file, flags.target, flags.seeds) else {
         return usage();
     };
-    let program = match load(&file) {
+    let program = match load_within(&file, &mut Vec::new(), flags.mutation) {
         Ok(program) => program,
         Err(error) => {
             eprintln!("{error}");

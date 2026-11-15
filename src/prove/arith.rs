@@ -64,6 +64,7 @@ struct Prover<'a> {
     findings: Vec<Finding>,
     proved: BTreeMap<&'static str, u64>,
     shrinks: BTreeMap<String, ShrinkBound>,
+    anchored: BTreeMap<Var, Quantity>,
 }
 
 pub fn prove(program: &Program, report: &mut Report) {
@@ -239,6 +240,7 @@ impl<'a> Prover<'a> {
             findings: Vec::new(),
             proved: BTreeMap::new(),
             shrinks: BTreeMap::new(),
+            anchored: BTreeMap::new(),
         }
     }
 
@@ -455,7 +457,11 @@ impl<'a> Prover<'a> {
     }
 
     fn proves(&mut self, facts: &[Linear], goal: &Linear) -> bool {
-        linear::implies(facts, goal, &mut self.budget).unwrap_or(false)
+        linear::implies_split(facts, goal, &mut self.budget).unwrap_or(false)
+    }
+
+    fn proves_feasible(&mut self, facts: &[Linear], goal: &Linear) -> bool {
+        linear::implies_feasible(facts, goal, &mut self.budget).unwrap_or(false)
     }
 
     fn counterexample(&mut self, state: &State, goal: &Linear) -> Option<String> {
@@ -487,6 +493,10 @@ impl<'a> Prover<'a> {
         property: &'static str,
         message: String,
     ) -> bool {
+        if self.quiet > 0 {
+            state.facts.push(goal);
+            return false;
+        }
         let proven = self.proves(&state.facts, &goal);
         if proven {
             if self.quiet == 0 {
@@ -515,5 +525,11 @@ impl<'a> Prover<'a> {
             linear::lower(&state.facts, value, fresh, &mut self.budget)
         };
         measured.unwrap_or(Extent::Unbounded)
+    }
+
+    fn range(&mut self, state: &State, value: &Linear) -> (Extent, Extent) {
+        let fresh = self.fresh_raw("_measure");
+        linear::range(&state.facts, value, fresh, &mut self.budget)
+            .unwrap_or((Extent::Unbounded, Extent::Unbounded))
     }
 }

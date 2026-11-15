@@ -19,6 +19,10 @@ pub fn run(context: &Context, action: Action) -> Result<(), String> {
         Action::Rollback { to } => rollback(context, to.as_deref()),
         Action::Secrets(secret) => secrets(context, secret),
         Action::Destroy => destroy(context),
+        Action::Monitor { events, .. } => {
+            status(context)?;
+            logs(context, events)
+        }
     }
 }
 

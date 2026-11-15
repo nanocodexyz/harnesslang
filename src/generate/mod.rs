@@ -54,6 +54,10 @@ pub struct Decls {
     pub fields: Vec<(String, Ty)>,
     pub names: std::collections::BTreeSet<String>,
     pub provable: bool,
+    pub wait_ms: Option<usize>,
+    pub dispatch_hooks: bool,
+    pub cut_tokens: Option<usize>,
+    pub defaults: Vec<Vec<Option<String>>>,
 }
 
 impl Decls {
@@ -161,6 +165,8 @@ fn render(rng: &mut Rng, seed: u64) -> String {
     let mut lines = vec![format!("harness fuzz{seed}"), String::new()];
     lines.extend(decls::render(rng, &decls));
     lines.extend(body::invariants(rng, &decls));
+    lines.extend(body::hooks(rng, &decls));
+    lines.extend(body::dispatch_hooks(rng, &decls));
     let handlers = rng.range(1, decls::HANDLERS_MAX);
     let mut names = std::collections::BTreeSet::new();
     for index in 0..handlers {

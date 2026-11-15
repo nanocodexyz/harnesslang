@@ -1,3 +1,4 @@
+pub mod climb;
 mod handler;
 mod inline;
 
@@ -79,6 +80,16 @@ pub fn check(source: &ast::Program) -> Checked<ir::Program> {
 }
 
 pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::Program> {
+    check_mutated(source, load, crate::run::mutation::Mutation::None)
+}
+
+pub fn check_mutated(
+    source: &ast::Program,
+    load: &mut Loader<'_>,
+    mutation: crate::run::mutation::Mutation,
+) -> Checked<ir::Program> {
+    let declared = climb::declare(source)?;
+    let source = declared.as_ref().unwrap_or(source);
     let mut program = ir::Program {
         name: source.name.text.clone(),
         constants: Vec::new(),
@@ -97,6 +108,8 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
         blobs: None,
         idle: None,
         forked: None,
+        wallet: None,
+        climbs: Vec::new(),
     };
     let mut globals = Globals {
         constants: BTreeMap::new(),
@@ -118,10 +131,13 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
     forks(source, &mut program, &mut globals, &mut values)?;
     codes(source, &mut program, &mut globals, &mut values)?;
     listings(source, &mut program, &mut globals, &mut values)?;
+    wallet(source, &mut program, &globals, &mut values)?;
     state(source, &mut program, &mut globals, &mut values)?;
     events(source, &mut program, &globals, &mut values)?;
     interrupts(source, &mut program)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
+    let expanded =
+        climb::expand(&expanded, &mut program, &globals, mutation)?.unwrap_or(expanded);
     globals.hooks = hooks(&expanded, &program, &globals)?;
     let expanded = session_end(&expanded).unwrap_or(expanded);
     let expanded = idle(&expanded, &mut program, &globals)?.unwrap_or(expanded);
@@ -134,7 +150,7 @@ pub fn check_with(source: &ast::Program, load: &mut Loader<'_>) -> Checked<ir::P
 }
 
 fn claim(values: &mut BTreeMap<String, Position>, name: &ast::Name, what: &str) -> Checked<()> {
-    if name.text.starts_with(WILDCARD) {
+    if name.text.starts_with(WILDCARD) && !name.text.starts_with(climb::PREFIX) {
         return error(
             name.at,
             format!(
@@ -910,9 +926,21 @@ fn tools(
                 format!("tool '{}' has the name of a variant", tool.name.text),
             );
         }
-        let params = params(program, globals, &tool.params)?;
-        let defaults = defaults(program, globals, &params, &tool.defaults)?;
+        let mut params = params(program, globals, &tool.params)?;
+        let mut defaults = defaults(program, globals, &params, &tool.defaults)?;
         let returns = resolve(program, globals, &tool.returns)?;
+        if let Some(wallet) = &tool.paid {
+            if tool.attaches.is_some() || matches!(returns, Type::Blob(_)) {
+                return error(
+                    wallet.at,
+                    format!(
+                        "tool '{}' returns a blob: a paid call returns u64, bool, text or a text enum",
+                        tool.name.text
+                    ),
+                );
+            }
+            paid_param(&tool.name, &mut params, &mut defaults)?;
+        }
         if !matches!(returns, Type::U64 | Type::Bool | Type::Text | Type::Blob(_))
             && program.text_enum(&returns).is_none()
         {
@@ -962,9 +990,143 @@ fn tools(
             spawn: None,
             fork: None,
             finds: None,
+            paid: tool.paid.is_some(),
         });
     }
     Ok(())
+}
+
+fn paid_param(
+    owner: &ast::Name,
+    params: &mut Vec<ir::Field>,
+    defaults: &mut Vec<Option<ir::Literal>>,
+) -> Checked<()> {
+    if params.iter().any(|param| param.name == ir::PAYMENT_PARAM) {
+        return error(
+            owner.at,
+            format!(
+                "'{}' is paid, so its parameter '{}' carries the payment: rename the declared one",
+                owner.text,
+                ir::PAYMENT_PARAM
+            ),
+        );
+    }
+    params.push(ir::Field {
+        name: ir::PAYMENT_PARAM.to_owned(),
+        ty: Type::Text,
+    });
+    defaults.push(Some(ir::Literal::Text(String::new())));
+    Ok(())
+}
+
+fn wallet(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &Globals,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    let mut declared: Option<&ast::Wallet> = None;
+    for item in &source.items {
+        let Item::Wallet(wallet) = item else { continue };
+        if let Some(previous) = declared {
+            return error(
+                wallet.name.at,
+                format!(
+                    "a harness has one wallet; '{}' is already declared at {}",
+                    previous.name.text, previous.name.at
+                ),
+            );
+        }
+        declared = Some(wallet);
+    }
+    for (name, paid) in paid_names(source) {
+        if declared.is_none_or(|wallet| wallet.name.text != paid.text) {
+            return error(
+                paid.at,
+                format!(
+                    "'{name}' is paid by '{}', which is not a declared wallet",
+                    paid.text
+                ),
+            );
+        }
+    }
+    let Some(wallet) = declared else {
+        return Ok(());
+    };
+    claim(values, &wallet.name, "wallet")?;
+    let spend = bound(program, globals, &wallet.spend, "a wallet's spend cap")?;
+    let charge = bound(program, globals, &wallet.charge, "a wallet's charge cap")?;
+    let payments = bound(program, globals, &wallet.payments, "a paid call's payments")?;
+    if charge.value == 0 {
+        return error(
+            wallet.charge.at,
+            format!(
+                "wallet '{}' charges at most 0, so it never pays",
+                wallet.name.text
+            ),
+        );
+    }
+    if charge.value > spend.value {
+        return error(
+            wallet.charge.at,
+            format!(
+                "wallet '{}' charges at most {} ({}) a payment, over its spend cap {} ({})",
+                wallet.name.text, charge.name, charge.value, spend.name, spend.value
+            ),
+        );
+    }
+    let tool = program.tools.len();
+    program.tools.push(ir::Tool {
+        name: wallet.name.text.clone(),
+        params: vec![
+            ir::Field {
+                name: ir::WALLET_REQUIRED_PARAM.to_owned(),
+                ty: Type::Text,
+            },
+            ir::Field {
+                name: ir::WALLET_MAX_PARAM.to_owned(),
+                ty: Type::U64,
+            },
+        ],
+        defaults: vec![None, None],
+        returns: Type::U64,
+        attaches: None,
+        effect: crate::effect::EffectClass::External,
+        recoverable: true,
+        interrupts: ir::Interrupts::default(),
+        jobs: None,
+        spawn: None,
+        fork: None,
+        finds: None,
+        paid: false,
+    });
+    program.wallet = Some(ir::Wallet {
+        name: wallet.name.text.clone(),
+        spend,
+        charge,
+        payments,
+        tool,
+        spent: usize::MAX,
+    });
+    Ok(())
+}
+
+fn paid_names(source: &ast::Program) -> Vec<(String, &ast::Name)> {
+    source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Tool(tool) => tool
+                .paid
+                .as_ref()
+                .map(|paid| (tool.name.text.clone(), paid)),
+            Item::Listing(listing) => listing
+                .paid
+                .as_ref()
+                .map(|paid| (listing.name.text.clone(), paid)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn tool_jobs(
@@ -1181,6 +1343,7 @@ fn spawns(
             jobs: None,
             finds: None,
             fork: None,
+            paid: false,
             spawn: Some(ir::Spawn {
                 file: spawn.file.text.clone(),
                 handler: spawn.handler.text.clone(),
@@ -1453,8 +1616,11 @@ fn listings(
             );
         }
         let bound = bound(program, globals, &listing.bound, "a listing's bound")?;
-        let params = params(program, globals, &listing.params)?;
-        let defaults = defaults(program, globals, &params, &listing.defaults)?;
+        let mut params = params(program, globals, &listing.params)?;
+        let mut defaults = defaults(program, globals, &params, &listing.defaults)?;
+        if listing.paid.is_some() {
+            paid_param(name, &mut params, &mut defaults)?;
+        }
         globals
             .listings
             .insert(name.text.clone(), program.listings.len());
@@ -1464,6 +1630,7 @@ fn listings(
             params,
             defaults,
             effect: listing.effect,
+            paid: listing.paid.is_some(),
         });
     }
     for item in &source.items {
@@ -1809,7 +1976,34 @@ fn state(
             ty,
         });
     }
+    paid_fields(program, globals);
     Ok(())
+}
+
+fn paid_fields(program: &mut ir::Program, globals: &mut Globals) {
+    if program.wallet.is_none() {
+        return;
+    }
+    let mut hidden: Vec<(String, Type)> = vec![
+        (ir::SPENT_FIELD.to_owned(), Type::U64),
+        (ir::PAID_TAG_FIELD.to_owned(), Type::U64),
+        (ir::PAID_MORE_FIELD.to_owned(), Type::Bool),
+        (ir::PAID_REF_FIELD.to_owned(), Type::Text),
+        (ir::PAID_TEXT_FIELD.to_owned(), Type::Text),
+    ];
+    for tool in program.tools.iter().filter(|tool| tool.paid) {
+        if let Some(name) = handler::value_field_name(program, &tool.returns)
+            && !hidden.iter().any(|(known, _)| *known == name)
+        {
+            hidden.push((name, tool.returns.clone()));
+        }
+    }
+    for (name, ty) in hidden {
+        globals.fields.insert(name.clone(), program.state.len());
+        program.state.push(ir::Field { name, ty });
+    }
+    let spent = globals.fields[ir::SPENT_FIELD];
+    program.wallet.as_mut().expect("checked above").spent = spent;
 }
 
 fn idle_handler<'s>(
@@ -2178,6 +2372,17 @@ fn invariants(source: &ast::Program, program: &mut ir::Program, globals: &Global
         let checked = handler::invariant(program, globals, definition)?;
         program.invariants.push(checked);
     }
+    if let Some(wallet) = &program.wallet {
+        program.invariants.push(ir::Invariant {
+            name: ir::SPEND_INVARIANT.to_owned(),
+            condition: ir::Expr::Binary {
+                op: ir::BinaryOp::LessEqual,
+                operand: Type::U64,
+                left: Box::new(ir::Expr::Field(wallet.spent)),
+                right: Box::new(ir::Expr::Constant(globals.constants[&wallet.spend.name])),
+            },
+        });
+    }
     Ok(())
 }
 
@@ -2306,6 +2511,7 @@ fn forks(
             spawn: None,
             fork: Some(at),
             finds: None,
+            paid: false,
         });
     }
     Ok(())

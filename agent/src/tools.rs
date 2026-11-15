@@ -106,6 +106,7 @@ pub enum Ran {
     Image(Vec<u8>),
     Failed(String),
     Job(String),
+    Units(u64),
 }
 
 pub enum Recovered {
@@ -182,7 +183,7 @@ impl Workspace {
             Ran::Ok(text) => Value::object([("ok", Value::text(text))]),
             Ran::Failed(text) => Value::object([("failed", Value::text(text))]),
             Ran::Job(text) => Value::object([("job", Value::text(text))]),
-            Ran::Image(_) => return,
+            Ran::Image(_) | Ran::Units(_) => return,
         };
         let path = self.receipt(turn, seq, RECEIPT_DONE);
         if let Err(error) = atomic_write(&path, &value.encode()) {
@@ -606,7 +607,7 @@ pub fn settled(
 pub fn shown(shell: &Shell) -> String {
     match rendered(shell) {
         Ran::Ok(text) | Ran::Failed(text) | Ran::Job(text) => text,
-        Ran::Image(_) => String::new(),
+        Ran::Image(_) | Ran::Units(_) => String::new(),
     }
 }
 

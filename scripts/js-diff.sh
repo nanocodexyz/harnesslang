@@ -31,6 +31,8 @@ plant_expression() {
     mode_dropped) echo 's/world.model({ turn: this.turn, seq, callsMax, mode: site.mode,/world.model({ turn: this.turn, seq, callsMax, mode: null,/' ;;
     blob_unjournaled) echo 's/this.blobs.journaled(data, true)/this.blobs.journaled(data, false)/' ;;
     text_after_kept) echo 's/return at < 0 ? "" : subject.slice(at + separator.length);/return at < 0 ? "" : subject.slice(at);/' ;;
+    payment_unset) echo 's/^  decoded.payment = payment;$/  void payment;/' ;;
+    paid_outcome_original) echo 's/^  if (tag === 0n) return variant(0, \[value()\]);$/  if (tag === 0n) return original();/' ;;
     grandchild_unscoped) echo 's/return { tag: "ok", value: scope === ROOT_SCOPE ? key : scope + SPAWN_SCOPE_SEPARATOR + key };/return { tag: "ok", value: key };/' ;;
     idle_early) echo 's/if (clock < due) return { ran: "not_due"/if (false \&\& clock < due) return { ran: "not_due"/' ;;
     interrupted_undecoded) echo 's/if (fields.length === 0 \&\& Array.isArray(payload) \&\& payload.length === 0) return/if (false \&\& Array.isArray(payload)) return/' ;;

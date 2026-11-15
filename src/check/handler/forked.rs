@@ -20,6 +20,7 @@ pub fn forked(program: &ir::Program, globals: &Globals, hook: &ast::Hook) -> Che
         side: None,
         forked: true,
         used: std::collections::BTreeSet::new(),
+        paid_sites: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::with_capacity(hook.params.len());
     for param in &hook.params {

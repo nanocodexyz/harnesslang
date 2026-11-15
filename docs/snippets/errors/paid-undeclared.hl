@@ -1,0 +1,5 @@
+harness shop
+
+tool fetch(url: text) -> text effect idempotent paid by tempo
+
+on ping() -> u64 { return 1 }

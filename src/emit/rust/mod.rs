@@ -218,6 +218,14 @@ fn generate(program: &Program, target: Target) -> String {
         &mut out,
         format!("pub const JOB_EVENT: Option<(&str, u64)> = {jobs};"),
     );
+    let wallet = program.wallet.as_ref().map_or_else(
+        || "None".to_owned(),
+        |wallet| format!("Some({:?})", wallet.name),
+    );
+    line(
+        &mut out,
+        format!("pub const WALLET: Option<&str> = {wallet};"),
+    );
     let model_interrupts = program
         .model
         .as_ref()
@@ -790,7 +798,7 @@ fn inputs<'p>(out: &mut String, program: &'p Program, types: &mut Types<'p>) {
     }
     writeln!(
         out,
-        "pub fn tool_input(tool: &str, raw: &str) -> ToolInput {{\n    let check: fn(&mut Json) -> Result<(), String> = match tool {{\n{arms}        _ => match listed(tool) {{\n{listed}            _ => return ToolInput::Untyped,\n        }},\n    }};\n    typed_input(tool, raw, check)\n}}\n"
+        "pub fn tool_input(tool: &str, raw: &str) -> ToolInput {{\n    if WALLET == Some(tool) {{\n        return ToolInput::Invalid(wallet_refusal(tool));\n    }}\n    let check: fn(&mut Json) -> Result<(), String> = match tool {{\n{arms}        _ => match listed(tool) {{\n{listed}            _ => return ToolInput::Untyped,\n        }},\n    }};\n    typed_input(tool, raw, check)\n}}\n"
     )
     .expect("writing to a string succeeds");
 }

@@ -2,7 +2,7 @@ use crate::effect::EffectClass;
 use crate::generate::{CALL, Decls, ENTRY, REPLY, Ty, chance, weighted};
 use crate::sim::rng::Rng;
 
-const TEXT_LITERALS: [&str; 17] = [
+pub const TEXT_LITERALS: [&str; 17] = [
     "constructor",
     "toString",
     "__proto__",
@@ -29,6 +29,10 @@ const TEXT_ATOM_PERCENT: u64 = 60;
 const UNIT_PARENS_PERCENT: u64 = 30;
 const TOOL_NAME_PERCENT: u64 = 20;
 const PARENS_PERCENT: u64 = 20;
+const CUT_PIECE_PERCENT: u64 = 25;
+const BOUNDED_WAIT_PERCENT: u64 = 50;
+const TEXT_BUILTIN_PERCENT: u64 = 15;
+const TEXT_BUILTINS: [&str; 3] = ["before", "after", "trim"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pick {
@@ -44,23 +48,29 @@ enum Pick {
     Not,
     Construct,
     Effect,
+    Wait,
+    TextLen,
+    Contains,
 }
 
-const U64_PICKS: [(Pick, u64); 6] = [
+const U64_PICKS: [(Pick, u64); 8] = [
     (Pick::Literal, 4),
     (Pick::Atom, 5),
     (Pick::Binary, 3),
     (Pick::Len, 2),
     (Pick::Now, 1),
     (Pick::Random, 1),
+    (Pick::Wait, 1),
+    (Pick::TextLen, 1),
 ];
-const BOOL_PICKS: [(Pick, u64); 6] = [
+const BOOL_PICKS: [(Pick, u64); 7] = [
     (Pick::Literal, 2),
     (Pick::Atom, 3),
     (Pick::Compare, 4),
     (Pick::Equal, 3),
     (Pick::Logic, 2),
     (Pick::Not, 1),
+    (Pick::Contains, 1),
 ];
 const SUM_PICKS: [(Pick, u64); 3] = [(Pick::Construct, 3), (Pick::Atom, 3), (Pick::Effect, 6)];
 const COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
@@ -73,6 +83,8 @@ pub struct Context<'a> {
     pub indices: Vec<String>,
     pub effects: bool,
     pub fields: bool,
+    pub subject: bool,
+    pub lane: bool,
 }
 
 pub fn text_literal(value: &str) -> String {
@@ -145,10 +157,11 @@ impl Context<'_> {
     }
 
     pub fn expr(&mut self, rng: &mut Rng, ty: &Ty, expected: bool, depth: u32) -> Option<String> {
+        let subject = std::mem::take(&mut self.subject);
         match ty {
             Ty::U64 | Ty::Bool | Ty::Text => Some(self.scalar(rng, ty, depth)),
             Ty::List(..) => self.atom(rng, ty),
-            Ty::Sum(_) | Ty::Known(_) | Ty::Maybe(_) => self.sum(rng, ty, expected, depth),
+            Ty::Sum(_) | Ty::Known(_) | Ty::Maybe(_) => self.sum(rng, ty, expected, depth, subject),
         }
     }
 
@@ -167,6 +180,8 @@ impl Context<'_> {
                 Pick::Binary | Pick::Logic | Pick::Not => depth > 0,
                 Pick::Len => has_lists,
                 Pick::Now | Pick::Random => self.effects,
+                Pick::Wait => self.effects && self.decls.wait_ms.is_some(),
+                Pick::TextLen | Pick::Contains => !self.decls.provable,
                 _ => true,
             })
             .collect()
@@ -189,6 +204,16 @@ impl Context<'_> {
             }
             Pick::Now => "now()".to_owned(),
             Pick::Random => "random()".to_owned(),
+            Pick::Wait => {
+                let wait = self.decls.wait_ms.expect("a feasible wait has a constant");
+                let cap = &self.decls.constants[wait].0;
+                if self.decls.provable || !chance(rng, BOUNDED_WAIT_PERCENT) || depth == 0 {
+                    return format!("wait({cap})");
+                }
+                let duration = self.number(rng, depth - 1);
+                format!("wait({duration}) at most {cap}")
+            }
+            Pick::TextLen => format!("len({})", self.text(rng)),
             _ => self.number_literal(rng),
         }
     }
@@ -251,6 +276,11 @@ impl Context<'_> {
                 format!("({left}) {op} ({right})")
             }
             Pick::Not => format!("not ({})", self.boolean(rng, next)),
+            Pick::Contains => {
+                let haystack = self.text(rng);
+                let needle = self.text(rng);
+                format!("contains({haystack}, {needle})")
+            }
             _ => ["true", "false"][rng.pick(2)].to_owned(),
         }
     }
@@ -265,6 +295,10 @@ impl Context<'_> {
         atoms
     }
 
+    pub fn text_expr(&mut self, rng: &mut Rng) -> String {
+        self.text(rng)
+    }
+
     fn text(&mut self, rng: &mut Rng) -> String {
         let parts = rng.range(1, TEXT_PARTS_MAX);
         let atoms = self.text_atoms();
@@ -272,19 +306,47 @@ impl Context<'_> {
             (chance(rng, TEXT_ATOM_PERCENT) && !atoms.is_empty()).then(|| rng.below(parts));
         let mut pieces = Vec::new();
         for index in 0..parts {
-            if Some(index) == atom_at {
-                pieces.push(atoms[rng.pick(atoms.len())].clone());
+            let piece = if Some(index) == atom_at {
+                atoms[rng.pick(atoms.len())].clone()
             } else if chance(rng, TOOL_NAME_PERCENT) && !self.decls.tools.is_empty() {
                 let tool = &self.decls.tools[rng.pick(self.decls.tools.len())];
-                pieces.push(text_literal(&tool.name));
+                text_literal(&tool.name)
             } else {
-                pieces.push(text_literal(TEXT_LITERALS[rng.pick(TEXT_LITERALS.len())]));
-            }
+                text_literal(TEXT_LITERALS[rng.pick(TEXT_LITERALS.len())])
+            };
+            pieces.push(self.wrap_text(rng, piece));
         }
         pieces.join(" ++ ")
     }
 
-    fn sum(&mut self, rng: &mut Rng, ty: &Ty, expected: bool, depth: u32) -> Option<String> {
+    fn wrap_text(&mut self, rng: &mut Rng, piece: String) -> String {
+        if let Some(tokens) = self.decls.cut_tokens
+            && chance(rng, CUT_PIECE_PERCENT)
+        {
+            return format!(
+                "truncate_middle({piece}, {})",
+                self.decls.constants[tokens].0
+            );
+        }
+        if self.decls.provable || !chance(rng, TEXT_BUILTIN_PERCENT) {
+            return piece;
+        }
+        let builtin = TEXT_BUILTINS[rng.pick(TEXT_BUILTINS.len())];
+        if builtin == "trim" {
+            return format!("trim({piece})");
+        }
+        let separator = text_literal(TEXT_LITERALS[rng.pick(TEXT_LITERALS.len())]);
+        format!("{builtin}({piece}, {separator})")
+    }
+
+    fn sum(
+        &mut self,
+        rng: &mut Rng,
+        ty: &Ty,
+        expected: bool,
+        depth: u32,
+        subject: bool,
+    ) -> Option<String> {
         let mut picks = SUM_PICKS.to_vec();
         while !picks.is_empty() {
             let pick = weighted(rng, &picks);
@@ -292,7 +354,7 @@ impl Context<'_> {
             let made = match pick {
                 Pick::Construct => self.construct(rng, ty, expected, depth),
                 Pick::Atom => self.atom(rng, ty),
-                _ => self.effect(rng, ty, depth),
+                _ => self.effect(rng, ty, depth, subject),
             };
             if made.is_some() {
                 return made;
@@ -333,7 +395,7 @@ impl Context<'_> {
         Some(format!("{name}({})", args.join(", ")))
     }
 
-    fn effect(&mut self, rng: &mut Rng, ty: &Ty, depth: u32) -> Option<String> {
+    fn effect(&mut self, rng: &mut Rng, ty: &Ty, depth: u32, subject: bool) -> Option<String> {
         if !self.effects || depth == 0 {
             return None;
         }
@@ -360,7 +422,8 @@ impl Context<'_> {
             })
             .map(Some)
             .collect();
-        if external && **inner == Ty::Text {
+        let dispatchable = !self.lane && (subject || !self.decls.dispatch_hooks);
+        if external && **inner == Ty::Text && dispatchable {
             candidates.push(None);
         }
         if candidates.is_empty() {

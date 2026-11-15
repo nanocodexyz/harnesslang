@@ -82,10 +82,19 @@ pub enum Mutation {
     ForkHookSkipped,
     CellLeaks,
     CellCancelIgnored,
+    CapUnchecked,
+    SpentUnaccounted,
+    CredentialDropped,
+    ClimbAcceptAny,
+    ClimbRevertSkipped,
+    ClimbLedgerDropsLosses,
+    ClimbBudgetUnchecked,
+    ClimbCostDoubleCounted,
+    ClimbGateIgnored,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 89] = [
         Self::None,
         Self::FlushAfterDispatch,
         Self::RecoveryRedispatchesExternal,
@@ -166,6 +175,15 @@ impl Mutation {
         Self::ForkHookSkipped,
         Self::CellLeaks,
         Self::CellCancelIgnored,
+        Self::CapUnchecked,
+        Self::SpentUnaccounted,
+        Self::CredentialDropped,
+        Self::ClimbAcceptAny,
+        Self::ClimbRevertSkipped,
+        Self::ClimbLedgerDropsLosses,
+        Self::ClimbBudgetUnchecked,
+        Self::ClimbCostDoubleCounted,
+        Self::ClimbGateIgnored,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -250,6 +268,15 @@ impl Mutation {
             Self::ForkHookSkipped => "fork_hook_skipped",
             Self::CellLeaks => "cell_leaks",
             Self::CellCancelIgnored => "cell_cancel_ignored",
+            Self::CapUnchecked => "cap_unchecked",
+            Self::SpentUnaccounted => "spent_unaccounted",
+            Self::CredentialDropped => "credential_dropped",
+            Self::ClimbAcceptAny => "climb_accept_any",
+            Self::ClimbRevertSkipped => "climb_revert_skipped",
+            Self::ClimbLedgerDropsLosses => "climb_ledger_drops_losses",
+            Self::ClimbBudgetUnchecked => "climb_budget_unchecked",
+            Self::ClimbCostDoubleCounted => "climb_cost_double_counted",
+            Self::ClimbGateIgnored => "climb_gate_ignored",
         }
     }
 
@@ -344,7 +371,16 @@ impl Mutation {
             | Self::ForkLiveState
             | Self::ForkHookSkipped
             | Self::CellLeaks
-            | Self::CellCancelIgnored => all,
+            | Self::CellCancelIgnored
+            | Self::CapUnchecked
+            | Self::SpentUnaccounted
+            | Self::CredentialDropped
+            | Self::ClimbAcceptAny
+            | Self::ClimbRevertSkipped
+            | Self::ClimbLedgerDropsLosses
+            | Self::ClimbBudgetUnchecked
+            | Self::ClimbCostDoubleCounted
+            | Self::ClimbGateIgnored => all,
             Self::EventRedelivered | Self::EventAckEarly | Self::BatchDrainsReplayed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,

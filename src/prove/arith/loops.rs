@@ -8,6 +8,11 @@ use crate::prove::linear::{self, Extent, Linear, Var};
 
 type Spread = (Option<i128>, Option<i128>);
 
+struct Pass {
+    anchors: BTreeMap<Quantity, Var>,
+    end: Option<State>,
+}
+
 struct Summary {
     delta: BTreeMap<Quantity, Spread>,
     absolute: BTreeMap<Quantity, Spread>,
@@ -33,6 +38,15 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
         Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
             fields.iter().any(|field| reads(field, quantities))
         }
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .any(|part| reads(part, quantities)),
         Expr::Binary { left, right, .. }
         | Expr::With {
             list: left,
@@ -171,6 +185,7 @@ impl Prover<'_> {
             let var = self.fresh(&mut start, &name, max);
             start.env.insert(*quantity, var);
             start.anchors.insert(var);
+            self.anchored.insert(var, *quantity);
             anchors.insert(*quantity, var);
         }
         self.bind_iteration(&mut start, kind, None);
@@ -191,14 +206,14 @@ impl Prover<'_> {
         kind: LoopKind<'_>,
         body: &[Stmt],
         quantities: &BTreeSet<Quantity>,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, Option<Pass>) {
         let program = self.program;
         let mut kept = Vec::new();
         let candidates: Vec<usize> = (0..program.invariants.len())
             .filter(|index| reads(&program.invariants[*index].condition, quantities))
             .collect();
         if candidates.is_empty() {
-            return kept;
+            return (kept, None);
         }
         let (free, _) = self.iteration_start(state, kind, quantities, &[]);
         for index in candidates {
@@ -210,26 +225,32 @@ impl Prover<'_> {
         let rounds_max = kept.len();
         for _ in 0..=rounds_max {
             if kept.is_empty() {
-                return kept;
+                return (kept, None);
             }
-            let (start, _) = self.iteration_start(state, kind, quantities, &kept);
+            let (start, anchors) = self.iteration_start(state, kind, quantities, &kept);
             self.quiet += 1;
             let end = self.block(body, start);
             self.quiet -= 1;
             let Some(end) = end else {
-                return kept;
+                return (kept, Some(Pass { anchors, end: None }));
             };
             let before = kept.len();
             let mut preserved = Vec::new();
-            for index in kept {
-                if self.implied(&end, &program.invariants[index].condition) {
-                    preserved.push(index);
+            for index in &kept {
+                if self.implied(&end, &program.invariants[*index].condition) {
+                    preserved.push(*index);
                 }
             }
-            kept = preserved;
-            if kept.len() == before {
-                return kept;
+            if preserved.len() == before {
+                return (
+                    kept,
+                    Some(Pass {
+                        anchors,
+                        end: Some(end),
+                    }),
+                );
             }
+            kept = preserved;
         }
         unreachable!("every round before the last drops an invariant, so the rounds end with none")
     }
@@ -246,6 +267,16 @@ impl Prover<'_> {
         self.quiet += 1;
         let end = self.block(body, start);
         self.quiet -= 1;
+        self.summary_of(kind, quantities, Pass { anchors, end })
+    }
+
+    fn summary_of(
+        &mut self,
+        kind: LoopKind<'_>,
+        quantities: &BTreeSet<Quantity>,
+        pass: Pass,
+    ) -> Option<Summary> {
+        let Pass { anchors, end } = pass;
         let end = end?;
         let mut summary = Summary {
             delta: BTreeMap::new(),
@@ -261,14 +292,10 @@ impl Prover<'_> {
             let delta = now
                 .subtract(&Linear::var(anchors[quantity]))
                 .expect("a difference of two variables fits");
-            let spread = (
-                finite(self.extent(&end, &delta, false)),
-                finite(self.extent(&end, &delta, true)),
-            );
-            let absolute = (
-                finite(self.extent(&end, &now, false)),
-                finite(self.extent(&end, &now, true)),
-            );
+            let (low, high) = self.range(&end, &delta);
+            let spread = (finite(low), finite(high));
+            let (low, high) = self.range(&end, &now);
+            let absolute = (finite(low), finite(high));
             if let Some(index) = index
                 && let Some(indexed) = self.slope(&end, &delta, index, spread)
             {
@@ -298,9 +325,8 @@ impl Prover<'_> {
             else {
                 continue;
             };
-            let low = finite(self.extent(end, &rest, false));
-            let high = finite(self.extent(end, &rest, true));
-            if let (Some(low), Some(high)) = (low, high)
+            let (low, high) = self.range(end, &rest);
+            if let (Some(low), Some(high)) = (finite(low), finite(high))
                 && high.checked_sub(low)? < best.2.checked_sub(best.1).unwrap_or(i128::MAX)
             {
                 best = (slope, low, high);
@@ -348,7 +374,8 @@ impl Prover<'_> {
         let var = self.fresh(state, &name, max);
         let now = Linear::var(var);
         let base = Linear::var(start);
-        let (low, high) = spread;
+        let informative = |bound: &i128| bound.abs() < U64_MAX;
+        let (low, high) = (spread.0.filter(informative), spread.1.filter(informative));
         if let Some(low) = low
             && let Some(reached) = steps.scale(low).and_then(|scaled| base.add(&scaled))
             && let Some(fact) = reached.subtract(&now)
@@ -377,9 +404,12 @@ impl Prover<'_> {
         }
         let mut quantities = BTreeSet::new();
         modified(body, self.program, &mut quantities);
-        let assumed = self.inductive(&state, kind, body, &quantities);
-        let summary = self.summarize_body(&state, kind, body, &quantities, &assumed);
         let label = self.label(kind);
+        let (assumed, pass) = self.inductive(&state, kind, body, &quantities);
+        let summary = match pass {
+            Some(pass) => self.summary_of(kind, &quantities, pass),
+            None => self.summarize_body(&state, kind, body, &quantities, &assumed),
+        };
         let mut iteration = state.clone();
         let counter = self.fresh(&mut iteration, &format!("iteration of {label}"), U64_MAX);
         let counter_value = Linear::var(counter);
@@ -414,7 +444,9 @@ impl Prover<'_> {
         self.bind_iteration(&mut iteration, kind, Some(counter));
         let iteration = self.assume_invariants(iteration, &assumed);
         self.path.push(label);
-        self.block(body, iteration);
+        if self.quiet == 0 {
+            self.block(body, iteration);
+        }
         self.path.pop();
         let exit = self.exit(state, kind, &count, &quantities, summary.as_ref())?;
         let exit = self.assume_invariants(exit, &assumed);
@@ -501,20 +533,25 @@ impl Prover<'_> {
             );
             env.insert(quantity, var);
             keep.insert(var);
-            joined.push(var);
+            joined.push((var, quantity));
         }
         let anchors = left.anchors.intersection(&right.anchors).copied().collect();
         let left_facts = linear::project(&left.facts, &keep, &mut self.budget).unwrap_or_default();
         let right_facts =
             linear::project(&right.facts, &keep, &mut self.budget).unwrap_or_default();
-        let mut facts = BTreeSet::new();
+        let left_set: BTreeSet<&Linear> = left_facts.iter().collect();
+        let right_set: BTreeSet<&Linear> = right_facts.iter().collect();
+        let mut facts: BTreeSet<Linear> = left_set
+            .intersection(&right_set)
+            .map(|fact| (*fact).clone())
+            .collect();
         for fact in &left_facts {
-            if self.proves(&right_facts, fact) {
+            if !right_set.contains(fact) && self.proves_feasible(&right_facts, fact) {
                 facts.insert(fact.clone());
             }
         }
         for fact in &right_facts {
-            if self.proves(&left_facts, fact) {
+            if !left_set.contains(fact) && self.proves_feasible(&left_facts, fact) {
                 facts.insert(fact.clone());
             }
         }
@@ -530,10 +567,26 @@ impl Prover<'_> {
                 anchors: BTreeSet::new(),
             },
         ];
-        for var in &joined {
+        let joined_set: BTreeSet<Var> = joined.iter().map(|(var, _)| *var).collect();
+        let mut related: BTreeSet<(Var, Var)> = BTreeSet::new();
+        for side in &sides {
+            for fact in &side.facts {
+                for left_var in fact.terms.keys() {
+                    for right_var in fact.terms.keys() {
+                        related.insert((*left_var, *right_var));
+                    }
+                }
+            }
+        }
+        for (var, quantity) in &joined {
             let mut measures = vec![Linear::var(*var)];
             for other in &keep {
-                if other != var {
+                let mirrored = joined_set.contains(other) && other < var;
+                let foreign = self
+                    .anchored
+                    .get(other)
+                    .is_some_and(|anchored| anchored != quantity);
+                if other != var && !mirrored && !foreign && related.contains(&(*var, *other)) {
                     measures.push(
                         Linear::var(*var)
                             .subtract(&Linear::var(*other))
@@ -556,8 +609,8 @@ impl Prover<'_> {
         let mut low = Some(i128::MAX);
         let mut high = Some(i128::MIN);
         for side in sides {
-            let side_low = finite(self.extent(side, measure, false));
-            let side_high = finite(self.extent(side, measure, true));
+            let (side_low, side_high) = self.range(side, measure);
+            let (side_low, side_high) = (finite(side_low), finite(side_high));
             low = low.zip(side_low).map(|(a, b)| a.min(b));
             high = high.zip(side_high).map(|(a, b)| a.max(b));
         }

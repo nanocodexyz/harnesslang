@@ -233,10 +233,13 @@ unknown = 0
 child_unknown = 0
 discarded = []
 parent_unknown = set()
+spawn_calls = set()
 for line in open(f"{out}/journal/journal.jsonl"):
     record = json.loads(line)["record"]
     if "recovery" in record:
         parent_unknown.update(record["recovery"].get("unknown", []))
+    if record.get("call", {}).get("tool") == "spawn_agent":
+        spawn_calls.add(record["call"]["call_id"])
 for journal in journals:
     replies = set()
     for line in open(f"{journal}/journal.jsonl"):
@@ -286,7 +289,7 @@ for line in open(f"{out}/journal/journal.jsonl"):
     output = record.get("result", {}).get("output", {})
     if isinstance(output.get("ok"), str) and "the child recorded" in output["ok"]:
         joined.append(output["ok"])
-spawn_unknown = any(key.replace(".", "/") in parent_unknown for key in children)
+spawn_unknown = any(key.replace(".", "/") in parent_unknown for key in children) or bool(spawn_calls & parent_unknown)
 if mode == "mock" and not spawn_unknown:
     if len(children) != 1:
         sys.exit(f"agent-drill: expected one child journal under {children_dir}, found {children}")

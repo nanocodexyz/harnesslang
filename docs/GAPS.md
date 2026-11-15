@@ -88,3 +88,69 @@ What does not differ: tool calls per reply (Claude Code 0.99, hl-agent 0.98, nan
 Not harness gaps: cancel-async-tasks fails in every arm (0 of 8, 0 of 1, 1 of 4) on cleanup after a SIGINT that no agent tests; query-optimize and raman-fitting fail on a runtime margin and a fit in every arm.
 
 Reruns of the closed gaps (hl-agent only, claude-sonnet-4-6, 2 attempts on the five tasks, then 3 on the two that still failed; paths under the gap-mining lane's `output/gaps/`). With the Inputs block and the first Finishing changes (run1, run2): db-wal-recovery 4 of 4 (before the fix 1 of 5), sqlite-with-gcov 2 of 4 (0 of 5), configure-git-webserver 3 of 4 (4 of 5), git-multibranch 3 of 4 (3 of 5), polyglot-c-py 2 of 4 (4 of 8); the five together 14 of 20 against 12 of 28, $4.41 for 20 attempts. The Finishing block then named the two failures it still let through (installing python3 with apt-get, and keeping what a smoke test produced): configure-git-webserver 3 of 3, polyglot-c-py 1 of 3 (run4, $1.44). A regression run on six tasks hl-agent passed every time before (run3: fix-git, git-leak-recovery, sqlite-db-truncate, build-pmars, regex-log, sanitize-git-repo, 1 attempt each, $1.57) passed 5 of 6; fix-git, 6 of 6 before, failed once. Status: 1 and 3 hold; 2 holds for sqlite-with-gcov and git-multibranch but polyglot-c-py still fails 4 of its 7 attempts since, so it stays open; 4 and 5 are open.
+
+# What nanocode's MPP does that harnesslang cannot write
+
+`wallet` and `paid by` (LANGUAGE.md, Payments) cover a 402 on a tool call, an
+MCP tool of a listing and an HTTP fetch tool, paid as one-shot charges or session
+vouchers, each payment an external recoverable call of the wallet, the spend cap a
+proved invariant, and paid calls in parallel lanes. The list below comes from a read
+of nanocode d83b08f's `crates/integrations/mpp` and nanocode-ts d5b21f1's
+`src/machines`, ranked by how much of a real paying harness each blocks.
+
+## 1. Paid model calls
+
+nanocode pays the Tempo gateway's 402 on Messages and Responses requests through the
+same flow, keeps the gateway's `payment-failed` and `verification-failed` 402s in
+Claude Code's backoff (claude client lib.rs) and fails the turn after the last attempt.
+Here `paid by` is refused on a model: the payment desugaring keeps the last attempt's
+result in hidden state fields (a tag, the value, the failure text), which holds a tool's
+`maybe<T>` but not a model's `reply` or `attempt`, whose variants carry lists and usage.
+Smallest addition: a paid site's result slot as a typed hidden local the backends declare
+mutable before the payment loop, so a paid model call desugars as a paid tool does, with
+the credential carried in a hidden model setting the way `with {...}` carries settings.
+
+## 2. Settlement and receipts
+
+nanocode's `PendingPayment` commits, rolls back, invalidates (410 Gone) or abandons each
+credential by how the server answered (flow.rs), and records the `payment-receipt`
+header in its `PaymentResponse` event. Here the language tells the wallet only to pay; `hl-agent pay`'s host payer
+settles each credential by nanocode's rules and records the receipt and the
+`PaymentResponse` event in its own ledger (`scripts/mpp-drill.sh` catches
+`receipt_on_refusal`), but the harness journal holds neither, so a program cannot
+read a receipt and another host may settle differently.
+Smallest addition: a `none` call of the wallet after each presentation carrying the
+presentation's outcome and receipt, so the receipt is journaled once and a mutation that
+settles a refused payment as committed (nanocode-sim's `receipt_on_refusal`) is caught.
+
+## 3. Session channels beyond a voucher per 402
+
+nanocode's `SessionProvider` opens and tops up an on-chain channel, sends prepaid
+vouchers without a 402 round trip, retries once after a stale channel's 410 and closes
+the channel (session.rs, store.rs). Here a session challenge is paid like a charge and the
+channel lives in the wallet host; the program cannot see deposits or close a channel.
+
+## 4. Challenge choice
+
+nanocode ranks challenges by `Accept-Payment` preferences, refuses expired ones and a
+zero-amount proof for another realm, and nanocode-ts orders MACH sessions first. Here the
+wallet host chooses; the program cannot state a preference.
+
+## 5. Payments made inside a host tool
+
+nanocode's forward proxy lets shell commands pay `*.mpp.tempo.xyz` (proxy.rs) and its
+identity pass answers an email-attestation challenge (identity.rs). A bash tool here that
+pays through such a proxy pays outside the journal and the cap.
+
+## 6. Spend across sessions
+
+`spent()` is one session's: a fork copies the parent's spend and spends on from it, and a
+spawned child has a cap of its own, so a session family can spend its cap once per session.
+nanocode's wallet spends from one balance per key. Smallest addition: a family cap carried
+in the spawn tool's `sessions at most` bound, with the child's spend reported in its result.
+
+## 7. A real wallet in hl-agent
+
+hl-agent has no wallet host: signing a Tempo payment needs secp256k1 and Keccak, which a
+zero-dependency hl-agent would have to carry itself, and no payment may spend real funds.
+The simulator's wallet and the kill -9 drill's host stand in for it.

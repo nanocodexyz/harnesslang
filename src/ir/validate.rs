@@ -181,6 +181,15 @@ fn reads_local(value: &Expr) -> bool {
         | Expr::TextLen(operand)
         | Expr::Truncate { text: operand, .. } => reads_local(operand),
         Expr::TextBuiltin { args, .. } => args.iter().any(reads_local),
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .any(|part| reads_local(part)),
         Expr::Cancelled => false,
     }
 }
@@ -207,6 +216,15 @@ fn reads_events(value: &Expr) -> bool {
         | Expr::TextLen(operand)
         | Expr::Truncate { text: operand, .. } => reads_events(operand),
         Expr::TextBuiltin { args, .. } => args.iter().any(reads_events),
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .any(|part| reads_events(part)),
     }
 }
 
@@ -458,10 +476,25 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
     }
 }
 
+fn presents_payment(args: &[Expr]) -> bool {
+    let [Expr::Construct { fields, .. }] = args else {
+        return false;
+    };
+    matches!(
+        fields.get(ir::CALL_INPUT),
+        Some(Expr::TextBuiltin {
+            op: ir::TextOp::WithPayment,
+            ..
+        })
+    )
+}
+
 fn lane_valid(handler: &Handler, statements: &[Stmt]) -> bool {
     statements.iter().all(|statement| match statement {
         Stmt::Finish { .. } | Stmt::Parallel(_) | Stmt::Take { .. } => false,
-        Stmt::Effect { site, .. } => handler.sites[*site].kind != SiteKind::Dispatch,
+        Stmt::Effect { site, args, .. } => {
+            handler.sites[*site].kind != SiteKind::Dispatch || presents_payment(args)
+        }
         Stmt::If {
             then, otherwise, ..
         } => lane_valid(handler, then) && lane_valid(handler, otherwise),
@@ -514,6 +547,21 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
         Expr::TextBuiltin { op, args } => {
             assert_eq!(args.len(), op.arity(), "a text builtin takes its arity");
             args.iter().for_each(|arg| expr(program, handler, arg));
+        }
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => {
+            assert!(
+                program.wallet.is_some(),
+                "only a harness with a wallet pays"
+            );
+            for part in [tag, value, reason, original] {
+                expr(program, handler, part);
+            }
         }
     }
 }

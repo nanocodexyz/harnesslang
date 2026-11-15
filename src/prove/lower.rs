@@ -268,6 +268,15 @@ fn arithmetic(value: &Expr) -> bool {
         Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
             fields.iter().any(arithmetic)
         }
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .any(|part| arithmetic(part)),
         Expr::U64(_)
         | Expr::Bool(_)
         | Expr::Text(_)

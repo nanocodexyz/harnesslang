@@ -153,7 +153,7 @@ and the nanocode oracle cover it.
 
 ## Deploy
 
-`hl deploy`, `status`, `logs`, `rollback`, `secrets` and `destroy` ship a
+`hl deploy`, `status`, `monitor`, `logs`, `rollback`, `secrets` and `destroy` ship a
 harness and watch it without wrangler or the Vercel CLI: they call the
 Cloudflare and Vercel REST APIs with `CLOUDFLARE_API_TOKEN` and
 `CLOUDFLARE_ACCOUNT_ID` or `VERCEL_TOKEN` (and `VERCEL_TEAM_ID`). `hl deploy
@@ -183,6 +183,13 @@ status cloudflare demo
 tail cloudflare demo: following (tail 00000000000000000000000000000005)
 2026-11-14T00:00:06.000Z ok POST https://demo.hl-fake.workers.dev/sessions/s1/turn
   log turn 1 answered
+> hl monitor --target cloudflare --name demo --out output/deploy-demo/cloudflare
+monitor cloudflare demo
+  url https://demo.hl-fake.workers.dev
+  version a0000000-0000-4000-8000-000000000003 serves 100% (deployment d0000000-0000-4000-8000-000000000004)
+  last 60 minutes: 1 events, 0 errors (0.0% failed)
+  recent 1:
+    2026-11-14T00:00:06.000Z log turn 1 answered
 > hl rollback --target cloudflare --name demo --out output/deploy-demo/cloudflare
 rollback cloudflare demo: version a0000000-0000-4000-8000-000000000001 (#1) serves 100% (deployment d0000000-0000-4000-8000-000000000006), was a0000000-0000-4000-8000-000000000003
   the Durable Object's storage is not rolled back: the older code reads the journal as it is now
@@ -190,6 +197,15 @@ rollback cloudflare demo: version a0000000-0000-4000-8000-000000000001 (#1) serv
 > hl destroy --target cloudflare --name demo --out output/deploy-demo/cloudflare --yes
 destroy cloudflare demo: deleted the script, its versions and its Durable Objects' storage
 ```
+
+`hl deploy FILE` puts a bearer token in front of every route: the first
+deploy draws 32 random bytes, sets them as the `HL_AUTH_TOKEN` secret in the
+same request that creates the script or project, and writes them to
+`OUT/auth-token` (mode 600); requests without `Authorization: Bearer TOKEN`
+get 401, and a deployment without the secret answers 503 rather than serve.
+`hl secrets set HL_AUTH_TOKEN` rotates it. A `--bundle` ships as it is.
+`hl monitor` shows the serving version, the error rate over `--minutes` and
+the latest turns in one round trip.
 
 `hl deploy --endpoints` lists every operation it calls, with its operation ID
 in the pinned specs.

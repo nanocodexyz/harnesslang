@@ -21,6 +21,9 @@ const UNDECLARED_TOOL_PPM: u64 = 250_000;
 const TOOL_FAILURE_PPM: u64 = 150_000;
 const UNDECLARED_TOOLS: [&str; 2] = ["web_fetch", "spawn_agent"];
 const RUN_OWNER: &str = "jsonl";
+const PAYMENT_PARAM: &str = "payment";
+const PAYMENT_REQUIRED_PREFIX: &str = "payment required: ";
+const DRILL_PRICE_UNITS: u64 = 1000;
 
 struct Rng(u64);
 
@@ -72,6 +75,22 @@ impl Host for Drill {
         }
         let line = checks::dispatch_line(&id, request.tool, request.effect, &self.tag);
         append_synced(&mut self.ledger, &line);
+        if program::WALLET == Some(request.tool) {
+            return Output::Ok(Json::Number(DRILL_PRICE_UNITS));
+        }
+        if let Some(Json::String(payment)) = request.input.get(PAYMENT_PARAM) {
+            if payment.is_empty() {
+                let challenge = Json::object(vec![
+                    ("amount", Json::String(DRILL_PRICE_UNITS.to_string())),
+                    ("id", Json::String(id.clone())),
+                    ("intent", Json::text("charge")),
+                    ("method", Json::text("tempo")),
+                ]);
+                let challenges = Json::object(vec![("challenges", Json::Array(vec![challenge]))]);
+                return Output::Failed(format!("{PAYMENT_REQUIRED_PREFIX}{}", challenges.encode()));
+            }
+            return Output::Ok(Json::String(format!("paid {}-{id}", request.tool)));
+        }
         if self.rng.chance(TOOL_FAILURE_PPM) {
             return Output::Failed(format!("{} failed at {id}", request.tool));
         }
@@ -93,7 +112,11 @@ impl Host for Drill {
                 Json::String(format!("done-{}-{}", request.turn, request.seq)),
             )]);
         }
-        let declared = ["read", "edit", "bash"];
+        let declared = if program::WALLET.is_some() {
+            ["read", "fetch", "bash"]
+        } else {
+            ["read", "edit", "bash"]
+        };
         let count = 1 + self.rng.below(request.calls_max);
         let mut calls = Vec::new();
         for index in 0..count {
@@ -425,6 +448,7 @@ fn typed_input(tool: &str, index: u64) -> String {
         "read" => vec![("path", Json::String(format!("input-{index}")))],
         "edit" => vec![("path", Json::String(format!("input-{index}"))), ("body", Json::String(format!("body-{index}")))],
         "bash" => vec![("command", Json::String(format!("input-{index}")))],
+        "fetch" => vec![("url", Json::String(format!("input-{index}")))],
         _ => return format!("input-{index}"),
     };
     Json::object(fields).encode()

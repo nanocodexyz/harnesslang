@@ -60,11 +60,18 @@ pub enum Invariant {
     SettingsSent,
     ForkStateEqual,
     CellSettledAtTurnEnd,
+    SpendWithinCap,
+    SpendAccounted,
+    PaymentPresented,
+    ClimbKeptValid,
+    ClimbStateFollows,
+    ClimbLedgerComplete,
+    ClimbCostBalanced,
     InterruptDecoded,
 }
 
 impl Invariant {
-    pub const ALL: [Self; 46] = [
+    pub const ALL: [Self; 53] = [
         Self::ExternalOnce,
         Self::SeqUnique,
         Self::UnknownReported,
@@ -110,6 +117,13 @@ impl Invariant {
         Self::SettingsSent,
         Self::ForkStateEqual,
         Self::CellSettledAtTurnEnd,
+        Self::SpendWithinCap,
+        Self::SpendAccounted,
+        Self::PaymentPresented,
+        Self::ClimbKeptValid,
+        Self::ClimbStateFollows,
+        Self::ClimbLedgerComplete,
+        Self::ClimbCostBalanced,
         Self::InterruptDecoded,
     ];
 
@@ -160,6 +174,13 @@ impl Invariant {
             Self::SettingsSent => "settings_sent",
             Self::ForkStateEqual => "fork_state_equal",
             Self::CellSettledAtTurnEnd => "cell_settled_at_turn_end",
+            Self::SpendWithinCap => "spend_within_cap",
+            Self::SpendAccounted => "spend_accounted",
+            Self::PaymentPresented => "payment_presented",
+            Self::ClimbKeptValid => "climb_kept_valid",
+            Self::ClimbStateFollows => "climb_state_follows",
+            Self::ClimbLedgerComplete => "climb_ledger_complete",
+            Self::ClimbCostBalanced => "climb_cost_balanced",
             Self::InterruptDecoded => "interrupt_decoded",
         }
     }
@@ -489,6 +510,7 @@ pub fn check(
     idempotent_known(&calls, records)?;
     checkpoint_compacted(program, world, records)?;
     liveness_and_replay(program, world, turns, records)?;
+    crate::sim::climb::check(program, world, records)?;
     world.inbox.kept(records)?;
     crate::sim::idle::check(program, world, records)?;
     world.jobs.check(program, records)?;
@@ -889,6 +911,7 @@ pub fn safety(world: &SimWorld<'_>, records: &[Record]) -> Result<Calls, Violati
     blob_journaled(world.program, records)?;
     search_listed(world.program, records)?;
     interrupt_honored(world.program, records)?;
+    crate::sim::mpp::check(world, records)?;
     interrupt_decoded(world, records)?;
     for (id, dispatched) in world
         .dispatched

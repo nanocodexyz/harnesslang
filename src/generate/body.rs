@@ -30,9 +30,12 @@ enum Kind {
     Loop,
     For,
     Return,
+    Clear,
+    Keep,
+    Rewrite,
 }
 
-const STATEMENT_WEIGHTS: [(Kind, u64); 8] = [
+const STATEMENT_WEIGHTS: [(Kind, u64); 11] = [
     (Kind::Let, 5),
     (Kind::Assign, 4),
     (Kind::Push, 4),
@@ -41,7 +44,19 @@ const STATEMENT_WEIGHTS: [(Kind, u64); 8] = [
     (Kind::Loop, 2),
     (Kind::For, 2),
     (Kind::Return, 1),
+    (Kind::Clear, 1),
+    (Kind::Keep, 1),
+    (Kind::Rewrite, 1),
 ];
+const REWRITE_ARM_PERCENT: u64 = 50;
+const REWRITE_DROP_PERCENT: u64 = 30;
+const HOOK_PERCENT: u64 = 25;
+const HOOK_STATEMENTS_MAX: u64 = 3;
+const LIFECYCLE_HOOKS: [&str; 2] = ["on session start", "on stop"];
+const PARALLEL_PERCENT: u64 = 50;
+const WALK_CALLS_PERCENT: u64 = 60;
+const ALLOW_PERCENT: u64 = 30;
+const DENY_PERCENT: u64 = 70;
 
 struct Body<'a> {
     context: Context<'a>,
@@ -62,6 +77,8 @@ pub fn invariants(rng: &mut Rng, decls: &Decls) -> Vec<String> {
         indices: Vec::new(),
         effects: false,
         fields: true,
+        subject: false,
+        lane: false,
     };
     let lists: Vec<(String, Ty)> = context.lists();
     (0..rng.below(INVARIANTS_MAX + 1))
@@ -74,6 +91,108 @@ pub fn invariants(rng: &mut Rng, decls: &Decls) -> Vec<String> {
             format!("invariant inv{index}: {condition}")
         })
         .collect()
+}
+
+pub fn hooks(rng: &mut Rng, decls: &Decls) -> Vec<String> {
+    let mut lines = Vec::new();
+    for hook in LIFECYCLE_HOOKS {
+        if !chance(rng, HOOK_PERCENT) {
+            continue;
+        }
+        let mut context = Context {
+            decls,
+            locals: Vec::new(),
+            indices: Vec::new(),
+            effects: true,
+            fields: true,
+            subject: false,
+            lane: false,
+        };
+        let fields: Vec<(String, Ty)> = decls
+            .fields
+            .iter()
+            .filter(|(_, ty)| matches!(ty, Ty::U64 | Ty::Bool | Ty::Text))
+            .cloned()
+            .collect();
+        if fields.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(format!("{hook} {{"));
+        for _ in 0..rng.range(1, HOOK_STATEMENTS_MAX) {
+            let (name, ty) = fields[rng.pick(fields.len())].clone();
+            if let Some(value) = context.expr(rng, &ty, true, EXPRESSION_DEPTH_MAX) {
+                lines.push(format!("{INDENT}{name} = {value}"));
+            }
+        }
+        lines.push("}".to_owned());
+    }
+    lines
+}
+
+pub fn dispatch_hooks(rng: &mut Rng, decls: &Decls) -> Vec<String> {
+    if !decls.dispatch_hooks {
+        return Vec::new();
+    }
+    let mut used = decls.names.clone();
+    let call = fresh(rng, &mut used, "c".to_owned());
+    let outcome = fresh(rng, &mut used, "outcome".to_owned());
+    let before = rng.below(2) == 0;
+    let after = !before || rng.below(2) == 0;
+    let mut lines = Vec::new();
+    let mut context = Context {
+        decls,
+        locals: vec![(call.clone(), Ty::Sum(CALL))],
+        indices: Vec::new(),
+        effects: false,
+        fields: true,
+        subject: false,
+        lane: false,
+    };
+    if before {
+        lines.push(String::new());
+        lines.push(format!("before tool({call}: call) {{"));
+        lines.extend(decision(rng, &mut context, 1));
+        if chance(rng, ALLOW_PERCENT) {
+            let input = context.text_expr(rng);
+            lines.push(format!("{INDENT}allow({input})"));
+        }
+        lines.push("}".to_owned());
+    }
+    if after {
+        lines.push(String::new());
+        lines.push(format!(
+            "after tool({call}: call, {outcome}: maybe<text>) {{"
+        ));
+        let output = fresh(rng, &mut used, "o".to_owned());
+        lines.push(format!("{INDENT}match {outcome} {{"));
+        lines.push(format!("{INDENT}{INDENT}ok({output}) => {{"));
+        context.locals.push((output, Ty::Text));
+        lines.extend(decision(rng, &mut context, 3));
+        context.locals.pop();
+        lines.push(format!("{INDENT}{INDENT}}}"));
+        lines.push(format!("{INDENT}{INDENT}failed(_) => {{"));
+        lines.extend(decision(rng, &mut context, 3));
+        lines.push(format!("{INDENT}{INDENT}}}"));
+        lines.push(format!("{INDENT}{INDENT}unknown => {{}}"));
+        lines.push(format!("{INDENT}}}"));
+        lines.push("}".to_owned());
+    }
+    lines
+}
+
+fn decision(rng: &mut Rng, context: &mut Context, depth: usize) -> Vec<String> {
+    let indent = INDENT.repeat(depth);
+    if !chance(rng, DENY_PERCENT) {
+        return Vec::new();
+    }
+    let condition = context.boolean(rng, EXPRESSION_DEPTH_MAX);
+    let reason = context.text_expr(rng);
+    vec![
+        format!("{indent}if {condition} {{"),
+        format!("{indent}{INDENT}deny({reason})"),
+        format!("{indent}}}"),
+    ]
 }
 
 fn provable_invariant(rng: &mut Rng, decls: &Decls, lists: &[(String, Ty)]) -> String {
@@ -98,6 +217,8 @@ fn return_type(rng: &mut Rng, decls: &Decls) -> Ty {
         indices: Vec::new(),
         effects: false,
         fields: true,
+        subject: false,
+        lane: false,
     };
     for _ in 0..RETURN_TYPE_DRAWS_MAX {
         let ty = param_type(rng, decls);
@@ -136,6 +257,8 @@ pub fn handler(
             indices: Vec::new(),
             effects: false,
             fields: true,
+            subject: false,
+            lane: false,
         },
         used,
         names: 0,
@@ -155,7 +278,14 @@ pub fn handler(
         .then(|| body.context.boolean(rng, EXPRESSION_DEPTH_MAX));
     body.context.effects = true;
     body.lines.push("{".to_owned());
-    let returned = body.statements(rng, 1);
+    let mut returned = false;
+    if decls.dispatch_hooks && index == 0 {
+        body.statements_left -= 1;
+        returned = body.dispatch_match(rng, 1, "call(\"t0\", \"{}\", \"c0\")");
+    }
+    if !returned {
+        returned = body.statements(rng, 1);
+    }
     if !returned {
         body.final_return(rng);
     }
@@ -245,11 +375,12 @@ impl Body<'_> {
             .filter(|(kind, _)| match kind {
                 Kind::If | Kind::Match => nested,
                 Kind::Loop | Kind::For => looping,
-                Kind::Return => depth > 1,
+                Kind::Return => depth > 1 && !self.context.lane,
                 _ => true,
             })
             .collect();
-        match weighted(rng, &picks) {
+        let kind = weighted(rng, &picks);
+        match kind {
             Kind::Let => self.let_statement(rng, depth),
             Kind::Assign => self.assign(rng, depth),
             Kind::Push => self.push(rng, depth),
@@ -257,6 +388,8 @@ impl Body<'_> {
             Kind::Match => return self.match_statement(rng, depth),
             Kind::Loop => self.loop_statement(rng, depth),
             Kind::For => self.for_statement(rng, depth),
+            Kind::Clear | Kind::Keep => self.shrink(rng, depth, kind),
+            Kind::Rewrite => self.rewrite(rng, depth),
             Kind::Return => {
                 let ty = self.returns.clone();
                 if let Some(value) = self.context.expr(rng, &ty, true, EXPRESSION_DEPTH_MAX) {
@@ -322,6 +455,76 @@ impl Body<'_> {
             let count = self.pushes.entry(name).or_insert(0);
             *count = count.saturating_add(self.multiplier);
         }
+    }
+
+    fn rewrite(&mut self, rng: &mut Rng, depth: u32) {
+        let decls = self.context.decls;
+        let lists: Vec<(String, Ty)> = decls
+            .fields
+            .iter()
+            .filter_map(|(name, ty)| match ty {
+                Ty::List(element, _) if matches!(**element, Ty::Sum(_)) => {
+                    Some((name.clone(), (**element).clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if lists.is_empty() {
+            return;
+        }
+        let (name, element) = lists[rng.pick(lists.len())].clone();
+        let variants = decls.variants(&element).expect("a sum has variants");
+        let effects = std::mem::replace(&mut self.context.effects, false);
+        self.line(depth, format!("rewrite {name} {{"));
+        for (variant, fields) in variants {
+            if !chance(rng, REWRITE_ARM_PERCENT) {
+                continue;
+            }
+            let scope = self.context.locals.len();
+            let mut bindings = Vec::new();
+            for field in &fields {
+                let binding = self.name(rng, "r");
+                bindings.push(binding.clone());
+                self.context.locals.push((binding, field.clone()));
+            }
+            let pattern = if bindings.is_empty() {
+                variant.clone()
+            } else {
+                format!("{variant}({})", bindings.join(", "))
+            };
+            let target = if chance(rng, REWRITE_DROP_PERCENT) {
+                Some("drop".to_owned())
+            } else {
+                self.context.expr(rng, &element, true, EXPRESSION_DEPTH_MAX)
+            };
+            self.context.locals.truncate(scope);
+            if let Some(target) = target {
+                self.line(depth + 1, format!("{pattern} => {target}"));
+            }
+        }
+        self.line(depth, "}".to_owned());
+        self.context.effects = effects;
+    }
+
+    fn shrink(&mut self, rng: &mut Rng, depth: u32, kind: Kind) {
+        let lists: Vec<String> = self
+            .context
+            .decls
+            .fields
+            .iter()
+            .filter(|(_, ty)| matches!(ty, Ty::List(..)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if lists.is_empty() {
+            return;
+        }
+        let name = lists[rng.pick(lists.len())].clone();
+        if kind == Kind::Clear {
+            self.line(depth, format!("clear {name}"));
+            return;
+        }
+        let count = self.context.number(rng, EXPRESSION_DEPTH_MAX);
+        self.line(depth, format!("keep {name} last {count}"));
     }
 
     fn if_statement(&mut self, rng: &mut Rng, depth: u32, keyword: &str) -> bool {
@@ -418,7 +621,7 @@ impl Body<'_> {
             format!("{variant}({})", bindings.join(", "))
         };
         self.line(depth, format!("{pattern} => {{"));
-        let returned = self.block(rng, depth + 1);
+        let returned = self.walk_calls(rng, depth + 1, scope) || self.block(rng, depth + 1);
         let comma = if chance(rng, ARM_COMMA_PERCENT) {
             ","
         } else {
@@ -445,6 +648,73 @@ impl Body<'_> {
         self.line(depth, "}".to_owned());
     }
 
+    fn dispatch_match(&mut self, rng: &mut Rng, depth: u32, call: &str) -> bool {
+        self.line(depth, format!("match dispatch({call}) {{"));
+        let mut variants = self
+            .context
+            .decls
+            .variants(&Ty::Maybe(Box::new(Ty::Text)))
+            .expect("an outcome has variants");
+        shuffle(rng, &mut variants);
+        let mut all_return = true;
+        for (variant, fields) in variants {
+            all_return &= self.arm(rng, depth + 1, &variant, &fields);
+        }
+        self.line(depth, "}".to_owned());
+        all_return
+    }
+
+    fn walk_calls(&mut self, rng: &mut Rng, depth: u32, scope: usize) -> bool {
+        let calls = self.context.locals[scope..]
+            .iter()
+            .find_map(|(name, ty)| match ty {
+                Ty::List(element, capacity) if **element == Ty::Sum(CALL) => {
+                    Some((name.clone(), *capacity))
+                }
+                _ => None,
+            });
+        let Some((list, capacity)) = calls else {
+            return false;
+        };
+        if self.context.lane || self.loops >= LOOP_NESTING_MAX || !chance(rng, WALK_CALLS_PERCENT) {
+            return false;
+        }
+        self.statements_left = self.statements_left.saturating_sub(1);
+        let times = self.context.decls.constants[capacity].1;
+        if !self.context.decls.dispatch_hooks && chance(rng, PARALLEL_PERCENT) {
+            self.parallel_statement(rng, depth, &list, times);
+            return false;
+        }
+        let name = self.name(rng, "x");
+        self.line(depth, format!("for {name} in {list} {{"));
+        let saved = self.multiplier;
+        self.multiplier = self.multiplier.saturating_mul(times);
+        self.loops += 1;
+        self.context.locals.push((name.clone(), Ty::Sum(CALL)));
+        self.dispatch_match(rng, depth + 1, &name);
+        self.context.locals.pop();
+        self.loops -= 1;
+        self.multiplier = saved;
+        self.line(depth, "}".to_owned());
+        false
+    }
+
+    fn parallel_statement(&mut self, rng: &mut Rng, depth: u32, list: &str, times: u64) {
+        let name = self.name(rng, "x");
+        self.line(depth, format!("for {name} in {list} parallel {{"));
+        let saved = self.multiplier;
+        self.multiplier = self.multiplier.saturating_mul(times);
+        self.loops += 1;
+        self.context.lane = true;
+        self.context.locals.push((name.clone(), Ty::Sum(CALL)));
+        self.dispatch_match(rng, depth + 1, &name);
+        self.context.locals.pop();
+        self.context.lane = false;
+        self.loops -= 1;
+        self.multiplier = saved;
+        self.line(depth, "}".to_owned());
+    }
+
     fn for_statement(&mut self, rng: &mut Rng, depth: u32) {
         let lists = self.context.lists();
         if lists.is_empty() {
@@ -454,10 +724,18 @@ impl Body<'_> {
         let Ty::List(element, capacity) = ty else {
             unreachable!("lists() returns lists")
         };
+        let times = self.context.decls.constants[capacity].1;
+        let parallel = *element == Ty::Sum(CALL)
+            && !self.context.lane
+            && !self.context.decls.dispatch_hooks
+            && chance(rng, PARALLEL_PERCENT);
+        if parallel {
+            self.parallel_statement(rng, depth, &list, times);
+            return;
+        }
         let name = self.name(rng, "x");
         self.line(depth, format!("for {name} in {list} {{"));
         self.context.locals.push((name, *element));
-        let times = self.context.decls.constants[capacity].1;
         self.repeated(rng, depth, times);
         self.context.locals.pop();
         self.line(depth, "}".to_owned());

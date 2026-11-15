@@ -72,6 +72,7 @@ pub enum Mutation {
     DropRequires,
     RepeatAssign,
     DropCellFinish,
+    DropPayGuard,
 }
 
 const LOWERING_MUTATIONS: [run::mutation::Mutation; 30] = [
@@ -107,12 +108,13 @@ const LOWERING_MUTATIONS: [run::mutation::Mutation; 30] = [
     run::mutation::Mutation::CellLeaks,
 ];
 
-const PROGRAM_MUTATIONS: [Mutation; 5] = [
+const PROGRAM_MUTATIONS: [Mutation; 6] = [
     Mutation::DropFlush,
     Mutation::DropFinish,
     Mutation::DropRequires,
     Mutation::RepeatAssign,
     Mutation::DropCellFinish,
+    Mutation::DropPayGuard,
 ];
 
 impl Mutation {
@@ -132,6 +134,7 @@ impl Mutation {
             Self::DropRequires => "drop_requires",
             Self::RepeatAssign => "repeat_assign",
             Self::DropCellFinish => "drop_cell_finish",
+            Self::DropPayGuard => "drop_pay_guard",
         }
     }
 
@@ -195,6 +198,42 @@ fn repeat_assignments(statements: &mut Vec<Stmt>) {
     *statements = out;
 }
 
+fn overcharged(statements: &[Stmt]) -> bool {
+    statements.iter().any(|statement| {
+        matches!(statement, Stmt::Assign { value: crate::ir::Expr::Text(text), .. } if text == crate::ir::PAYMENT_OVERCHARGED)
+    })
+}
+
+fn drop_pay_guard(statements: &mut Vec<Stmt>) {
+    let mut out = Vec::with_capacity(statements.len());
+    for mut statement in statements.drain(..) {
+        match &mut statement {
+            Stmt::If {
+                then, otherwise, ..
+            } if overcharged(otherwise) => {
+                drop_pay_guard(then);
+                out.append(then);
+                continue;
+            }
+            Stmt::If {
+                then, otherwise, ..
+            } => {
+                drop_pay_guard(then);
+                drop_pay_guard(otherwise);
+            }
+            Stmt::Match { arms, .. } => {
+                arms.iter_mut()
+                    .for_each(|arm| drop_pay_guard(&mut arm.body));
+            }
+            Stmt::Loop { body, .. } | Stmt::For { body, .. } => drop_pay_guard(body),
+            Stmt::Parallel(parallel) => drop_pay_guard(&mut parallel.body),
+            _ => {}
+        }
+        out.push(statement);
+    }
+    *statements = out;
+}
+
 pub fn mutate(program: &Program, mutation: Mutation) -> Program {
     let mut program = program.clone();
     for handler in &mut program.handlers {
@@ -206,6 +245,7 @@ pub fn mutate(program: &Program, mutation: Mutation) -> Program {
             }
             Mutation::DropRequires => handler.requires = None,
             Mutation::RepeatAssign => repeat_assignments(&mut handler.body),
+            Mutation::DropPayGuard => drop_pay_guard(&mut handler.body),
             Mutation::None
             | Mutation::Lowering(_)
             | Mutation::DropFlush

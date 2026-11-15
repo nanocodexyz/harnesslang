@@ -1016,7 +1016,10 @@ impl<'a> Engine<'a> {
                 self.locals[*local] = Some(self.eval(value)?);
             }
             Stmt::Assign { field, value } => {
-                self.state[*field] = self.eval(value)?;
+                let value = self.eval(value)?;
+                if !self.payment_mutated(*field) {
+                    self.state[*field] = value;
+                }
             }
             Stmt::Push { field, value } => self.push(*field, value)?,
             Stmt::Shrink { field, kept } => self.shrink(*field, kept)?,
@@ -1776,6 +1779,20 @@ impl<'a> Engine<'a> {
                 self.sites.insert(seq, SiteLog::Open(call.clone()));
                 self.execute(site_id, seq, &call, &args)
             }
+        }
+    }
+
+    fn payment_mutated(&mut self, field: usize) -> bool {
+        let Some(wallet) = &self.program.wallet else {
+            return false;
+        };
+        match self.mutation {
+            Mutation::SpentUnaccounted => field == wallet.spent,
+            Mutation::CredentialDropped if self.program.state[field].name == ir::PAID_REF_FIELD => {
+                self.state[field] = Value::Text(String::new());
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2719,6 +2736,9 @@ impl<'a> Engine<'a> {
     }
 
     fn dispatched_returns(&self, tool: &str) -> Type {
+        if self.program.is_wallet(tool) {
+            return Type::U64;
+        }
         match self
             .program
             .tool(tool)
@@ -3292,6 +3312,15 @@ fn reads_cancelled(expr: &Expr) -> bool {
         | Expr::TextLen(operand)
         | Expr::Truncate { text: operand, .. } => reads_cancelled(operand),
         Expr::TextBuiltin { args, .. } => args.iter().any(reads_cancelled),
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .any(|part| reads_cancelled(part)),
     }
 }
 
@@ -3382,6 +3411,18 @@ pub fn evaluate_with(
                 ir::TextValue::Text(text) => Value::Text(text),
             }
         }
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => match eval(tag)?.as_u64() {
+            0 => Value::Variant(ir::OK, vec![eval(value)?]),
+            1 => Value::Variant(ir::FAILED, vec![eval(reason)?]),
+            ir::OUTCOME_TAG_UNKNOWN => Value::Variant(ir::UNKNOWN, Vec::new()),
+            _ => eval(original)?,
+        },
         Expr::Cancelled => {
             Value::Bool(cancelled.expect("a turn reads its events before it evaluates 'cancelled'"))
         }

@@ -111,12 +111,14 @@ impl<'a, 'p> Body<'a, 'p> {
                     let name = &self.program.state[*field].name;
                     let field = self.field(*field);
                     self.line(&format!(
-                        "keep_last_after(&mut state.{field}, {count}, {first}, {capacity}, {name:?})?;"
+                        "{{ let kept_count = {count}; let kept_first = {first}; keep_last_after(&mut state.{field}, kept_count, kept_first, {capacity}, {name:?})?; }}"
                     ));
                     return;
                 }
                 let field = self.field(*field);
-                self.line(&format!("keep_last(&mut state.{field}, {count});"));
+                self.line(&format!(
+                    "{{ let kept_count = {count}; keep_last(&mut state.{field}, kept_count); }}"
+                ));
             }
             Stmt::If {
                 condition,
@@ -595,7 +597,7 @@ impl<'a, 'p> Body<'a, 'p> {
             Expr::With { list, .. } => self.type_of(list),
             Expr::Local(local) => self.handler.locals[*local].ty.clone(),
             Expr::Field(field) => self.program.state[*field].ty.clone(),
-            Expr::Construct { ty, .. } => ty.clone(),
+            Expr::Construct { ty, .. } | Expr::Outcome { ty, .. } => ty.clone(),
             Expr::TextBuiltin { op, .. } => op.result(),
             Expr::Binary { op, .. } => match op {
                 BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => Type::U64,
@@ -663,6 +665,23 @@ impl<'a, 'p> Body<'a, 'p> {
                 format!("text_{}({})", op.name(), args.join(", "))
             }
             Expr::Cancelled => "engine.cancelled()".to_owned(),
+            Expr::Outcome {
+                ty,
+                tag,
+                value,
+                reason,
+                original,
+            } => {
+                let tag = self.expr(tag);
+                let ok = self.construct(ty, ir::OK, std::slice::from_ref(value));
+                let failed = self.construct(ty, ir::FAILED, std::slice::from_ref(reason));
+                let unknown = self.construct(ty, ir::UNKNOWN, &[]);
+                let original = self.expr(original);
+                format!(
+                    "(match {tag} {{ 0 => {ok}, 1 => {failed}, {} => {unknown}, _ => {original} }})",
+                    ir::OUTCOME_TAG_UNKNOWN
+                )
+            }
         }
     }
 

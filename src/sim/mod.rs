@@ -1,4 +1,5 @@
 pub mod cell;
+pub mod climb;
 pub mod dump;
 pub mod events;
 pub mod exhaustive;
@@ -7,6 +8,7 @@ pub mod fork;
 pub mod idle;
 pub mod invariants;
 pub mod jobs;
+pub mod mpp;
 pub mod park;
 pub mod rng;
 pub mod side;
@@ -455,6 +457,12 @@ fn in_flight_stats(stats: &Stats) -> String {
             stats.jobs, stats.job_notices, stats.jobs_died
         );
     }
+    if stats.payment_required > 0 {
+        out += &format!(
+            " payment_required={} pays={} paid_units={} presented={}",
+            stats.payment_required, stats.pays, stats.paid_units, stats.presented
+        );
+    }
     out
 }
 
@@ -520,6 +528,10 @@ pub(crate) fn add(total: &mut Stats, more: &Stats) {
     total.idle_turns += more.idle_turns;
     total.idle_refused += more.idle_refused;
     total.yields += more.yields;
+    total.payment_required += more.payment_required;
+    total.pays += more.pays;
+    total.paid_units += more.paid_units;
+    total.presented += more.presented;
 }
 
 pub struct Placement<'a> {

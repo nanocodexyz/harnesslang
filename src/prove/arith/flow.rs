@@ -49,17 +49,17 @@ impl Prover<'_> {
             } => {
                 self.value(&mut state, condition);
                 let text = self.names.expr(condition);
-                let taken = self.assume(state.clone(), condition, true);
-                let skipped = self.assume(state, condition, false);
+                let taken = self.assume_settled(state.clone(), condition, true);
+                let skipped = self.assume_settled(state.clone(), condition, false);
                 let then_end = self.branch(format!("if {text}"), then, taken);
                 let otherwise_end = self.branch(format!("else of if {text}"), otherwise, skipped);
-                self.join(then_end, otherwise_end)
+                self.merge(state, vec![then_end, otherwise_end])
             }
             Stmt::Match { subject, ty, arms } => {
                 self.value(&mut state, subject);
                 let text = self.names.expr(subject);
                 let variants = ty.variants(self.program).expect("a match subject is a sum");
-                let mut end = None;
+                let mut ends = Vec::with_capacity(arms.len());
                 let usage = self.usage_arm(ty);
                 for arm in arms {
                     let mut entered = state.clone();
@@ -77,10 +77,9 @@ impl Prover<'_> {
                         }
                     }
                     let label = format!("match {text}: {}", variants[arm.variant].name);
-                    let arm_end = self.branch(label, &arm.body, entered);
-                    end = self.join(end, arm_end);
+                    ends.push(self.branch(label, &arm.body, (entered, None)));
                 }
-                end
+                self.merge(state, ends)
             }
             Stmt::Loop { index, bound, body } => self.repeat(
                 state,
@@ -136,6 +135,24 @@ impl Prover<'_> {
         }
     }
 
+    fn merge(&mut self, before: State, ends: Vec<Option<State>>) -> Option<State> {
+        let reached: Vec<State> = ends.into_iter().flatten().collect();
+        let unchanged = |end: &State| {
+            before
+                .env
+                .iter()
+                .all(|(quantity, var)| end.env.get(quantity) == Some(var))
+        };
+        if reached.len() > 1 && reached.iter().all(unchanged) {
+            return Some(before);
+        }
+        let mut end = None;
+        for arm_end in reached {
+            end = self.join(end, Some(arm_end));
+        }
+        end
+    }
+
     fn usage_arm(&self, ty: &Type) -> Option<(usize, i128)> {
         let window = self.program.model.as_ref()?.window.as_ref()?;
         (*ty == Type::Sum(window.attempt))
@@ -176,8 +193,18 @@ impl Prover<'_> {
         self.obligation(state, goal, "wait_bound", message);
     }
 
-    fn branch(&mut self, label: String, statements: &[Stmt], state: State) -> Option<State> {
-        if !linear::feasible(&state.facts, &mut self.budget).unwrap_or(true) {
+    fn branch(
+        &mut self,
+        label: String,
+        statements: &[Stmt],
+        settled: (State, Option<bool>),
+    ) -> Option<State> {
+        let (state, feasible) = settled;
+        let feasible = match feasible {
+            Some(known) => known,
+            None => linear::feasible(&state.facts, &mut self.budget).unwrap_or(true),
+        };
+        if !feasible {
             return None;
         }
         self.path.push(label);

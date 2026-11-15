@@ -1,0 +1,21 @@
+harness keep_reads_list
+
+const cap: u64 = 4
+
+type item = item(u64)
+
+state {
+  items: list<u64, cap>
+  marked: list<item, cap>
+}
+
+on add(n: u64) -> u64
+  requires len(items) + 1 <= cap
+    and len(marked) + 1 <= cap
+{
+  push items n
+  keep items last len(items) - 1
+  push marked item(n)
+  keep marked last len(marked) - 1 after item(len(marked))
+  return len(items)
+}

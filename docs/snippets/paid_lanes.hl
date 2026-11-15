@@ -1,0 +1,44 @@
+harness paid_lanes
+
+const rounds_max: u64 = 4
+const calls_max: u64 = 3
+const context_max: u64 = 64
+const spend_cap: u64 = 120000
+const charge_max: u64 = 50000
+const payments_max: u64 = 3
+
+type outcome = done(text, u64) | exhausted(u64)
+
+wallet tempo spend at most spend_cap charge at most charge_max payments at most payments_max
+
+tool fetch(url: text) -> text effect idempotent paid by tempo
+tool search(query: text) -> text effect external paid by tempo
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words, spent()) }
+      calls(requested) => {
+        for call in requested parallel {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted(spent())
+}

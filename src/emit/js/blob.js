@@ -337,6 +337,7 @@ function reportsUnknown(type) {
 
 function dispatchedReturns(tool) {
   const declared = PROGRAM.tools.find((candidate) => candidate.name === tool);
+  if (PROGRAM.wallet === tool) return declared.returns;
   if (PROGRAM.blobs !== undefined && declared !== undefined && declared.returns.blob !== undefined) return declared.returns;
   return "text";
 }

@@ -1,0 +1,69 @@
+harness tune
+
+const cycles_max: u64 = 4
+const candidates_max: u64 = 2
+const trials_max: u64 = 3
+const failures_max: u64 = 3
+const cost_max: u64 = 30
+const propose_cost_max: u64 = 2
+const trial_cost_max: u64 = 1
+const nanos_max: u64 = 1000000
+const bytes_max: u64 = 100000
+const bytes_slack: u64 = 64
+const failing_max: u64 = 100
+const margin_nanos: u64 = 50
+const ledger_max: u64 = 64
+
+tool suggest(base: text) -> text effect idempotent
+tool bench(subject: text) -> u64 effect idempotent
+tool size(subject: text) -> u64 effect none
+tool failing(subject: text) -> u64 effect idempotent
+
+on cancel
+
+state {
+  config: text
+  log: list<cycle, ledger_max>
+  ended: climb_end
+}
+
+on prompt(start: text) -> text {
+  climb speed over config from start ledger log end ended
+    cycles cycles_max candidates candidates_max trials trials_max
+    cost cost_max propose propose_cost_max trial trial_cost_max
+    failures failures_max
+    metric nanos lower at most nanos_max
+    metric bytes lower at most bytes_max within bytes_slack
+    metric broken lower at most failing_max
+    gate broken == 0
+    accept mean by margin_nanos
+  {
+    propose(base) {
+      loop pick below candidates_max {
+        match suggest(base) {
+          ok(change) => { yield candidate(change, "try " ++ change) }
+          failed(_) => {}
+        }
+        yield cost 1
+      }
+    }
+    measure(subject) {
+      match bench(subject) {
+        ok(nanos) => {
+          match failing(subject) {
+            ok(count) => {
+              match size(subject) {
+                ok(bytes) => { yield score(nanos, bytes, count) }
+                failed(_) => {}
+              }
+            }
+            failed(_) => {}
+          }
+        }
+        failed(_) => {}
+      }
+      yield cost trial_cost_max
+    }
+  }
+  return config
+}

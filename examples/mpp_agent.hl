@@ -1,0 +1,58 @@
+harness mpp_agent
+
+const turn_steps_max: u64 = 16
+const calls_per_step_max: u64 = 4
+const context_entries_max: u64 = 1024
+const turns_max: u64 = 1000000
+const mcp_tools_max: u64 = 32
+const spend_cap_units: u64 = 5000000
+const charge_max_units: u64 = 50000
+const payments_per_call_max: u64 = 3
+
+type outcome = completed(text, u64) | failed(text) | exhausted(u64)
+
+wallet tempo spend at most spend_cap_units charge at most charge_max_units payments at most payments_per_call_max
+
+tool read(path: text) -> text effect none
+tool fetch(url: text) -> text effect idempotent paid by tempo
+tool bash(command: text) -> text effect external
+tools from listing(mcp, mcp_tools_max) (arguments: text) effect external paid by tempo
+
+model infer calls calls_per_step_max
+
+state {
+  context: list<entry, context_entries_max>
+  turns: u64
+}
+
+invariant turns_bounded: turns <= turns_max
+invariant context_bounded: len(context) <= context_entries_max
+
+on prompt(input: text) -> outcome
+  requires turns < turns_max
+    and len(context) + 2 + turn_steps_max * (1 + calls_per_step_max) <= context_entries_max
+{
+  push context user(input)
+  turns = turns + 1
+  match mcp() {
+    ok(_) => {}
+    failed(error) => { push context user(error) }
+  }
+  loop step below turn_steps_max {
+    let reply = infer(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return completed(words, spent()) }
+      calls(requested) => {
+        for call in requested {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted(spent())
+}
