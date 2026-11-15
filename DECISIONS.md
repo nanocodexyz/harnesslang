@@ -1087,6 +1087,26 @@ Measurements: 120 new rows (hl-agent and hl-agent-medium, 20 tasks x 3), 08:24 t
 
 Commands: `cargo build --release` at the root and in `agent/`, the binary patched with setup.sh's patchelf into an agent root with root-r4's lib; `nice -n 10 python3 evals/run.py --suite evals/suite.txt --tasks /home/hand/wt/eval-head/output/eval/tasks-all --agent-root output/eval/root --agents hl-agent,hl-agent-medium --attempts 3 --model claude-sonnet-4-6 --parallel 4 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --meter-port 19110 --relay-port 14110 --out output/eval/s1r`, with the s1x3r nanocode and Claude Code rows copied into `output/eval/s1r/rows` first; `python3 evals/report.py output/eval/s1r`.
 
+## 2026-11-15: eval-confirm: a 60-task suite to confirm hl-agent's suite-1 lead; runs held on the docker disk
+
+Branch eval-confirm, from master 93c1571. It establishes:
+
+- **evals/suite3.txt is the next 20 Terminal-Bench 2.1 tasks by a fixed rule**: the dataset's task names in the order `python3 evals/fetch.py terminal-bench-2.1 DIR --list` prints them (sorted by name), leaving out suites 1 and 2, skipping a task whose task.toml asks for gpus above 0 or memory_mb above 8192. No task in that range was skipped: none asks for a GPU and none for more than 8192 MB (caffe-cifar-10, filter-js-from-html and gpt2-codegolf ask for exactly 8192; caffe-cifar-10 for 4 CPUs). evals/suite-60.txt is suites 1, 2 and 3 in that order.
+- **Whether each suite-3 task builds here is not yet checked.** None of their 20 images is pulled, and the docker disk (/var/lib/docker, 98 GB) stood at 98 to 100% full (0.3 to 2.4 GB free) from other lanes' images and containers when this lane started, above the 97% at which it was to stop. No eval row ran and nothing was spent; no container or image was removed. A task that fails to pull or build when the runs start is to be replaced by the next name in the same order, recorded here.
+
+Commands: `python3 evals/fetch.py terminal-bench-2.1 output/eval/tasks3 TASK...` for the 49 tasks outside suites 1 and 2, their task.toml `gpus` and `memory_mb` read for the rule, `df -h /var/lib/docker` at 10:13 and 10:16 UTC.
+
+## 2026-11-15: eval-confirm runs: suite 60 x 3 on Sonnet, then suites 1+2 x 2 on Haiku, under a disk and spend watchdog
+
+Branch eval-confirm, from 3c6d6b3. It establishes:
+
+- **Every suite-3 task built here; none was replaced.** All 20 images are prebuilt on Docker Hub (0.03 to 1.27 GB compressed, custom-memory-heap-crash 6 GB unpacked) and pulled without error; none asks for more than 4 CPUs or 8192 MB (caffe-cifar-10 asks for exactly 4 and 8192), so the replacement rule never fired.
+- **`evals/run.py` holds new rows while a pause file exists** (`PAUSE_FILE`, polled every `PAUSE_POLL_SEC`): `run_row` waits before starting a row when `<out>/pause` is present, so a watchdog can lower the effective parallelism to 0 without killing rows in flight. The watchdog (scratch, output/eval/watch.py) writes the file when `df /home/hand` reaches 94% and removes it at 91%, deletes each finished row`s journal/home tree (journal/hl too at 88% and above), removes only this lane`s exited containers and, under disk pressure, only suite-3 images this lane pulled after all their rows finished; it also writes the pause at $116 of real spend and kills this lane`s driver at $120. Real spend is each new row`s responses.jsonl through `meter.usage_of` and `report.cost`, as evals/remeter.py computes it; the 180 copied suite-1 rows are not counted.
+- **Order and parallelism.** The run started at `--parallel 3` over suite 60 (task-major, longest agent timeout first, so build-pov-ray at 12000 s and the 3600 s suite-3 tasks led). At 12:20 UTC, on the lead`s request, it was restarted at `--parallel 5` with suites 1+2 first (their images were cached; every suite-1 row is copied, so this runs suite 2), then suite 60 for the rest of suite 3, then the Haiku pass. The three caffe-cifar-10 rows in flight at the restart were killed; their $1.67 of spend is counted in the cap and the rows reran.
+- **Upstream drops error rows, not failures.** Claude Code rows whose every request ended in a reset connection from the upstream (`ConnectionResetError` in the meter, status 0) retried until the 900 s timeout and were scored errored ("no model request succeeded"); report.py leaves them out of pass rates and lists them.
+- **Results** are in evals/RESULTS.md under "eval-confirm", regenerated from snapshots of finished rows (remetered) at every 150 new rows and at the end: per suite and overall Wilson intervals, real cost per attempt, paired sign tests for every pair of agents and the discordant rows (per-task losses) of each pair.
+
+Commands: `cargo build --release -j2` in agent/ under `nice -n 15`, the binary patched with patchelf (from /home/hand/wt/eval/output/eval/tools) into output/eval/root, a copy of int-evals` root-r4 whose nanocode and Claude Code binaries are hard links; `nice -n 10 env -u NANOEVAL_ANTHROPIC_UPSTREAM python3 -u evals/run.py --suite S --tasks output/eval/tasks60 --agent-root output/eval/root --agents hl-agent,nanocode,claude-code --parallel 5 --limits none --ca-bundle /etc/ssl/certs/ca-certificates.crt --meter-port 19390 --relay-port 14390` with S suite 1+2 then evals/suite-60.txt (`--attempts 3 --model claude-sonnet-4-6 --out output/eval/c60`, the 180 eval-rerun s1r rows of these three agents copied in first), then suite 1+2 `--attempts 2 --model claude-haiku-4-5 --out output/eval/h12`; `python3 evals/remeter.py` and `python3 evals/report.py` on snapshots of finished rows.
 ## 2026-11-14: wasm: the compiler writes WebAssembly modules, every program lowers, one fixed host per platform
 
 Branch wasm, from master ca53d55, merged from sub-lanes wasm-interp, wasm-events, wasm-blobs, wasm-cells2, wasm-hosts, wasm-jobs (with wasm-spawn) and wasm-speed. It establishes:
@@ -1219,4 +1239,24 @@ Commands: the analysis scripts in `output/an2.py` to `output/an8.py` over `/home
 ## agent-drill: a child killed before its first record is an orphan, not a crash of the checker (2026-11-15)
 
 With `AGENT_DRILL_SEED=1`, a kill can land right after the parent journals `spawn_agent` and before the child writes its first usage line. The checker then opened the child's missing `usage.jsonl` and failed with FileNotFoundError: 2 of 10 runs on master d474d32 and the agent stage of one full `scripts/check.sh` run. The dispatch count now skips a child with no usage log, since it dispatched nothing. The per-journal pass allows a missing `journal.jsonl` or `usage.jsonl` only for a child whose spawn the parent's recovery left unknown, and fails with a named error otherwise. `for i in $(seq 1 24); do AGENT_DRILL_SEED=1 scripts/agent-drill.sh; done`: 24 of 24 pass, every run with one child, against 2 failures in 10 on master.
+## 2026-11-15: eval-confirm: hl-agent against nanocode and stock Claude Code on 60 tasks, claude-sonnet-4-6
+
+Branch eval-confirm. It establishes:
+
+- **hl-agent passes more tasks for less on 60 Terminal-Bench 2.1 tasks.** Suites 1 and 2 (20 tasks each) ran three attempts per agent; suite 3 (20 tasks) ran three attempts on its first 4 tasks and one attempt on the other 16, because nanocode and Claude Code cost about $1.1 an attempt there and three attempts would have passed the spend cap. 147 attempts per agent.
+- **Throughput.** The suite-3 remainder ran as a separate `run.py` over the same rows directory at parallel 12 (from 4); the earlier instance was paused with its pause file and retired once its in-flight rows ended. Eight rows started under a parallel-8 instance were stopped and rerun under the parallel-12 one, so a few dollars of their first starts are not in the metered total. The rows wait on the model, so parallel 12 kept the 5-core Hand under load 3.
+
+Measurements (claude-sonnet-4-6, 2026-11-15, `python3 output/eval/mkreport.py`):
+
+| Agent | Passed | Pass rate (95% Wilson) | Cost/attempt | Wall/attempt |
+| --- | ---: | --- | ---: | ---: |
+| hl-agent | 119/147 | 81.0% (73.8-86.5%) | $0.197 | 272 s |
+| Claude Code | 97/147 (8 errored) | 69.8% (61.7-76.8%) | $0.330 | 440 s |
+| nanocode | 97/147 | 66.0% (58.0-73.2%) | $0.346 | 499 s |
+
+- Paired sign tests: hl-agent against nanocode 29 to 7 (p < 0.001), against Claude Code 24 to 9 (p = 0.014); Claude Code against nanocode 12 to 9 (p = 0.664).
+- Per suite, hl-agent against nanocode: suite 1 95.0% vs 88.3% ($0.082 vs $0.227), suite 2 71.7% vs 50.0% ($0.211 vs $0.346), suite 3 70.4% vs 51.9% on 27 attempts ($0.419 vs $0.609).
+- hl-agent is +15.0 points over nanocode at 0.57x its cost per attempt.
+
+Commands: `python3 evals/run.py --suite evals/suite-60.txt --tasks T --agent-root R --agents hl-agent,nanocode,claude-code --attempts 3 --model claude-sonnet-4-6 --parallel 4 --limits none --out output/eval/c60`, the same with `--suite output/eval/suite3-left.txt --attempts 1 --parallel 12`, `python3 output/eval/mkreport.py`.
 

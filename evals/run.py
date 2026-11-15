@@ -40,6 +40,8 @@ CONTAINER_RUN_DIGITS = 12
 PACKAGE_FILES = ("instruction.md", "README.md", "task.toml")
 PACKAGE_DIRECTORIES = ("environment", "solution", "steps", "tests")
 OUTCOMES = ("passed", "failed", "errored")
+PAUSE_FILE = "pause"
+PAUSE_POLL_SEC = 15
 
 
 def sh(args, timeout=SETUP_TIMEOUT_SEC, check=True, **kwargs):
@@ -265,6 +267,8 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
     done = finished(out)
     if done:
         return done
+    while os.path.exists(os.path.join(os.path.dirname(runs), PAUSE_FILE)):
+        time.sleep(PAUSE_POLL_SEC)
     config = task_config(row["dir"])
     journal = os.path.join(out, "journal")
     name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
