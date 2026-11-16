@@ -11,3 +11,4 @@ pub mod sim;
 pub mod syntax;
 pub mod target;
 pub mod wasm;
+pub mod wire;
