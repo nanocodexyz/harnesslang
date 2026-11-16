@@ -1,4 +1,5 @@
 import http.client
+import ipaddress
 import http.server
 import json
 import os
@@ -12,13 +13,20 @@ import urllib.parse
 PROVIDERS = {
     "anthropic": {"origin": "https://api.anthropic.com", "key_env": "ANTHROPIC_API_KEY", "origin_env": "NANOEVAL_ANTHROPIC_UPSTREAM"},
     "openai": {"origin": "https://api.openai.com", "key_env": "OPENAI_API_KEY", "origin_env": "NANOEVAL_OPENAI_UPSTREAM"},
+    "chatgpt": {"origin": "https://chatgpt.com", "key_env": "NANOEVAL_CHATGPT_LOGIN", "origin_env": "NANOEVAL_CHATGPT_UPSTREAM"},
 }
+CHATGPT_PREFIX = "/backend-api/codex"
+CHATGPT_HALT_STATUSES = (401, 403, 429)
+CHATGPT_HALT_FILE = "chatgpt-halted.json"
+LOGIN_PRIVATE_MODE = 0o077
+SSE_PREFIXES = (b"event:", b"data:")
+CLIENTS_ENV = "NANOEVAL_METER_CLIENTS"
 DEFAULT_PROVIDER = "anthropic"
 TOOL_USE_TYPES = ("tool_use", "function_call", "custom_tool_call", "local_shell_call", "web_search_call")
 WEBSOCKET_REFUSED = 426
 UPSTREAM_TIMEOUT_SEC = 900
 READ_CHUNK = 65536
-DROPPED_REQUEST_HEADERS = {"host", "x-api-key", "authorization", "content-length", "transfer-encoding", "connection", "accept-encoding"}
+DROPPED_REQUEST_HEADERS = {"host", "x-api-key", "authorization", "chatgpt-account-id", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 DROPPED_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "content-encoding"}
 
 
@@ -37,12 +45,31 @@ def upstream(origin):
 
 def route(rest):
     head, _, tail = rest.partition("/")
+    if head == "chatgpt":
+        path = "/" + tail
+        if path.startswith("/v1/"):
+            path = path[len("/v1"):]
+        return head, CHATGPT_PREFIX + path
     if head in PROVIDERS and head != DEFAULT_PROVIDER:
         return head, "/" + tail
     return DEFAULT_PROVIDER, "/" + rest
 
 
+def chatgpt_login(path):
+    if os.stat(path).st_mode & LOGIN_PRIVATE_MODE:
+        raise SystemExit(path + " must not be readable by group or other users")
+    with open(path) as handle:
+        login = json.load(handle)
+    tokens = login.get("tokens") or {}
+    if login.get("auth_mode") != "chatgpt" or not isinstance(tokens.get("access_token"), str) or not isinstance(tokens.get("account_id"), str):
+        raise SystemExit(path + " holds no ChatGPT plan login")
+    return tokens
+
+
 def credentials(provider, key):
+    if provider == "chatgpt":
+        tokens = chatgpt_login(key)
+        return {"authorization": "Bearer " + tokens["access_token"], "chatgpt-account-id": tokens["account_id"]}
     if provider == "openai":
         return {"authorization": "Bearer " + key}
     return {"x-api-key": key}
@@ -158,6 +185,8 @@ class Meter(http.server.BaseHTTPRequestHandler):
     runs = "."
     keys = {}
     lock = threading.Lock()
+    halted = None
+    clients = None
 
     def log_message(self, format, *args):
         return
@@ -172,6 +201,9 @@ class Meter(http.server.BaseHTTPRequestHandler):
         self.forward(read_body(self))
 
     def forward(self, body):
+        if self.clients is not None and not any(ipaddress.ip_address(self.client_address[0]) in network for network in self.clients):
+            self.send_error(403, "the meter serves only " + os.environ[CLIENTS_ENV])
+            return
         parts = self.path.split("/", 3)
         if len(parts) < 4 or parts[1] != "run" or parts[2] in ("", ".", ".."):
             self.send_error(404, "expected /run/<id>/<path>")
@@ -184,6 +216,9 @@ class Meter(http.server.BaseHTTPRequestHandler):
             return
         if provider not in self.keys:
             self.send_error(503, "the meter has no " + PROVIDERS[provider]["key_env"])
+            return
+        if provider == "chatgpt" and Meter.halted is not None:
+            self.send_error(503, "the meter stopped the ChatGPT route after status " + str(Meter.halted))
             return
         started = time.time()
         headers = {name: value for name, value in self.headers.items() if name.lower() not in DROPPED_REQUEST_HEADERS}
@@ -217,6 +252,8 @@ class Meter(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             record["status"] = response.status
+            if provider == "chatgpt" and response.status in CHATGPT_HALT_STATUSES:
+                self.halt(response.status, run)
             if not streaming:
                 try:
                     parsed = json.loads(raw)
@@ -227,7 +264,10 @@ class Meter(http.server.BaseHTTPRequestHandler):
                     else:
                         assembler.message["error"] = parsed
                 except ValueError:
-                    assembler.message["error"] = raw[:2000].decode(errors="replace")
+                    if raw.lstrip().startswith(SSE_PREFIXES):
+                        assembler.feed_stream(raw + b"\n\n")
+                    else:
+                        assembler.message["error"] = raw[:2000].decode(errors="replace")
         except (OSError, http.client.HTTPException) as error:
             record["status"] = 0
             assembler.message["error"] = repr(error)
@@ -250,6 +290,13 @@ class Meter(http.server.BaseHTTPRequestHandler):
                     handle.write(body)
 
 
+    def halt(self, status, run):
+        with self.lock:
+            Meter.halted = status
+            with open(os.path.join(self.runs, CHATGPT_HALT_FILE), "w") as handle:
+                json.dump({"status": status, "run": run, "at": time.time()}, handle)
+
+
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
@@ -258,10 +305,14 @@ def main():
     if len(sys.argv) != 4:
         raise SystemExit("usage: meter.py ADDRESS PORT RUNS_DIR")
     keys = {provider: os.environ[spec["key_env"]] for provider, spec in PROVIDERS.items() if os.environ.get(spec["key_env"])}
+    if "chatgpt" in keys:
+        chatgpt_login(keys["chatgpt"])
     if not keys:
         raise SystemExit("meter.py needs " + " or ".join(spec["key_env"] for spec in PROVIDERS.values()))
     Meter.runs = os.path.abspath(sys.argv[3])
     Meter.keys = keys
+    if os.environ.get(CLIENTS_ENV):
+        Meter.clients = [ipaddress.ip_network(network) for network in os.environ[CLIENTS_ENV].split(",")]
     server = Server((sys.argv[1], int(sys.argv[2])), Meter)
     server.serve_forever()
 

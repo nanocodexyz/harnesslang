@@ -9,8 +9,10 @@ PRICES_PER_MTOK = {
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write_5m": 3.75, "cache_write_1h": 6.0, "cache_read": 0.30},
     "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.10},
     "gpt-5.5": {"input": 5.0, "output": 30.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.50},
+    "gpt-6-luna": {"input": 0.10, "output": 0.50, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.01},
+    "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.05},
 }
-PRICES_SOURCE = "https://docs.anthropic.com/en/docs/about-claude/pricing, read 2026-11-14; https://developers.openai.com/api/docs/models/gpt-5.5 (prompts under 272K tokens), read 2026-11-15"
+PRICES_SOURCE = "https://docs.anthropic.com/en/docs/about-claude/pricing, read 2026-11-14; https://developers.openai.com/api/docs/models/gpt-5.5 (prompts under 272K tokens), read 2026-11-15; gpt-6-luna and gpt-6.1-terra at the standard-context list rates agent/src/openai.rs carries"
 CODEX_TOOL_ITEMS = ("command_execution", "file_change", "mcp_tool_call", "web_search")
 TOKENS_PER_MTOK = 1_000_000
 INNER_TOOL_MARK = "\u00b7 "

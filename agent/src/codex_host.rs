@@ -5,6 +5,7 @@ use crate::codex_harness::program::{self, Arguments};
 use crate::codex_harness::{self, Exit, FileDisk, Json, Ran, RunError, TurnRequest};
 use crate::json::Value;
 use crate::openai;
+use crate::reviewer::{self, Reviewer, Verdict};
 use crate::tools;
 use crate::transport::Sent;
 use crate::{EXIT_HARNESS_ERROR, Ledger, Options, now_ms, outcome_of, random, write_usage};
@@ -19,6 +20,9 @@ const STEER_PREFIX: &str = "steer-";
 const CACHE_KEY_FILE: &str = "cache_key";
 const PREAMBLE_FILE: &str = "preamble.json";
 const LABEL: &str = "hl-agent";
+const FINISH_CHECKS_MAX: u64 = 2;
+const REVIEWED: &str = "A reviewer read the task and the end of your transcript and found that the task is not done yet. Fix each point below, check each one by running commands, and end your turn only with a short report of the checks you ran and their results.";
+const FINISH_CHECK: &str = "Before this task is done, check it by running commands, not by reading your own code. Go through each behaviour the task states, one by one: each file exists at the exact path it names with the content or format it asks for, each program runs with the exact command and interpreter it names, each service responds through the protocol, port and account the task names, and each output matches the stated format. Run every check now. If any check fails or a stated behaviour is not yet verified, fix it and continue working. End your turn again only after the work passes, with a short report listing each check you ran and its result.";
 
 pub struct CodexAgent {
     client: openai::Client,
@@ -26,6 +30,8 @@ pub struct CodexAgent {
     exec: codex::Exec,
     ledger: Ledger,
     control: PathBuf,
+    reviewer: Option<Reviewer>,
+    last_context: Value,
 }
 
 fn control_dir(journal: &Path) -> PathBuf {
@@ -66,6 +72,40 @@ fn cancel_pending(control: &Path) -> bool {
 }
 
 impl CodexAgent {
+    fn review(&mut self, index: u64) -> Option<String> {
+        let reviewer = self.reviewer.as_ref()?;
+        let (verdict, used) = reviewer.review(&self.last_context, index);
+        let outcome = if verdict.is_ok() { "ok" } else { "failed" };
+        self.ledger.append(Value::object([
+            ("kind", Value::text("model")),
+            ("at_ms", Value::number(now_ms())),
+            ("model", Value::text(reviewer::MODEL)),
+            ("outcome", Value::text(outcome)),
+            ("input_tokens", Value::number(used.input)),
+            ("output_tokens", Value::number(used.output)),
+            ("cache_read_tokens", Value::number(used.cache_read)),
+            ("cache_write_tokens", Value::number(used.cache_write)),
+            (
+                "cost_nano_usd",
+                Value::number(reviewer::cost_nano_usd(used)),
+            ),
+        ]));
+        match verdict {
+            Ok(Verdict::Done(text)) => {
+                eprintln!("{LABEL}: review {index}: {text}");
+                None
+            }
+            Ok(Verdict::NotDone(text)) => {
+                eprintln!("{LABEL}: review {index}: {text}");
+                Some(text)
+            }
+            Err(error) => {
+                eprintln!("{LABEL}: review {index}: {error}");
+                None
+            }
+        }
+    }
+
     fn record_model(&mut self, used: openai::Usage, outcome: &str) {
         let mut line = Value::object([
             ("kind", Value::text("model")),
@@ -296,6 +336,9 @@ impl codex_harness::Host for CodexAgent {
     fn model(&mut self, request: &codex_harness::ModelRequest<'_>) -> Json {
         let context =
             Value::decode(&(request.context)().encode()).expect("the harness encodes valid JSON");
+        if self.reviewer.is_some() {
+            self.last_context = context.clone();
+        }
         let effort = request
             .settings
             .and_then(|settings| settings.get(openai::EFFORT_SETTING))
@@ -423,6 +466,10 @@ fn setup(options: &Options) -> Result<(CodexAgent, String), String> {
         state: state.clone(),
         image_bytes_max: None,
     };
+    let reviewer = options.reviewer_url.as_deref().map(|url| Reviewer {
+        relay: PathBuf::from(url),
+        instruction: instruction.clone(),
+    });
     Ok((
         CodexAgent {
             client,
@@ -430,9 +477,22 @@ fn setup(options: &Options) -> Result<(CodexAgent, String), String> {
             exec: codex::Exec::new(cwd, state),
             ledger: Ledger { file },
             control,
+            reviewer,
+            last_context: Value::Array(Vec::new()),
         },
         instruction,
     ))
+}
+
+fn ended_completed(ran: &Result<Ran, RunError>) -> bool {
+    let Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish)) = ran else {
+        return false;
+    };
+    if finish.outcome != codex_harness::Outcome::Completed {
+        return false;
+    }
+    let result = Value::decode(&finish.result.encode()).expect("the harness encodes valid JSON");
+    outcome_of(&result).0 == "completed"
 }
 
 fn effort_of(text: &str) -> Option<program::SumEffortLevel> {
@@ -481,11 +541,40 @@ pub fn main(options: &Options) -> ! {
         }
         turn += 1;
     }
-    let request = TurnRequest {
-        turn,
-        arguments: Arguments::Prompt(instruction, options.rounds.min(program::ROUNDS_MAX)),
+    let mut input = instruction;
+    let mut checks = 0;
+    let ran = loop {
+        let request = TurnRequest {
+            turn,
+            arguments: Arguments::Prompt(input, options.rounds.min(program::ROUNDS_MAX)),
+        };
+        let ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
+        if checks >= FINISH_CHECKS_MAX || !ended_completed(&ran) {
+            break ran;
+        }
+        checks += 1;
+        turn += 1;
+        input = FINISH_CHECK.to_owned();
     };
-    let ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
+    assert!(checks <= FINISH_CHECKS_MAX);
+    let mut ran = ran;
+    let mut reviews = 0;
+    while reviews < reviewer::REVIEWS_MAX && ended_completed(&ran) {
+        let Some(review) = agent.review(reviews) else {
+            break;
+        };
+        reviews += 1;
+        turn += 1;
+        let request = TurnRequest {
+            turn,
+            arguments: Arguments::Prompt(
+                format!("{REVIEWED}\n\n{review}"),
+                options.rounds.min(program::ROUNDS_MAX),
+            ),
+        };
+        ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
+    }
+    assert!(reviews <= reviewer::REVIEWS_MAX);
     agent.exec.stop_all();
     agent.ledger.append(Value::object([
         ("kind", Value::text("end")),

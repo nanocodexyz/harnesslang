@@ -405,7 +405,7 @@ impl Client {
     }
 }
 
-fn usage(body: &Value) -> Usage {
+pub fn usage(body: &Value) -> Usage {
     let field = |name: &str| {
         body.get("usage")
             .and_then(|usage| usage.get(name))

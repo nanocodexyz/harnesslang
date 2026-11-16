@@ -29,10 +29,11 @@ RUN_SHELL = 'if command -v bash >/dev/null 2>&1; then exec bash "$1"; else exec 
 AGENTS = ("nanocode", "hl-agent", "hl-agent-medium", "claude-code", "codex")
 AGENT_BINARIES = {"hl-agent-medium": "hl-agent"}
 AGENT_ARGS = {"hl-agent-medium": ["--effort", "medium"]}
-AGENT_KEYS = {"nanocode": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "hl-agent": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "hl-agent-medium": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"), "claude-code": ("ANTHROPIC_API_KEY",), "codex": ("OPENAI_API_KEY",)}
+AGENT_KEYS = {"nanocode": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN"), "hl-agent": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN"), "hl-agent-medium": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN"), "claude-code": ("ANTHROPIC_API_KEY",), "codex": ("OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN")}
+OPENAI_ROUTES = {"openai": "/openai", "chatgpt": "/chatgpt"}
+CHATGPT_HALT_FILE = "chatgpt-halted.json"
 METERED_KEY = "metered-by-host"
 CLAUDE_MODEL_PREFIX = "claude-"
-OPENAI_ROUTE = "/openai"
 MODEL_ENDPOINTS = ("/messages", "/responses", "/responses/compact")
 MUSL_LOADER = "/lib/ld-musl-x86_64.so.1"
 CLAUDE_CODE_SELECT = 'if [ -e ' + MUSL_LOADER + ' ]; then exec ' + AGENT_MOUNT + '/bin/claude-code-musl "$@"; else exec ' + AGENT_MOUNT + '/bin/claude-code "$@"; fi'
@@ -91,6 +92,10 @@ def task_config(directory):
     }
 
 
+def bridge_subnet():
+    return sh(["docker", "network", "inspect", DOCKER_BRIDGE, "-f", "{{(index .IPAM.Config 0).Subnet}}"]).stdout.strip()
+
+
 def network():
     gateway = sh(["docker", "network", "inspect", DOCKER_BRIDGE, "-f", "{{(index .IPAM.Config 0).Gateway}}"]).stdout.strip()
     proxy = urllib.parse.urlsplit(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "")
@@ -124,8 +129,8 @@ def image_for(task, config, env, lock):
     return tag
 
 
-def agent_command(agent, model, workdir, run_url, instruction, max_turns, hl_agent_args):
-    openai_url = run_url + OPENAI_ROUTE
+def agent_command(agent, model, workdir, run_url, instruction, max_turns, hl_agent_args, openai_route):
+    openai_url = run_url + OPENAI_ROUTES[openai_route]
     if agent == "codex":
         return (
             {"CODEX_API_KEY": METERED_KEY, "OPENAI_BASE_URL": openai_url + "/v1", "HOME": JOURNAL_MOUNT + "/home"},
@@ -296,8 +301,8 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
         instruction = open(os.path.join(row["dir"], "instruction.md")).read()
         with open(os.path.join(journal, "instruction.md"), "w") as handle:
             handle.write(instruction)
-        run_url = "http://" + gateway + ":" + str(args.meter_port) + "/run/" + row["id"]
-        agent_env, argv = agent_command(row["agent"], args.model, workdir, run_url, instruction, args.max_turns, args.hl_agent_arg or [])
+        run_url = "http://" + (args.meter_host or gateway) + ":" + str(args.meter_port) + "/run/" + row["id"]
+        agent_env, argv = agent_command(row["agent"], args.model, workdir, run_url, instruction, args.max_turns, args.hl_agent_arg or [], args.openai_route)
         agent_result = run_agent(name, row, agent_env, argv, config["agent_timeout"], journal)
         peak = sh(["docker", "exec", name, "cat", "/sys/fs/cgroup/memory.peak"], check=False).stdout.strip()
         verifier = verify(name, row, config, out)
@@ -318,10 +323,13 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
     return result
 
 
-def start_services(gateway, upstream, runs, logs, meter_port, relay_port):
+def start_services(gateway, upstream, runs, logs, meter_port, relay_port, meter_host):
     processes = []
     meter_log = open(os.path.join(logs, "meter.log"), "a")
-    processes.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "meter.py"), gateway, str(meter_port), runs], stdout=meter_log, stderr=meter_log, start_new_session=True))
+    meter_env = dict(os.environ)
+    if meter_host != gateway:
+        meter_env["NANOEVAL_METER_CLIENTS"] = bridge_subnet()
+    processes.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "meter.py"), meter_host, str(meter_port), runs], stdout=meter_log, stderr=meter_log, env=meter_env, start_new_session=True))
     if upstream:
         relay_log = open(os.path.join(logs, "relay.log"), "a")
         processes.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "relay.py"), gateway, str(relay_port), upstream], stdout=relay_log, stderr=relay_log, start_new_session=True))
@@ -330,7 +338,7 @@ def start_services(gateway, upstream, runs, logs, meter_port, relay_port):
         if exited:
             raise SystemExit("the meter or relay exited (is its port taken?); see " + logs)
         try:
-            socket.create_connection((gateway, meter_port), timeout=1).close()
+            socket.create_connection((meter_host, meter_port), timeout=1).close()
             time.sleep(METER_READY_SLEEP_SEC)
             if all(process.poll() is None for process in processes):
                 return processes
@@ -359,6 +367,8 @@ def main():
     parser.add_argument("--only", action="append")
     parser.add_argument("--ca-bundle")
     parser.add_argument("--hl-agent-arg", action="append")
+    parser.add_argument("--openai-route", choices=tuple(OPENAI_ROUTES), default="openai")
+    parser.add_argument("--meter-host")
     args = parser.parse_args()
     agents = args.agents.split(",")
     for agent in agents:
@@ -388,7 +398,7 @@ def main():
         json.dump({"argv": sys.argv[1:], "rows": len(rows), "started": time.time()}, handle, indent=1)
     gateway, upstream = network()
     env = container_env(gateway, upstream, args.relay_port)
-    services = start_services(gateway, upstream, runs, os.path.abspath(args.out), args.meter_port, args.relay_port)
+    services = start_services(gateway, upstream, runs, os.path.abspath(args.out), args.meter_port, args.relay_port, args.meter_host or gateway)
     lock = threading.Lock()
     try:
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
@@ -399,6 +409,9 @@ def main():
                 except Exception as error:
                     result = record_crash(futures[future], args, runs, error)
                 print(result["id"], result["outcome"], result.get("note") or "", flush=True)
+                if os.path.isfile(os.path.join(runs, CHATGPT_HALT_FILE)):
+                    cancelled = sum(1 for pending in futures if pending.cancel())
+                    print("the meter halted the ChatGPT route; cancelled " + str(cancelled) + " rows", flush=True)
     finally:
         for process in services:
             os.killpg(process.pid, signal.SIGTERM)

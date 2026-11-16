@@ -78,7 +78,7 @@ faults=(throttle cut failed overloaded)
   printf '{"calls":[{"name":"exec_command","input":{"cmd":"sleep 1; echo polled >> effects.log","yield_time_ms":250}}]},'
   printf '{"calls":[{"name":"write_stdin","input":{"session_id":1,"yield_time_ms":5000}}]},'
   printf '{"calls":[{"name":"apply_patch","patch":"*** Begin Patch\\n*** Add File: done.txt\\n+done\\n*** End Patch\\n"}]},'
-  printf '{"answer":"All steps ran."}]\n'
+  printf '{"answer":"All steps ran."},{"answer":"Checked: effects.log and done.txt are present."},{"answer":"Checked again."}]\n'
 } > "$out/script.json"
 printf 'Run each step with exec_command, then add done.txt with apply_patch.\n' > "$out/instruction.md"
 start_mock "$out"
@@ -199,7 +199,7 @@ EOF
 control=$out/control
 mkdir -p "$control/ws"
 control_ws=$(cd "$control/ws" && pwd)
-printf '[{"calls":[{"name":"exec_command","input":{"cmd":"sleep 2; echo first >> effects.log"}}]},{"expect":"also write steered.txt","calls":[{"name":"exec_command","input":{"cmd":"echo steered > steered.txt"}}]},{"answer":"Steered."},{"calls":[{"name":"exec_command","input":{"cmd":"sleep %s; echo late >> effects.log"}}]},{"delay_ms":%d,"answer":"never"}]\n' "$cancel_sleep" "$cancel_stream_ms" > "$control/script.json"
+printf '[{"calls":[{"name":"exec_command","input":{"cmd":"sleep 2; echo first >> effects.log"}}]},{"expect":"also write steered.txt","calls":[{"name":"exec_command","input":{"cmd":"echo steered > steered.txt"}}]},{"answer":"Steered."},{"answer":"Checked: steered.txt is present."},{"answer":"Checked again."},{"calls":[{"name":"exec_command","input":{"cmd":"sleep %s; echo late >> effects.log"}}]},{"delay_ms":%d,"answer":"never"}]\n' "$cancel_sleep" "$cancel_stream_ms" > "$control/script.json"
 printf 'Run the commands.\n' > "$control/instruction.md"
 start_mock "$control"
 run_control() {
@@ -220,7 +220,7 @@ wait_for 'exec_command: sleep 2'
 "$agent" steer --journal "$control/journal" --text "also write steered.txt" > /dev/null
 wait "$pid"
 [ "$(cat "$control_ws/steered.txt")" = steered ] || { echo "codex-drill: the steer did not reach the model" >&2; exit 1; }
-run_control 2 &
+run_control 4 &
 pid=$!
 wait_for "exec_command: sleep $cancel_sleep"
 began=$(date +%s%N)
@@ -232,7 +232,7 @@ if pgrep -f "sleep $cancel_sleep; echo late" > /dev/null; then
   exit 1
 fi
 models_before=$(grep -c ' model ' "$control/agent.err")
-run_control 3 &
+run_control 5 &
 pid=$!
 for _ in $(seq 1 "$cancel_polls"); do
   [ "$(grep -c ' model ' "$control/agent.err")" -gt "$models_before" ] && break
@@ -255,7 +255,7 @@ for line in open(f"{control}/journal/journal.jsonl"):
         statuses[record["status"]["turn"]] = record["status"]["status"]["finished"]["result"]
     if "event" in record:
         events.append(record["event"])
-expected = {"1": {"completed": "Steered."}, "2": "cancelled_turn", "3": "cancelled_turn"}
+expected = {"1": {"completed": "Steered."}, "2": {"completed": "Checked: steered.txt is present."}, "3": {"completed": "Checked again."}, "4": "cancelled_turn", "5": "cancelled_turn"}
 if statuses != expected:
     sys.exit(f"codex-drill: control turns finished {statuses}, expected {expected}")
 if "late" in open(f"{control}/ws/effects.log").read():

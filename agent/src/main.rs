@@ -6,6 +6,7 @@ mod jobs;
 mod json;
 mod mpp;
 mod openai;
+mod reviewer;
 mod stream;
 mod tools;
 mod transport;
@@ -34,7 +35,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/claude-code-system.json");
 const TOOL_DEFINITIONS: &str = include_str!("../prompts/tools.json");
 const SUBAGENT_TOOL_DEFINITIONS: &str = include_str!("../prompts/subagent-tools.json");
 const JOINS_PER_TURN_MAX: u64 = harness::ROUNDS_MAX * harness::CALLS_PER_ROUND_MAX;
-const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort high|medium|low|xhigh] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]\n       hl-agent pay --instruction <file> --cwd <dir> --model <id> --journal <dir> [--turn N]\n       hl-agent steer --journal <dir> --text <message>\n       hl-agent cancel --journal <dir>";
+const USAGE: &str = "usage: hl-agent run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort high|medium|low|xhigh] [--reviewer-relay <dir>] [--keep-warm N] [--turn N] [--fork-from <journal> [--at T]]\n       hl-agent pay --instruction <file> --cwd <dir> --model <id> --journal <dir> [--turn N]\n       hl-agent steer --journal <dir> --text <message>\n       hl-agent cancel --journal <dir>";
 const PLAIN_MODEL_ATTEMPTS: u64 = 3;
 const PLAIN_MODEL_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 const MPP_SYSTEM_PROMPT: &str = include_str!("../prompts/mpp-system.json");
@@ -61,6 +62,7 @@ pub struct Options {
     pub at: Option<u64>,
     pub effort: Option<String>,
     pub effort_text: Option<String>,
+    pub reviewer_url: Option<String>,
     pub harness: String,
 }
 
@@ -84,6 +86,7 @@ fn options() -> Options {
     let mut effort = None;
     let mut effort_text = None;
     let mut harness = None;
+    let mut reviewer_url = None;
     let mut rest = args[1..].iter();
     while let Some(flag) = rest.next() {
         let value = rest
@@ -132,6 +135,7 @@ fn options() -> Options {
                 effort_text = Some(value);
             }
             "--harness" => harness = Some(value),
+            "--reviewer-relay" => reviewer_url = Some(value),
             "--fork-from" => fork_from = Some(PathBuf::from(value)),
             "--at" => {
                 at =
@@ -162,6 +166,9 @@ fn options() -> Options {
     if harness == HARNESS_CODEX && (keep_warm > 0 || fork_from.is_some()) {
         fail_usage("--keep-warm and --fork-from are for the Claude harness");
     }
+    if harness == HARNESS_CLAUDE && reviewer_url.is_some() {
+        fail_usage("--reviewer-relay is for the Codex harness");
+    }
     Options {
         instruction: instruction.unwrap_or_else(|| fail_usage("--instruction is required")),
         cwd: cwd.unwrap_or_else(|| fail_usage("--cwd is required")),
@@ -174,6 +181,7 @@ fn options() -> Options {
         at,
         effort,
         effort_text,
+        reviewer_url,
         harness,
     }
 }

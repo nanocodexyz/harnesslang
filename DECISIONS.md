@@ -929,7 +929,7 @@ Measurements (5-core Hand, load 30 to 57 from other agents throughout):
 | bugs found and fixed | 0 | 2 (1 compiler, 1 generator) | |
 | interpreter and crash-point programs per hour | not measured | 2,250 | |
 
-Not done: `dev-georgios` was not attached to this thread, so every shard ran on the shared hosted Hand. The generator still leaves out spawn and join, suspend, idle turns, side questions, fork, code cells, blobs, listings, model modes and settings, jobs and interruptible effects, `fn`, and the compaction hooks; those reach the differential runs only through the examples and snippets.
+Not done: `the eval machine` was not attached to this thread, so every shard ran on the shared hosted Hand. The generator still leaves out spawn and join, suspend, idle turns, side questions, fork, code cells, blobs, listings, model modes and settings, jobs and interruptible effects, `fn`, and the compaction hooks; those reach the differential runs only through the examples and snippets.
 
 Commands: `hl gen --seeds A..B --out DIR`, `FUZZ_JOBS=N scripts/fuzz-swarm.sh A..B`, `FUZZ_ROTATE=0 FUZZ_JOBS=2 scripts/fuzz-swarm.sh 0..40`, `scripts/fuzz-regress.sh`, `hl fuzz-prove --seeds 0..3000 --sim-seeds 10`, `nice scripts/check.sh`.
 
@@ -1260,3 +1260,98 @@ Measurements (claude-sonnet-4-6, 2026-11-15, `python3 output/eval/mkreport.py`):
 
 Commands: `python3 evals/run.py --suite evals/suite-60.txt --tasks T --agent-root R --agents hl-agent,nanocode,claude-code --attempts 3 --model claude-sonnet-4-6 --parallel 4 --limits none --out output/eval/c60`, the same with `--suite output/eval/suite3-left.txt --attempts 1 --parallel 12`, `python3 output/eval/mkreport.py`.
 
+
+## 2026-11-15: eval-luna: hl-agent on gpt-6-luna through a ChatGPT plan login, metered at list price
+
+Branch eval-luna, from master 31f1ab4. It establishes:
+
+- **The meter has a ChatGPT plan route.** `/run/<id>/chatgpt/<path>` forwards to `https://chatgpt.com/backend-api/codex/<path>` (a leading `/v1` is dropped, so a client whose base URL is `<run>/chatgpt` and that posts `/v1/responses` lands on `/backend-api/codex/responses`). `NANOEVAL_CHATGPT_LOGIN` names a Codex login file in ChatGPT mode; the meter refuses one readable by group or others, and reads `tokens.access_token` and `tokens.account_id` from it on every request, sending them as `authorization: Bearer` and `chatgpt-account-id` (the two headers the existing plan path in the TypeScript eval system sends; nothing else was needed). The token is never in an environment variable, a command line, a log or a record. `NANOEVAL_CHATGPT_UPSTREAM` replaces the origin like the other two routes. Usage is metered exactly as on the OpenAI route.
+- **The ChatGPT backend streams without a content type.** Its responses carry no `content-type` header, so the meter took the SSE body for a non-JSON error and metered zero tokens. A body that does not parse as JSON and starts with `event:` or `data:` is now read as an event stream. Measured on one request (model gpt-6-luna, effort low, "Reply with the single word: pong"): status 200, 21 input and 5 output tokens metered, stop reason completed.
+- **The meter stops the plan route on its first 401, 403 or 429.** It answers every later ChatGPT request with 503 and writes `chatgpt-halted.json` in the runs directory; `run.py` cancels the rows it has not started when it sees that file. A plan login is someone's daily-use plan: a usage limit stops the screen instead of being retried by every row. No such status occurred in this entry.
+- **`run.py --openai-route chatgpt`** points the OpenAI-speaking arms (hl-agent, nanocode, codex) at that route; `NANOEVAL_CHATGPT_LOGIN` counts as their key.
+- **`run.py --meter-host ADDRESS`** binds the meter to an address other than the Docker bridge gateway and gives it to the containers. A host whose firewall drops input to every local address but loopback and its tailnet address (the machine of this entry, whose INPUT chain accepts only 127.0.0.0/8 and 100.64.0.0/10 destinations) cannot serve the containers on 172.17.0.1: the meter listened there and every connection timed out, so `run.py` reported that the meter did not start. With the meter on the tailnet address the containers reach it through the bridge. Since that address is reachable from the tailnet, the meter then serves only clients in the bridge's subnet (`NANOEVAL_METER_CLIENTS`, set by `run.py` from `docker network inspect bridge`) and answers anyone else 403.
+- **`report.py` prices gpt-6-luna and gpt-6.1-terra** at the standard-context list rates in `agent/src/openai.rs` (luna $0.10 input, $0.01 cached, $0.50 output per million; terra $1, $0.05, $5).
+
+Setup: hl-agent built at this commit (`cargo build --release` in `agent/`), patched to the agent root's loader with patchelf and run from an agent root laid out like the confirmation run's (`bin/hl-agent` and the glibc `lib/`). The eight d8 tasks of Terminal-Bench 2.1 ran on a 32-core Linux machine with Docker (load average 12 to 22 from other work), two rows at a time, `--limits none` as the Sonnet reference ran, with:
+
+    NANOEVAL_CHATGPT_LOGIN=$HOME/.codex/auth.json nice -n 10 python3 evals/run.py --suite d8.txt --tasks tasks \
+      --agent-root root --agents hl-agent --attempts 2 --model gpt-6-luna --parallel 2 --limits none \
+      --meter-port 19700 --relay-port 14700 --openai-route chatgpt --meter-host <tailnet address> --out out/luna1
+
+and the same with `--attempts 1 --hl-agent-arg=--effort --hl-agent-arg=high --out out/lunahigh`. hl-agent's default effort for this host is medium. The Sonnet reference is the confirmation run's rows of the same tasks (3 attempts each). Costs are list price from the meter's tokens (luna's cached tokens are billed at the cached rate, the rest of the input at the input rate).
+
+| Arm (d8, Terminal-Bench 2.1) | Attempts | Passed | $/attempt (list) | Requests/attempt | Agent wall/attempt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| nanocode, claude-sonnet-4-6 (reference) | 24 | 10 | 0.331 | 13.5 | 475 s |
+| hl-agent, claude-sonnet-4-6 (reference) | 24 | 18 | 0.181 | 14.6 | 281 s |
+| hl-agent, gpt-6-luna, effort medium | 16 | 7 | 0.0092 | 11.0 | 100 s |
+| hl-agent, gpt-6-luna, effort high (7 of 8 tasks; query-optimize still running when this was written) | 7 | 3 | 0.0256 | 16.6 | 172 s |
+
+Effort high, the one cheap tweak tried, does not help: 3 of 7 (build-pmars, adaptive-rejection-sampler, count-dataset-tokens pass; db-wal-recovery, which medium passed twice, fails) at 2.8 times the cost of medium, with 3,506 reasoning tokens an attempt against 859. Thinking longer per turn did not make luna verify its work before ending; configure-git-webserver, extract-elf and gcode-to-text fail the same way at both efforts.
+
+Per task, luna at medium: adaptive-rejection-sampler 2/2, count-dataset-tokens 2/2, db-wal-recovery 2/2, build-pmars 1/2, configure-git-webserver 0/2, extract-elf 0/2, gcode-to-text 0/2, query-optimize 0/2. It passes three tasks nanocode on Sonnet fails or rarely passes (adaptive-rejection-sampler 0/3, db-wal-recovery 0/3, count-dataset-tokens 1/3) and fails three nanocode passes (configure-git-webserver 3/3, extract-elf 2/3, build-pmars 3/3 against 1/2).
+
+What the failures look like: luna stops early, not late. No row timed out; the mean attempt used 11 requests and 100 s against Sonnet hl-agent's 14.6 and 281 s. On configure-git-webserver it wrote a setup script and a README, checked the script's syntax and ended without running it, so nothing the verifier probes existed. On extract-elf it wrote the extractor, ran it once on the sample and ended. Cost is not the constraint: at $0.009 an attempt, luna spends 2.8% of nanocode's list price, under a twentieth of the $0.05 budget.
+
+The prompt cache helps less here than on the Anthropic route: 53K cached against 71K uncached input tokens per attempt. The per-attempt input is small enough that this changes the cost by cents per hundred attempts.
+
+Not measured: gpt-6.1-terra (luna passed more than 3 of 8 on its first attempt, so the plan's fallback did not trigger), any task outside d8, and whether a "verify before you finish" change to the Codex host's instructions fixes the early stop, which is what the failures point at. The plan's target (nanocode's pass rate plus 20 points at 0.15 of its cost) is not met: luna matches nanocode on d8 (44% against 42%) at 0.03 of its cost, and is 31 points below hl-agent on Sonnet on the same tasks.
+
+## 2026-11-15: eval-luna2: a finish gate and a relayed Sonnet review for the Codex host on gpt-6-luna
+
+Branch eval-luna2, from eval-luna cd12631. It establishes:
+
+- **Finish gate in the Codex host** (`agent/src/codex_host.rs`). When a prompt turn ends `completed`, the host starts another prompt turn with a fixed message (`FINISH_CHECK`): check each stated behaviour by running commands (paths, programs with the named interpreter, services on the named port and account, output formats), fix and continue if anything is unverified, and end only with a report of the checks run. At most `FINISH_CHECKS_MAX` (2) gate turns per task. The gate lives in the host, not in `examples/codex_agent.hl`: the program is unchanged, so no new invariant or mutation was needed.
+- **The Claude host's Finishing block** is ported into `agent/prompts/codex-instructions.md` (plus one sentence: a script you wrote is not done until you ran it; test a program on more than the one sample).
+- **`--reviewer-relay <dir>`** (Codex host only, `agent/src/reviewer.rs`). After the gate, the host asks claude-sonnet-4-6 for a review of the task and the last 16 context entries (brief bounded at 6,000 tokens, answer at 1,500), at most `REVIEWS_MAX` (2) per task; a reply starting `NOT DONE` becomes the next prompt turn. The request is written to `<dir>/request-N.json` and the host waits (at most 900 s) for `response-N.json`. The relay is file-based because the hosted machine (which holds the Anthropic key) and the eval machine (which holds the plan login) have no network path to each other in either direction over the tailnet (curl timed out both ways); the orchestrating agent copied each request to the hosted machine, posted it through a standalone `evals/meter.py` on 127.0.0.1:19710, and copied the answer back. Neither credential crossed machines. Sonnet tokens are recorded in the ledger at list price ($3 in, $15 out, $0.30 cache read, $3.75 cache write per million).
+
+Measurement (2026-11-15, 19:45 to 20:45 UTC, the eval-luna setup copied to `~/hl-luna2`, `--parallel 2 --limits none --openai-route chatgpt`, ports 19710/14710, gpt-6-luna effort medium, 8 d8 tasks of Terminal-Bench 2.1; cost is list price from the ledger):
+
+| Arm | Attempts | Passed | $/attempt (luna + Sonnet) | Requests/attempt | Wall/attempt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| eval-luna baseline (no gate) | 16 | 7 | 0.0092 | 11.0 | 100 s |
+| A: gate + Finishing block | 16 | 10 | 0.021 | 21.6 | 188 s |
+| B: A + Sonnet review, on A's 3 all-failing tasks only | 6 | 0 | 0.0565 (0.030 + 0.026) | 27.5 (1.33 Sonnet) | 272 s |
+
+Per task, arm A: adaptive-rejection-sampler 2/2, build-pmars 2/2, configure-git-webserver 2/2 (0/2 before), count-dataset-tokens 2/2, db-wal-recovery 2/2, extract-elf 0/2, gcode-to-text 0/2, query-optimize 0/2. The gate fixed the "wrote a setup script, never ran it" failure: configure-git-webserver now passes both attempts, and build-pmars went from 1/2 to 2/2. It doubled requests and cost per attempt and is still a third of the $0.05 budget.
+
+Arm B ran only on extract-elf, gcode-to-text and query-optimize (A's 0/2 tasks), so its rows measure the review's marginal effect where the gate did not help: none. Sonnet said DONE on both extract-elf and both query-optimize attempts (the transcripts showed checks that passed, but the outputs were wrong against hidden tests), and NOT DONE twice on each gcode-to-text attempt (luna never decoded the printed text); luna then worked another ~300 s and still failed. The review cannot see what the hidden verifier checks, so on these tasks it adds cost without passes. Arm B was not run on the five passing tasks; on the full d8 it would be at most A's 10/16.
+
+Incidents: the eval machine's root disk filled to 100% (others' work) at 19:53; two rows wrote cut JSONL lines and the run was stopped, the containers removed, and resumed at 20:03 once 16 GB were free. adaptive-rejection-sampler attempt 2 was scored from its verifier reward (1) after dropping the one cut `requests.jsonl` line. Load average on that machine ran 20 to 41 from other work (our two containers were a small share). Plan rows used this lane: 27 of 50; no 401/403/429.
+
+Not met: the target (Sonnet hl-agent 18/24 = 75% on d8) — A reaches 62.5% at 0.12 of Sonnet hl-agent's cost and 0.06 of nanocode's. The remaining failures (extract-elf, gcode-to-text, query-optimize) are capability, not early stopping.
+
+Commands: `cargo build --release` in `agent/`; binary patched with patchelf to `/opt/nanoeval-agent/lib`; `sh go.sh out/gateA gpt-6-luna 2` (go.sh = eval-luna's with ports 19710/14710); `sh go.sh out/revB2 gpt-6-luna 2 --suite d3.txt --agent-root ~/hl-luna2/rootB --hl-agent-arg=--reviewer-relay --hl-agent-arg=/opt/nanoeval-journal/hl/review`.
+
+## 2026-11-15: full-suite run of the Codex host on gpt-6-luna with the finish gate
+
+Arm A of eval-luna2 (gate binary `~/hl-luna2/root` on the eval machine, built from ef9d652) on the 60 tasks of `evals/suite-60.txt`, 3 attempts each, against the published Sonnet rows (`output/eval/snap/c60-all`, 147 attempts each).
+
+Where it ran: the hosted Hand and the eval machine are not tailnet peers of each other (`tailscale ping <tailnet address>` from the hosted Hand: no matching peer; TCP to a test listener on <tailnet address>:19740 timed out both ways), so the token-bearing relay could not be split from the task containers. Everything runs on the eval machine under its rules: `evals/luna-full.sh` starts a two-task batch only while the 1-minute load is at most 26 and other lanes' containers leave room within 3 rows on the plan, stops below 12 GB free, removes the images it pulled after each batch, and stops after three failed batches in a row or when the meter writes `chatgpt-halted.json`. Meter and relay ports 19740/14740, `--openai-route chatgpt --meter-host <tailnet address>`, `--limits none`.
+
+Reused attempts (same binary and settings): the 16 d8 gate rows from `~/hl-luna2/out/gateA` (8 tasks x 2) and 24 rows from `~/hl-luna3/out/A` (24 tasks x 1).
+
+Self-check signal (`evals/selfcheck.py`, no grader input): `unknown` when the agent exited non-zero or timed out or left no final report; `fail` when the last 4000 characters of its final report contain a doubt cue (cannot, unable, unverified, mismatch, does not match, depends on, blocked, failed and the like); `pass` otherwise. It is written into each row's result.json as `self_check` and `self_check_cue`. The cue list was written after reading the 40 reused rows, so only later rows measure it out of sample.
+
+Final, all 180 rows, 2026-11-16 (`python3 evals/lunafull.py output/luna-full/rows output/eval/snap/c60-all output/luna-full/snap output/luna-full/design.txt`):
+
+| Agent | Attempts | Pass rate (95% Wilson) | Cost/attempt | Wall/attempt | Requests/attempt |
+| --- | ---: | --- | ---: | ---: | ---: |
+| hl-agent gpt-6-luna gate | 180 | 74.4% (67.6-80.3%) | $0.027 at list rates | 183 s | 22.3 |
+| hl-agent Sonnet | 147 | 81.0% (73.8-86.5%) | $0.197 | 272 s | 13.9 |
+| nanocode Sonnet | 147 | 66.0% (58.0-73.2%) | $0.346 | 499 s | 15.7 |
+| Claude Code Sonnet | 147 | 69.8% (61.7-76.8%) | $0.330 | 440 s | 14.8 |
+
+- On the 147 attempts paired with the Sonnet rows the Luna arm passes 114 (77.6%): against nanocode 28 Luna-only vs 11 nanocode-only passes (sign test p = 0.009), +11.6 points; against hl-agent Sonnet 13 vs 18 (p = 0.473). Its 33 extra suite-3 attempts (tasks the Sonnet run took once) pull the unpaired rate to 74.4%.
+- Cost: 0.078x nanocode per attempt at list rates; the median attempt is about $0.011, and long sessions (caffe-cifar-10 $0.21, compile-compcert $0.13, build-pov-ray and build-cython-ext about $0.065) carry the mean.
+- Luna fails every attempt on chess-best-move, circuit-fibsqrt, dna-assembly, dna-insert, extract-elf, feal-differential-cryptanalysis, gcode-to-text, pypi-server, query-optimize and raman-fitting.
+- Self-check on all 180 rows: fail on 24 rows, 19 of them failed; it caught 19 of 46 failures.
+
+Self-check against the verifier on 85 rows: pass 70 passed / 9 failed, fail 0 / 5, unknown 1 / 0. Escalating on fail: precision 5/5, recall 5/14; on fail or unknown: precision 5/6, recall 5/14. Out of sample (45 later rows): nothing flagged, recall 0/2. The final report alone rarely admits a miss; a later lane should read the gate's check results from the journal rather than the prose.
+
+Resume: `cd ~/luna-full && setsid nohup sh -c 'sh go.sh; echo EXIT=$? >> out/go.exit' > out/go.out 2>&1 < /dev/null &` (it skips rows that have result.json), then `python3 evals/selfcheck.py out/rows` and the report command above.
+
+
+## 2026-11-16: codex drill answers the finish gate
+
+The finish gate runs its checks as extra journal turns after the prompted one, so `hl-agent run --turn N` with the gate uses turns N+1 and N+2 when turn N completes. The drill's scripted model had no answers for those turns: the main run asked for a step past the end of its script, and the control run's steer and cancel turns 2 and 3 collided with the gate's turns. The drill now scripts two short answers for the gate after each completed turn and drives the control's cancel turns as 4 and 5. `CODEX_DRILL_SEED=1 scripts/codex-drill.sh` passes (kills=12, control steer and cancel ok), and the planted `batch_flush_after_dispatch` is still caught.
