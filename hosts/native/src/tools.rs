@@ -186,7 +186,7 @@ impl Workspace {
         };
         let path = self.receipt(turn, seq, RECEIPT_DONE);
         if let Err(error) = atomic_write(&path, &value.encode()) {
-            eprintln!("hl-agent: {}: {error}", path.display());
+            eprintln!("hl-host: {}: {error}", path.display());
         }
     }
 
@@ -759,7 +759,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         .file_name()
         .ok_or("file has no name")?
         .to_string_lossy();
-    let temporary = path.with_file_name(format!(".{name}.hl-agent-write"));
+    let temporary = path.with_file_name(format!(".{name}.hl-host-write"));
     std::fs::write(&temporary, content).map_err(|error| format!("write: {error}"))?;
     if let Ok(metadata) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&temporary, metadata.permissions());
