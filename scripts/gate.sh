@@ -72,8 +72,11 @@ programs_not_on_wasm() {
       fi
     done
   done
-  agent_sources=$(grep -E 'emit_source\(' agent/build.rs | grep -cvE '^fn emit_source' || true)
-  grep -nE 'emit_source\(' agent/build.rs | grep -vE '^[0-9]+:fn emit_source' | sed 's#^#agent/build.rs:#' >> "$scratch/not_on_wasm.txt" || true
+  agent_sources=0
+  if [ -f agent/build.rs ]; then
+    agent_sources=$(grep -E 'emit_source\(' agent/build.rs | grep -cvE '^fn emit_source' || true)
+    grep -nE 'emit_source\(' agent/build.rs | grep -vE '^[0-9]+:fn emit_source' | sed 's#^#agent/build.rs:#' >> "$scratch/not_on_wasm.txt" || true
+  fi
   echo $((pairs + agent_sources))
 }
 

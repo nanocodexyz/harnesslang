@@ -1456,3 +1456,7 @@ Event intake records (`"record":{"event":…}`, a steer or other event taken int
 
 `proved_external_once` mirrors the fixed host's epoch fence: a dispatch from an owner whose epoch is below the one that last dispatched the call is refused by the host (the trace answers it failed) and is not counted, as the interpreter's world does; and a second owner taking over inside a hook leaves the outer run's epoch, unflushed answer and per-run counts as they were when it returns.
 
+
+## 2026-11-16: gate.sh without agent/
+
+`scripts/gate.sh` counts hl-agent's emitted-source programs only while `agent/build.rs` exists, so the gate keeps working once agent/ is removed (its lines and programs then count 0, and the change lowers gate.txt).
