@@ -912,11 +912,11 @@ rerun sends it again:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=10 target=native-jsonl profile=async mutation=listing_unchecked: listed call 2/3 (mcp__eta) ran as Some("eta-v7") while listing mcp admitted None in turn 2: a tool that changed since admission must be refused
+FAIL invariant=tool_admitted seed=27 target=native-jsonl profile=clean mutation=listing_unchecked: listed call 2/10 (mcp__delta) ran as Some("delta-v1") while listing mcp admitted None in turn 2: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=18 target=native-jsonl profile=errors mutation=input_unchecked: call 3/3 (exec_command) ran with input "{\"alpha-62\":true,\"cmd\":\"eta-22\",\"login\":true,\"workdir\":\"beta-5\"}", which does not fit its declared input: not a JSON object
+FAIL invariant=tool_admitted seed=25 target=native-jsonl profile=errors mutation=input_unchecked: call 2/10 (update_plan) ran with input "{\"alpha-33\":true,\"plan\":\"theta-29\"}", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
-FAIL invariant=unknown_reported seed=10 target=native-jsonl profile=async mutation=listed_class_dropped: external call 2/16 (mcp__theta) was dispatched but the journal has no durable call record for it
+FAIL invariant=replay_equal seed=13 target=native-jsonl profile=async mutation=listed_class_dropped: replaying the journal failed: Corrupt("replay of turn 4 diverged at seq 14: tool 'mcp__alpha' was recorded with another class or input")
 ```
 
 The checker's listing errors:

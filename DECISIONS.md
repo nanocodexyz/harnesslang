@@ -1526,3 +1526,13 @@ The same smoke on the pull request that moves `codex_agent.hl` onto compiler-emi
 - The front keeps `--spawn tool=program:handler`: a compiled spawn request carries only the spawn key, not the child's program and handler, so the host still needs to be told which module a spawn tool runs. Every run starts with the program's `configure` handler, and a child's `configure` gets the parent's arguments.
 - gate.txt: `host_lines_beyond_fixed` 8448 to 0 and `programs_not_on_wasm` 91 to 10 with agent/ gone. `emitted_source_lines` rose from 967299 to 973580 because the wire programs (lane1-wire, lane1-programs) are larger in the source backends; master's programs measure 967299 with this branch's compiler, so the rise is the programs, and gate.txt takes the new number by hand.
 - LANGUAGE.md gains a Wire models section (`docs/snippets/wire.hl`), `wire` in the contextual words and `[ "wire" name ]` in the model grammar, so `scripts/docs-check.sh` passes again.
+
+## 2026-11-16: codex_agent.hl escalates a failed finish check to a second model
+
+Escalation from Luna to Terra comes back as an option of the harness, not the host: `configure` gains `escalate_model: text` as its last parameter, `""` for none, and the hl-agent compatible front passes `--escalate-model <model>` through it. It reproduces the unpushed binary behind the 80.0% baseline, as reconstructed from its rows:
+
+- The FINISH_CHECK text now asks the model to end its report with the line `VERDICT: PASS` when every check passed, or `VERDICT: FAIL` when any failed or a stated behaviour is unverified.
+- When an escalate model is configured and a finish-check turn ends with a report whose last line, after trimming, is not exactly `VERDICT: PASS` (a failed or missing verdict), the same session goes on with its whole context on the escalate model, at the same effort, with the ESCALATE prompt. Every later request of the session, the remaining finish checks, reviews and compaction included, goes to that model. It escalates at most once per session.
+- The model id lives in state as `request_model`; `compose` rebuilds `head` and `review_head` from it, so a resumed or re-configured session keeps the escalated model. `configure` never clears `escalated`, since the host calls it on every run. Text verbosity follows the model the request goes to.
+- The host logs nothing about it: the switch shows in the journal as the ESCALATE user message and the model id of the requests after it.
+- The verdict is read with `contains` and `after` in a loop of at most `verdict_lines_max` = 8 marks; a report repeating the mark more often counts as not passed. The extra pass shares the prompt's one round loop, so the proved worst cases are unchanged.
