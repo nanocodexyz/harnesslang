@@ -34,12 +34,13 @@ const CLAUDE_SPAWN_HANDLER: &str = "delegated";
 const PROMPT_HANDLER: &str = "prompt";
 const REFRESH_HANDLER: &str = "refresh";
 const EFFORT_DEFAULT: &str = "default";
-const FINISH_CHECKS_DEFAULT: u64 = 2;
+const FINISH_CHECKS_DEFAULT: &str = "2";
 const ROUNDS_DEFAULT: u64 = u32::MAX as u64;
 const KEEP_WARM_MAX: u64 = 64;
 const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 const FIRST_TURN: u64 = 1;
 const NO_HANDLER: &str = "no handler";
+const ARGUMENTS_REFUSED: &str = "a turn request has a turn, a handler and arguments";
 
 pub fn now_ms() -> u64 {
     let elapsed = SystemTime::now()
@@ -88,7 +89,7 @@ struct Flags {
     max_turns: Option<u64>,
     effort: Option<String>,
     reviewer: Option<String>,
-    finish_checks: Option<u64>,
+    finish_checks: Option<String>,
     keep_warm: u64,
     text: Option<String>,
     request: Option<PathBuf>,
@@ -134,7 +135,7 @@ fn flags(args: &[String]) -> Flags {
             "--max-turns" => flags.max_turns = Some(number_flag(flag, &value)),
             "--effort" => flags.effort = Some(value),
             "--reviewer-relay" => flags.reviewer = Some(value),
-            "--finish-checks" => flags.finish_checks = Some(number_flag(flag, &value)),
+            "--finish-checks" => flags.finish_checks = Some(value),
             "--keep-warm" => flags.keep_warm = number_flag(flag, &value),
             "--text" => flags.text = Some(value),
             "--request" => flags.request = Some(PathBuf::from(value)),
@@ -427,7 +428,12 @@ fn front(flags: Flags) {
                 ("requested_effort", Json::text(&effort)),
                 (
                     "finish_checks",
-                    Json::int(flags.finish_checks.unwrap_or(FINISH_CHECKS_DEFAULT)),
+                    Json::text(
+                        flags
+                            .finish_checks
+                            .as_deref()
+                            .unwrap_or(FINISH_CHECKS_DEFAULT),
+                    ),
                 ),
                 ("model_name", Json::text(&model)),
                 (
@@ -476,6 +482,16 @@ fn front(flags: Flags) {
                     session.close();
                     fail_usage(&reason);
                 }
+            }
+            Err(error) if error.contains(ARGUMENTS_REFUSED) => {
+                session.close();
+                fail_usage(&format!(
+                    "{program} refused the configure arguments {}: check --model, --effort and --finish-checks",
+                    session
+                        .configured()
+                        .map(|json| json.encode())
+                        .unwrap_or_default()
+                ));
             }
             Err(error) if error.contains(NO_HANDLER) => {
                 eprintln!("{LABEL}: {program} declares no configure handler; prompting directly");
