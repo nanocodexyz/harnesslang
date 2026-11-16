@@ -1468,3 +1468,7 @@ The SQL crash and takeover drill (`scripts/rust-sql-drill.sh`) now runs the comp
 `scripts/gate.sh` counts hl-agent's emitted-source programs only while `agent/build.rs` exists, so the gate keeps working once agent/ is removed (its lines and programs then count 0, and the change lowers gate.txt).
 
 A target whose `hl emit --format source` answers that the harness has no source form there (the JS backend deleted, wasm only) counts 0 emitted source lines.
+
+## No CI and no pull requests
+
+Georgios replaced CI with agent-driven verification. Each agent runs `scripts/ci.sh` (build, `check.sh` with every target's differential wasm run, `hl prove` on every program, the `gate.sh` ratchet) on a sandbox it gets itself, then pushes to master with the result in the commit message. `.github/workflows`, the `CI Gate` status and master's branch protection are gone. The ratchet and differential tests stay as scripts.
