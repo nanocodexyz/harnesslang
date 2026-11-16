@@ -22,8 +22,11 @@ const read_offset_first: u64 = 1
 const read_limit_whole: u64 = 0
 const image_bytes_max: u64 = 1048576
 const images_kept: u64 = 100
+const probe_timeout_ms: u64 = 30000
+const agents_chunks_max: u64 = 4
 
 type outcome = submitted(text) | failed(text) | exhausted
+type effort_choice = "default" | "low" | "medium" | "high"
 type claude_reply = answer(text, text) | calls(list<call, calls_per_round_max>, text, text)
 
 tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
@@ -32,7 +35,7 @@ tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool
 tool Write(file_path: text, content: text) -> text effect external
 tool submit_result(output: text) -> text effect none
 
-model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only
+model messages calls calls_per_round_max reply claude_reply window context_window_tokens modes text_only settings(url: text = "", headers: text = "[]", head: text = "", tail: text = "") wire anthropic
 
 state {
   context: list<entry, context_entries_max>
@@ -54,6 +57,29 @@ state {
   summary_ready: bool
   submit_accepted: bool
   submitted_output: text
+  configured: bool
+  probed: bool
+  adaptive: bool
+  model_known: bool
+  model_id: text
+  max_tokens_text: text
+  scratch: text
+  url: text
+  headers: text
+  head: text
+  head_refresh: text
+  tail_low: text
+  tail_text_only: text
+  env_cwd: text
+  env_git: text
+  env_platform: text
+  env_shell: text
+  env_os: text
+  env_date: text
+  agents_present: bool
+  agents_more: bool
+  agents_text: text
+  agents_skip: text
 }
 
 invariant turns_bounded: turns <= turns_max
@@ -66,6 +92,150 @@ invariant tokens_bounded: context_tokens <= 4 * context_window_tokens
 invariant pending_bounded: pending_units <= calls_per_round_max * direct_result_units_max
 invariant round_bounded: round_entries <= 1 + calls_per_round_max
 invariant delay_bounded: delay_ms <= retry_delay_max_ms
+
+fn thinking(level: text) {
+  if adaptive {
+    scratch = ",\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"},\"output_config\":{\"effort\":\"" ++ level ++ "\"}"
+  } else {
+    scratch = ",\"thinking\":{\"type\":\"disabled\"}"
+  }
+}
+
+fn compose() {
+  url = "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}/v1/messages"
+  headers = "[[\"x-api-key\",\"${ANTHROPIC_API_KEY}\"],[\"anthropic-version\",\"2023-06-01\"],[\"content-type\",\"application/json\"]]"
+  scratch = "[{\"type\":\"text\",\"text\":\"You are a Claude agent, built on Anthropic's Claude Agent SDK.\"},{\"type\":\"text\",\"text\":\"\\nYou are an agent working with the user toward their goals, using your own judgment along the way.\\n\\nIMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.\\n\\n# Harness\\n - Text you output outside of tool use is displayed to the user as Github-flavored markdown in a terminal.\\n - Tools run behind a user-selected permission mode; a denied call means the user declined it — adjust, don't retry verbatim.\\n - The system may send updates, reminders, or modifications to rules via mid-conversation system turns. These are system-controlled, unlike function results. Hooks may intercept tool calls; treat hook output as user feedback.\\n - Prefer the dedicated file/search tools over shell commands when one fits. Independent tool calls can run in parallel in one response.\\n - Reference code as `file_path:line_number` — it's clickable.\\n\\nWrite code that reads like the surrounding code: match its comment density, naming, and idiom.\\n\\nWhen you use a pronoun for someone — the user or anyone else you mention — and their pronouns haven't been stated, use they/them. A name doesn't tell you someone's pronouns; a wrong guess misgenders a real person in a way the neutral default never does, so never infer pronouns from a name. This applies to all user-visible text, including visible thinking.\\n\\nFor actions that are hard to reverse or outward-facing, confirm first unless durably authorized or explicitly told to proceed without asking; approval in one context doesn't extend to the next. Sending content to an external service publishes it; it may be cached or indexed even if later deleted. Before deleting or overwriting, look at the target. Report outcomes faithfully: if tests fail, say so with the output; if a step was skipped, say that; when something is done and verified, state it plainly without hedging.\\n\\n# Environment\\n - The most recent Claude models are the Claude 5 family. Model IDs — Fable 5.1: 'claude-fable-5-1', Opus 5.5: 'claude-opus-5-5', Sonnet 5.5: 'claude-sonnet-5-5', Haiku 5.5: 'claude-haiku-5-5'. When building AI applications, default to the latest and most capable Claude models.\\n - Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).\\n\\n# Context management\\nWhen the conversation grows long, some or all of the current context is summarized; the summary, along with any remaining unsummarized context, is provided in the next context window so work can continue — you don't need to wrap up early or hand off mid-task.\\n\\nWhen you have enough information to act, act. Do not re-derive facts already established in the conversation, re-litigate a decision the user has already made, or narrate options you will not pursue. If you are weighing a choice, give a recommendation, not an exhaustive survey\\n\\n<total_tokens>15000000 tokens left</total_tokens>\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"# Tool calls\\nEach tool call costs a model turn, so do the work in as few as it allows. Put steps whose order is already known into one Bash command (`&&`, a loop, a here-doc script) instead of one call per step, and check their result in that same command. Make calls that do not depend on each other, such as reads of different files, together in one response. Read only the part of a file you need: search a large file with `grep -n` first, then Read with offset and limit. Return only the output the next decision needs: cut long output with grep, head or tail. Start a server in the background with its output redirected to a file, and check it in the command that starts it. Use separate calls only when an intermediate result needs your judgment.\\n\\n# Inputs\\nThe files and state the task gives you may be the only copy. Look at them with read-only tools first (ls, file, xxd, head, git log). Before running anything that can write to them, copy them aside with `cp -a` and work on the copy: opening a database (SQLite checkpoints or deletes a WAL or journal it cannot read when the connection closes), a build, converter or formatter run in place, a git command that rewrites refs or the index.\\n\\n# Finishing\\nWrite each file the task asks for as soon as you have a working version, then improve it in place, so a time limit never leaves nothing behind. Before you finish, check the result the way it will be used: run the exact command or interpreter the task names on the exact paths it names, in a fresh login shell such as `env -i bash -lc '<command>'`, where variables you exported and other session state are gone. Check every requirement the task states, not only the main one, and exercise each behaviour it names for real: step through a debugger it mentions, deliver a keyboard interrupt as SIGINT to a separate process running the program (`python3 prog.py & sleep 1; kill -INT $!`), and run with more work than any limit it sets as well as less. A program the task says is on PATH must be found there, so install or link it into /usr/local/bin rather than exporting PATH. If the check needs an interpreter or tool that is missing (python3, node, a compiler), install it with the system package manager (`apt-get install -y python3`) and run the check. A part you have not run is not done: never finish with \\\"X is not installed here, but it should work\\\". Test a service through the interface its user will use: the protocol, port, account and authentication the task names. Leave what the task produced in place: do not delete or revert what a smoke test created inside the deliverable (a deployed page, a pushed commit, rows in a database, files in a web root), since the user's own check expects to find it; remove only scratch files outside it, such as a temporary clone. Keep your own test inputs and scratch files out of the task's directories (use /tmp): a file of yours next to the deliverables can shadow the one the user's check reads. Put things exactly where the task names: extract an archive in full into the directory it gives, not selected parts of it. Finish the work instead of asking which way to go: when the task allows two readings, take the one its files support (for lost git work, `git reflog` shows what was checked out and when), do it, and say what you chose.\",\"cache_control\":{\"type\":\"ephemeral\"}},{\"type\":\"text\",\"text\":\"# Environment\\nYou have been invoked in the following environment: \\nPrimary working directory: " ++ env_cwd ++ "\\nIs a git repository: " ++ env_git ++ "\\nPlatform: " ++ env_platform
+  if env_shell != "" {
+    scratch = scratch ++ "\\nShell: " ++ env_shell
+  }
+  if env_os != "" {
+    scratch = scratch ++ "\\nOS Version: " ++ env_os
+  }
+  scratch = scratch ++ "\\nToday's date: " ++ env_date ++ "\"}"
+  if agents_present {
+    scratch = scratch ++ ",{\"type\":\"text\",\"text\":\"# AGENTS.md instructions for " ++ env_cwd ++ "\\n\\n<INSTRUCTIONS>\\n" ++ agents_text ++ "\\n</INSTRUCTIONS>\"}"
+  }
+  head = "{\"model\":\"" ++ model_id ++ "\",\"max_tokens\":" ++ max_tokens_text ++ ",\"system\":" ++ scratch ++ "],\"tools\":[{\"name\":\"Read\",\"description\":\"Reads a file from the local filesystem.\\n\\n- `file_path` must be an absolute path.\\n- Reads up to 2000 lines by default.\\n- When you already know which part of the file you need, only read that part. This can be important for larger files.\\n- Results are returned using cat -n format, with line numbers starting at 1\\n- Reads images (PNG, JPG, …) and presents them visually. Reads PDFs via the `pages` parameter (e.g. \\\"1-5\\\", max 20 pages/request; required for PDFs over 10 pages). Reads Jupyter notebooks (.ipynb) as cells with outputs.\\n- Reading a directory, a missing file, or an empty file returns an error or system reminder rather than content.\\n- Do NOT re-read a file you just edited to verify — Edit/Write would have errored if the change failed, and the harness tracks file state for you.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"file_path\":{\"description\":\"The absolute path to the file to read\",\"type\":\"string\"},\"offset\":{\"description\":\"The line number to start reading from. Only provide if the file is too large to read at once\",\"type\":\"integer\",\"minimum\":0,\"maximum\":9007199254740991},\"limit\":{\"description\":\"The number of lines to read. Only provide if the file is too large to read at once.\",\"type\":\"integer\",\"exclusiveMinimum\":0,\"maximum\":9007199254740991},\"pages\":{\"description\":\"Page range for PDF files (e.g., \\\"1-5\\\", \\\"3\\\", \\\"10-20\\\"). Only applicable to PDF files. Maximum 20 pages per request.\",\"type\":\"string\"},\"allow_large\":{\"description\":\"Set to true to read a text file, or a line range of one, that is over the usual size limits, up to what still fits in your context. Only use this when you genuinely need all of it or the user asked for the whole file; otherwise read it in parts with offset and limit, or search it.\",\"type\":\"boolean\"}},\"required\":[\"file_path\"],\"additionalProperties\":false}},{\"name\":\"Edit\",\"description\":\"Performs exact string replacement in a file.\\n\\n- You must Read the file in this conversation before editing, or the call will fail.\\n- `old_string` must match the file exactly, including indentation, and be unique — the edit fails otherwise. Strip the Read line prefix (line number + tab) before matching.\\n- `replace_all: true` replaces every occurrence instead.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"file_path\":{\"description\":\"The absolute path to the file to modify\",\"type\":\"string\"},\"old_string\":{\"description\":\"The text to replace\",\"type\":\"string\"},\"new_string\":{\"description\":\"The text to replace it with (must be different from old_string)\",\"type\":\"string\"},\"replace_all\":{\"description\":\"Replace all occurrences of old_string (default false)\",\"default\":false,\"type\":\"boolean\"}},\"required\":[\"file_path\",\"old_string\",\"new_string\"],\"additionalProperties\":false}},{\"name\":\"Write\",\"description\":\"Writes a file to the local filesystem, overwriting if one exists.\\n\\nWhen to use: creating a new file, or fully replacing one you've already Read. Overwriting an existing file you haven't Read will fail. For partial changes, use Edit instead.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"file_path\":{\"description\":\"The absolute path to the file to write (must be absolute, not relative)\",\"type\":\"string\"},\"content\":{\"description\":\"The content to write to the file\",\"type\":\"string\"}},\"required\":[\"file_path\",\"content\"],\"additionalProperties\":false}},{\"name\":\"Bash\",\"description\":\"Executes a bash command and returns its output.\\n\\n- Working directory persists between calls, but prefer absolute paths — `cd` in a compound command can trigger a permission prompt. Shell state (env vars, functions) does not persist; the shell is initialized from the user's profile.\\n- IMPORTANT: Avoid using this tool to run `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user.\\n- Command output is displayed to you, not reliably to the user.\\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command.\\n- `run_in_background` runs the command detached: it keeps running across turns and re-invokes you when it exits. With it, `timeout` is how long the command may run in the background (default 600000, max 7200000); at that limit it is stopped and you are re-invoked. No `&` needed.\\n\\n# Git\\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\\n- Commit or push only when the user asks. If on the default branch, branch first.\\n- End git commit messages and PR bodies with the attribution lines given in the conversation's system-reminder, when one is present.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"command\":{\"description\":\"The command to execute\",\"type\":\"string\"},\"timeout\":{\"description\":\"Optional timeout in milliseconds (max 600000 for a foreground command)\",\"type\":\"number\"},\"description\":{\"description\":\"Clear, concise description of what this command does in active voice. Never use words like \\\"complex\\\" or \\\"risk\\\" in the description - just describe what it does.\\n\\nSay what the command does in plain words: do not echo the command's text, its flags, or file paths - the user reads this description, often without seeing the command.\\n\\nFor simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):\\n- ls → \\\"List files in current directory\\\"\\n- git status → \\\"Show working tree status\\\"\\n- npm install → \\\"Install package dependencies\\\"\\n\\nFor commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:\\n- find . -name \\\"*.tmp\\\" -exec rm {} \\\\; → \\\"Find and delete all .tmp files recursively\\\"\\n- git reset --hard origin/main → \\\"Discard all local changes and match remote main\\\"\\n- curl -s url | jq '.data[]' → \\\"Fetch JSON from URL and extract data array elements\\\"\",\"type\":\"string\"},\"run_in_background\":{\"description\":\"Set to true to run this command in the background. With it, `timeout` limits how long the command may run in the background before it is stopped (default 600000 ms, max 7200000 ms).\",\"type\":\"boolean\"},\"dangerouslyDisableSandbox\":{\"description\":\"Set this to true to dangerously override sandbox mode and run commands without sandboxing.\",\"type\":\"boolean\"}},\"required\":[\"command\"],\"additionalProperties\":false}},{\"name\":\"submit_result\",\"description\":\"Submits the current child subagent turn's final output. Supply only the output the task asks for. After an accepted receipt your turn ends. Invalid values can be corrected and retried.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"output\":{\"type\":\"string\",\"description\":\"The final result, as text: JSON text when the task asks for structured output.\"}},\"required\":[\"output\"],\"additionalProperties\":false},\"cache_control\":{\"type\":\"ephemeral\"}}],\"messages\":"
+  head_refresh = "{\"model\":\"" ++ model_id ++ "\",\"max_tokens\":0,\"system\":" ++ scratch ++ "],\"tools\":[{\"name\":\"Read\",\"description\":\"Reads a file from the local filesystem.\\n\\n- `file_path` must be an absolute path.\\n- Reads up to 2000 lines by default.\\n- When you already know which part of the file you need, only read that part. This can be important for larger files.\\n- Results are returned using cat -n format, with line numbers starting at 1\\n- Reads images (PNG, JPG, …) and presents them visually. Reads PDFs via the `pages` parameter (e.g. \\\"1-5\\\", max 20 pages/request; required for PDFs over 10 pages). Reads Jupyter notebooks (.ipynb) as cells with outputs.\\n- Reading a directory, a missing file, or an empty file returns an error or system reminder rather than content.\\n- Do NOT re-read a file you just edited to verify — Edit/Write would have errored if the change failed, and the harness tracks file state for you.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"file_path\":{\"description\":\"The absolute path to the file to read\",\"type\":\"string\"},\"offset\":{\"description\":\"The line number to start reading from. Only provide if the file is too large to read at once\",\"type\":\"integer\",\"minimum\":0,\"maximum\":9007199254740991},\"limit\":{\"description\":\"The number of lines to read. Only provide if the file is too large to read at once.\",\"type\":\"integer\",\"exclusiveMinimum\":0,\"maximum\":9007199254740991},\"pages\":{\"description\":\"Page range for PDF files (e.g., \\\"1-5\\\", \\\"3\\\", \\\"10-20\\\"). Only applicable to PDF files. Maximum 20 pages per request.\",\"type\":\"string\"},\"allow_large\":{\"description\":\"Set to true to read a text file, or a line range of one, that is over the usual size limits, up to what still fits in your context. Only use this when you genuinely need all of it or the user asked for the whole file; otherwise read it in parts with offset and limit, or search it.\",\"type\":\"boolean\"}},\"required\":[\"file_path\"],\"additionalProperties\":false}},{\"name\":\"Edit\",\"description\":\"Performs exact string replacement in a file.\\n\\n- You must Read the file in this conversation before editing, or the call will fail.\\n- `old_string` must match the file exactly, including indentation, and be unique — the edit fails otherwise. Strip the Read line prefix (line number + tab) before matching.\\n- `replace_all: true` replaces every occurrence instead.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"file_path\":{\"description\":\"The absolute path to the file to modify\",\"type\":\"string\"},\"old_string\":{\"description\":\"The text to replace\",\"type\":\"string\"},\"new_string\":{\"description\":\"The text to replace it with (must be different from old_string)\",\"type\":\"string\"},\"replace_all\":{\"description\":\"Replace all occurrences of old_string (default false)\",\"default\":false,\"type\":\"boolean\"}},\"required\":[\"file_path\",\"old_string\",\"new_string\"],\"additionalProperties\":false}},{\"name\":\"Write\",\"description\":\"Writes a file to the local filesystem, overwriting if one exists.\\n\\nWhen to use: creating a new file, or fully replacing one you've already Read. Overwriting an existing file you haven't Read will fail. For partial changes, use Edit instead.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"file_path\":{\"description\":\"The absolute path to the file to write (must be absolute, not relative)\",\"type\":\"string\"},\"content\":{\"description\":\"The content to write to the file\",\"type\":\"string\"}},\"required\":[\"file_path\",\"content\"],\"additionalProperties\":false}},{\"name\":\"Bash\",\"description\":\"Executes a bash command and returns its output.\\n\\n- Working directory persists between calls, but prefer absolute paths — `cd` in a compound command can trigger a permission prompt. Shell state (env vars, functions) does not persist; the shell is initialized from the user's profile.\\n- IMPORTANT: Avoid using this tool to run `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user.\\n- Command output is displayed to you, not reliably to the user.\\n- `timeout` is in milliseconds: default 120000, max 600000 for a foreground command.\\n- `run_in_background` runs the command detached: it keeps running across turns and re-invokes you when it exits. With it, `timeout` is how long the command may run in the background (default 600000, max 7200000); at that limit it is stopped and you are re-invoked. No `&` needed.\\n\\n# Git\\n- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.\\n- Use the `gh` CLI for GitHub operations (PRs, issues, API).\\n- Commit or push only when the user asks. If on the default branch, branch first.\\n- End git commit messages and PR bodies with the attribution lines given in the conversation's system-reminder, when one is present.\",\"input_schema\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"command\":{\"description\":\"The command to execute\",\"type\":\"string\"},\"timeout\":{\"description\":\"Optional timeout in milliseconds (max 600000 for a foreground command)\",\"type\":\"number\"},\"description\":{\"description\":\"Clear, concise description of what this command does in active voice. Never use words like \\\"complex\\\" or \\\"risk\\\" in the description - just describe what it does.\\n\\nSay what the command does in plain words: do not echo the command's text, its flags, or file paths - the user reads this description, often without seeing the command.\\n\\nFor simple commands (git, npm, standard CLI tools), keep it brief (5-10 words):\\n- ls → \\\"List files in current directory\\\"\\n- git status → \\\"Show working tree status\\\"\\n- npm install → \\\"Install package dependencies\\\"\\n\\nFor commands that are harder to parse at a glance (piped commands, obscure flags, etc.), add enough context to clarify what it does:\\n- find . -name \\\"*.tmp\\\" -exec rm {} \\\\; → \\\"Find and delete all .tmp files recursively\\\"\\n- git reset --hard origin/main → \\\"Discard all local changes and match remote main\\\"\\n- curl -s url | jq '.data[]' → \\\"Fetch JSON from URL and extract data array elements\\\"\",\"type\":\"string\"},\"run_in_background\":{\"description\":\"Set to true to run this command in the background. With it, `timeout` limits how long the command may run in the background before it is stopped (default 600000 ms, max 7200000 ms).\",\"type\":\"boolean\"},\"dangerouslyDisableSandbox\":{\"description\":\"Set this to true to dangerously override sandbox mode and run commands without sandboxing.\",\"type\":\"boolean\"}},\"required\":[\"command\"],\"additionalProperties\":false}},{\"name\":\"submit_result\",\"description\":\"Submits the current child subagent turn's final output. Supply only the output the task asks for. After an accepted receipt your turn ends. Invalid values can be corrected and retried.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"output\":{\"type\":\"string\",\"description\":\"The final result, as text: JSON text when the task asks for structured output.\"}},\"required\":[\"output\"],\"additionalProperties\":false},\"cache_control\":{\"type\":\"ephemeral\"}}],\"messages\":"
+  thinking("low")
+  tail_low = ",\"stream\":true" ++ scratch ++ "}"
+  tail_text_only = ",\"stream\":true,\"tool_choice\":{\"type\":\"none\"}" ++ scratch ++ "}"
+  scratch = ""
+}
+
+fn probed_output(out: text, chunk: u64) {
+  if not contains(out, "@@hl-end@@") {
+    return failed("the environment probe printed no end marker: " ++ out)
+  }
+  if chunk == 0 {
+    env_cwd = before(after(out, "@@hl-cwd@@"), "@@hl-")
+    env_git = before(after(out, "@@hl-git@@"), "@@hl-")
+    env_platform = before(after(out, "@@hl-platform@@"), "@@hl-")
+    env_shell = before(after(out, "@@hl-shell@@"), "@@hl-")
+    env_os = before(after(out, "@@hl-os@@"), "@@hl-")
+    env_date = before(after(out, "@@hl-date@@"), "@@hl-")
+  }
+  let agents = before(after(out, "@@hl-agents@@"), "@@hl-end@@")
+  if contains(agents, "present@@hl-text@@") {
+    agents_present = true
+    agents_text = agents_text ++ before(after(agents, "present@@hl-text@@"), "@@hl-more@@")
+    agents_more = contains(agents, "@@hl-more@@")
+    agents_skip = agents_skip ++ "1"
+  }
+}
+
+fn probe(cwd: text) {
+  agents_more = true
+  agents_present = false
+  agents_text = ""
+  agents_skip = ""
+  loop chunk below agents_chunks_max {
+    if agents_more {
+      agents_more = false
+      match Bash("c='" ++ cwd ++ "'; s='" ++ agents_skip ++ "'\ncd -- \"$c\" || exit 1\ne() { LC_ALL=C od -An -tu1 -v | LC_ALL=C awk 'BEGIN { n = 0 } { for (i = 1; i <= NF; i++) { b[n] = $i + 0; n++ } } END { while (n > 0 && (b[n-1] == 32 || b[n-1] == 9 || b[n-1] == 10 || b[n-1] == 13 || b[n-1] == 12 || b[n-1] == 11)) n--; i = 0; while (i < n) { c = b[i]; if (c == 34) { printf \"%s\", \"\\\\\\\"\"; i++ } else if (c == 92) { printf \"%s\", \"\\\\\\\\\"; i++ } else if (c == 10) { printf \"%s\", \"\\\\n\"; i++ } else if (c == 9) { printf \"%s\", \"\\\\t\"; i++ } else if (c == 13) { printf \"%s\", \"\\\\r\"; i++ } else if (c < 32 || c == 127) { printf \"\\\\u%04x\", c; i++ } else if (c < 128) { printf \"%c\", c; i++ } else if (c >= 240 && c < 248 && i + 3 < n) { p = (c - 240) * 262144 + (b[i+1] - 128) * 4096 + (b[i+2] - 128) * 64 + (b[i+3] - 128) - 65536; printf \"\\\\u%04x\\\\u%04x\", 55296 + int(p / 1024), 56320 + p % 1024; i += 4 } else if (c >= 224 && c < 240 && i + 2 < n) { printf \"\\\\u%04x\", (c - 224) * 4096 + (b[i+1] - 128) * 64 + (b[i+2] - 128); i += 3 } else if (c >= 192 && c < 224 && i + 1 < n) { printf \"\\\\u%04x\", (c - 192) * 64 + (b[i+1] - 128); i += 2 } else { printf \"%s\", \"\\\\ufffd\"; i++ } } }'; }\nk=24000\nif [ -z \"$s\" ]; then\nprintf '@@hl-cwd@@'; printf '%s' \"$c\" | e\nprintf '@@hl-git@@'; d=$c; g=false; while :; do if [ -e \"$d/.git\" ]; then g=true; break; fi; if [ \"$d\" = / ] || [ -z \"$d\" ]; then break; fi; d=$(dirname -- \"$d\"); done; printf '%s' \"$g\"\nprintf '@@hl-platform@@'; uname -s 2>/dev/null | tr 'A-Z' 'a-z' | e\nprintf '@@hl-shell@@'; if [ -n \"${SHELL:-}\" ]; then printf '%s' \"${SHELL##*/}\" | e; fi\nprintf '@@hl-os@@'; uname -sr 2>/dev/null | e\nprintf '@@hl-date@@'; date +%Y-%m-%d 2>/dev/null | e\nfi\nprintf '@@hl-agents@@'\nif [ -f AGENTS.md ] && [ -r AGENTS.md ]; then printf 'present@@hl-text@@'; e < AGENTS.md | tail -c +$((${#s} * k + 1)) | head -c \"$k\"; t=$(e < AGENTS.md | wc -c); if [ \"$t\" -gt $(((${#s} + 1) * k)) ]; then printf '@@hl-more@@'; fi; fi\nprintf '@@hl-end@@'", probe_timeout_ms, "Read the environment for the system prompt", false, false) {
+        ok(out) => { probed_output(out, chunk) }
+        failed(error) => { return failed("the environment probe failed: " ++ error) }
+        unknown => { return failed("the environment probe ended unknown") }
+      }
+    }
+  }
+  if agents_more {
+    return failed("AGENTS.md is longer than the environment probe reads")
+  }
+  probed = true
+}
+
+fn model_table(model_name: text) {
+  model_known = false
+  adaptive = false
+  if model_name == "claude-opus-5-5" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-fable-5-5" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-fable-5-2" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-mythos-5-2" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-fable-5-1" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-mythos-5-1" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-sonnet-5-5" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-haiku-5-5" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-opus-5" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-sonnet-5" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-opus-4-6" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-sonnet-4-6" {
+    model_known = true
+    max_tokens_text = "128000"
+    adaptive = true
+  } else if model_name == "claude-haiku-4-5" {
+    model_known = true
+    max_tokens_text = "64000"
+  } else if model_name == "claude-haiku-4-5-20251001" {
+    model_known = true
+    max_tokens_text = "64000"
+  } else if model_name == "claude-sonnet-4-5" {
+    model_known = true
+    max_tokens_text = "64000"
+  } else if model_name == "claude-sonnet-4-5-20250929" {
+    model_known = true
+    max_tokens_text = "64000"
+  } else if model_name == "claude-opus-4-5" {
+    model_known = true
+    max_tokens_text = "64000"
+  } else if model_name == "claude-opus-4-5-20251101" {
+    model_known = true
+    max_tokens_text = "64000"
+  }
+}
 
 fn back_off(error: text, after_ms: u64, limit: u64, throttled: bool) {
   if attempts + 1 >= limit {
@@ -118,7 +288,7 @@ fn compact() {
     ++ "</summary>\n</example>\n\nPlease provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response. \n\nThere may be additional summarization instructions provided in the included context. If so, remember to follow these instructions when creating the above summary. Examples of instructions include:\n<example>\n## Compact Instructions\n"
     ++ "When summarizing the conversation focus on typescript code changes and also remember the mistakes you made and how you fixed them.\n</example>\n\n<example>\n# Summary instructions\nWhen you are using compact - please focus on test output and code changes. Include file reads verbatim.\n</example>\n\n"
     ++ "\nREMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task."
-  match messages(context with user(compaction_prompt)) {
+  match messages(context with user(compaction_prompt)) with {url: url, headers: headers, head: head, tail: tail_low} {
     ok(summary, stop, _, _, _, _) => {
       match summary {
         answer(words, _) => { summary_stopped(words, stop) }
@@ -138,7 +308,7 @@ fn compact() {
 }
 
 fn forced_summary() {
-  match messages(context with user(compaction_prompt)) mode text_only {
+  match messages(context with user(compaction_prompt)) mode text_only with {url: url, headers: headers, head: head, tail: tail_text_only} {
     ok(summary, stop, _, _, _, _) => {
       match summary {
         answer(words, _) => { summary_stopped(words, stop) }
@@ -223,6 +393,23 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
   round_entries = 1 + len(requested)
 }
 
+on configure(model_name: text, requested_effort: effort_choice, cwd: text) -> outcome {
+  if contains(cwd, "'") {
+    return failed("the working directory holds a single quote, which the environment probe cannot quote")
+  }
+  model_table(model_name)
+  if not model_known {
+    return failed("unknown Claude model " ++ model_name ++ ": nanocode's table has no max_tokens for it")
+  }
+  model_id = model_name
+  if not probed {
+    probe(cwd)
+  }
+  compose()
+  configured = true
+  return submitted("")
+}
+
 on delegated(role: text, task: text) -> outcome
   requires turns < turns_max
 {
@@ -255,7 +442,7 @@ on delegated(role: text, task: text) -> outcome
       if len(context) + 5 + calls_per_round_max > context_entries_max {
         return failed("the context has no room for a round after compaction")
       }
-      match messages(context) {
+      match messages(context) with {url: url, headers: headers, head: head, tail: tail_low} {
         throttled(error, after_ms) => { back_off(error, after_ms, throttled_attempts_max, true) }
         transient(error, after_ms) => { back_off(error, after_ms, attempts_max, false) }
         rejected(error) => { return failed("provider rejected the request: " ++ error) }
