@@ -248,4 +248,5 @@ def main():
         print("errored: " + row["id"] + ": " + str(row.get("note")))
 
 
-main()
+if __name__ == "__main__":
+    main()
