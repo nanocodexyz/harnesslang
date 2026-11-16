@@ -1453,3 +1453,6 @@ Commands: `scripts/gate.sh`, `scripts/gate.sh --prove` (33 s on the 5-core Hand)
 
 Event intake records (`"record":{"event":…}`, a steer or other event taken into a run) are left out of the per-run record count, as `hl prove`'s worst case leaves them out: docs/snippets/events.hl's run handler is proved at 19 records per run and flushes 22 when three steers arrive, on the interpreter and the module alike, so the prover's records bound does not yet cover taken events. `src/generate/body.rs`'s statement budget is renamed `GENERATED_STATEMENTS_MAX`: docs-check matched it against LANGUAGE.md's `STATEMENTS_PER_HANDLER_MAX` = 65,536 and failed or passed depending on file order.
 
+
+`proved_external_once` mirrors the fixed host's epoch fence: a dispatch from an owner whose epoch is below the one that last dispatched the call is refused by the host (the trace answers it failed) and is not counted, as the interpreter's world does; and a second owner taking over inside a hook leaves the outer run's epoch, unflushed answer and per-run counts as they were when it returns.
+

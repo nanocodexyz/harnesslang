@@ -194,7 +194,8 @@ pub struct Seed<'e> {
     deadlines: std::collections::BTreeMap<String, Json>,
     pending_deadlines: std::collections::BTreeMap<String, Json>,
     handler: String,
-    external: std::collections::BTreeMap<String, u64>,
+    external: std::collections::BTreeMap<String, (u64, i64)>,
+    epoch: i64,
     unflushed: Option<String>,
     run_records: u64,
     run_requests: u64,
@@ -202,7 +203,8 @@ pub struct Seed<'e> {
 }
 
 impl<'e> Seed<'e> {
-    fn begin_run(&mut self, context: &mut Context) {
+    fn begin_run(&mut self, context: &mut Context, epoch: i64) {
+        self.epoch = epoch;
         self.unflushed = None;
         self.run_records = 0;
         self.run_requests = 0;
@@ -235,7 +237,11 @@ impl<'e> Seed<'e> {
         self.unflushed = None;
         self.run_records += bytes
             .lines()
-            .filter(|line| !line.is_empty() && !line.contains("\"record\":{\"event\":"))
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.starts_with("{\"event\":")
+                    && !line.contains("\"record\":{\"event\":")
+            })
             .count() as u64;
         context.stats.records_max = context.stats.records_max.max(self.run_records);
         if let Some(bound) = context.bounds.records_per_run.get(&self.handler)
@@ -271,7 +277,11 @@ impl<'e> Seed<'e> {
             );
         }
         let key = format!("{call} {}", request.get("nested").or_null().encode());
-        let count = self.external.entry(key).or_insert(0);
+        let (count, claimed) = self.external.entry(key).or_insert((0, self.epoch));
+        if self.epoch < *claimed {
+            return Ok(());
+        }
+        *claimed = self.epoch;
         *count += 1;
         context.stats.external += 1;
         if *count > 1 {
@@ -301,6 +311,7 @@ impl<'e> Seed<'e> {
             pending_deadlines: std::collections::BTreeMap::new(),
             handler: String::new(),
             external: std::collections::BTreeMap::new(),
+            epoch: 0,
             unflushed: None,
             run_records: 0,
             run_requests: 0,
@@ -369,7 +380,6 @@ impl<'e> Seed<'e> {
     fn run(&mut self, context: &mut Context, event: &Json) -> Result<(), Stop> {
         self.pending_deadlines.clear();
         let journal = self.opened_bytes(event)?;
-        self.begin_run(context);
         let started = (context.clock)();
         let mut instance = Instance::new(&context.loaded.module, Limits::NODE);
         context.stats.instantiate_ms += (context.clock)() - started;
@@ -377,6 +387,7 @@ impl<'e> Seed<'e> {
         let ran = (context.clock)();
         let request = self.request.clone().unwrap_or_else(|| "null".to_owned());
         let epoch = event.get("epoch").bigint().map_err(Stop::Error)?;
+        self.begin_run(context, epoch);
         let mut host = World {
             seed: self,
             context,
@@ -409,10 +420,10 @@ impl<'e> Seed<'e> {
 
     fn side(&mut self, context: &mut Context, event: &Json) -> Result<(), Stop> {
         let journal = self.opened_bytes(event)?;
-        self.begin_run(context);
         let mut instance = Instance::new(&context.loaded.module, Limits::NODE);
         context.stats.runs += 1;
         let epoch = event.get("epoch").bigint().map_err(Stop::Error)?;
+        self.begin_run(context, epoch);
         let mut host = World {
             seed: self,
             context,
@@ -657,7 +668,22 @@ impl<'e> World<'_, 'e, '_> {
         if answer.is_text("owner") {
             let owner = self.seed.next(self.context, "owner", "a second owner")?;
             self.context.stats.owners += 1;
-            return self.seed.run(self.context, owner);
+            let outer = (
+                self.seed.epoch,
+                self.seed.unflushed.take(),
+                self.seed.run_records,
+                self.seed.run_requests,
+                self.seed.run_bounded,
+            );
+            let ran = self.seed.run(self.context, owner);
+            (
+                self.seed.epoch,
+                self.seed.unflushed,
+                self.seed.run_records,
+                self.seed.run_requests,
+                self.seed.run_bounded,
+            ) = outer;
+            return ran;
         }
         if !answer.is_text("ok") {
             return failure(format!("unknown hook answer {}", answer.concat()));
