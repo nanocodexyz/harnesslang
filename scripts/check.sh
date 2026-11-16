@@ -409,24 +409,6 @@ agent() {
   echo "agent: codex_agent.hl on hl-agent survives kill -9 against the fake Responses API, steers and cancels, and batch_flush_after_dispatch is caught"
 }
 
-mpp_host() {
-  local oracle=
-  if [ "${HL_ORACLE:-0}" = 1 ]; then
-    cargo build --release --locked --quiet --manifest-path oracle/Cargo.toml
-    oracle=oracle/target/release/hl-oracle
-  fi
-  MPP_DRILL_SEEDS=1..8 MPP_DRILL_ORACLE="$oracle" scripts/mpp-drill.sh
-  node scripts/mpp-payer-drill.mjs
-  for plant in pay_twice settle_twice commit_on_refusal receipt_on_refusal; do
-    if ! MPP_DRILL_PLANT=$plant MPP_DRILL_SEEDS=1..20 scripts/mpp-drill.sh > "$scratch/mpp-drill-$plant.log" 2>&1; then
-      echo "mpp-host: $plant survived the MPP drill against the simulated server:" >&2
-      tail -n 5 "$scratch/mpp-drill-$plant.log" >&2
-      exit 1
-    fi
-  done
-  echo "mpp-host: hl-agent pays the simulated MPP server through kill -9 with nanocode's settlements, and pay_twice, settle_twice, commit_on_refusal and receipt_on_refusal are caught"
-}
-
 stage build build
 stage census scripts/mutations.sh --census
 queue rules rules
@@ -486,7 +468,6 @@ queue fuzz-regress scripts/fuzz-regress.sh
 queue js-mutations scripts/js-mutations.sh
 queue prove scripts/prove-mutations.sh
 queue agent agent
-queue mpp-host mpp_host
 run_queued
 stage census-examples census_examples
 if [ "${HL_ORACLE:-0}" = 1 ]; then

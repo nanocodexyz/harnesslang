@@ -25,27 +25,6 @@ doctest = false
 bench = false
 
 [[bin]]
-name = "mpp-server"
-path = "src/bin/mpp_server.rs"
-test = false
-doctest = false
-bench = false
-
-[[bin]]
-name = "mpp-payer"
-path = "src/bin/mpp_payer.rs"
-test = false
-doctest = false
-bench = false
-
-[[bin]]
-name = "hl-climb"
-path = "src/bin/hl_climb.rs"
-test = false
-doctest = false
-bench = false
-
-[[bin]]
 name = "mock-responses"
 path = "src/bin/mock_responses.rs"
 test = false

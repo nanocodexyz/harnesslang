@@ -294,22 +294,9 @@ wallet what became of an open one, and an unknown one reserves the whole room,
 so no target re-pays on replay; LANGUAGE.md's Payments has the simulator's
 `spend_within_cap`, `spend_accounted` and `payment_presented`.
 
-The host side is `hl-agent pay`, which runs `examples/mpp_agent.hl` emitted as
-native-jsonl Rust: its payer (`agent/src/mpp.rs`) holds a wallet identity
-(`did:pkh:eip155:42431:0x...`, Tempo's testnet chain id) and a balance in
-`state/wallet.json`, reads a 402's `WWW-Authenticate: Payment` challenges into
-nanocode's wire fields, pays the first payable one by appending a credential to
-the fsynced `state/payments.jsonl` (the wallet call's recovery reads it), sends
-the credential with the retry, and settles it the way nanocode's
-`PendingPayment` does: commit on success or a receipt, roll back a refusal
-without one, abandon a 5xx or a lost connection without one, once per
-challenge, with nanocode's `PaymentResponse` event on success. The payer only
-simulates signing: a real Tempo transaction needs secp256k1 and Keccak, which
-the zero-dependency host does not carry. `scripts/mpp-drill.sh` runs it
-through kill -9 against `mpp-server`, a port of nanocode-sim's MPP scenario
-(its offers, fates and judge) as an HTTP server, and `hl-oracle --mpp` reads
-the journal with nanocode-turnlog and the challenges, credentials and receipts
-with nanocode-mpp's own types.
+Its host side is parked: the paying host (`hl-agent pay`, its payer and the simulated
+MPP server) left `agent/` when every program there moved to compiled WebAssembly,
+and `examples/mpp_agent.hl` stays a checked, simulated and compiled program.
 
 ### Fork and rewind
 
@@ -873,12 +860,10 @@ made.
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
 - `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
-  subagent `examples/claude_code_child.hl` emitted as native-jsonl Rust and
+  subagent `examples/claude_code_child.hl` compiled to WebAssembly and
   hosted against the Anthropic API, each spawned child a session with its own
-  journal under the parent's (`children/T.S/`); `hl-agent pay` hosts
-  `examples/mpp_agent.hl` with an MPP payer, and `mpp-server` is the simulated
-  paying server of `scripts/mpp-drill.sh`; and `examples/codex_agent.hl`
-  hosted against the OpenAI Responses API, with steers and cancels dropped
+  journal under the parent's (`children/T.S/`); and `examples/codex_agent.hl`
+  compiled to WebAssembly and hosted against the OpenAI Responses API, with steers and cancels dropped
   into the journal's `control/` by `hl-agent steer` and `hl-agent cancel`
 - `oracle/`: the nanocode oracle, its own workspace, the Cloudflare
   platform probes and the deploy fake (`oracle/deploy/fake.mjs`)
