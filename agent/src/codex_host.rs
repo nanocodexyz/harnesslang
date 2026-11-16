@@ -410,10 +410,14 @@ fn cache_key(state: &Path) -> Result<String, String> {
     if let Ok(text) = std::fs::read_to_string(&path) {
         return Ok(text.trim().to_owned());
     }
+    let (high, low) = (random(), random().rotate_left(u32::BITS));
     let key = format!(
-        "hl-{:016x}{:016x}",
-        random(),
-        random().rotate_left(u32::BITS)
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xffff,
+        high & 0xfff,
+        (low >> 48) & 0x3fff | 0x8000,
+        low & 0xffff_ffff_ffff
     );
     let temporary = state.join(format!("{CACHE_KEY_FILE}.new"));
     std::fs::write(&temporary, &key)

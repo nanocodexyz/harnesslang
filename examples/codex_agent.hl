@@ -6,6 +6,7 @@ const steers_per_turn_max: u64 = 8
 const context_entries_max: u64 = 4096
 const context_window_tokens: u64 = 272000
 const auto_compact_tenths: u64 = 9
+const compact_tokens: u64 = 48000
 const turns_max: u64 = 1000000
 const stream_retries_max: u64 = 5
 const retry_base_ms: u64 = 200
@@ -177,6 +178,9 @@ on prompt(input: text, rounds: u64) -> outcome
       compact_pending = true
     }
     if context_tokens * 40 + pending_units * 10 >= context_window_tokens * auto_compact_tenths * 4 {
+      compact_pending = true
+    }
+    if context_tokens * 4 + pending_units >= compact_tokens * 4 {
       compact_pending = true
     }
     if compact_pending {

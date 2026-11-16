@@ -363,6 +363,8 @@ impl Client {
             ("authorization", format!("Bearer {}", self.key)),
             ("content-type", "application/json".to_owned()),
             ("accept", "text/event-stream".to_owned()),
+            ("session-id", self.cache_key.clone()),
+            ("thread-id", self.cache_key.clone()),
         ];
         transport::post(&transport::Post {
             base_url: &self.base_url,

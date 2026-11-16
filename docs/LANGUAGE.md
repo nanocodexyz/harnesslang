@@ -912,7 +912,7 @@ rerun sends it again:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=10 target=native-jsonl profile=async mutation=listing_unchecked: listed call 2/5 (mcp__delta) ran as None while listing mcp admitted Some("delta-v1") in turn 2: a tool that changed since admission must be refused
+FAIL invariant=tool_admitted seed=30 target=native-jsonl profile=clean mutation=listing_unchecked: listed call 3/19 (mcp__theta) ran as Some("theta-v9") while listing mcp admitted None in turn 3: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
 FAIL invariant=tool_admitted seed=6 target=native-jsonl profile=clean mutation=input_unchecked: call 2/4 (write_stdin) ran with input "gamma-0", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
