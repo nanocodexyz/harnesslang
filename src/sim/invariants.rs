@@ -1250,6 +1250,18 @@ fn settings_named(settings: Option<&Json>) -> String {
     )
 }
 
+fn rejected_locally(world: &SimWorld<'_>, turn: u64, seq: u64, response: &Json) -> bool {
+    let wired = world
+        .program
+        .model
+        .as_ref()
+        .is_some_and(|model| model.wire.is_some());
+    let unsent = !world.model_modes.contains_key(&(turn, seq));
+    let transient =
+        matches!(response, Json::Object(map) if map.len() == 1 && map.contains_key("transient"));
+    wired && unsent && transient
+}
+
 fn settings_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> {
     for record in records {
         let Record::Model {
@@ -1301,6 +1313,9 @@ fn mode_sent(world: &SimWorld<'_>, records: &[Record]) -> Result<(), Violation> 
             continue;
         };
         if *response == crate::run::engine::interrupted_response() {
+            continue;
+        }
+        if rejected_locally(world, *turn, *seq, response) {
             continue;
         }
         let answered: Vec<&Option<String>> = answered(world, *turn, *seq, response)

@@ -496,7 +496,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `with` `within` `yield`
+Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `wire` `with` `within` `yield`
 
 Builtin functions, whose names declarations may not take:
 
