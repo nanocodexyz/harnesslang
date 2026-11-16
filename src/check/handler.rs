@@ -1318,6 +1318,7 @@ impl Checker<'_> {
     fn setting_default(&self, setting: &ir::Setting) -> Expr {
         match &setting.default {
             ir::Literal::Bool(value) => Expr::Bool(*value),
+            ir::Literal::Text(value) if setting.ty == Type::Text => Expr::Text(value.clone()),
             ir::Literal::Text(value) => {
                 let sum = self
                     .program
