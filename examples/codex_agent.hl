@@ -364,7 +364,7 @@ fn escalate() {
 
 fn select_model() {
   request_model = model_id
-  if escalated {
+  if escalated and escalate_id != "" {
     request_model = escalate_id
   }
   verbose = (contains(request_model, "gpt-5") and before(request_model, "gpt-5") == "") or (contains(request_model, "gpt-6") and before(request_model, "gpt-6") == "")
