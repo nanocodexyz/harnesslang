@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
 
+use harnesslang::wasm::js::Json;
+use harnesslang::wasm::native::{self, Journal, World};
+use harnesslang::wasm::sim::Loaded;
+
 use crate::codex;
-use crate::codex_harness::program::{self, Arguments};
-use crate::codex_harness::{self, Exit, FileDisk, Json, Ran, RunError, TurnRequest};
+use crate::codex_harness;
+use crate::host;
 use crate::json::Value;
 use crate::openai;
 use crate::reviewer::{self, Reviewer, Verdict};
@@ -23,6 +27,11 @@ const LABEL: &str = "hl-agent";
 const FINISH_CHECKS_MAX: u64 = 2;
 const REVIEWED: &str = "A reviewer read the task and the end of your transcript and found that the task is not done yet. Fix each point below, check each one by running commands, and end your turn only with a short report of the checks you ran and their results.";
 const FINISH_CHECK: &str = "Before this task is done, check it by running commands, not by reading your own code. Go through each behaviour the task states, one by one: each file exists at the exact path it names with the content or format it asks for, each program runs with the exact command and interpreter it names, each service responds through the protocol, port and account the task names, and each output matches the stated format. Run every check now. If any check fails or a stated behaviour is not yet verified, fix it and continue working. Nobody will answer a question or supply anything: if something seems missing, find it in the environment or take the most reasonable assumption, and make every requested file and program exist and run. End your turn again only after the work passes, with a short report listing each check you ran and its result.";
+
+const CANCELLABLE_TOOLS: [&str; 2] = ["exec_command", "write_stdin"];
+const EFFORT_LEVELS: [&str; 4] = ["medium", "low", "high", "xhigh"];
+const SET_EFFORT: &str = "set_effort";
+const PROMPT: &str = "prompt";
 
 pub struct CodexAgent {
     client: openai::Client,
@@ -135,7 +144,7 @@ impl CodexAgent {
         cancellable: bool,
         attached: &openai::Attached<'_>,
     ) -> Value {
-        let call = codex_harness::call_id(turn, seq);
+        let call = harnesslang::run::journal::call_id(turn, seq);
         let body = match self.client.body(context, effort, attached) {
             Ok(body) => body,
             Err(error) => {
@@ -204,7 +213,10 @@ impl CodexAgent {
             ("kind", Value::text("tool")),
             ("at_ms", Value::number(now_ms())),
             ("tool", Value::text(tool)),
-            ("call", Value::text(&codex_harness::call_id(turn, seq))),
+            (
+                "call",
+                Value::text(&harnesslang::run::journal::call_id(turn, seq)),
+            ),
         ]));
         let shown = input
             .get("cmd")
@@ -213,7 +225,7 @@ impl CodexAgent {
             .unwrap_or("");
         eprintln!(
             "{LABEL}: {} {tool}: {shown}",
-            codex_harness::call_id(turn, seq)
+            harnesslang::run::journal::call_id(turn, seq)
         );
         let control = self.control.clone();
         let stop = move || cancellable && cancel_pending(&control);
@@ -231,7 +243,7 @@ impl CodexAgent {
         ran
     }
 
-    fn deliveries(&self) -> Vec<codex_harness::Delivery> {
+    fn deliveries(&self) -> Vec<Json> {
         let Ok(entries) = std::fs::read_dir(&self.control) else {
             return Vec::new();
         };
@@ -244,135 +256,25 @@ impl CodexAgent {
         names
             .into_iter()
             .filter_map(|name| {
-                let inbound = if name.starts_with(CANCEL_PREFIX) {
-                    codex_harness::Inbound::Cancel
+                let delivery = if name.starts_with(CANCEL_PREFIX) {
+                    Json::Object(vec![(
+                        "cancel".to_owned(),
+                        Json::Object(vec![("id".to_owned(), Json::Text(name))]),
+                    )])
                 } else {
-                    codex_harness::Inbound::Steer(
-                        std::fs::read_to_string(self.control.join(&name)).ok()?,
-                    )
+                    let message = std::fs::read_to_string(self.control.join(&name)).ok()?;
+                    Json::Object(vec![(
+                        "steer".to_owned(),
+                        Json::Object(vec![
+                            ("id".to_owned(), Json::Text(name)),
+                            ("message".to_owned(), Json::Text(message)),
+                        ]),
+                    )])
                 };
-                Some(codex_harness::Delivery { id: name, inbound })
+                Some(delivery)
             })
             .collect()
     }
-}
-
-fn output_of(ran: tools::Ran) -> codex_harness::Output {
-    match ran {
-        tools::Ran::Ok(text) | tools::Ran::Job(text) => {
-            codex_harness::Output::Ok(Json::String(text))
-        }
-        tools::Ran::Image(bytes) => {
-            codex_harness::Output::Ok(codex_harness::host_blob_bytes(&bytes))
-        }
-        tools::Ran::Failed(text) => codex_harness::Output::Failed(text),
-        tools::Ran::Units(units) => codex_harness::Output::Ok(Json::Number(units)),
-    }
-}
-
-impl codex_harness::Host for CodexAgent {
-    fn tool(&mut self, request: &codex_harness::ToolRequest<'_>) -> codex_harness::Output {
-        let input = Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
-        let ran = self.run_tool(
-            request.turn,
-            request.seq,
-            request.tool,
-            &input,
-            request.interrupts.cancel,
-        );
-        output_of(ran)
-    }
-
-    fn recover(&mut self, request: &codex_harness::ToolRequest<'_>) -> codex_harness::Recovered {
-        let input = Value::decode(&request.input.encode()).expect("the harness encodes valid JSON");
-        let recovered = match codex::patch_applied(&self.workspace.root, &input) {
-            Some(ran) if request.tool == "apply_patch" => tools::Recovered::Reply(ran),
-            _ => self
-                .workspace
-                .recover(request.turn, request.seq, request.tool, &input),
-        };
-        let answer = match &recovered {
-            tools::Recovered::Reply(_) => "reply",
-            tools::Recovered::NotDispatched => "not_dispatched",
-            tools::Recovered::Unknown => "unknown",
-        };
-        let call = codex_harness::call_id(request.turn, request.seq);
-        eprintln!("{LABEL}: {call} recover {}: {answer}", request.tool);
-        self.ledger.append(Value::object([
-            ("kind", Value::text("recover")),
-            ("at_ms", Value::number(now_ms())),
-            ("tool", Value::text(request.tool)),
-            ("call", Value::text(&call)),
-            ("answer", Value::text(answer)),
-        ]));
-        match recovered {
-            tools::Recovered::Reply(ran) => codex_harness::Recovered::Reply(output_of(ran)),
-            tools::Recovered::NotDispatched => codex_harness::Recovered::NotDispatched,
-            tools::Recovered::Unknown => codex_harness::Recovered::Unknown,
-        }
-    }
-
-    fn inbox(&mut self, _turn: u64) -> Vec<codex_harness::Delivery> {
-        self.deliveries()
-    }
-
-    fn answer(
-        &mut self,
-        _turn: u64,
-        _position: u64,
-        answers: &[(String, codex_harness::EventAnswer)],
-    ) {
-        for (id, answer) in answers {
-            if *answer == codex_harness::EventAnswer::Full {
-                continue;
-            }
-            eprintln!("{LABEL}: event {id}: {answer:?}");
-            let _ = std::fs::remove_file(self.control.join(id));
-        }
-    }
-
-    fn listing(&mut self, _request: &codex_harness::ListingRequest<'_>) -> codex_harness::Output {
-        codex_harness::Output::Ok(Json::Object(std::collections::BTreeMap::new()))
-    }
-
-    fn model(&mut self, request: &codex_harness::ModelRequest<'_>) -> Json {
-        let context =
-            Value::decode(&(request.context)().encode()).expect("the harness encodes valid JSON");
-        if self.reviewer.is_some() {
-            self.last_context = context.clone();
-        }
-        let effort = request
-            .settings
-            .and_then(|settings| settings.get(openai::EFFORT_SETTING))
-            .and_then(|effort| effort.as_str());
-        let attached = |digest: &str| {
-            request.blobs.get(digest).map(|bytes| {
-                (
-                    tools::media_type(bytes).unwrap_or_default().to_owned(),
-                    codex_harness::base64_encode(bytes),
-                )
-            })
-        };
-        let reply = self.run_model(
-            request.turn,
-            request.seq,
-            effort,
-            &context,
-            request.interrupts.cancel,
-            &attached,
-        );
-        Json::decode(&reply.encode()).expect("a reply the host built decodes as harness JSON")
-    }
-
-    fn now(&mut self) -> u64 {
-        now_ms()
-    }
-
-    fn random(&mut self) -> u64 {
-        random()
-    }
-
-    fn acknowledge(&mut self, _finish: &codex_harness::Finish) {}
 }
 
 fn environment_context(cwd: &Path) -> String {
@@ -499,30 +401,243 @@ fn setup(options: &Options) -> Result<(CodexAgent, String), String> {
     ))
 }
 
-fn ended_completed(ran: &Result<Ran, RunError>) -> bool {
-    let Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish)) = ran else {
-        return false;
-    };
-    if finish.outcome != codex_harness::Outcome::Completed {
-        return false;
-    }
-    let result = Value::decode(&finish.result.encode()).expect("the harness encodes valid JSON");
-    outcome_of(&result).0 == "completed"
+struct Hosted<'a> {
+    agent: &'a mut CodexAgent,
+    finish: Option<Json>,
 }
 
-fn effort_of(text: &str) -> Option<program::SumEffortLevel> {
-    match text {
-        "medium" => Some(program::SumEffortLevel::Medium),
-        "low" => Some(program::SumEffortLevel::Low),
-        "high" => Some(program::SumEffortLevel::High),
-        "xhigh" => Some(program::SumEffortLevel::Xhigh),
+fn number(json: &Json, what: &str) -> Result<u64, String> {
+    json.bigint()
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| format!("{what} is not a number: {}", json.encode()))
+}
+
+fn text(json: &Json) -> Option<&str> {
+    match json {
+        Json::Text(text) => Some(text),
         _ => None,
     }
 }
 
+impl World for Hosted<'_> {
+    fn tool(&mut self, request: &Json) -> Result<Json, String> {
+        let turn = number(request.get("turn"), "a tool request's turn")?;
+        let seq = number(request.get("seq"), "a tool request's seq")?;
+        let tool = text(request.get("tool"))
+            .ok_or("a tool request names its tool")?
+            .to_owned();
+        let input = host::to_value(request.get("input"));
+        let cancellable = CANCELLABLE_TOOLS.contains(&tool.as_str());
+        Ok(host::output_json(self.agent.run_tool(
+            turn,
+            seq,
+            &tool,
+            &input,
+            cancellable,
+        )))
+    }
+
+    fn model(&mut self, request: &Json) -> Result<Json, String> {
+        let turn = number(request.get("turn"), "a model request's turn")?;
+        let seq = number(request.get("seq"), "a model request's seq")?;
+        let context = host::to_value(request.get("context"));
+        if self.agent.reviewer.is_some() {
+            self.agent.last_context = context.clone();
+        }
+        let effort = text(request.get("settings").get(openai::EFFORT_SETTING)).map(str::to_owned);
+        let mut blobs = Vec::new();
+        if let Json::Object(held) = request.get("blobs") {
+            for (digest, data) in held {
+                let data = text(data).ok_or("a model request's blob is base64 text")?;
+                let bytes = harnesslang::run::blob::base64_decode(data)?;
+                blobs.push((
+                    digest.clone(),
+                    tools::media_type(&bytes).unwrap_or_default().to_owned(),
+                    data.to_owned(),
+                ));
+            }
+        }
+        let attached = |digest: &str| {
+            blobs
+                .iter()
+                .find(|(held, _, _)| held == digest)
+                .map(|(_, media, data)| (media.clone(), data.clone()))
+        };
+        let reply = self
+            .agent
+            .run_model(turn, seq, effort.as_deref(), &context, true, &attached);
+        Ok(host::to_json(&reply))
+    }
+
+    fn now(&mut self) -> Result<u64, String> {
+        Ok(now_ms())
+    }
+
+    fn random(&mut self) -> Result<u64, String> {
+        Ok(random())
+    }
+
+    fn world(&mut self, request: &Json) -> Result<Json, String> {
+        let event = text(request.get("event")).unwrap_or_default().to_owned();
+        match event.as_str() {
+            "inbox" => Ok(Json::Object(vec![(
+                "answer".to_owned(),
+                Json::Array(self.agent.deliveries()),
+            )])),
+            "answer" => {
+                let Json::Array(answers) = request.get("answers") else {
+                    return Err("an answer request lists its answers".to_owned());
+                };
+                for answer in answers {
+                    let id = text(answer.get("id")).ok_or("an answer names its event")?;
+                    let name = text(answer.get("answer")).unwrap_or_default();
+                    if name == "full" {
+                        continue;
+                    }
+                    eprintln!("{LABEL}: event {id}: {name}");
+                    let _ = std::fs::remove_file(self.agent.control.join(id));
+                }
+                Ok(Json::Object(Vec::new()))
+            }
+            "recover" => self.recover(request),
+            "clock" => Ok(Json::Object(vec![(
+                "answer".to_owned(),
+                Json::int(now_ms()),
+            )])),
+            "sleep" => {
+                let until = number(request.get("until"), "a sleep's until")?;
+                let now = now_ms();
+                if until > now {
+                    std::thread::sleep(std::time::Duration::from_millis(until - now));
+                }
+                Ok(Json::Object(vec![
+                    ("answer".to_owned(), Json::text("ok")),
+                    ("clock".to_owned(), Json::int(now_ms().max(until))),
+                ]))
+            }
+            "jobs" => Ok(Json::Object(vec![(
+                "answer".to_owned(),
+                Json::Array(Vec::new()),
+            )])),
+            "listing" => Ok(Json::Object(vec![(
+                "output".to_owned(),
+                Json::Object(vec![("ok".to_owned(), Json::Object(Vec::new()))]),
+            )])),
+            "resumed" => Ok(Json::Object(Vec::new())),
+            other => Err(format!(
+                "{LABEL} answers no {other} request: {}",
+                request.encode()
+            )),
+        }
+    }
+
+    fn acknowledge(&mut self, finish: &Json) -> Result<(), String> {
+        self.finish = Some(finish.clone());
+        Ok(())
+    }
+}
+
+impl Hosted<'_> {
+    fn recover(&mut self, request: &Json) -> Result<Json, String> {
+        let turn = number(request.get("turn"), "a recovery's turn")?;
+        let seq = number(request.get("seq"), "a recovery's seq")?;
+        let tool = text(request.get("tool"))
+            .ok_or("a recovery names its tool")?
+            .to_owned();
+        let input = host::to_value(request.get("input"));
+        let recovered = match codex::patch_applied(&self.agent.workspace.root, &input) {
+            Some(ran) if tool == "apply_patch" => tools::Recovered::Reply(ran),
+            _ => self.agent.workspace.recover(turn, seq, &tool, &input),
+        };
+        let name = match &recovered {
+            tools::Recovered::Reply(_) => "reply",
+            tools::Recovered::NotDispatched => "not_dispatched",
+            tools::Recovered::Unknown => "unknown",
+        };
+        let call = harnesslang::run::journal::call_id(turn, seq);
+        eprintln!("{LABEL}: {call} recover {tool}: {name}");
+        self.agent.ledger.append(Value::object([
+            ("kind", Value::text("recover")),
+            ("at_ms", Value::number(now_ms())),
+            ("tool", Value::text(&tool)),
+            ("call", Value::text(&call)),
+            ("answer", Value::text(name)),
+        ]));
+        Ok(Json::Object(vec![(
+            "answer".to_owned(),
+            match recovered {
+                tools::Recovered::Reply(ran) => {
+                    Json::Object(vec![("reply".to_owned(), host::output_json(ran))])
+                }
+                tools::Recovered::NotDispatched | tools::Recovered::Unknown => Json::text(name),
+            },
+        )]))
+    }
+}
+
+enum Ended {
+    Finished(host::Finish),
+    Failed(String),
+}
+
+fn run_turn(
+    loaded: &Loaded,
+    agent: &mut CodexAgent,
+    journal: &mut Journal,
+    handler: &str,
+    turn: u64,
+    arguments: Value,
+) -> Ended {
+    let request = host::request(handler, turn, arguments);
+    let mut hosted = Hosted {
+        agent,
+        finish: None,
+    };
+    let exit = match native::run(loaded, journal, &request, &mut hosted) {
+        Ok(exit) => exit,
+        Err(error) => return Ended::Failed(error),
+    };
+    let finish = match text(exit.get("exit")) {
+        Some("finished") => match hosted.finish.take() {
+            Some(finish) => finish,
+            None => return Ended::Failed("a finished turn is acknowledged".to_owned()),
+        },
+        Some("already_finished") => exit.get("finish").clone(),
+        _ => return Ended::Failed(format!("the module exited {}", exit.encode())),
+    };
+    match (
+        number(finish.get("turn"), "a finish's turn"),
+        finish.get("outcome").is_text("completed"),
+    ) {
+        (Ok(turn), completed) => Ended::Finished(host::Finish {
+            turn,
+            completed,
+            result: host::to_value(finish.get("result")),
+        }),
+        (Err(error), _) => Ended::Failed(error),
+    }
+}
+
+fn ended_completed(ended: &Ended) -> bool {
+    match ended {
+        Ended::Finished(finish) if finish.completed => outcome_of(&finish.result).0 == "completed",
+        _ => false,
+    }
+}
+
+fn prompt(input: &str, rounds: u64) -> Value {
+    Value::object([
+        ("input", Value::text(input)),
+        (
+            "rounds",
+            Value::number(rounds.min(codex_harness::ROUNDS_MAX)),
+        ),
+    ])
+}
+
 pub fn main(options: &Options) -> ! {
-    codex_harness::self_check();
-    codex_harness::jsonl_self_check();
+    let loaded = host::load(codex_harness::MODULE);
     let (mut agent, instruction) = setup(options).unwrap_or_else(|error| {
         eprintln!("{LABEL}: {error}");
         std::process::exit(EXIT_HARNESS_ERROR)
@@ -532,7 +647,7 @@ pub fn main(options: &Options) -> ! {
         ("at_ms", Value::number(now_ms())),
     ]));
     let journal_path = options.journal.join("journal.jsonl");
-    let mut disk = FileDisk::open(&journal_path).unwrap_or_else(|error| {
+    let mut disk = Journal::open(&journal_path).unwrap_or_else(|error| {
         eprintln!("{LABEL}: {}: {error}", journal_path.display());
         std::process::exit(EXIT_HARNESS_ERROR)
     });
@@ -542,19 +657,22 @@ pub fn main(options: &Options) -> ! {
         .as_deref()
         .or_else(|| openai::default_effort(&options.model));
     if let Some(effort) = effort_text {
-        let Some(level) = effort_of(effort) else {
+        if !EFFORT_LEVELS.contains(&effort) {
             eprintln!("{LABEL}: --effort {effort} is not medium, low, high or xhigh");
             std::process::exit(crate::EXIT_USAGE);
-        };
-        let setting = TurnRequest {
-            turn,
-            arguments: Arguments::SetEffort(level),
-        };
-        match codex_harness::run_jsonl(&mut agent, &mut disk, &setting) {
-            Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish))
-                if finish.outcome == codex_harness::Outcome::Completed => {}
-            other => {
-                eprintln!("{LABEL}: --effort: the set_effort turn ended {other:?}");
+        }
+        let level = Value::object([("level", Value::text(effort))]);
+        match run_turn(&loaded, &mut agent, &mut disk, SET_EFFORT, turn, level) {
+            Ended::Finished(finish) if finish.completed => {}
+            Ended::Finished(finish) => {
+                eprintln!(
+                    "{LABEL}: --effort: the set_effort turn trapped: {}",
+                    finish.result.encode()
+                );
+                std::process::exit(EXIT_HARNESS_ERROR);
+            }
+            Ended::Failed(error) => {
+                eprintln!("{LABEL}: --effort: the set_effort turn ended {error}");
                 std::process::exit(EXIT_HARNESS_ERROR);
             }
         }
@@ -568,11 +686,8 @@ pub fn main(options: &Options) -> ! {
     let mut input = instruction;
     let mut checks = 0;
     let ran = loop {
-        let request = TurnRequest {
-            turn,
-            arguments: Arguments::Prompt(input, options.rounds.min(program::ROUNDS_MAX)),
-        };
-        let ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
+        let arguments = prompt(&input, options.rounds);
+        let ran = run_turn(&loaded, &mut agent, &mut disk, PROMPT, turn, arguments);
         if checks >= finish_checks || !ended_completed(&ran) {
             break ran;
         }
@@ -589,14 +704,8 @@ pub fn main(options: &Options) -> ! {
         };
         reviews += 1;
         turn += 1;
-        let request = TurnRequest {
-            turn,
-            arguments: Arguments::Prompt(
-                format!("{REVIEWED}\n\n{review}"),
-                options.rounds.min(program::ROUNDS_MAX),
-            ),
-        };
-        ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
+        let arguments = prompt(&format!("{REVIEWED}\n\n{review}"), options.rounds);
+        ran = run_turn(&loaded, &mut agent, &mut disk, PROMPT, turn, arguments);
     }
     assert!(reviews <= reviewer::REVIEWS_MAX);
     for (session, pid) in agent.exec.leave_running() {
@@ -607,33 +716,17 @@ pub fn main(options: &Options) -> ! {
         ("at_ms", Value::number(now_ms())),
     ]));
     let (finish, code) = match &ran {
-        Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish))
-            if finish.outcome == codex_harness::Outcome::Completed =>
-        {
-            let (name, text) = outcome_of(
-                &Value::decode(&finish.result.encode()).expect("the harness encodes valid JSON"),
-            );
+        Ended::Finished(finish) if finish.completed => {
+            let (name, text) = outcome_of(&finish.result);
             println!("{text}");
             (name, 0)
         }
-        Ok(Ran::Finished(finish) | Ran::AlreadyFinished(finish)) => {
+        Ended::Finished(finish) => {
             eprintln!("{LABEL}: the harness trapped: {}", finish.result.encode());
             ("trap".to_owned(), EXIT_HARNESS_ERROR)
         }
-        Ok(other) => {
-            eprintln!("{LABEL}: the prompt turn ended {other:?}");
-            ("error".to_owned(), EXIT_HARNESS_ERROR)
-        }
-        Err(RunError::Open(error)) => {
-            eprintln!("{LABEL}: journal: {error}");
-            ("error".to_owned(), EXIT_HARNESS_ERROR)
-        }
-        Err(RunError::Exit(Exit::Corrupt(error))) => {
-            eprintln!("{LABEL}: journal: {error}");
-            ("error".to_owned(), EXIT_HARNESS_ERROR)
-        }
-        Err(RunError::Exit(Exit::Stop(stop))) => {
-            eprintln!("{LABEL}: stopped: {stop:?}");
+        Ended::Failed(error) => {
+            eprintln!("{LABEL}: {error}");
             ("error".to_owned(), EXIT_HARNESS_ERROR)
         }
     };

@@ -391,11 +391,11 @@ pub fn view_image(root: &Path, input: &Value) -> Ran {
             "{path} is not a PNG, JPEG, GIF or WebP image; convert or render it to PNG first"
         ));
     }
-    if bytes.len() as u64 > crate::codex_harness::program::IMAGE_BYTES_MAX {
+    if bytes.len() as u64 > crate::codex_harness::IMAGE_BYTES_MAX {
         return Ran::Failed(format!(
             "{path} is {} bytes, more than the {} an image may have; scale it down or crop it first",
             bytes.len(),
-            crate::codex_harness::program::IMAGE_BYTES_MAX
+            crate::codex_harness::IMAGE_BYTES_MAX
         ));
     }
     Ran::Image(bytes)

@@ -5727,9 +5727,8 @@ FAIL invariant=climb_kept_valid seed=12 target=native-jsonl profile=async mutati
 a propose block in which Claude edits a git working tree with Bash, Read and
 Edit for up to `rounds_max` model calls and its final answer becomes the
 candidate's commit message, and a measure block that benchmarks a revision and
-counts failing tests, gated to zero. `agent/`'s `hl-climb` hosts it:
-`hl-climb run --goal FILE --cwd REPO --bench CMD --test CMD --model ID --journal DIR`,
-where the benchmark's last output line is microseconds.
+counts failing tests, gated to zero. Its host is parked: `hl-climb` left `agent/`
+when every program there moved to compiled WebAssembly.
 
 ```console
 $ hl check examples/autoresearch.hl | grep -E 'handler prompt: no_overflow|proved for'
