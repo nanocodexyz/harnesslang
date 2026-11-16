@@ -128,9 +128,9 @@ the credential carried in a hidden model setting the way `with {...}` carries se
 
 nanocode's `PendingPayment` commits, rolls back, invalidates (410 Gone) or abandons each
 credential by how the server answered (flow.rs), and records the `payment-receipt`
-header in its `PaymentResponse` event. Here the language tells the wallet only to pay; `hl-agent pay`'s host payer
-settles each credential by nanocode's rules and records the receipt and the
-`PaymentResponse` event in its own ledger (`scripts/mpp-drill.sh` catches
+header in its `PaymentResponse` event. Here the language tells the wallet only to pay; the parked `hl-agent pay` host payer
+settled each credential by nanocode's rules and records the receipt and the
+`PaymentResponse` event in its own ledger (`scripts/mpp-drill.sh` caught
 `receipt_on_refusal`), but the harness journal holds neither, so a program cannot
 read a receipt and another host may settle differently.
 Smallest addition: a `none` call of the wallet after each presentation carrying the

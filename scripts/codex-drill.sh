@@ -36,7 +36,7 @@ trap report EXIT
 
 case "$plant" in
   none) plant_text= ;;
-  batch_flush_after_dispatch) plant_text='if external { ==> if false && external {' ;;
+  batch_flush_after_dispatch) plant_text=batch_flush_skipped ;;
   *)
     echo "codex-drill: unknown CODEX_DRILL_PLANT $plant (none, batch_flush_after_dispatch)" >&2
     exit 2

@@ -81,7 +81,6 @@ pub fn output_json(ran: tools::Ran) -> Json {
         )]),
         tools::Ran::Failed(text) => object(vec![("failed", Json::Text(text))]),
         tools::Ran::Job(text) => object(vec![("ok", object(vec![("job", Json::Text(text))]))]),
-        tools::Ran::Units(units) => object(vec![("ok", Json::int(units))]),
     }
 }
 
