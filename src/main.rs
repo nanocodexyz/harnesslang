@@ -12,6 +12,7 @@ use harnesslang::target::{self, Target};
 
 const USAGE_EXIT: u8 = 2;
 const FAILURE_EXIT: u8 = 1;
+const WIRE_DIFF_SEEDS: u64 = 2000;
 const SUMMARIZED_RESULT: &str = "summarized";
 
 use harnesslang::load::{load, load_within};
@@ -74,6 +75,7 @@ fn main() -> ExitCode {
         "assemble" => assemble_command(rest),
         "bundle" => bundle_command(rest),
         "wasm-sim" => wasm_sim_command(rest),
+        "wire-diff" => wire_diff_command(rest),
         "sql" => harnesslang::emit::sql::command::run(rest),
         "prove" => ExitCode::from(harnesslang::prove::cli::run(rest, load)),
         "deploy" | "status" | "monitor" | "logs" | "rollback" | "secrets" | "destroy" => {
@@ -651,6 +653,27 @@ fn assemble_command(args: &[String]) -> ExitCode {
         Ok(module) => write_bytes(&module.encode()),
         Err(error) => {
             eprintln!("assemble: error: {error}");
+            ExitCode::from(FAILURE_EXIT)
+        }
+    }
+}
+
+fn wire_diff_command(args: &[String]) -> ExitCode {
+    let seeds = match args {
+        [flag, value] if flag == "--seeds" => parse_seeds(value),
+        [] => Some(0..WIRE_DIFF_SEEDS),
+        _ => None,
+    };
+    let Some(seeds) = seeds else {
+        return usage();
+    };
+    match harnesslang::wire::diff::run(seeds) {
+        Ok(summary) => {
+            print!("{summary}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
             ExitCode::from(FAILURE_EXIT)
         }
     }
