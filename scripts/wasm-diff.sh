@@ -20,6 +20,21 @@ mkdir -p "$out"
 
 [ -x "$hl" ] || cargo build --release --locked
 
+proved_bounds() {
+  local file=$1 target=$2 log=$3 line
+  if ! "$hl" prove --target "$target" "$file" > "$log" 2>&1; then
+    echo "wasm-diff: hl prove failed $file on $target:" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  while read -r line; do
+    runner+=($line)
+  done < <(sed -nE \
+    -e "s/^  proved handler ([A-Za-z0-9_]+) on $target: worst_case: ([0-9]+) journal records per run .*/--records-max \1=\2/p" \
+    -e "s/^  proved handler ([A-Za-z0-9_]+) on $target: worst_case: ([0-9]+) outbound requests <= .*/--requests-max \1=\2/p" \
+    "$log")
+}
+
 diff_one() {
   local file=$1 target=$2
   local dir started ended runner
@@ -38,7 +53,10 @@ diff_one() {
   fi
   case $host in
     node) runner=(node scripts/wasm-sim.mjs --target "$target" --module "$dir/harness.wasm" --trace "$dir/trace.jsonl") ;;
-    native) runner=("$hl" wasm-sim --target "$target" --module "$dir/harness.wasm" --trace "$dir/trace.jsonl") ;;
+    native)
+      runner=("$hl" wasm-sim --target "$target" --module "$dir/harness.wasm" --trace "$dir/trace.jsonl")
+      proved_bounds "$file" "$target" "$dir/prove.log" || return 1
+      ;;
     platform)
       case $target in
         cloudflare | vercel) ;;

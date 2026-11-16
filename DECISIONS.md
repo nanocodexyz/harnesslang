@@ -1445,3 +1445,8 @@ Measured at a80bd7f: emitted_source_lines 967,299; host_lines_beyond_fixed 11,25
 
 Commands: `scripts/gate.sh`, `scripts/gate.sh --prove` (33 s on the 5-core Hand).
 
+
+## 2026-11-16: the wasm differential checks what hl prove proved
+
+`hl prove` proves durability (a call's result is flushed before the next external dispatch), external calls at most once, and per-handler worst cases (journal records and outbound requests per run); until now only the interpreter's simulator checked these, and the wasm path was held to them only through `backend_equal` against the interpreter's trace. `hl wasm-sim` now checks them on what the compiled module itself does: an external dispatch (a tool call or the before_run hook of an external dispatch) while a tool or model answer is unflushed fails `proved_durability`; the same external call (turn, seq, tool, nested path) dispatched twice across a seed's runs fails `proved_external_once`; and `--records-max HANDLER=N` / `--requests-max HANDLER=N` fail `proved_worst_case` when one run flushes more journal records or makes more model and tool requests than N. The ok line reports external_once, records_per_run_max, requests_per_run_max and bounded_runs. `scripts/wasm-diff.sh` with `WASM_DIFF_HOST=native` runs `hl prove` on each program and target and passes every proved bound to `hl wasm-sim`, so CI's native-host wasm run of every program on every target asserts the proofs on the module's own execution counts. All 135 pairs pass at seeds 0..20 (47 s on the 5-core Hand); agent.hl on cloudflare peaks at 87 records and 43 requests per run.
+

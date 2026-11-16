@@ -68,7 +68,21 @@ pub(crate) enum Import {
 pub enum Stop {
     Stopped(&'static str),
     Failure(String),
+    Proved(&'static str, String),
     Error(String),
+}
+
+fn unproved<T>(property: &'static str, message: String) -> Result<T, Stop> {
+    Err(Stop::Proved(
+        property,
+        short(&message, DETAIL_CHARACTERS_MAX),
+    ))
+}
+
+#[derive(Default)]
+pub struct Bounds {
+    pub records_per_run: std::collections::BTreeMap<String, u64>,
+    pub requests_per_run: std::collections::BTreeMap<String, u64>,
 }
 
 fn failure<T>(message: String) -> Result<T, Stop> {
@@ -104,6 +118,10 @@ pub struct Stats {
     pub instantiate_ms: f64,
     pub run_ms: f64,
     pub ops: u64,
+    pub external: u64,
+    pub records_max: u64,
+    pub requests_max: u64,
+    pub bounded_runs: u64,
 }
 
 pub struct Loaded {
@@ -151,14 +169,16 @@ pub fn load(bytes: &[u8]) -> Result<Loaded, String> {
 pub struct Context<'m> {
     loaded: &'m Loaded,
     clock: &'m dyn Fn() -> f64,
+    bounds: &'m Bounds,
     pub stats: Stats,
 }
 
 impl<'m> Context<'m> {
-    pub fn new(loaded: &'m Loaded, clock: &'m dyn Fn() -> f64) -> Context<'m> {
+    pub fn new(loaded: &'m Loaded, clock: &'m dyn Fn() -> f64, bounds: &'m Bounds) -> Context<'m> {
         Context {
             loaded,
             clock,
+            bounds,
             stats: Stats::default(),
         }
     }
@@ -173,9 +193,99 @@ pub struct Seed<'e> {
     scope: Json,
     deadlines: std::collections::BTreeMap<String, Json>,
     pending_deadlines: std::collections::BTreeMap<String, Json>,
+    handler: String,
+    external: std::collections::BTreeMap<String, u64>,
+    unflushed: Option<String>,
+    run_records: u64,
+    run_requests: u64,
+    run_bounded: bool,
 }
 
 impl<'e> Seed<'e> {
+    fn begin_run(&mut self, context: &mut Context) {
+        self.unflushed = None;
+        self.run_records = 0;
+        self.run_requests = 0;
+        let records = context.bounds.records_per_run.contains_key(&self.handler);
+        let requests = context.bounds.requests_per_run.contains_key(&self.handler);
+        self.run_bounded = records || requests;
+        if self.run_bounded {
+            context.stats.bounded_runs += 1;
+        }
+    }
+
+    fn requested(&mut self, context: &mut Context) -> Result<(), Stop> {
+        self.run_requests += 1;
+        context.stats.requests_max = context.stats.requests_max.max(self.run_requests);
+        if let Some(bound) = context.bounds.requests_per_run.get(&self.handler)
+            && self.run_requests > *bound
+        {
+            return unproved(
+                "worst_case",
+                format!(
+                    "handler {}: the wasm module made {} outbound requests in one run, over the {bound} hl prove proved",
+                    self.handler, self.run_requests
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn flushed(&mut self, context: &mut Context, bytes: &str) -> Result<(), Stop> {
+        self.unflushed = None;
+        self.run_records += bytes.bytes().filter(|byte| *byte == b'\n').count() as u64;
+        context.stats.records_max = context.stats.records_max.max(self.run_records);
+        if let Some(bound) = context.bounds.records_per_run.get(&self.handler)
+            && self.run_records > *bound
+        {
+            return unproved(
+                "worst_case",
+                format!(
+                    "handler {}: the wasm module flushed {} journal records in one run, over the {bound} hl prove proved",
+                    self.handler, self.run_records
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn dispatching(&mut self, context: &mut Context, request: &Json) -> Result<(), Stop> {
+        if !request.get("effect").is_text("external") {
+            return Ok(());
+        }
+        let call = format!(
+            "{}/{} {}",
+            request.get("turn").concat(),
+            request.get("seq").concat(),
+            request.get("tool").concat()
+        );
+        if let Some(unflushed) = &self.unflushed {
+            return unproved(
+                "durability",
+                format!(
+                    "the wasm module dispatched external call {call} before it flushed {unflushed}"
+                ),
+            );
+        }
+        let key = format!("{call} {}", request.get("nested").or_null().encode());
+        let count = self.external.entry(key).or_insert(0);
+        *count += 1;
+        context.stats.external += 1;
+        if *count > 1 {
+            return unproved(
+                "external_once",
+                format!(
+                    "the wasm module dispatched external call {call} {} times",
+                    *count
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn answered(&mut self, what: String) {
+        self.unflushed = Some(what);
+    }
     pub fn new(events: &'e [Json]) -> Seed<'e> {
         Seed {
             events,
@@ -186,6 +296,12 @@ impl<'e> Seed<'e> {
             scope: Json::Undefined,
             deadlines: std::collections::BTreeMap::new(),
             pending_deadlines: std::collections::BTreeMap::new(),
+            handler: String::new(),
+            external: std::collections::BTreeMap::new(),
+            unflushed: None,
+            run_records: 0,
+            run_requests: 0,
+            run_bounded: false,
         }
     }
 
@@ -250,6 +366,7 @@ impl<'e> Seed<'e> {
     fn run(&mut self, context: &mut Context, event: &Json) -> Result<(), Stop> {
         self.pending_deadlines.clear();
         let journal = self.opened_bytes(event)?;
+        self.begin_run(context);
         let started = (context.clock)();
         let mut instance = Instance::new(&context.loaded.module, Limits::NODE);
         context.stats.instantiate_ms += (context.clock)() - started;
@@ -289,6 +406,7 @@ impl<'e> Seed<'e> {
 
     fn side(&mut self, context: &mut Context, event: &Json) -> Result<(), Stop> {
         let journal = self.opened_bytes(event)?;
+        self.begin_run(context);
         let mut instance = Instance::new(&context.loaded.module, Limits::NODE);
         context.stats.runs += 1;
         let epoch = event.get("epoch").bigint().map_err(Stop::Error)?;
@@ -341,6 +459,7 @@ impl<'e> Seed<'e> {
                 }
                 let request = Json::Object(fields);
                 self.request = Some(request.encode());
+                self.handler = event.get("handler").concat();
             } else if kind.is_text("run") {
                 self.next(context, "run", "")?;
                 self.run(context, event)?;
@@ -504,6 +623,16 @@ impl<'e> World<'_, 'e, '_> {
 
     fn hook(&mut self, point: i32, kind: i32, effect: &Json) -> Result<(), Stop> {
         let name = index_text(POINTS, point);
+        if point == POINT_BEFORE_RUN
+            && kind == KIND_DISPATCH
+            && effect.is_text("external")
+            && let Some(unflushed) = &self.seed.unflushed
+        {
+            return unproved(
+                "durability",
+                format!("the wasm module began an external dispatch before it flushed {unflushed}"),
+            );
+        }
         let event = self.seed.next(self.context, "hook", &name.concat())?;
         same(
             &format!("hook point at event {}", self.seed.index - 1),
@@ -535,6 +664,8 @@ impl<'e> World<'_, 'e, '_> {
 
     fn tool_event(&mut self, request: &Json) -> Result<&'e Json, Stop> {
         let detail = short(&request.encode(), DETAIL_CHARACTERS_MAX);
+        self.seed.requested(self.context)?;
+        self.seed.dispatching(self.context, request)?;
         let event = self.seed.next(self.context, "tool", &detail)?;
         let checks = [
             ("turn", "turn", "turn"),
@@ -671,6 +802,9 @@ impl<'e> World<'_, 'e, '_> {
         }
         self.context.stats.flushes += 1;
         let answer = event.get("answer");
+        if answer.is_text("ok") {
+            self.seed.flushed(self.context, &bytes)?;
+        }
         if answer.is_text("crash") {
             return Err(Stop::Stopped("crash"));
         }
@@ -691,6 +825,11 @@ impl<'e> World<'_, 'e, '_> {
     ) -> Result<Option<Value>, Error<Stop>> {
         let request = self.json(instance, args).map_err(Error::Stop)?;
         let output = self.tool_event(&request).map_err(Error::Stop)?;
+        self.seed.answered(format!(
+            "the result of call {}/{}",
+            request.get("turn").concat(),
+            request.get("seq").concat()
+        ));
         self.give_json(instance, output)
     }
 
@@ -705,6 +844,7 @@ impl<'e> World<'_, 'e, '_> {
             request.get("turn").concat(),
             request.get("seq").concat()
         );
+        self.seed.requested(self.context).map_err(Error::Stop)?;
         let event = self
             .seed
             .next(self.context, "model", &detail)
@@ -739,6 +879,7 @@ impl<'e> World<'_, 'e, '_> {
             )
         })();
         checked.map_err(Error::Stop)?;
+        self.seed.answered(format!("the model response {detail}"));
         self.give_json(instance, event.get("response"))
     }
 
@@ -783,6 +924,7 @@ impl<'e> World<'_, 'e, '_> {
         }
         if request.get("event").is_text("batch") {
             let answer = self.batch(&request).map_err(Error::Stop)?;
+            self.seed.answered("the results of a batch".to_owned());
             return self.give_json(instance, &answer);
         }
         if request.get("event").is_text("deadline") {
@@ -879,14 +1021,20 @@ pub enum Outcome {
     Errored(String),
 }
 
-pub fn replay(target: &str, bytes: &[u8], trace: &str, clock: &dyn Fn() -> f64) -> Outcome {
+pub fn replay(
+    target: &str,
+    bytes: &[u8],
+    trace: &str,
+    clock: &dyn Fn() -> f64,
+    bounds: &Bounds,
+) -> Outcome {
     let compiled = clock();
     let loaded = match load(bytes) {
         Ok(loaded) => loaded,
         Err(error) => return Outcome::Errored(error),
     };
     let compile_ms = clock() - compiled;
-    let mut context = Context::new(&loaded, clock);
+    let mut context = Context::new(&loaded, clock, bounds);
     let mut current: Option<(Json, Vec<Json>)> = None;
     for line in trace.split('\n') {
         if line.is_empty() {
@@ -944,6 +1092,11 @@ fn replay_seed(
                 "FAIL invariant=backend_equal seed={seed_name} target={target}: {message}"
             )));
         }
+        Err(Stop::Proved(property, message)) => {
+            return Err(Outcome::Failed(format!(
+                "FAIL invariant=proved_{property} seed={seed_name} target={target}: {message}"
+            )));
+        }
         Err(Stop::Error(message)) => {
             return Err(Outcome::Errored(format!("seed {seed_name}: {message}")));
         }
@@ -960,7 +1113,7 @@ fn replay_seed(
 fn summary(target: &str, stats: &Stats, module_bytes: usize, compile_ms: f64) -> String {
     let per_run_us = stats.instantiate_ms * 1000.0 / stats.runs.max(1) as f64;
     format!(
-        "ok backend=wasm target={target} seeds={} events={} runs={} owners={} flushes={} hooks={} world={} module_bytes={module_bytes} compile_ms={compile_ms:.1} instantiate_us_per_run={per_run_us:.1} run_ms={:.1} ops_per_run={}",
+        "ok backend=wasm target={target} seeds={} events={} runs={} owners={} flushes={} hooks={} world={} module_bytes={module_bytes} compile_ms={compile_ms:.1} instantiate_us_per_run={per_run_us:.1} run_ms={:.1} ops_per_run={} external_once={} records_per_run_max={} requests_per_run_max={} bounded_runs={}",
         stats.seeds,
         stats.events,
         stats.runs,
@@ -969,6 +1122,10 @@ fn summary(target: &str, stats: &Stats, module_bytes: usize, compile_ms: f64) ->
         stats.hooks,
         stats.world,
         stats.run_ms,
-        stats.ops / stats.runs.max(1)
+        stats.ops / stats.runs.max(1),
+        stats.external,
+        stats.records_max,
+        stats.requests_max,
+        stats.bounded_runs
     )
 }
