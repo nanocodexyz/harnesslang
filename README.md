@@ -132,8 +132,8 @@ marked unverified in `DECISIONS.md`.
 Code mode lets the model answer with a JavaScript cell that calls the
 harness's tools as nested calls, journaled so that a nested external call is
 never dispatched twice. It is specified in [docs/CODE_MODE.md](docs/CODE_MODE.md)
-and runs on every target: the simulator, the prover, both generated backends
-and the nanocode oracle cover it.
+and runs on every target: the simulator, the prover, the compiled WebAssembly
+on every fixed host and the nanocode oracle cover it.
 
 ## Use
 

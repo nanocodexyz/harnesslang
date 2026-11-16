@@ -1758,7 +1758,7 @@ on withdraw(change: text, reason: text) -> report
 ```
 
 ```console
-$ for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do hl emit --format source --target $target docs/snippets/fn_inline.hl > output/fn_inline.out; hl emit --format source --target $target docs/snippets/fn.hl | cmp - output/fn_inline.out && echo "$target: identical"; done
+$ for target in native-jsonl native-sqlite server-postgres cloudflare vercel; do hl emit --target $target docs/snippets/fn_inline.hl > output/fn_inline.wasm; hl emit --target $target docs/snippets/fn.hl | cmp - output/fn_inline.wasm && echo "$target: identical"; done
 native-jsonl: identical
 native-sqlite: identical
 server-postgres: identical
@@ -5998,18 +5998,15 @@ What the proofs assume and leave out is in
 | `native-jsonl` | a process | an append-only JSONL file per session, a CRC-32 per line | one line | nobody | at load | the program's own | one std-only Rust file; the host implements `Host` (tools, model, clock, randomness, acknowledgement) and `Disk`, and calls `run_jsonl` per turn |
 | `native-sqlite` | a process | SQLite rows through the host's `Sql` | one transaction | nobody | at load | the program's own | one std-only Rust file; the host implements `Host` and `Sql` and calls `run_sql` |
 | `server-postgres` | a server pool | Postgres rows through the host's `Sql` | one transaction, fenced by owner epoch | a second owner after a lease expires | at load, by the new owner | the program's own | as `native-sqlite`, with the epoch fence in every flush |
-| `cloudflare` | a Durable Object | the object's SQLite | one event | nobody; an alarm restarts the object after a reset | at load | outbound requests per invocation | one ES module: the `HarnessObject` Durable Object class and a Worker whose `fetch` routes each session to its object |
-| `vercel` | a Function driving a Workflow run | the run's event log | one step | a retried step | in the step, by attempt number | none yet (duration is reported) | one ES module exporting `harness`, which holds the `"use workflow"` session and the `"use step"` step to bind |
+| `cloudflare` | a Durable Object | the object's SQLite | one event | nobody; an alarm restarts the object after a reset | at load | outbound requests per invocation | `program.wasm`, run by the fixed host `hosts/cloudflare.mjs`: the `HarnessObject` Durable Object class and a Worker whose `fetch` routes each session to its object |
+| `vercel` | a Function driving a Workflow run | the run's event log | one step | a retried step | in the step, by attempt number | none yet (duration is reported) | `program.mjs` (the module's bytes as an ES module), run by the fixed host `hosts/vercel.mjs` and its `"use workflow"` session and `"use step"` step in `hosts/vercel-session.mjs` |
 
 ```console
 $ hl emit --format source --target server-postgres examples/agent.hl | grep -E '^pub fn run_sql|^pub trait Sql'
 pub trait Sql {
 pub fn run_sql<H: Host>(host: &mut H, sql: &mut dyn Sql, journal: &mut SqlJournal, request: &TurnRequest) -> Result<Ran, RunError> {
-$ hl emit --format source --target cloudflare examples/agent.hl | grep -E '^export'
-export { HarnessObject, harness };
-export default worker;
-$ hl emit --format source --target vercel examples/agent.hl | grep -E '^export'
-export { harness };
+$ hl emit --format wat --target cloudflare examples/agent.hl | grep -oE '^\(import "hl" "[a-z]+"' | cut -d'"' -f4 | paste -sd' '
+fail hook flush keep tool model now random attempt acknowledge world
 ```
 
 Generated programs use only their language's standard library and the

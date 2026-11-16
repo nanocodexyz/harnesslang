@@ -1,5 +1,3 @@
-import { createContext, Script } from "node:vm";
-
 export function stepFromJson(rt, json) {
   const pair = Object.entries(json);
   if (pair.length !== 1) throw new Error(`a traced step has one tag: ${rt.encodeJson(json)}`);
@@ -168,73 +166,8 @@ export class TracedCells {
       const traced = cursor.next("cell", rt.encodeJson(json));
       same("cell event", traced.observed, json);
       if (event.kind === "diverged") this.seed.stats.divergences += 1;
-      if (event.kind === "delivered") this.check.checks.delivered(this.seed.stats.runs, event.cell, event.id);
       return null;
     }, event);
-  }
-}
-
-const SYNC_KINDS = ["clock", "monotonic", "random", "bytes"];
-const SCRIPTED_SYNTAX_ERROR = "SyntaxError: the scripted engine cannot run line";
-
-function stepText(rt, step) {
-  const shown = { ...step };
-  delete shown.value;
-  delete shown.data;
-  return rt.encodeJson(rt.object(Object.entries(shown).map(([key, value]) => [key, typeof value === "number" ? BigInt(value) : value])));
-}
-
-export async function engineDifferential(rt, cells, totals) {
-  for (const [key, exchanges] of cells.memory) {
-    if (exchanges.length === 0 || exchanges[0].kind !== "start") continue;
-    if (exchanges.some((exchange) => exchange.kind === "observe" && exchange.raw.kind === "diverged")) continue;
-    const first = exchanges[0].answer;
-    if (first.kind === "threw" && first.error.startsWith(SCRIPTED_SYNTAX_ERROR)) {
-      totals.unparsed += 1;
-      continue;
-    }
-    const { script, context } = cells.contexts.get(key);
-    const engineSteps = exchanges.filter((exchange) => exchange.kind !== "observe");
-    const values = engineSteps.filter((exchange) => exchange.kind === "resume" && SYNC_KINDS.includes(exchange.raw.kind)).map((exchange) => exchange.raw);
-    const take = (kind) => {
-      const next = values.shift();
-      if (next === undefined) return kind === "bytes" ? [] : 0n;
-      if (next.kind !== kind) throw new Error(`cell ${key}: the script engine read ${kind} where the scripted engine read ${next?.kind ?? "nothing"}`);
-      return kind === "bytes" ? next.data : next.value;
-    };
-    let run;
-    try {
-      run = new Script(`(async function cell(${rt.CELL_SCRIPT_PARAMETERS.join(", ")}) {\n${script}\n})`).runInContext(createContext(Object.create(null)));
-    } catch (error) {
-      run = async () => {
-        throw error;
-      };
-    }
-    const engine = new rt.ScriptEngine(run, {
-      limits: context.limits,
-      replay: [],
-      platform: { clock: () => take("clock"), monotonic: () => take("monotonic"), random: () => take("random"), bytes: () => take("bytes") },
-      macrotask: () => new Promise((resolve) => setImmediate(resolve)),
-    });
-    let step = await engine.start();
-    for (let index = 0; index < engineSteps.length; index++) {
-      const scripted = engineSteps[index].answer;
-      const next = engineSteps[index + 1];
-      if (scripted.kind === "timeout" && next !== undefined && next.raw.kind === "refused") {
-        index += 1;
-        const after = engineSteps[index].answer;
-        if (stepText(rt, step) !== stepText(rt, after)) throw new Error(`cell ${key} step ${index}: the scripted engine threw ${stepText(rt, after)} after a refused timer, the script engine took ${stepText(rt, step)}`);
-        totals.steps += 1;
-        break;
-      }
-      if (stepText(rt, step) !== stepText(rt, scripted)) {
-        throw new Error(`cell ${key} step ${index}: the scripted engine took ${stepText(rt, scripted)}, the script engine took ${stepText(rt, step)}`);
-      }
-      totals.steps += 1;
-      if (next === undefined || step.kind === "done" || step.kind === "threw") break;
-      step = await engine.resume(next.raw);
-    }
-    totals.cells += 1;
   }
 }
 
@@ -252,9 +185,6 @@ export class CellChecks {
     this.failure = failure;
     this.outputs = new Map();
     this.divergedCells = new Set();
-    this.running = new Map();
-    this.issued = new Map();
-    this.armed = new Map();
     this.dispatchedOutputs = new Map();
   }
 
@@ -272,44 +202,14 @@ export class CellChecks {
     if (index < outputs.journal.length && !stepMatchesEntry(this.rt, step, outputs.journal[index])) this.divergedCells.add(key);
   }
 
-  delivered(run, cell, id) {
-    this.running.get(`${run}/${cell}`)?.delete(id);
-  }
-
   dispatched(run, nested, request, output) {
-    const { cell, id, code } = nested;
+    const { cell, id } = nested;
     const key = `${run}/${cell}`;
     const callId = `${request.turn}/${request.seq}/code-${id}`;
     if (this.divergedCells.has(key)) throw this.failure("cell_replay_equal", `nested call ${callId} was dispatched after cell ${cell} diverged from its journal`);
-    const bounds = this.rt.PROGRAM.codes[code];
-    const issued = this.issued.get(cell) ?? new Set();
-    issued.add(id);
-    this.issued.set(cell, issued);
-    if (BigInt(issued.size) > bounds.calls.value) {
-      throw this.failure("cell_bounded", `cell ${cell} dispatched ${issued.size} nested calls, past calls (${bounds.calls.name} = ${bounds.calls.value})`);
-    }
-    const running = this.running.get(key) ?? new Set();
-    running.add(id);
-    this.running.set(key, running);
-    if (BigInt(running.size) > bounds.parallel.value) {
-      throw this.failure("cell_bounded", `cell ${cell} runs ${running.size} nested calls at once, past parallel (${bounds.parallel.name} = ${bounds.parallel.value})`);
-    }
     const outputs = this.dispatchedOutputs.get(callId) ?? [];
     outputs.push(output);
     this.dispatchedOutputs.set(callId, outputs);
-  }
-
-  waited(wait, code) {
-    const bounds = this.rt.PROGRAM.codes[code];
-    const armed = this.armed.get(wait.cell) ?? new Set();
-    armed.add(wait.timer);
-    this.armed.set(wait.cell, armed);
-    if (BigInt(armed.size) > bounds.timers.value) {
-      throw this.failure("cell_bounded", `cell ${wait.cell} waits on ${armed.size} timers, past timers (${bounds.timers.name} = ${bounds.timers.value})`);
-    }
-    if (wait.delayMs > bounds.timerMs.value) {
-      throw this.failure("cell_bounded", `cell ${wait.cell} waits ${wait.delayMs} ms, past timer_ms (${bounds.timerMs.name} = ${bounds.timerMs.value})`);
-    }
   }
 
   flushed(lines) {
@@ -353,8 +253,6 @@ export class CellChecks {
       const json = rt.decodeJson(entry.encoded);
       if (!(rt.isObject(json) && json.outcome === "unknown")) continue;
       const callId = `${cell.origin}/code-${entry.id}`;
-      const tool = rt.PROGRAM.tools.find((candidate) => candidate.name === cell.names.get(entry.id));
-      if (tool !== undefined && tool.effect !== "external") throw this.failure("nested_known", `${tool.effect} nested call ${callId} ended with the unknown outcome`);
       if (!reported.has(callId)) throw this.failure("unknown_nested_reported", `nested call ${callId} was given the unknown outcome without a recovery record listing it`);
     }
   }

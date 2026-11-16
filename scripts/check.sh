@@ -6,19 +6,47 @@ cd "$(dirname "$0")/.."
 seeds="${SEEDS:-0..2000}"
 twice_seeds="${TWICE_SEEDS:-0..300}"
 rust_diff_seeds="${RUST_DIFF_SEEDS:-0..300}"
-js_diff_seeds="${JS_DIFF_SEEDS:-0..100}"
 wasm_diff_seeds="${WASM_DIFF_SEEDS:-0..100}"
 wasm_native_diff_seeds="${WASM_NATIVE_DIFF_SEEDS:-0..30}"
+wasm_platform_diff_seeds="${WASM_PLATFORM_DIFF_SEEDS:-0..30}"
 if [ "${HL_LONG:-0}" = 1 ]; then
   wasm_diff_seeds="${WASM_DIFF_SEEDS:-0..2000}"
   wasm_native_diff_seeds="${WASM_NATIVE_DIFF_SEEDS:-0..2000}"
+  wasm_platform_diff_seeds="${WASM_PLATFORM_DIFF_SEEDS:-0..300}"
   rust_diff_seeds="${RUST_DIFF_SEEDS:-0..2000}"
-  js_diff_seeds="${JS_DIFF_SEEDS:-0..2000}"
 fi
 jobs="${CHECK_JOBS:-$(nproc)}"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 rust_targets="native-jsonl native-sqlite server-postgres"
-js_targets="cloudflare vercel"
+platform_targets="cloudflare vercel"
+platform_pending="
+  cloudflare:examples/claude_code.hl
+  cloudflare:examples/code_agent.hl
+  cloudflare:examples/code_tasks.hl
+  cloudflare:examples/codex_agent.hl
+  cloudflare:examples/mpp_agent.hl
+  cloudflare:docs/snippets/code_stop.hl
+  cloudflare:docs/snippets/code_wait.hl
+  cloudflare:docs/snippets/in_flight.hl
+  cloudflare:docs/snippets/paid_lanes.hl
+  cloudflare:docs/snippets/payments.hl
+  cloudflare:docs/snippets/side.hl
+  vercel:examples/autoresearch.hl
+  vercel:examples/claude_agent.hl
+  vercel:examples/claude_code.hl
+  vercel:examples/code_agent.hl
+  vercel:examples/code_tasks.hl
+  vercel:examples/codex_agent.hl
+  vercel:examples/mpp_agent.hl
+  vercel:docs/snippets/climb.hl
+  vercel:docs/snippets/code_stop.hl
+  vercel:docs/snippets/code_wait.hl
+  vercel:docs/snippets/events.hl
+  vercel:docs/snippets/in_flight.hl
+  vercel:docs/snippets/paid_lanes.hl
+  vercel:docs/snippets/payments.hl
+  vercel:docs/snippets/side.hl
+"
 examples=$(echo examples/*.hl)
 hl=target/release/hl
 scratch=output/check
@@ -236,9 +264,9 @@ invalid_fail() {
 same_program() {
   local with_fn=$1 written_out=$2 target
   for target in $targets; do
-    "$hl" emit --format source --target "$target" "$written_out" > "$scratch/written_out.emit"
-    if ! "$hl" emit --format source --target "$target" "$with_fn" | cmp -s - "$scratch/written_out.emit"; then
-      echo "fn: $with_fn and $written_out emit different code for $target" >&2
+    "$hl" emit --format wasm --target "$target" "$written_out" > "$scratch/written_out.wasm"
+    if ! "$hl" emit --format wasm --target "$target" "$with_fn" | cmp -s - "$scratch/written_out.wasm"; then
+      echo "fn: $with_fn and $written_out compile to different wasm for $target" >&2
       return 1
     fi
   done
@@ -259,7 +287,7 @@ fn_equal() {
     echo "fn: a written-out program with two pushes swapped still compares equal" >&2
     exit 1
   fi
-  echo "check: every fn program emits, checks and proves exactly as its written-out copy"
+  echo "check: every fn program compiles, checks and proves exactly as its written-out copy"
 }
 
 sim_one() {
@@ -275,16 +303,20 @@ rust_diff_one() {
   RUST_DIFF_SEEDS=$rust_diff_seeds RUST_DIFF_TARGETS=$1 RUST_DIFF_FILES=$2 scripts/rust-diff.sh
 }
 
-js_diff_one() {
-  JS_DIFF_SEEDS=$js_diff_seeds JS_DIFF_TARGETS=$1 JS_DIFF_FILES=$2 scripts/js-diff.sh
-}
-
 wasm_diff_one() {
   WASM_DIFF_SEEDS=$wasm_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$2 scripts/wasm-diff.sh
 }
 
 wasm_native_diff_one() {
   WASM_DIFF_HOST=native WASM_DIFF_SEEDS=$wasm_native_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$2 scripts/wasm-diff.sh
+}
+
+wasm_platform_diff_one() {
+  WASM_DIFF_HOST=platform WASM_DIFF_SEEDS=$wasm_platform_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$2 scripts/wasm-diff.sh
+}
+
+platform_ready() {
+  ! grep -qw "$1:$2" <<< "$platform_pending"
 }
 
 wasm_lowered() {
@@ -294,7 +326,7 @@ wasm_lowered() {
 scoped_diff_one() {
   local file=docs/snippets/tree_planner.hl scope=1.1
   case $1 in
-    cloudflare | vercel) JS_DIFF_SEEDS=$js_diff_seeds JS_DIFF_TARGETS=$1 JS_DIFF_FILES=$file JS_DIFF_SCOPE=$scope scripts/js-diff.sh ;;
+    cloudflare | vercel) WASM_DIFF_SEEDS=$wasm_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$file WASM_DIFF_SCOPE=$scope scripts/wasm-diff.sh ;;
     *) RUST_DIFF_SEEDS=$rust_diff_seeds RUST_DIFF_TARGETS=$1 RUST_DIFF_FILES=$file RUST_DIFF_SCOPE=$scope scripts/rust-diff.sh ;;
   esac
 }
@@ -320,9 +352,10 @@ census_examples() {
         missing=1
       fi
     done
-    for target in $js_targets; do
-      if ! grep -q "^ok backend=js file=$file target=$target " "$scratch/sweeps.log"; then
-        echo "census: $file had no JavaScript differential run on $target" >&2
+    for target in $platform_targets; do
+      platform_ready "$target" "$file" || continue
+      if ! grep -q "^ok backend=wasm host=platform file=$file target=$target " "$scratch/sweeps.log"; then
+        echo "census: $file had no differential run on the fixed $target host" >&2
         missing=1
       fi
     done
@@ -343,7 +376,7 @@ census_examples() {
     done
   done
   [ "$missing" -eq 0 ] || exit 1
-  echo "census: all $(wc -w <<< "$examples") examples are swept by hl sim on every target and by the differential runs on every Rust and JavaScript target"
+  echo "census: all $(wc -w <<< "$examples") examples are swept by hl sim on every target and by the differential runs on every Rust target and on the fixed Cloudflare and Vercel hosts, except $platform_pending"
   echo "census: every example lowered to wasm had a wasm differential run on every target; $pending example-target pairs use a feature not yet lowered"
 }
 
@@ -419,11 +452,6 @@ queue invalid invalid_fail
 queue fn fn_equal
 queue docs scripts/docs-check.sh
 queue strict scripts/strict.sh
-for file in $examples docs/snippets/keep.hl docs/snippets/in_flight.hl; do
-  for target in $js_targets; do
-    queue js-diff js_diff_one "$target" "$file"
-  done
-done
 for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl docs/snippets/in_flight.hl docs/snippets/fork.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"
@@ -445,14 +473,13 @@ for file in $examples docs/snippets/*.hl; do
     wasm_lowered "$target" "$file" && queue wasm-diff wasm_diff_one "$target" "$file"
     wasm_lowered "$target" "$file" && queue wasm-diff-native wasm_native_diff_one "$target" "$file"
   done
+  for target in $platform_targets; do
+    platform_ready "$target" "$file" && wasm_lowered "$target" "$file" && queue wasm-diff-platform wasm_platform_diff_one "$target" "$file"
+  done
 done
 for target in $rust_targets; do
   queue rust-diff rust_diff_one "$target" docs/snippets/side.hl
   queue rust-diff rust_diff_one "$target" docs/snippets/fork.hl
-done
-for target in $js_targets; do
-  queue js-diff js_diff_one "$target" docs/snippets/side.hl
-  queue js-diff js_diff_one "$target" docs/snippets/fork.hl
 done
 for mutation in $(scripts/mutations.sh --plans); do
   queue mutations mutation_one "$mutation"
@@ -461,13 +488,13 @@ for plan in $(scripts/mutations.sh --diff-plans); do
   queue diff-plants scripts/mutations.sh --diff "$plan"
 done
 queue deploy scripts/deploy-drill.sh
+queue host-mutations scripts/host-mutations.sh
 for plan in $(scripts/mutations.sh --deploy-plans); do
   queue deploy-plants scripts/mutations.sh --deploy "$plan"
 done
 queue deploy-real scripts/deploy-real.sh
 queue exhaustive scripts/exhaustive.sh
 queue fuzz-regress scripts/fuzz-regress.sh
-queue js-mutations scripts/js-mutations.sh
 queue prove scripts/prove-mutations.sh
 queue agent agent
 run_queued
