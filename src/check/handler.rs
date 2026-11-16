@@ -630,8 +630,14 @@ impl Checker<'_> {
             }
         }
         let checked = declared.and_then(|()| self.block(body));
-        self.scopes.pop().expect("the scoped block's own scope is popped");
-        assert_eq!(self.scopes.len(), depth, "a scoped block leaves its caller's scopes");
+        self.scopes
+            .pop()
+            .expect("the scoped block's own scope is popped");
+        assert_eq!(
+            self.scopes.len(),
+            depth,
+            "a scoped block leaves its caller's scopes"
+        );
         let (statements, returned) = checked?;
         out.extend(statements);
         Ok(returned)
@@ -1312,6 +1318,7 @@ impl Checker<'_> {
     fn setting_default(&self, setting: &ir::Setting) -> Expr {
         match &setting.default {
             ir::Literal::Bool(value) => Expr::Bool(*value),
+            ir::Literal::Text(value) if setting.ty == Type::Text => Expr::Text(value.clone()),
             ir::Literal::Text(value) => {
                 let sum = self
                     .program

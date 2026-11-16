@@ -34,6 +34,8 @@ const EMPTY_CHANGE_CONTEXT: &str = "@@";
 const HEREDOC_OPENERS: [&str; 3] = ["<<EOF", "<<'EOF'", "<<\"EOF\""];
 const HEREDOC_LINES_MIN: usize = 4;
 
+type LineMatch = dyn Fn(&str, &str) -> bool;
+
 struct Session {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -263,13 +265,12 @@ impl Exec {
         if cmd.is_empty() {
             return Ran::Failed("missing command line for unified exec request".to_owned());
         }
-        if self.sessions.len() >= MAX_PROCESSES {
-            if let Some(oldest) = self.sessions.keys().next().copied()
-                && let Some(mut session) = self.sessions.remove(&oldest)
-            {
-                let _ = tools::kill_group(&mut session.child);
-                let _ = session.child.wait();
-            }
+        if self.sessions.len() >= MAX_PROCESSES
+            && let Some(oldest) = self.sessions.keys().next().copied()
+            && let Some(mut session) = self.sessions.remove(&oldest)
+        {
+            let _ = tools::kill_group(&mut session.child);
+            let _ = session.child.wait();
         }
         let shell = match text_field(input, "shell") {
             "" if on_path(SHELL) => SHELL,
@@ -391,11 +392,11 @@ pub fn view_image(root: &Path, input: &Value) -> Ran {
             "{path} is not a PNG, JPEG, GIF or WebP image; convert or render it to PNG first"
         ));
     }
-    if bytes.len() as u64 > crate::codex_harness::IMAGE_BYTES_MAX {
+    if bytes.len() as u64 > tools::IMAGE_BYTES_MAX {
         return Ran::Failed(format!(
             "{path} is {} bytes, more than the {} an image may have; scale it down or crop it first",
             bytes.len(),
-            crate::codex_harness::IMAGE_BYTES_MAX
+            tools::IMAGE_BYTES_MAX
         ));
     }
     Ran::Image(bytes)
@@ -605,7 +606,7 @@ fn seek(lines: &[String], pattern: &[String], start: usize, end_of_file: bool) -
         start
     };
     let last = lines.len() - pattern.len();
-    let passes: [&dyn Fn(&str, &str) -> bool; 4] = [
+    let passes: [&LineMatch; 4] = [
         &|a, b| a == b,
         &|a, b| a.trim_end() == b.trim_end(),
         &|a, b| a.trim() == b.trim(),

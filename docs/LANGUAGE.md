@@ -493,7 +493,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `with` `within` `yield`
+Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `wire` `with` `within` `yield`
 
 Builtin functions, whose names declarations may not take:
 
@@ -553,7 +553,7 @@ tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
 listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class [ paid ] ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] ;
+model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] [ "wire" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -909,11 +909,11 @@ rerun sends it again:
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=30 target=native-jsonl profile=clean mutation=listing_unchecked: listed call 3/19 (mcp__theta) ran as Some("theta-v9") while listing mcp admitted None in turn 3: a tool that changed since admission must be refused
+FAIL invariant=tool_admitted seed=27 target=native-jsonl profile=clean mutation=listing_unchecked: listed call 2/10 (mcp__delta) ran as Some("delta-v1") while listing mcp admitted None in turn 2: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=input_unchecked: call 1/4 (view_image) ran with input "{\"epsilon-35\":true,\"path\":\"gamma-41\"}", which does not fit its declared input: not a JSON object
+FAIL invariant=tool_admitted seed=25 target=native-jsonl profile=errors mutation=input_unchecked: call 2/10 (update_plan) ran with input "{\"alpha-33\":true,\"plan\":\"theta-29\"}", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
-FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 2/13 (mcp__zeta) was dispatched 3 times
+FAIL invariant=replay_equal seed=13 target=native-jsonl profile=async mutation=listed_class_dropped: replaying the journal failed: Corrupt("replay of turn 4 diverged at seq 14: tool 'mcp__alpha' was recorded with another class or input")
 ```
 
 The checker's listing errors:
@@ -1314,6 +1314,132 @@ session settings do: `set_effort` stores it between turns, each `prompt` turn
 pins the effort in effect when it starts, and its requests and prompt cache
 refreshes send the pinned value, which hl-agent puts in the request's
 `output_config`.
+
+### Wire models
+
+`wire anthropic` or `wire openai` at the end of a model declaration makes
+the program, not the host, build the model's HTTP request. The call sends
+`head`, the context rendered as the API's messages (Messages for
+`anthropic`, Responses input for `openai`) and `tail` to `url` with
+`headers`, all four `text` settings the program sets, and decodes the
+answer into the model's reply itself. The host only moves bytes: it
+substitutes `${NAME}` in headers from its environment, sends the request
+and hands back the status, headers and body. A wire model's reply type must
+have the shape its wire decodes, and its settings must name those four
+fields. The interpreter, the simulator and the compiled targets share one
+codec (`src/wire`, mirrored in the WebAssembly runtime), so the request a
+journal records is the request every backend would send:
+
+```hl docs/snippets/wire.hl
+harness wired
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const window_tokens: u64 = 200000
+const image_bytes_max: u64 = 1048576
+
+type outcome = done(text) | failed(text) | exhausted
+type claude_reply = answer(text, text) | calls(list<call, calls_max>, text, text)
+
+tool read(path: text) -> text or blob<image_bytes_max> effect none
+tool bash(command: text) -> text effect external
+
+model claude calls calls_max reply claude_reply window window_tokens settings(url: text = "https://api.anthropic.com/v1/messages", headers: text = "[[\"x-api-key\",\"${ANTHROPIC_API_KEY}\"],[\"anthropic-version\",\"2023-06-01\"]]", head: text = "{\"model\":\"claude-opus-5-5\",\"max_tokens\":32000,\"stream\":true,\"messages\":", tail: text = "}") wire anthropic
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    match claude(context) {
+      throttled(error, _) => { return failed(error) }
+      transient(error, _) => { return failed(error) }
+      rejected(error) => { return failed(error) }
+      ok(reply, _, _, _, _, _) => {
+        push context assistant(reply)
+        match reply {
+          answer(words, _) => { return done(words) }
+          calls(requested, _, _) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                blob(image) => { push context attached(call, image) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+The same program on the OpenAI Responses wire, which the checks run as well:
+
+```hl docs/snippets/wire_openai.hl
+harness wired
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const window_tokens: u64 = 200000
+const image_bytes_max: u64 = 1048576
+
+type outcome = done(text) | failed(text) | exhausted
+type claude_reply = message(text, text, bool) | calls(list<call, calls_max>, text, text)
+
+tool read(path: text) -> text or blob<image_bytes_max> effect none
+tool bash(command: text) -> text effect external
+
+model claude calls calls_max reply claude_reply window window_tokens settings(url: text = "https://api.anthropic.com/v1/messages", headers: text = "[[\"x-api-key\",\"${ANTHROPIC_API_KEY}\"],[\"anthropic-version\",\"2023-06-01\"]]", head: text = "{\"model\":\"claude-opus-5-5\",\"max_tokens\":32000,\"stream\":true,\"messages\":", tail: text = "}") wire openai
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    match claude(context) {
+      throttled(error, _) => { return failed(error) }
+      transient(error, _) => { return failed(error) }
+      rejected(error) => { return failed(error) }
+      ok(reply, _, _, _, _, _) => {
+        push context assistant(reply)
+        match reply {
+          message(words, _, _) => { return done(words) }
+          calls(requested, _, _) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                blob(image) => { push context attached(call, image) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+`examples/claude_code.hl` and `examples/claude_code_child.hl` are
+`wire anthropic` programs and `examples/codex_agent.hl` a `wire openai`
+one; each sets its request's settings in a `configure` handler the host runs
+before every prompt.
 
 ### state
 
@@ -4203,8 +4329,8 @@ starts `examples/claude_code_child.hl`'s `delegated(role, task)`, the Claude
 harness without its MCP listing, which ends when the model calls
 `submit_result`; `list_agents` asks the host; and a round that holds a
 `wait_agent` call runs its calls one after another, joining at each
-`wait_agent`, since the arms of a `parallel` for run no effects. `hl-agent`
-(`agent/`) is its host: a spawn writes the child's arguments to
+`wait_agent`, since the arms of a `parallel` for run no effects. `hl-host`
+(`hosts/native/`) is its host: a spawn writes the child's arguments to
 `children/T.S/spawn.json` under the parent's journal directory and runs the
 child on a thread, with its own journal there; a join is answered once the
 child's status is durable. After a kill, the parent's replay reaches its open
@@ -4702,14 +4828,15 @@ every target, and a fork never sees a turn a crash could roll back. A harness
 with blobs cannot fork, since a checkpoint holds no blob's bytes.
 
 A host forks a session it holds through the same `fork_entry` (the
-interpreter's, or the fixed host's), so `on forked` needs no fork tool. `hl-agent run --fork-from
-J [--at T]` writes the two records from journal `J` at its latest finished
-turn, or at turn `T`, as the first records of a new journal and runs its
-instruction as that session's first turn; `--turn N` runs an instruction as a
-later turn of the same journal, which gives a parent turns to rewind.
+interpreter's, or the fixed host's), so `on forked` needs no fork tool. The fixed
+native host does not fork yet: the per-program host's `--fork-from J [--at T]`,
+which wrote the two records from journal `J` at its latest finished turn, or at
+turn `T`, as the first records of a new journal, left with it; `hl-host run
+--turn N` runs an instruction as a later turn of the same journal, which gives
+a parent turns to rewind.
 `examples/claude_code.hl`'s `on forked` disarms the prompt cache refresh, whose
 due belongs to the parent's last request, and with `discarded > 0` pushes
-nanocode's rewind notice. hl-agent refuses to fork a state that holds images,
+nanocode's rewind notice. A host refuses to fork a state that holds images,
 whose bytes stay in the parent's journal.
 
 ### Idle turns
@@ -4830,7 +4957,7 @@ How it runs:
   times `N`, the most the idle turns after one other turn can cost.
 - Hosts. Rust: `idle_due(start, records)` and `JsonlJournal::idle_due` give the
   armed due, `run_turn` returns `Ran::NotDue` for a refused request, and
-  `hl-agent run --keep-warm N` stays alive after its prompt and runs up to `N`
+  `hl-host run --keep-warm N` stays alive after its prompt and runs up to `N`
   idle turns. Cloudflare: after every finished turn the Durable Object sets its
   alarm to the due, and `alarm()` runs the idle turn when no turn is
   unfinished. Vercel: before each request the session reads the due in a step
@@ -5719,7 +5846,7 @@ FAIL invariant=climb_kept_valid seed=12 target=native-jsonl profile=async mutati
 a propose block in which Claude edits a git working tree with Bash, Read and
 Edit for up to `rounds_max` model calls and its final answer becomes the
 candidate's commit message, and a measure block that benchmarks a revision and
-counts failing tests, gated to zero. Its host is parked: `hl-climb` left `agent/`
+counts failing tests, gated to zero. Its host is parked: `hl-climb` left the per-program host
 when every program there moved to compiled WebAssembly.
 
 ```console

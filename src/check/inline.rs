@@ -326,7 +326,9 @@ impl<'a> Inliner<'a> {
 
     fn hook(&mut self, hook: &'a ast::Hook) -> Checked<ast::Hook> {
         let mut walk = Walk::new(Owner::Hook(hook.kind));
-        hook.params.iter().try_for_each(|param| walk.bind(&param.name))?;
+        hook.params
+            .iter()
+            .try_for_each(|param| walk.bind(&param.name))?;
         let body = self.block(&mut walk, &hook.body)?;
         Ok(ast::Hook {
             kind: hook.kind,

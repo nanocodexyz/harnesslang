@@ -93,11 +93,32 @@ fn failure<T>(message: String) -> Result<T, Stop> {
 fn same(what: &str, expected: &Json, actual: &Json) -> Result<(), Stop> {
     let (left, right) = (expected.encode(), actual.encode());
     if left != right {
+        let at = left
+            .bytes()
+            .zip(right.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
         return failure(format!(
-            "{what}: the interpreter has {left}, the wasm module has {right}"
+            "{what}: the two differ at byte {at}: the interpreter has ...{}..., the wasm module has ...{}...",
+            window(&left, at),
+            window(&right, at)
         ));
     }
     Ok(())
+}
+
+const WINDOW_BYTES: usize = 240;
+
+fn window(text: &str, at: usize) -> &str {
+    let mut start = at.saturating_sub(WINDOW_BYTES);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + WINDOW_BYTES).min(text.len());
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    &text[start..end]
 }
 
 fn index_text<const N: usize>(names: [&str; N], index: i32) -> Json {
@@ -875,6 +896,15 @@ impl<'e> World<'_, 'e, '_> {
             .seed
             .next(self.context, "model", &detail)
             .map_err(Error::Stop)?;
+        if !matches!(request.get("http"), Json::Undefined) {
+            let checked = (|| {
+                same("model call turn", event.get("turn"), request.get("turn"))?;
+                same("model call seq", event.get("seq"), request.get("seq"))?;
+                same("model http request", event.get("http"), request.get("http"))
+            })();
+            checked.map_err(Error::Stop)?;
+            return self.give_json(instance, event.get("answer"));
+        }
         let checked = (|| {
             same("model call turn", event.get("turn"), request.get("turn"))?;
             same("model call seq", event.get("seq"), request.get("seq"))?;

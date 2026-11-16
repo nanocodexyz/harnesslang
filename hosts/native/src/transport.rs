@@ -10,52 +10,67 @@ pub const CURL_TIMED_OUT: i32 = 28;
 pub const RESPONSE_BYTES_MAX: usize = 32 * 1024 * 1024;
 pub const HTTP_PORT: u16 = 80;
 pub const READ_CHUNK_BYTES: usize = 8192;
-pub const MILLISECONDS_PER_SECOND: u64 = 1000;
 pub const STOP_POLL: Duration = Duration::from_millis(50);
 const HEADER_END: &[u8] = b"\r\n\r\n";
+const CURL_HEADER_FILE: &str = "headers.txt";
+const CURL_BODY_FILE: &str = "request.json";
 
 pub struct Post<'a> {
-    pub base_url: &'a str,
-    pub path: &'a str,
-    pub headers: &'a [(&'a str, String)],
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
     pub body: &'a str,
     pub scratch: &'a Path,
     pub partial: &'a Path,
     pub stop: &'a dyn Fn() -> bool,
 }
 
+pub struct Response {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
 pub enum Sent {
-    Done(u16, String, u64),
+    Done(Response),
     Stopped,
 }
 
-pub fn post(request: &Post<'_>) -> Result<Sent, String> {
-    if let Some(rest) = request.base_url.strip_prefix("http://") {
-        std::fs::write(request.scratch.join("request.json"), request.body)
-            .map_err(|error| format!("write request: {error}"))?;
+pub fn send(request: &Post<'_>) -> Result<Sent, String> {
+    std::fs::write(request.partial, b"")
+        .map_err(|error| format!("{}: {error}", request.partial.display()))?;
+    if let Some(rest) = request.url.strip_prefix("http://") {
         return plain(rest, request);
     }
     curl(request)
 }
 
+fn quoted(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn curl(request: &Post<'_>) -> Result<Sent, String> {
-    let body = request.scratch.join("request.json");
+    let body = request.scratch.join(CURL_BODY_FILE);
     std::fs::write(&body, request.body).map_err(|error| format!("write request: {error}"))?;
-    let headers = request.scratch.join("headers.txt");
+    let headers = request.scratch.join(CURL_HEADER_FILE);
     let _ = std::fs::remove_file(&headers);
     let mut config = format!(
-        "url = \"{}{}\"\n",
-        request.base_url.trim_end_matches('/'),
-        request.path
+        "url = \"{}\"\nrequest = \"{}\"\n",
+        quoted(request.url),
+        quoted(request.method)
     );
     for (name, value) in request.headers {
-        config.push_str(&format!("header = \"{name}: {value}\"\n"));
+        config.push_str(&format!(
+            "header = \"{}: {}\"\n",
+            quoted(name),
+            quoted(value)
+        ));
     }
     config.push_str(&format!(
         "data-binary = \"@{}\"\noutput = \"{}\"\ndump-header = \"{}\"\n",
-        body.display(),
-        request.partial.display(),
-        headers.display()
+        quoted(&body.display().to_string()),
+        quoted(&request.partial.display().to_string()),
+        quoted(&headers.display().to_string())
     ));
     let mut child = Command::new("curl")
         .args([
@@ -77,7 +92,7 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
     child
         .stdin
         .take()
-        .expect("piped stdin")
+        .expect("curl's stdin is piped")
         .write_all(config.as_bytes())
         .map_err(|error| format!("curl stdin: {error}"))?;
     loop {
@@ -124,34 +139,36 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
             "response exceeds RESPONSE_BYTES_MAX ({RESPONSE_BYTES_MAX} bytes)"
         ));
     }
-    let text = std::fs::read_to_string(request.partial)
-        .map_err(|error| format!("read response: {error}"))?;
+    let bytes =
+        std::fs::read(request.partial).map_err(|error| format!("read response: {error}"))?;
     let head = std::fs::read_to_string(&headers).unwrap_or_default();
-    Ok(Sent::Done(status, text, retry_after_ms(&head)))
+    let last = head
+        .replace("\r\n", "\n")
+        .split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .last()
+        .unwrap_or_default()
+        .to_owned();
+    Ok(Sent::Done(Response {
+        status,
+        headers: header_pairs(&last),
+        body: String::from_utf8(bytes).map_err(|error| format!("response body: {error}"))?,
+    }))
 }
 
-pub fn retry_after_ms(head: &str) -> u64 {
-    let header = |name: &str| {
-        head.lines().find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.trim()
-                .eq_ignore_ascii_case(name)
-                .then(|| value.trim().to_owned())
+pub fn header_pairs(head: &str) -> Vec<(String, String)> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_owned()))
         })
-    };
-    if let Some(ms) = header("retry-after-ms").and_then(|value| value.parse::<u64>().ok()) {
-        return ms;
-    }
-    header("retry-after")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(0, |seconds| seconds.saturating_mul(MILLISECONDS_PER_SECOND))
+        .collect()
 }
 
 fn plain(rest: &str, request: &Post<'_>) -> Result<Sent, String> {
-    let (authority, prefix) = rest
-        .split_once('/')
-        .map_or((rest, ""), |(authority, path)| (authority, path));
-    let path = format!("/{}{}", prefix.trim_end_matches('/'), request.path).replace("//", "/");
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = format!("/{path}");
     let address = if authority.contains(':') {
         authority.to_owned()
     } else {
@@ -165,7 +182,10 @@ fn plain(rest: &str, request: &Post<'_>) -> Result<Sent, String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(STREAM_IDLE_SECONDS_MAX)))
         .map_err(|error| error.to_string())?;
-    let mut head = format!("POST {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    let mut head = format!(
+        "{} {path} HTTP/1.1\r\nHost: {authority}\r\n",
+        request.method
+    );
     for (name, value) in request.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -220,29 +240,27 @@ fn plain(rest: &str, request: &Post<'_>) -> Result<Sent, String> {
         file.write_all(&chunk[..read])
             .map_err(|error| format!("{}: {error}", request.partial.display()))?;
     }
-    let (status, body, retry_after) = parse(&response)?;
-    Ok(Sent::Done(status, body, retry_after))
+    parse(&response).map(Sent::Done)
 }
 
-fn parse(response: &[u8]) -> Result<(u16, String, u64), String> {
+fn parse(response: &[u8]) -> Result<Response, String> {
     let end = response
         .windows(HEADER_END.len())
         .position(|window| window == HEADER_END)
         .ok_or("response has no header end")?;
     let head = String::from_utf8_lossy(&response[..end]).into_owned();
-    let mut lines = head.split("\r\n");
-    let status: u16 = lines
+    let status: u16 = head
+        .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| format!("bad status line in {head}"))?;
+    let headers = header_pairs(&head);
     let header = |name: &str| {
-        head.split("\r\n").skip(1).find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.trim()
-                .eq_ignore_ascii_case(name)
-                .then(|| value.trim().to_ascii_lowercase())
-        })
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_ascii_lowercase())
     };
     let raw = &response[end + HEADER_END.len()..];
     let body = if header("transfer-encoding").is_some_and(|value| value.contains("chunked")) {
@@ -257,11 +275,11 @@ fn parse(response: &[u8]) -> Result<(u16, String, u64), String> {
     } else {
         raw.to_vec()
     };
-    Ok((
+    Ok(Response {
         status,
-        String::from_utf8(body).map_err(|error| format!("response body: {error}"))?,
-        retry_after_ms(&head),
-    ))
+        headers,
+        body: String::from_utf8(body).map_err(|error| format!("response body: {error}"))?,
+    })
 }
 
 fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, String> {

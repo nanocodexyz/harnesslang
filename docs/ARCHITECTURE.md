@@ -236,7 +236,7 @@ due) and records `{"at","due"}` in the `admitted` record; a refused request
 writes nothing. The count is a hidden state field the checker maintains, so the
 prover bounds it and replay restores it. The Durable Object arms its alarm at
 the due, the Vercel session races its next prompt against a workflow
-`sleep()`, and `hl-agent --keep-warm` stays alive for the refreshes.
+`sleep()`, and `hl-host --keep-warm` stays alive for the refreshes.
 
 ### Effects in flight
 
@@ -297,7 +297,7 @@ so no target re-pays on replay; LANGUAGE.md's Payments has the simulator's
 `spend_within_cap`, `spend_accounted` and `payment_presented`.
 
 Its host side is parked: the paying host (`hl-agent pay`, its payer and the simulated
-MPP server) left `agent/` when every program there moved to compiled WebAssembly,
+MPP server) left the per-program host when every program there moved to compiled WebAssembly,
 and `examples/mpp_agent.hl` stays a checked, simulated and compiled program.
 
 ### Fork and rewind
@@ -308,8 +308,8 @@ one's state after a finished turn: its journal opens with a `host` record
 holding the parent's durable state at that turn passed through `on forked`,
 which may assign but runs no effect. A rewind is a fork at an earlier turn,
 the number of discarded turns given to the hook. A host forks through the same
-`fork_entry` every backend exposes; `hl-agent --fork-from` uses the generated
-Rust one. LANGUAGE.md's Fork and rewind has the simulator's `fork_state_equal`.
+`fork_entry` every backend exposes; the fixed native host does not fork yet
+(the per-program host's `--fork-from` left with it). LANGUAGE.md's Fork and rewind has the simulator's `fork_state_equal`.
 
 ## Execution model
 
@@ -860,15 +860,22 @@ made.
     `destroy` against the Cloudflare and Vercel APIs and local installs
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
-- `agent/`: `hl-agent`, outside the build: `examples/claude_code.hl` and its
-  subagent `examples/claude_code_child.hl` compiled to WebAssembly and
-  hosted against the Anthropic API, each spawned child a session with its own
-  journal under the parent's (`children/T.S/`); and `examples/codex_agent.hl`
-  compiled to WebAssembly and hosted against the OpenAI Responses API, with steers and cancels dropped
-  into the journal's `control/` by `hl-agent steer` and `hl-agent cancel`
+- `hosts/native/`: `hl-host`, the fixed native host, outside the build:
+  it embeds `examples/claude_code.hl`, its subagent
+  `examples/claude_code_child.hl` and `examples/codex_agent.hl` compiled to
+  WebAssembly, configures each with its `configure` handler and sends the
+  HTTP requests their `wire anthropic` and `wire openai` models build; each
+  spawned child is a session with its own journal under the parent's
+  (`children/T.S/`), configured with the parent's arguments, and steers and
+  cancels drop into the journal's `control/` through `hl-host steer` and
+  `hl-host cancel`. Its front takes `hl-agent`'s flags, so the evals run it as
+  `hl-agent`
+- `scripts/fixtures/`: the mock Messages and Responses servers, the
+  syscall fixture programs, the host and wire probes, and the prompt sources
+  `scripts/program-literals.py` turns into the programs' literals
 - `oracle/`: the nanocode oracle, its own workspace, the Cloudflare
   platform probes and the deploy fake (`oracle/deploy/fake.mjs`)
-- `evals/`: runs `hl-agent`, nanocode, stock Claude Code and stock Codex on
+- `evals/`: runs `hl-agent` (`hl-host`), nanocode, stock Claude Code and stock Codex on
   Terminal-Bench and nanoeval tasks in the tasks' containers, through one meter
   that relays the Anthropic and OpenAI APIs and records every model request,
   and reports pass rates, cost and paired differences;

@@ -68,7 +68,7 @@ on_wasm() {
 }
 
 programs_not_on_wasm() {
-  local file target pairs=0 agent_sources
+  local file target pairs=0
   for file in $programs; do
     for target in $targets; do
       if ! on_wasm "$file" "$target"; then
@@ -77,12 +77,7 @@ programs_not_on_wasm() {
       fi
     done
   done
-  agent_sources=0
-  if [ -f agent/build.rs ]; then
-    agent_sources=$(grep -E 'emit_source\(' agent/build.rs | grep -cvE '^fn emit_source' || true)
-    grep -nE 'emit_source\(' agent/build.rs | grep -vE '^[0-9]+:fn emit_source' | sed 's#^#agent/build.rs:#' >> "$scratch/not_on_wasm.txt" || true
-  fi
-  echo $((pairs + agent_sources))
+  echo "$pairs"
 }
 
 host_sizes() {

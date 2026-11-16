@@ -56,7 +56,7 @@ fn spawned(messages: &[Value]) -> Option<String> {
     let id = blocks()
         .filter(|block| block.get("name").and_then(Value::as_str) == Some(SPAWN_TOOL))
         .filter_map(|block| block.get("id").and_then(Value::as_str))
-        .last()?;
+        .next_back()?;
     blocks()
         .find(|block| block.get("tool_use_id").and_then(Value::as_str) == Some(id))
         .and_then(|block| block.get("content").and_then(Value::as_str))

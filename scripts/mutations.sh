@@ -23,7 +23,7 @@ batch_flush_after_dispatch examples/claude_agent.hl --twice external_once|unknow
 results_in_completion_order examples/claude_agent.hl --twice sequential_equal
 batch_pushes_reversed examples/claude_agent.hl --twice checkpoint_compacted
 listing_unchecked examples/codex_agent.hl --twice tool_admitted
-listed_class_dropped examples/codex_agent.hl --twice external_once|unknown_reported
+listed_class_dropped examples/codex_agent.hl --twice external_once|unknown_reported|replay_equal
 input_unchecked examples/codex_agent.hl --twice tool_admitted
 retire_skipped docs/snippets/compaction.hl --twice checkpoint_compacted
 seal_skipped docs/snippets/compaction.hl --twice checkpoint_compacted

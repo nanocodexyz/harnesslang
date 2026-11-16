@@ -773,6 +773,40 @@ pub struct Model {
     pub modes: Vec<String>,
     pub settings: Vec<Setting>,
     pub interrupts: Interrupts,
+    pub wire: Option<Wire>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Anthropic,
+    Openai,
+}
+
+impl Wire {
+    pub const SETTINGS: [&'static str; 4] = ["url", "headers", "head", "tail"];
+    pub const PREAMBLE: &'static str = "preamble";
+
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::Openai),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+        }
+    }
+
+    pub const fn answer(self) -> &'static str {
+        match self {
+            Self::Anthropic => "answer",
+            Self::Openai => "message",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
