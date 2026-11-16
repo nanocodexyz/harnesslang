@@ -1520,3 +1520,15 @@ Native deploys already shipped `program.wasm`, and once hl-agent runs every prog
 - Lost: the Rust-only differential plants without a wasm counterpart (bound_message, double_fsync, batch_seq_from_zero, enum_unchecked, nested_flush_after_dispatch, timeout_rides, nested_enum_unchecked, default_unfilled, text_before_whole, text_after_kept, payment_unset, paid_outcome_original, recover_skipped, fork_entry_ignored), and the drill mutations that planted emitted Rust (nested_flush_after_dispatch, timeout_rides, cell_recovery_*, cell_ids_restart_at_checkpoint). Each needs a wasm plant in `src/emit/wasm` to come back.
 - Docs describe `program.wasm` and the fixed hosts; no doc shows emitted source.
 
+## 2026-11-16: the plants lost with the Rust and JavaScript backends are wasm plants
+
+Twelve of the fourteen differential plants that existed only in the deleted Rust and JavaScript backends, and the five drill mutations that planted emitted Rust, are now entries of `emit::wasm::PLANTS`: `hl emit --format wasm --plant <name>` writes the bug into the module, and `scripts/mutations.sh` plans each one against the wasm differential, which catches it as `backend_equal`.
+
+- bound_message (a bound's decode error loses its closing parenthesis), enum_unchecked and nested_enum_unchecked (a tool's or nested tool's output skips its return type check), default_unfilled (a tool's input skips its defaults), text_before_whole and text_after_kept (`before` returns the whole text; `after` keeps the separator), payment_unset (a paid call's input never gets its payment field), paid_outcome_original (a paid call's outcome arm tests the wrong value), recover_skipped (a recoverable tool is never asked to recover), fork_entry_ignored (a fork's entry checkpoint is accepted but dropped): caught on all five targets.
+- nested_flush_after_dispatch (a nested external call dispatches before its call record is flushed): caught on native-jsonl, native-sqlite, server-postgres and vercel; Cloudflare flushes before every nested dispatch, so the plant flushes the same records there.
+- timeout_rides (a timed wait in a cell rides past an unsaved cell header): caught on the three native targets; Cloudflare and Vercel flush before every timed wait.
+- cell_recovery_reports_failed, cell_recovery_redispatches_external, cell_ids_restart_at_checkpoint: caught by the differential on all five targets. The crash drill does not run them: its native wasm host (`scripts/rust/module_drill_host.rs`) runs no code cells, and the cell drill host was Rust-source only.
+- Dropped, double_fsync: the module ends a flush with one `host_flush` call and the native host syncs; a module cannot sync twice.
+- Dropped, batch_seq_from_zero: the SQL store numbers a batch's rows on the host from its head; the module passes only lines, so it cannot number them.
+
+The program's lowered text now joins the runtime text before plants apply, so a plant can name lowered code (paid_outcome_original does); every earlier plant names runtime text, which comes first, so none of them moved. Differential plants: 38 to 53.

@@ -32,7 +32,7 @@ pub const RUNTIME: [&str; 22] = [
     include_str!("runtime/host.wat"),
 ];
 
-pub const PLANTS: [(&str, &str, &str); 38] = [
+pub const PLANTS: [(&str, &str, &str); 53] = [
     (
         "flush_after_dispatch",
         "(if (i32.or (local.get $required) (i32.and (call $target_gate)",
@@ -219,6 +219,81 @@ pub const PLANTS: [(&str, &str, &str); 38] = [
         "(call $append (call $record_nested_result (local.get $call) (local.get $output)))",
         "(drop (local.get $output))",
     ),
+    (
+        "bound_message",
+        "(global.set $decode_error (call $wrapped (i32.const $s_bound_open) (i32.load offset=12 (local.get $type)) (i32.const $s_close_paren)))",
+        "(global.set $decode_error (call $wrapped (i32.const $s_bound_open) (i32.load offset=12 (local.get $type)) (i32.const $s_empty)))",
+    ),
+    (
+        "enum_unchecked",
+        "(else (local.set $output (call $checked (local.get $tool) (local.get $returns) (local.get $output)))))",
+        "(else (local.set $output (local.get $output))))",
+    ),
+    (
+        "nested_flush_after_dispatch",
+        "(if (i32.or (local.get $required) (call $target_gate))",
+        "(if (i32.or (i32.const 0) (call $target_gate))",
+    ),
+    (
+        "timeout_rides",
+        "(if (i32.or (global.get $c_header_unsaved) (i32.or (call $target_gate) (call $target_in_step)))",
+        "(if (i32.or (i32.const 0) (i32.or (call $target_gate) (call $target_in_step)))",
+    ),
+    (
+        "nested_enum_unchecked",
+        "(call $checked (i32.load offset=16 (local.get $call)) (i32.load offset=16 (local.get $tool)) (local.get $output)))",
+        "(local.get $output))",
+    ),
+    (
+        "default_unfilled",
+        "(local.set $at (local.get $count))\n  (local.set $index (i32.const 0))\n  block $filled_all",
+        "(i32.store offset=4 (local.get $input) (local.get $count))\n  (local.set $at (local.get $count))\n  (local.set $index (local.get $params))\n  block $filled_all",
+    ),
+    (
+        "text_before_whole",
+        "(call $text_value (call $text_slice (local.get $text) (i32.const 0) (local.get $at)))",
+        "(local.get $subject)",
+    ),
+    (
+        "text_after_kept",
+        "(i32.add (local.get $at) (call $text_len (call $value_text (local.get $separator))))",
+        "(local.get $at)",
+    ),
+    (
+        "payment_unset",
+        "(if (i32.eqz (local.get $node)) (then (return (local.get $input))))",
+        "(if (i32.const 1) (then (return (local.get $input))))",
+    ),
+    (
+        "paid_outcome_original",
+        "  i64.eqz\n  if (result i64)\n  i32.const 0\n",
+        "  i64.const -1\n  i64.eq\n  if (result i64)\n  i32.const 0\n",
+    ),
+    (
+        "recover_skipped",
+        "(if (i32.eqz (call $tool_recoverable (local.get $tool))) (then (return (global.get $RECOVERED_UNKNOWN))))",
+        "(if (i32.const 1) (then (return (global.get $RECOVERED_UNKNOWN))))",
+    ),
+    (
+        "fork_entry_ignored",
+        "(then (return (call $fold_fail (i32.const $s_fold_checkpoint)))))\n      (local.set $checkpoint",
+        "(then (return (call $fold_fail (i32.const $s_fold_checkpoint)))))\n      (if (call $entry_allowed (local.get $turn)) (then (return (i32.const 1))))\n      (local.set $checkpoint",
+    ),
+    (
+        "cell_recovery_reports_failed",
+        "(i32.const $k_outcome) (call $str (i32.const $s_unknown))))",
+        "(i32.const $k_outcome) (call $str (i32.const $s_failed))))",
+    ),
+    (
+        "cell_recovery_redispatches_external",
+        "(then (call $cell_unknown (local.get $call)) (return))",
+        "(then (call $cell_run_dispatch (local.get $call) (global.get $EFFECT_EXTERNAL) (i32.const 0) (i32.const 0)) (return))",
+    ),
+    (
+        "cell_ids_restart_at_checkpoint",
+        "(i64.add (i64.load (call $vec_at (global.get $cell_origins) (i32.sub (local.get $count) (i32.const 1)))) (i64.const 1)))",
+        "(i64.const 1))",
+    ),
 ];
 
 const BYTE_VALUES: usize = 256;
@@ -267,6 +342,7 @@ pub fn emit_text_planted(program: &Program, target: Target, plant: &str) -> Resu
     text.push_str(&crc_table());
     text.push_str(&base64_table());
     text.push_str(&json_special_table());
+    text.push_str(&lower::program_text(program, target)?);
     if plant != "none" {
         let Some((_, from, to)) = PLANTS.iter().find(|(name, _, _)| *name == plant) else {
             return Err(format!("unknown wasm plant {plant}"));
@@ -276,7 +352,6 @@ pub fn emit_text_planted(program: &Program, target: Target, plant: &str) -> Resu
         }
         text = text.replacen(from, to, 1);
     }
-    text.push_str(&lower::program_text(program, target)?);
     Ok(text)
 }
 

@@ -132,7 +132,22 @@ wasm cell_leaks docs/snippets/code_wait.hl native-jsonl,native-sqlite,server-pos
 wasm cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm nested_recovery_skipped examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
 wasm nested_result_unjournaled examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
-wasm fold_arms_flipped examples/minimal.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal"
+wasm fold_arms_flipped examples/minimal.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm bound_message examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm enum_unchecked examples/hooks.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm nested_flush_after_dispatch examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,vercel backend_equal
+wasm timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
+wasm nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm text_after_kept docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm payment_unset docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm paid_outcome_original docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm recover_skipped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm fork_entry_ignored docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm cell_recovery_reports_failed examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm cell_recovery_redispatches_external examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm cell_ids_restart_at_checkpoint examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal"
 diff_exempt="wasm crc_skipped native-sqlite: only native-jsonl writes a checksum per line, so the planted change runs on no other target
 wasm crc_skipped server-postgres: only native-jsonl writes a checksum per line, so the planted change runs on no other target
 wasm crc_skipped cloudflare: only native-jsonl writes a checksum per line, so the planted change runs on no other target
@@ -145,7 +160,10 @@ wasm batch_drain_skipped vercel: Vercel drains its inbox after a flush, not afte
 wasm cancel_read_unstamped native-jsonl: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 118
 wasm cancel_read_unstamped native-sqlite: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 206
 wasm cancel_read_unstamped server-postgres: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 401
-wasm cancel_read_unstamped cloudflare: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 206"
+wasm cancel_read_unstamped cloudflare: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 206
+wasm nested_flush_after_dispatch cloudflare: Cloudflare flushes before every nested dispatch, so dropping the external-call condition flushes the same records
+wasm timeout_rides cloudflare: Cloudflare flushes before every timed wait, so dropping the unsaved-header condition flushes the same records
+wasm timeout_rides vercel: Vercel flushes before every timed wait inside its step, so dropping the unsaved-header condition flushes the same records"
 caught_elsewhere=scripts/strict.sh
 
 [ -x "$hl" ] || cargo build --release --locked
