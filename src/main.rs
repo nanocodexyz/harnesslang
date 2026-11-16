@@ -19,7 +19,7 @@ use harnesslang::load::{load, load_within};
 fn usage() -> ExitCode {
     eprintln!(
         "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format wasm|mjs|wat|source] [--plant NAME] FILE
-       hl wasm-sim --target {targets} --module FILE.wasm --trace TRACE.jsonl
+       hl wasm-sim --target {targets} --module FILE.wasm --trace TRACE.jsonl [--records-max HANDLER=N]... [--requests-max HANDLER=N]...
        hl bundle --target {targets} --out DIR [--plant NAME] FILE
        {deploy}
        {prove}",
@@ -658,8 +658,24 @@ fn assemble_command(args: &[String]) -> ExitCode {
 
 fn wasm_sim_command(args: &[String]) -> ExitCode {
     let (mut target, mut module, mut trace) = (None, None, None);
+    let mut bounds = harnesslang::wasm::sim::Bounds::default();
     let mut words = args.iter();
     while let Some(arg) = words.next() {
+        let bound = match arg.as_str() {
+            "--records-max" => Some(&mut bounds.records_per_run),
+            "--requests-max" => Some(&mut bounds.requests_per_run),
+            _ => None,
+        };
+        if let Some(bound) = bound {
+            let Some((handler, value)) = words.next().and_then(|word| word.split_once('=')) else {
+                return usage();
+            };
+            let Ok(value) = value.parse::<u64>() else {
+                return usage();
+            };
+            bound.insert(handler.to_owned(), value);
+            continue;
+        }
         let slot = match arg.as_str() {
             "--target" => &mut target,
             "--module" => &mut module,
@@ -690,7 +706,7 @@ fn wasm_sim_command(args: &[String]) -> ExitCode {
     };
     let origin = std::time::Instant::now();
     let clock = || origin.elapsed().as_secs_f64() * 1000.0;
-    match harnesslang::wasm::sim::replay(&target, &bytes, &text, &clock) {
+    match harnesslang::wasm::sim::replay(&target, &bytes, &text, &clock, &bounds) {
         harnesslang::wasm::sim::Outcome::Passed(summary) => {
             println!("{summary}");
             ExitCode::SUCCESS

@@ -1,0 +1,3 @@
+emitted_source_lines 967299
+host_lines_beyond_fixed 11255
+programs_not_on_wasm 94
