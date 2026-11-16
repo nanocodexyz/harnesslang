@@ -112,12 +112,12 @@ pub fn request(handler: &str, turn: u64, arguments: Json) -> Json {
 }
 
 pub fn object(fields: Vec<(&str, Json)>) -> Json {
-    Json::Object(
-        fields
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect(),
-    )
+    let mut fields: Vec<(String, Json)> = fields
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+    fields.sort_by(|left, right| left.0.cmp(&right.0));
+    Json::Object(fields)
 }
 
 fn number(json: &Json, what: &str) -> Result<u64, String> {
