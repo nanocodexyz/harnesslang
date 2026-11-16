@@ -1532,3 +1532,14 @@ Twelve of the fourteen differential plants that existed only in the deleted Rust
 - Dropped, batch_seq_from_zero: the SQL store numbers a batch's rows on the host from its head; the module passes only lines, so it cannot number them.
 
 The program's lowered text now joins the runtime text before plants apply, so a plant can name lowered code (paid_outcome_original does); every earlier plant names runtime text, which comes first, so none of them moved. Differential plants: 38 to 53.
+
+## 2026-11-16: the fixed Cloudflare and Vercel hosts answer recover, jobs and hold, and take side model calls on the model import
+
+Nine of the 26 platform-pending pairs failed on the fixed hosts for reasons the hosts could fix without a decision of their own:
+
+- `recover`, `jobs` and `hold`: the module asks these through `world` (docs/LANGUAGE.md, Hosts), and the hosts threw on them. Both now forward `recover` and `jobs` to `HL_RECOVER_URL` and `HL_JOBS_URL` and answer `unknown` and `[]` without them, and answer `hold` as a sleep. `scripts/js-sim.mjs` serves both URLs from the trace, so the sim drives the same code a deploy runs instead of overriding the host's methods.
+- Hook points: the hosts named only the five run points and refused a cell's eight; they now carry all thirteen, with the nested-call effect on `cell_before_nested` and `cell_after_nested`.
+- Side model calls went to the host as a `side_model` world request carrying the context checksum, which only the simulators read. The runtime now sends them through the `model` import like any model call (turn 0 marks a side); `hl wasm-sim` and `scripts/wasm-sim.mjs` check the side's seq, mode, settings and context checksum against the trace there, so the trace and its checks are unchanged.
+- A side answer was reported to the sim's `sided` hook when it was taken from a leftover `asked` of an earlier run; the hosts now report only an answer asked in the same run.
+
+Host growth: cloudflare.mjs 769 to 787 lines, vercel.mjs plus vercel-session.mjs 619 to 637. Nine pairs leave the pending list (89 of 106 platform pairs pass at seeds 0..10); the cell-world requests on both hosts and Vercel's in-step events remain.

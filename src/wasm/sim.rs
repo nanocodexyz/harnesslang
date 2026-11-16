@@ -3,6 +3,7 @@ use super::exec::{Instance, Limits};
 use super::js::{Json, parse, short};
 use super::{Error, Host, Value};
 use crate::run::crc::crc32;
+use crate::run::side::SIDE_TURN;
 
 pub const DETAIL_CHARACTERS_MAX: usize = 400;
 const WORD_BITS: u32 = 32;
@@ -861,6 +862,9 @@ impl<'e> World<'_, 'e, '_> {
         args: &[Value],
     ) -> Result<Option<Value>, Error<Stop>> {
         let request = self.json(instance, args).map_err(Error::Stop)?;
+        if request.get("turn").bigint() == Ok(SIDE_TURN as i64) {
+            return self.side_model(instance, &request);
+        }
         let detail = format!(
             "{}/{}",
             request.get("turn").concat(),
@@ -902,6 +906,43 @@ impl<'e> World<'_, 'e, '_> {
         })();
         checked.map_err(Error::Stop)?;
         self.seed.answered(format!("the model response {detail}"));
+        self.give_json(instance, event.get("response"))
+    }
+
+    fn side_model(
+        &mut self,
+        instance: &mut Instance,
+        request: &Json,
+    ) -> Result<Option<Value>, Error<Stop>> {
+        let detail = format!("side {}", request.get("seq").concat());
+        let event = self
+            .seed
+            .next(self.context, "side_model", &detail)
+            .map_err(Error::Stop)?;
+        let encoded = match request.get("context") {
+            Json::Undefined => String::new(),
+            other => other.encode(),
+        };
+        let checked = (|| {
+            same("side_model seq", event.get("seq"), request.get("seq"))?;
+            same(
+                "side_model mode",
+                event.get("mode").or_null(),
+                request.get("mode").or_null(),
+            )?;
+            same(
+                "side_model settings",
+                event.get("settings").or_null(),
+                request.get("settings").or_null(),
+            )?;
+            same(
+                "side_model context_crc",
+                event.get("context_crc"),
+                &Json::int(crc32(encoded.as_bytes())),
+            )
+        })();
+        checked.map_err(Error::Stop)?;
+        self.context.stats.world += 1;
         self.give_json(instance, event.get("response"))
     }
 

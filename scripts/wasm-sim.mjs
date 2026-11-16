@@ -358,6 +358,15 @@ class Instance {
       tool: (at, length) => this.giveText(encodeJson(this.toolEvent(parseJson(this.text(at, length))))),
       model: (at, length) => {
         const request = parseJson(this.text(at, length));
+        if (request.turn === 0n) {
+          const side = seed.next("side_model", "side " + request.seq);
+          same("side_model seq", side.seq, request.seq);
+          same("side_model mode", side.mode ?? null, request.mode ?? null);
+          same("side_model settings", side.settings ?? null, request.settings ?? null);
+          same("side_model context_crc", side.context_crc, BigInt(crc32(encoder.encode(encodeJson(request.context)))));
+          stats.world += 1;
+          return this.giveText(encodeJson(side.response));
+        }
         const event = seed.next("model", request.turn + "/" + request.seq);
         same("model call turn", event.turn, request.turn);
         same("model call seq", event.seq, request.seq);

@@ -8,6 +8,8 @@ import * as rt from "./js-sim-records.mjs";
 
 const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
+const RECOVER_URL = "https://tools.simulation.invalid/recover";
+const JOBS_URL = "https://tools.simulation.invalid/jobs";
 const LISTINGS_URL = "https://listings.simulation.invalid/list";
 const TURN_URL = "https://harness.simulation.invalid/turn";
 const SIDE_URL = "https://harness.simulation.invalid/side";
@@ -271,7 +273,7 @@ class Seed {
     same("recover tool", event.tool, request.tool);
     same("recover input", event.input, request.input);
     this.stats.recovers += 1;
-    return rt.recoveredFrom(event.answer);
+    return event.answer;
   }
 
   jobs(turn, open) {
@@ -443,9 +445,11 @@ class Seed {
         const response = seed.model({ turn: body.turn, seq: body.seq, calls_max: body.calls_max, mode: body.mode ?? null, settings: body.settings ?? null, context: body.context });
         return new Response(rt.encodeJson(response), { status: HTTP_OK });
       }
+      if (url === RECOVER_URL) return new Response(rt.encodeJson(seed.recover(body)), { status: HTTP_OK });
+      if (url === JOBS_URL) return new Response(rt.encodeJson(seed.jobs(body.turn, body.open)), { status: HTTP_OK });
       throw new Error(`unexpected fetch of ${url}`);
     };
-    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
+    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, recoverUrl: RECOVER_URL, jobsUrl: JOBS_URL, now: () => seed.now(), random: () => seed.random() });
     const tool = host.tool;
     return {
       ...host,
@@ -465,12 +469,6 @@ class Seed {
       },
       async hold(turn, seq, untilMs) {
         return seed.sleep(turn, seq, untilMs, "hold");
-      },
-      async recover(request) {
-        return seed.recover(request);
-      },
-      async jobs(turn, open) {
-        return seed.jobs(turn, open);
       },
       async observe(event) {
         seed.cells.observe(event);

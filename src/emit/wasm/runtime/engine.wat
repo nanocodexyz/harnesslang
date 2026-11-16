@@ -468,10 +468,7 @@
   (local.set $buffer (call $model_request_blobs (local.get $buffer)))
   (if (local.get $preempted)
     (then (local.set $response (call $interrupted_response)))
-    (else
-      (if (global.get $side)
-        (then (local.set $response (call $side_model (local.get $buffer) (local.get $seq))))
-        (else (local.set $response (call $host_json (call $host_model (call $buf_data (local.get $buffer)) (call $buf_length (local.get $buffer)))))))))
+    (else (local.set $response (call $host_json (call $host_model (call $buf_data (local.get $buffer)) (call $buf_length (local.get $buffer)))))))
   (call $hook (global.get $POINT_AFTER_RUN) (global.get $KIND_MODEL) (call $call_effect (local.get $call)))
   (local.set $before (call $events_now))
   (call $drain_interrupting (local.get $interrupts))

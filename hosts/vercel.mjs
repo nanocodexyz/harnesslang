@@ -8,8 +8,9 @@ const LINE_END = "\n";
 const WORD_BITS = 32n;
 const LOW_WORD = 0xffffffffn;
 const U64_MAX = 0xffffffffffffffffn;
-const POINTS = ["before_flush", "after_flush", "before_run", "after_run", "before_acknowledge"];
+const POINTS = ["before_flush", "after_flush", "before_run", "after_run", "before_acknowledge", "cell_before_header", "cell_after_header", "cell_entry", "cell_before_nested", "cell_after_nested", "cell_waiting", "cell_before_finished", "cell_after_finished"];
 const RUN_POINTS = ["before_run", "after_run"];
+const NESTED_POINTS = ["cell_before_nested", "cell_after_nested"];
 const KINDS = ["tool", "dispatch", "model", "now", "random", "listing", "cell", "wait", "hold", "suspend", "deny"];
 const EFFECTS = ["none", "idempotent", "external"];
 const POINT_AFTER_FLUSH = { point: "after_flush" };
@@ -111,6 +112,7 @@ function finishFromJson(json) {
 function pointOf(point, kind, effect) {
   const name = POINTS[point];
   assert(name !== undefined, "a hook names a point");
+  if (NESTED_POINTS.includes(name)) return { point: name, effect: EFFECTS[effect] };
   if (!RUN_POINTS.includes(name)) return { point: name };
   return { point: name, kind: KINDS[kind], effect: EFFECTS[effect] };
 }
@@ -168,6 +170,12 @@ function defaultHost(config) {
     model(text) {
       return post(config.modelUrl, text);
     },
+    recover(text) {
+      return config.recoverUrl === undefined ? '"unknown"' : post(config.recoverUrl, text);
+    },
+    jobs(text) {
+      return config.jobsUrl === undefined ? "[]" : post(config.jobsUrl, text);
+    },
     now() {
       return BigInt(config.now());
     },
@@ -179,6 +187,9 @@ function defaultHost(config) {
       if (left > 0) await new Promise((resolve) => setTimeout(resolve, left));
       const clock = BigInt(config.now());
       return clock > untilMs ? clock : untilMs;
+    },
+    hold(turn, seq, untilMs) {
+      return this.sleep(turn, seq, untilMs);
     },
     random() {
       return u64(config.random(), "random");
@@ -347,6 +358,8 @@ class StepWorld {
         return encodeJson({ answer: u64(await host.clock(), "the clock") });
       case "sleep":
         return encodeJson({ clock: u64(await host.sleep(Number(request.turn), Number(request.seq), request.until), "the clock") });
+      case "hold":
+        return encodeJson({ clock: u64(await host.hold(Number(request.turn), Number(request.seq), request.until), "the clock") });
       case "resume": {
         const suspension = { turn: Number(request.turn), seq: Number(request.seq) };
         const resume = this.context.resume !== undefined ? await this.context.resume(suspension) : this.delivered;
@@ -362,12 +375,14 @@ class StepWorld {
       }
       case "listing":
         return '{"output":' + (await host.listing(encodeJson({ listing: request.listing, seq: request.seq, turn: request.turn }))) + "}";
+      case "recover":
+        return '{"answer":' + (await host.recover(encodeJson({ input: request.input, seq: request.seq, tool: request.tool, turn: request.turn }))) + "}";
+      case "jobs":
+        return '{"answer":' + (await host.jobs(encodeJson({ open: request.open, turn: request.turn }))) + "}";
       case "side":
         return this.side(request);
       case "side_tool":
         return '{"output":' + (await host.tool(encodeJson({ input: request.input, nested: null, seq: request.seq, tool: request.tool, turn: 0n }))) + "}";
-      case "side_model":
-        throw new Panic("a side question's model request carries the context's checksum, not the context a model host needs");
       case "side_answer":
         return this.sided(request);
       case "inbox":
@@ -385,13 +400,14 @@ class StepWorld {
     }
     const asked = this.context.side === undefined ? null : await this.context.side(Number(request.turn), Number(request.seq));
     this.asked = asked;
+    this.askedInRun = asked !== null;
     return asked === null ? "null" : encodeJson(asked);
   }
 
   async sided(answer) {
     const { event, ...fields } = answer;
     this.sideAnswer = fields;
-    if (this.context.sided !== undefined && this.asked !== null) await this.context.sided(this.asked, fields);
+    if (this.context.sided !== undefined && this.askedInRun === true) await this.context.sided(this.asked, fields);
     return "{}";
   }
 
