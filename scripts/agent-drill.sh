@@ -19,10 +19,26 @@ plant="${AGENT_DRILL_PLANT:-none}"
 seed="${AGENT_DRILL_SEED:-1}"
 out=output/agent-drill-$mode
 [ "$plant" = none ] || out="$out-$plant"
-target=agent/target
-[ "$plant" = none ] || target=output/agent-target-$plant
-agent=$target/release/hl-agent
-mock=$target/release/mock-messages
+host="${DRILL_HOST:-hl-agent}"
+case "$host" in
+  hl-agent)
+    target=agent/target
+    [ "$plant" = none ] || target=output/agent-target-$plant
+    manifest=agent/Cargo.toml
+    mock=$target/release/mock-messages
+    ;;
+  hl-host)
+    target=hosts/native/target
+    [ "$plant" = none ] || target=output/host-target-$plant
+    manifest=hosts/native/Cargo.toml
+    mock=scripts/fixtures/target/release/mock-messages
+    ;;
+  *)
+    echo "agent-drill: unknown DRILL_HOST $host (hl-agent, hl-host)" >&2
+    exit 2
+    ;;
+esac
+agent=$target/release/$host
 killed_status=137
 
 finished=0
@@ -48,7 +64,8 @@ case "$plant" in
 esac
 
 cargo build --release --locked -j2 --quiet
-HL_AGENT_PLANT="$wasm_plant" CARGO_TARGET_DIR="$(pwd)/$target" cargo build --release --locked -j2 --quiet --manifest-path agent/Cargo.toml
+HL_AGENT_PLANT="$wasm_plant" CARGO_TARGET_DIR="$(pwd)/$target" cargo build --release --locked -j2 --quiet --manifest-path "$manifest"
+[ "$host" = hl-agent ] || cargo build --release --locked -j2 --quiet --manifest-path scripts/fixtures/Cargo.toml
 
 rm -rf "$out"
 mkdir -p "$out/ws"
@@ -162,7 +179,7 @@ for attempt in $(seq 1 "$kills_max"); do
     if [ "$status" -eq "$killed_status" ]; then
       kills=$((kills + 1))
       case "$last" in
-        "hl-agent["*) kills_child=$((kills_child + 1)) ;;
+        "$host["*) kills_child=$((kills_child + 1)) ;;
       esac
       case "$last" in
         *" model "*) kills_model=$((kills_model + 1)) ;;
@@ -186,7 +203,7 @@ if [ "$status" != 0 ]; then
   set -e
 fi
 if [ "$status" -ne 0 ]; then
-  echo "agent-drill: hl-agent exited $status after $kills kills" >&2
+  echo "agent-drill: $host exited $status after $kills kills" >&2
   tail -n 20 "$out/agent.err" >&2
   exit 1
 fi
