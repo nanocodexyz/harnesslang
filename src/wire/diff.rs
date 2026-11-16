@@ -34,12 +34,25 @@ pub const PROBE: &str = r#"
 (text $p_interruptible "interruptible")
 (text $p_request "request")
 (text $p_error "error")
+(text $p_blobs "blobs")
+(func $probe_hold (param $blobs i32) (local $index i32)
+  (global.set $blob_held (call $vec_new (global.get $BLOB_ENTRY_BYTES)))
+  (if (i32.eqz (local.get $blobs)) (then (return)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (call $json_count (local.get $blobs))))
+      (call $blob_hold (call $json_key (local.get $blobs) (local.get $index)) (call $json_text (call $json_value (local.get $blobs) (local.get $index))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end)
 (func $wire_probe (export "hl_wire_probe") (param $bytes i32) (param $length i32) (result i64) (local $input i32) (local $wire i32) (local $mode i32) (local $buffer i32)
   (local.set $input (call $json_parse_bytes (local.get $bytes) (local.get $length)))
   (local.set $wire (i32.wrap_i64 (call $json_number_value (call $json_get (local.get $input) (i32.const $p_wire)))))
   (if (call $text_eq (call $json_text (call $json_get (local.get $input) (i32.const $p_op))) (i32.const $p_request))
     (then
       (global.set $turn (call $json_number_value (call $json_get (local.get $input) (i32.const $p_turn))))
+      (call $probe_hold (call $json_get (local.get $input) (i32.const $p_blobs)))
       (local.set $mode (call $json_get (local.get $input) (i32.const $p_mode)))
       (if (local.get $mode) (then (local.set $mode (call $json_text (local.get $mode)))))
       (local.set $buffer (call $wire_request (local.get $wire)
@@ -167,7 +180,7 @@ const TEXTS: [&str; 14] = [
     "quote \" and backslash \\",
     "tab\tand\rreturn",
     "control \u{1}\u{1f}",
-    "unicode é ✓ 🚀",
+    "unicode Ã© â ð",
     "{\"json\":\"looking\"}",
     "Please try again in 1.5s.",
     "rate limited, try again in 250ms",
@@ -210,6 +223,35 @@ const CODES: [&str; 16] = [
 ];
 
 const STATUSES: [u64; 12] = [200, 400, 401, 404, 408, 409, 413, 429, 500, 502, 503, 529];
+
+const BLOBS: [(&str, &[u8]); 10] = [
+    ("sha256:png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+    ("sha256:png-cut", b"\x89PNG\r\n"),
+    ("sha256:jpeg", b"\xff\xd8\xff\xe0\0\x10JFIF"),
+    ("sha256:gif87", b"GIF87a\x01\0"),
+    ("sha256:gif89", b"GIF89a"),
+    ("sha256:webp", b"RIFF\x24\0\0\0WEBPVP8 "),
+    ("sha256:wave", b"RIFF\x24\0\0\0WAVEfmt "),
+    ("sha256:riff-cut", b"RIFF\x24\0\0\0WEB"),
+    ("sha256:text", b"plain words"),
+    ("sha256:empty", b""),
+];
+
+const BLOB_ABSENT: &str = "sha256:absent";
+
+fn blobs() -> Json {
+    Json::Object(
+        BLOBS
+            .iter()
+            .map(|(digest, bytes)| {
+                (
+                    (*digest).to_owned(),
+                    Json::String(crate::run::blob::base64_encode(bytes)),
+                )
+            })
+            .collect(),
+    )
+}
 
 struct Gen {
     rng: Rng,
@@ -396,7 +438,7 @@ impl Gen {
     }
 
     fn entry(&mut self, wire: Wire) -> Json {
-        let (name, value) = match self.rng.below(7) {
+        let (name, value) = match self.rng.below(8) {
             0 => ("user", Json::String(self.text())),
             1 | 2 => ("assistant", self.reply(wire)),
             3 => (
@@ -408,6 +450,15 @@ impl Gen {
                 Json::Array(vec![self.call(), Json::String(self.text())]),
             ),
             5 => ("unknown", self.call()),
+            6 => {
+                let digest = if self.percent(10) {
+                    BLOB_ABSENT
+                } else {
+                    BLOBS[self.rng.pick(BLOBS.len())].0
+                };
+                let blob = Json::object([("blob", Json::text(digest))]);
+                ("attached", Json::Array(vec![self.call(), blob]))
+            }
             _ => ("notice", Json::String(self.text())),
         };
         Json::object([(name, value)])
@@ -608,7 +659,14 @@ fn request_rust(wire: Wire, input: &Json) -> String {
         settings: field("settings"),
         context: field("context").expect("a probe carries a context"),
     };
-    match crate::wire::request(&request, &|_| None) {
+    let held = field("blobs");
+    let attached = |digest: &str| {
+        let data = held?.get(digest)?.as_str()?;
+        let bytes = crate::run::blob::base64_decode(data).ok()?;
+        let media_type = crate::wire::media_type(&bytes).unwrap_or(crate::wire::MEDIA_TYPE_DEFAULT);
+        Some((media_type.to_owned(), data.to_owned()))
+    };
+    match crate::wire::request(&request, &attached) {
         Ok(json) => json.encode(),
         Err(error) => Json::object([("error", Json::String(error))]).encode(),
     }
@@ -638,6 +696,7 @@ pub fn case(seed: u64, wire: Wire) -> (Json, Json) {
         ("seq", Json::Number(generator.rng.below(500))),
         ("context", generator.context(wire)),
         ("settings", generator.settings()),
+        ("blobs", blobs()),
     ];
     match generator.rng.below(3) {
         0 => request.push(("mode", Json::text("refresh"))),
