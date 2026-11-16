@@ -12,6 +12,7 @@ pub const METHOD: &str = "POST";
 pub const STOPPED: &str = "the request was stopped";
 pub const MALFORMED: &str = "the host's answer to a wire model call is malformed";
 pub const MILLISECONDS_PER_SECOND: u64 = 1_000;
+pub const MEDIA_TYPE_DEFAULT: &str = "application/octet-stream";
 const PNG_SIGNATURE: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff];
 const GIF_SIGNATURES: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];

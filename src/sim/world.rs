@@ -947,14 +947,17 @@ impl World for SimWorld<'_> {
 
     fn model(&mut self, request: &ModelRequest<'_>) -> Json {
         if request.turn == SIDE_TURN {
-            return self.side_model_reply(request);
+            let drawn = self.side_model_reply(request);
+            let (response, answer) = wired(self.program, request, drawn);
+            return answer.unwrap_or(response);
         }
         self.count_effect(true);
         self.change_listings(LISTING_CHANGE_PPM);
         if let Some(think_ms) = crate::sim::cell::think_ms_max(self.program) {
             self.clock += self.rng.range(1, think_ms);
         }
-        let response = self.reply(request);
+        let drawn = self.reply(request);
+        let (response, answer) = wired(self.program, request, drawn);
         self.model_modes
             .entry((request.turn, request.seq))
             .or_default()
@@ -991,9 +994,15 @@ impl World for SimWorld<'_> {
             if let Some(settings) = request.settings {
                 fields.push((crate::run::journal::MODEL_SETTINGS, settings.clone()));
             }
+            if let Some(http) = request.http {
+                fields.push(("http", http.clone()));
+            }
+            if let Some(answer) = &answer {
+                fields.push(("answer", answer.clone()));
+            }
             fields
         });
-        response
+        answer.unwrap_or(response)
     }
 
     fn now(&mut self) -> u64 {
@@ -2055,4 +2064,16 @@ impl SimWorld<'_> {
         }
         self.acks.push(finish.clone());
     }
+}
+
+pub fn wired(program: &Program, request: &ModelRequest<'_>, drawn: Json) -> (Json, Option<Json>) {
+    let Some(model) = program.model.as_ref() else {
+        return (drawn, None);
+    };
+    let (Some(wire), Some(_)) = (model.wire, request.http) else {
+        return (drawn, None);
+    };
+    let answer = crate::wire::encode(wire, &drawn);
+    let canonical = crate::wire::decode(wire, &answer, model.interrupts.any());
+    (canonical, Some(answer))
 }

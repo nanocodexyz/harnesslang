@@ -628,7 +628,6 @@ pub fn encode(attempt: &Json) -> wire::Answer {
             let stop = fields.get(1).and_then(Json::as_str).unwrap_or("");
             let reason = STOPS
                 .iter()
-                .rev()
                 .find(|(drawn, _)| *drawn == stop)
                 .map_or("end_turn", |(_, wired)| *wired);
             let head = Value::object([
