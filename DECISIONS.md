@@ -1455,6 +1455,12 @@ Event intake records (`"record":{"event":…}`, a steer or other event taken int
 
 
 `proved_external_once` mirrors the fixed host's epoch fence: a dispatch from an owner whose epoch is below the one that last dispatched the call is refused by the host (the trace answers it failed) and is not counted, as the interpreter's world does; and a second owner taking over inside a hook leaves the outer run's epoch, unflushed answer and per-run counts as they were when it returns.
+## 2026-11-16: a native host stores its journal through a Store
+
+`harnesslang::wasm::native::run` and `idle` take any `Store` (`read`, `append(epoch, bytes)`, `keep(length)`, `epoch`) instead of the jsonl `Journal`, and pass the store's epoch to `hl_run` and `hl_idle`. `Journal` is the jsonl store with one owner at epoch 0, so every caller that passes a `Journal` is unchanged. A store that fences takeovers (SQLite, Postgres) refuses an append whose epoch is no longer the session's, and the run stops there; that is the seam the SQL drills and the fixed native host's SQL storage plug into, now that native-sqlite and server-postgres ship compiled wasm.
+
+
+The SQL crash and takeover drill (`scripts/rust-sql-drill.sh`) now runs the compiled `program.wasm` through `native::run` on a SQL `Store` (`scripts/rust/module_sql_drill_host.rs`) instead of the emitted Rust source: the store renders the journal catalogue of `src/emit/sql` (acquire with a lease, load, the fenced commit) against real SQLite and Postgres 16, kills the host and the Postgres backend with `kill -9`, and fences a paused owner after a takeover. `flush_after_dispatch` is the wasm plant; `no_fence` drops the fence predicate from the catalogue (`Mutation::NoFencePredicate`); both are caught (SQLite: external ran before its call record was durable; the paused owner exits 0, not fenced). The host starts each run at the turn after the last acknowledged one, and the kill window is 0..60 ms (was 0..30) because a wasm run replays the journal in the interpreter: at 30 ms SQLite session 1 never got past turn 5 in 400 kills. Measured: SQLite 4 sessions, 35 kills; Postgres 2 sessions, 26 kills (12 of the backend); takeover at externals 1..6 on both. `scripts/rust/sql_drill_host.rs` (the Rust-source host) is gone.
 
 
 ## 2026-11-16: gate.sh without agent/
