@@ -87,6 +87,13 @@ export class DurableCells {
   }
 }
 
+function doubles(rt, json) {
+  if (json instanceof rt.Fraction) return "double " + Number(json.text);
+  if (Array.isArray(json)) return json.map((item) => doubles(rt, item));
+  if (json === null || typeof json !== "object") return json;
+  return Object.fromEntries(Object.entries(json).map(([key, value]) => [key, doubles(rt, value)]));
+}
+
 export class TracedCells {
   constructor(seed, check) {
     this.seed = seed;
@@ -140,34 +147,30 @@ export class TracedCells {
       same("cell start cell", event.cell, BigInt(cell));
       same("cell start script", event.script, script);
       this.seed.stats.cells += 1;
-      const step = stepFromJson(rt, event.step);
-      this.check.checks.stepped(this.seed.stats.runs, cell, step);
-      return step;
+      this.check.checks.stepped(this.seed.stats.runs, cell, stepFromJson(rt, event.step));
+      return event.step;
     }, null);
   }
 
-  resume(cell, input) {
+  resume(cell, json) {
     const { rt, cursor, same } = this.check;
-    const json = inputJson(rt, input);
     return this.exchange(cell, "resume", json, () => {
       const event = cursor.next("cell_resume", `cell ${cell} ${rt.encodeJson(json)}`);
       same("cell resume cell", event.cell, BigInt(cell));
-      same("cell resume input", event.input, json);
-      const step = stepFromJson(rt, event.step);
-      this.check.checks.stepped(this.seed.stats.runs, cell, step);
-      return step;
-    }, input);
+      same("cell resume input", doubles(rt, event.input), doubles(rt, json));
+      this.check.checks.stepped(this.seed.stats.runs, cell, stepFromJson(rt, event.step));
+      return event.step;
+    }, json);
   }
 
-  observe(event) {
+  observe(cell, json) {
     const { rt, cursor, same } = this.check;
-    const json = eventJson(rt, event);
-    this.exchange(event.cell, "observe", json, () => {
+    this.exchange(cell, "observe", json, () => {
       const traced = cursor.next("cell", rt.encodeJson(json));
       same("cell event", traced.observed, json);
-      if (event.kind === "diverged") this.seed.stats.divergences += 1;
+      if (json.diverged !== undefined) this.seed.stats.divergences += 1;
       return null;
-    }, event);
+    }, json);
   }
 }
 

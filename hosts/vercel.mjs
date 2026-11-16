@@ -28,6 +28,14 @@ class StepEnd {
   }
 }
 
+const NO_CELLS = { waited: [], deadlines: [] };
+
+class StepWait {
+  constructor(request) {
+    this.wait = encodeJson({ cell: request.cell, timer: request.timer, until: request.until });
+  }
+}
+
 function assert(condition, message) {
   if (!condition) throw new Panic("assertion failed: " + message);
 }
@@ -176,6 +184,13 @@ function defaultHost(config) {
     jobs(text) {
       return config.jobsUrl === undefined ? "[]" : post(config.jobsUrl, text);
     },
+    cell(text) {
+      if (config.cellsUrl === undefined) throw new Panic("this module runs code cells, and HL_CELLS_URL names no cell engine");
+      return post(config.cellsUrl, text);
+    },
+    wait(cell, timer, untilMs) {
+      return this.sleep(0, 0, untilMs);
+    },
     now() {
       return BigInt(config.now());
     },
@@ -302,9 +317,12 @@ function suspensionIn(lines, exit) {
 }
 
 class StepWorld {
-  constructor(context, delivered) {
+  constructor(context, delivered, cells = NO_CELLS) {
     this.context = context;
     this.delivered = delivered;
+    this.waited = new Set(cells.waited);
+    this.deadlines = new Map(cells.deadlines);
+    this.pending = new Map();
     this.resuming = null;
     this.asked = null;
     this.sideAnswer = null;
@@ -360,6 +378,26 @@ class StepWorld {
         return encodeJson({ clock: u64(await host.sleep(Number(request.turn), Number(request.seq), request.until), "the clock") });
       case "hold":
         return encodeJson({ clock: u64(await host.hold(Number(request.turn), Number(request.seq), request.until), "the clock") });
+      case "cell_start":
+      case "cell_resume":
+      case "cell":
+        return host.cell(encodeJson(request));
+      case "tool":
+        return '{"output":' + (await host.tool(encodeJson({ effect: request.effect, input: request.input, nested: request.nested, seq: request.seq, tool: request.tool, turn: request.turn }))) + "}";
+      case "wait":
+        throw new StepWait(request);
+      case "waited": {
+        const answer = this.waited.has(request.cell + "/" + request.timer);
+        await this.context.observeWaited({ cell: Number(request.cell), timer: Number(request.timer) }, answer);
+        return encodeJson({ answer });
+      }
+      case "attempt":
+        return encodeJson({ answer: u64(await this.context.nestedAttempt(Number(request.turn), Number(request.seq), Number(request.nested)), "an attempt") });
+      case "deadline": {
+        const key = request.turn + "/" + request.site + "/" + request.cell;
+        if (!this.deadlines.has(key) && !this.pending.has(key)) this.pending.set(key, String(await host.now()));
+        return '{"answer":' + (this.deadlines.get(key) ?? this.pending.get(key)) + "}";
+      }
       case "resume": {
         const suspension = { turn: Number(request.turn), seq: Number(request.seq) };
         const resume = this.context.resume !== undefined ? await this.context.resume(suspension) : this.delivered;
@@ -456,13 +494,14 @@ async function runStep(input, context) {
   assert(input.kind === "run", "a step acknowledges, reads the idle due or runs");
   const request = checkedRequest(input.request);
   const delivered = input.resume === undefined || input.resume === null ? null : resumeFrom(decodeJson(input.resume));
-  const world = new StepWorld(context, delivered);
+  const world = new StepWorld(context, delivered, input.cells);
   let exit;
   try {
     exit = await new Instance(world).run(request.text, journalOf(input.lines));
   } catch (error) {
+    if (error instanceof StepWait) return { lines: [], wait: error.wait, deadlines: [...world.pending] };
     if (!(error instanceof StepEnd)) throw error;
-    const output = { lines: error.lines, deadlines: [] };
+    const output = { lines: error.lines, deadlines: [...world.pending] };
     const answered = world.resuming;
     if (answered !== null && error.lines.some((line) => {
       const { tag, body } = tagged(line);
@@ -516,6 +555,7 @@ async function driveTurn(platform, lines, state, requestText, known) {
   const stepsMax = (STEPS_PER_EFFECT_MAX + STEPS_PER_SUSPENSION_MAX) * Number(handler.effects_max) + STEPS_PER_TURN_FIXED;
   let live = false;
   let resume = null;
+  const cells = { waited: [], deadlines: [] };
   for (let step = 0; step < stepsMax; step++) {
     const log = state.turns.get(request.turn);
     if (log !== undefined && log.finished !== null) {
@@ -524,9 +564,16 @@ async function driveTurn(platform, lines, state, requestText, known) {
       await platform.step("acknowledge " + request.turn, { kind: "acknowledge", finish: encodeJson(finishJson(finish)) });
       return;
     }
-    const done = await platform.step("turn " + request.turn + " step " + step, { kind: "run", lines: lines.slice(), request: requestText, resume });
+    const done = await platform.step("turn " + request.turn + " step " + step, { kind: "run", lines: lines.slice(), request: requestText, resume, cells });
     resume = null;
     if (done.output.notDue === true) return;
+    cells.deadlines.push(...(done.output.deadlines ?? []));
+    if (done.output.wait !== undefined) {
+      const wait = decodeJson(done.output.wait);
+      await platform.sleep("turn " + request.turn + " wait " + wait.cell + "/" + wait.timer, { cell: Number(wait.cell), timer: Number(wait.timer), untilMs: wait.until });
+      cells.waited.push(wait.cell + "/" + wait.timer);
+      continue;
+    }
     if (done.output.suspended !== undefined) {
       const suspension = suspensionFrom(decodeJson(done.output.suspended));
       resume = await platform.resume("turn " + request.turn + " resume " + suspension.seq + " at step " + step, suspension);

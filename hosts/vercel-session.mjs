@@ -9,6 +9,7 @@ function host() {
     modelUrl: process.env.HL_MODEL_URL,
     recoverUrl: process.env.HL_RECOVER_URL,
     jobsUrl: process.env.HL_JOBS_URL,
+    cellsUrl: process.env.HL_CELLS_URL,
     now: () => Date.now(),
     random: harness.platformRandom,
   });
@@ -18,7 +19,9 @@ export async function harnessStep(input) {
   "use step";
   return harness.runStep(input, {
     attempt: getStepMetadata().attempt,
+    nestedAttempt: () => getStepMetadata().attempt,
     hook() {},
+    observeWaited() {},
     host: host(),
     async acknowledge(finish) {
       const body = harness.runtime.encodeJson(harness.runtime.finishJson(finish));
@@ -71,6 +74,9 @@ export async function harnessSession(sessionId, turnsMax, entry) {
       return harness.runtime.encodeJson(harness.runtime.resumeJson(harness.runtime.resumeFrom(harness.runtime.decodeJson(next.value.resume))));
     },
     async resumed() {},
+    async sleep(name, wait) {
+      await sleep(new Date(Number(wait.untilMs)));
+    },
     async hook() {},
   });
 }

@@ -175,6 +175,13 @@ function defaultHost(config) {
     jobs(text) {
       return config.jobsUrl === undefined ? "[]" : post(config.jobsUrl, text);
     },
+    cell(text) {
+      if (config.cellsUrl === undefined) throw new Panic("this module runs code cells, and HL_CELLS_URL names no cell engine");
+      return post(config.cellsUrl, text);
+    },
+    wait(cell, timer, untilMs) {
+      return this.sleep(0, 0, untilMs);
+    },
     now() {
       return BigInt(config.now());
     },
@@ -371,6 +378,15 @@ class CloudflareWorld {
         return encodeJson({ clock: u64(await host.sleep(Number(request.turn), Number(request.seq), request.until), "the clock") });
       case "hold":
         return encodeJson({ clock: u64(await host.hold(Number(request.turn), Number(request.seq), request.until), "the clock") });
+      case "cell_start":
+      case "cell_resume":
+      case "cell":
+        return host.cell(encodeJson(request));
+      case "tool":
+        return '{"output":' + (await host.tool(encodeJson({ effect: request.effect, input: request.input, nested: request.nested, seq: request.seq, tool: request.tool, turn: request.turn }))) + "}";
+      case "wait":
+        await host.wait(Number(request.cell), Number(request.timer), request.until);
+        return "{}";
       case "resume": {
         const suspension = { turn: Number(request.turn), seq: Number(request.seq) };
         const resume = simulation.resume !== undefined ? await simulation.resume(suspension) : this.object.pendingResume(suspension);
@@ -465,6 +481,7 @@ class HarnessObject {
       modelUrl: env.HL_MODEL_URL,
       recoverUrl: env.HL_RECOVER_URL,
       jobsUrl: env.HL_JOBS_URL,
+      cellsUrl: env.HL_CELLS_URL,
       now: () => Date.now(),
       random: platformRandom,
     });

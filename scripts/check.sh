@@ -18,20 +18,13 @@ targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 native_targets="native-jsonl native-sqlite server-postgres"
 platform_targets="cloudflare vercel"
 platform_pending="
-  cloudflare:examples/code_agent.hl
-  cloudflare:examples/code_tasks.hl
-  cloudflare:docs/snippets/code_stop.hl
-  cloudflare:docs/snippets/code_wait.hl
   vercel:examples/autoresearch.hl
   vercel:examples/claude_agent.hl
   vercel:examples/claude_code.hl
-  vercel:examples/code_agent.hl
-  vercel:examples/code_tasks.hl
   vercel:examples/codex_agent.hl
   vercel:examples/mpp_agent.hl
   vercel:docs/snippets/climb.hl
   vercel:docs/snippets/code_stop.hl
-  vercel:docs/snippets/code_wait.hl
   vercel:docs/snippets/events.hl
   vercel:docs/snippets/in_flight.hl
   vercel:docs/snippets/payments.hl

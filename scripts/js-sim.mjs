@@ -10,6 +10,7 @@ const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
 const RECOVER_URL = "https://tools.simulation.invalid/recover";
 const JOBS_URL = "https://tools.simulation.invalid/jobs";
+const CELLS_URL = "https://cells.simulation.invalid/engine";
 const LISTINGS_URL = "https://listings.simulation.invalid/list";
 const TURN_URL = "https://harness.simulation.invalid/turn";
 const SIDE_URL = "https://harness.simulation.invalid/side";
@@ -447,19 +448,14 @@ class Seed {
       }
       if (url === RECOVER_URL) return new Response(rt.encodeJson(seed.recover(body)), { status: HTTP_OK });
       if (url === JOBS_URL) return new Response(rt.encodeJson(seed.jobs(body.turn, body.open)), { status: HTTP_OK });
+      if (url === CELLS_URL) return new Response(rt.encodeJson(seed.cell(body)), { status: HTTP_OK });
       throw new Error(`unexpected fetch of ${url}`);
     };
-    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, recoverUrl: RECOVER_URL, jobsUrl: JOBS_URL, now: () => seed.now(), random: () => seed.random() });
-    const tool = host.tool;
+    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, recoverUrl: RECOVER_URL, jobsUrl: JOBS_URL, cellsUrl: CELLS_URL, now: () => seed.now(), random: () => seed.random() });
     return {
       ...host,
-      async tool(request) {
-        seed.nestedCell = request.nested?.cell ?? null;
-        seed.nestedCode = request.nested?.code ?? null;
-        return tool(request);
-      },
-      async wait(wait) {
-        seed.wait(wait);
+      async wait(cell, timer, untilMs) {
+        seed.wait({ cell, timer, untilMs });
       },
       clock() {
         return seed.clock();
@@ -470,10 +466,16 @@ class Seed {
       async hold(turn, seq, untilMs) {
         return seed.sleep(turn, seq, untilMs, "hold");
       },
-      async observe(event) {
-        seed.cells.observe(event);
-      },
     };
+  }
+
+  cell(body) {
+    const cell = Number(body.cell ?? body.observed?.[Object.keys(body.observed)[0]]?.cell);
+    this.nestedCell = cell;
+    if (body.event === "cell_start") return rt.object([["step", this.cells.start(cell, body.script, null)]]);
+    if (body.event === "cell_resume") return rt.object([["step", this.cells.resume(cell, body.input)]]);
+    this.cells.observe(cell, body.observed);
+    return rt.object([]);
   }
 }
 
