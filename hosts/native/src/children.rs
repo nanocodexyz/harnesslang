@@ -264,7 +264,7 @@ fn run(setup: &Setup, directory: &Path, key: &str, cancel: &Path) -> Result<Stri
         .get("arguments")
         .map(host::to_json)
         .ok_or_else(|| format!("{} has no arguments", spawn_path.display()))?;
-    let loaded = host::load(&host::module_path(&setup.module_dir, &program))?;
+    let loaded = host::load_program(setup.module_dir.as_deref(), &program)?;
     let label = format!("hl-host[{key}]");
     let mut session = Session::open(setup.clone(), directory, &label, cancel)?;
     session.ledger.mark("start", crate::now_ms());

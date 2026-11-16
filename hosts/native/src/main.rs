@@ -38,6 +38,7 @@ const ROUNDS_DEFAULT: u64 = u32::MAX as u64;
 const KEEP_WARM_MAX: u64 = 64;
 const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
 const FIRST_TURN: u64 = 1;
+const NO_HANDLER: &str = "no handler";
 
 pub fn now_ms() -> u64 {
     let elapsed = SystemTime::now()
@@ -182,14 +183,7 @@ fn send_event(command: &str, flags: &Flags) -> ! {
     }
 }
 
-fn exe_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn open(flags: &Flags, module_dir: PathBuf, spawns: Vec<Spawn>) -> (PathBuf, Session) {
+fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (PathBuf, Session) {
     let journal = flags
         .journal
         .clone()
@@ -221,12 +215,10 @@ fn generic(flags: Flags) {
         .unwrap_or_else(|| fail_usage("--handler is required"));
     let arguments = parse(flags.args.as_deref().unwrap_or("{}"))
         .unwrap_or_else(|error| fail_usage(&format!("--args: {error}")));
-    let module_dir = flags.module_dir.clone().unwrap_or_else(|| {
-        module
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let module_dir = flags
+        .module_dir
+        .clone()
+        .or_else(|| module.parent().map(Path::to_path_buf));
     let loaded = host::load(&module).unwrap_or_else(|error| fail(&error));
     let (journal, mut session) = open(&flags, module_dir, flags.spawns.clone());
     let turn = flags.turn.unwrap_or_else(|| {
@@ -420,9 +412,9 @@ fn front(flags: Flags) {
         }
         other => fail_usage(&format!("--harness {other} is not claude or codex")),
     };
-    let module_dir = flags.module_dir.clone().unwrap_or_else(exe_dir);
-    let module = host::module_path(&module_dir, program);
-    let loaded = host::load(&module).unwrap_or_else(|error| fail(&error));
+    let module_dir = flags.module_dir.clone();
+    let loaded =
+        host::load_program(module_dir.as_deref(), program).unwrap_or_else(|error| fail(&error));
     let (journal, mut session) = open(&flags, module_dir, spawns);
     let prompt = host::object(vec![
         ("input", Json::text(&instruction)),
@@ -433,7 +425,7 @@ fn front(flags: Flags) {
     ]);
     let path = session.journal_path();
     let held = last_turn(&path).unwrap_or_else(|error| fail(&error));
-    let (configure_turn, prompt_turn) = match (flags.turn, held) {
+    let (configure_turn, mut prompt_turn) = match (flags.turn, held) {
         (Some(turn), _) => (Some(turn), turn + 1),
         (None, Some(held)) if !held.finished && same(&held, PROMPT_HANDLER, &prompt) => {
             (None, held.turn)
@@ -459,6 +451,10 @@ fn front(flags: Flags) {
                     session.close();
                     fail_usage(&reason);
                 }
+            }
+            Err(error) if error.contains(NO_HANDLER) => {
+                eprintln!("{LABEL}: {program} declares no configure handler; prompting directly");
+                prompt_turn = turn;
             }
             other => {
                 session.close();

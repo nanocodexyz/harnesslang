@@ -1,0 +1,13 @@
+harness syscalls_child
+
+type outcome = finished(text) | broke(text)
+
+tool Bash(command: text) -> text effect external
+
+on work(task: text) -> outcome {
+  match Bash("printf child:%s " ++ task) {
+    ok(shown) => { return finished(shown) }
+    failed(error) => { return broke(error) }
+    unknown => { return broke("unknown") }
+  }
+}
