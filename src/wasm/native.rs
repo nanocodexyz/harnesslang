@@ -21,6 +21,13 @@ pub trait World {
     fn acknowledge(&mut self, finish: &Json) -> Result<(), String>;
 }
 
+pub trait Store {
+    fn read(&mut self) -> Result<Vec<u8>, String>;
+    fn append(&mut self, epoch: i64, bytes: &[u8]) -> Result<(), String>;
+    fn keep(&mut self, length: u64) -> Result<(), String>;
+    fn epoch(&self) -> i64;
+}
+
 pub struct Journal {
     path: PathBuf,
     file: File,
@@ -66,7 +73,7 @@ impl Journal {
         Ok(bytes)
     }
 
-    fn keep(&mut self, length: u64) -> Result<(), String> {
+    pub fn keep(&mut self, length: u64) -> Result<(), String> {
         let size = self
             .file
             .metadata()
@@ -91,9 +98,30 @@ impl Journal {
     }
 }
 
-struct Run<'w, 'j, 'm, W: World> {
+impl Store for Journal {
+    fn read(&mut self) -> Result<Vec<u8>, String> {
+        Journal::read(self)
+    }
+
+    fn append(&mut self, epoch: i64, bytes: &[u8]) -> Result<(), String> {
+        if epoch != EPOCH {
+            return Err("a native journal has one owner, epoch 0".to_owned());
+        }
+        Journal::append(self, bytes)
+    }
+
+    fn keep(&mut self, length: u64) -> Result<(), String> {
+        Journal::keep(self, length)
+    }
+
+    fn epoch(&self) -> i64 {
+        EPOCH
+    }
+}
+
+struct Run<'w, 'j, 'm, W: World, S: Store> {
     world: &'w mut W,
-    journal: &'j mut Journal,
+    journal: &'j mut S,
     loaded: &'m Loaded,
 }
 
@@ -118,7 +146,7 @@ fn words(packed: u64) -> [Value; 2] {
     ]
 }
 
-impl<W: World> Run<'_, '_, '_, W> {
+impl<W: World, S: Store> Run<'_, '_, '_, W, S> {
     fn text(&self, instance: &Instance, at: i32, length: i32) -> Result<String, String> {
         let bytes = instance
             .memory()
@@ -187,7 +215,7 @@ impl<W: World> Run<'_, '_, '_, W> {
     }
 }
 
-impl<W: World> Host for Run<'_, '_, '_, W> {
+impl<W: World, S: Store> Host for Run<'_, '_, '_, W, S> {
     type Stop = String;
 
     fn call(
@@ -213,15 +241,11 @@ impl<W: World> Host for Run<'_, '_, '_, W> {
                 Ok(None)
             }
             Import::Flush => {
-                if i64_arg(args, 0) != EPOCH {
-                    return Err(Error::Stop(
-                        "a native journal has one owner, epoch 0".to_owned(),
-                    ));
-                }
+                let epoch = i64_arg(args, 0);
                 let text = self
                     .text(instance, i32_arg(args, 1), i32_arg(args, 2))
                     .map_err(stop)?;
-                self.journal.append(text.as_bytes()).map_err(stop)?;
+                self.journal.append(epoch, text.as_bytes()).map_err(stop)?;
                 Ok(None)
             }
             Import::Keep => {
@@ -255,13 +279,14 @@ impl<W: World> Host for Run<'_, '_, '_, W> {
     }
 }
 
-pub fn run<W: World>(
+pub fn run<W: World, S: Store>(
     loaded: &Loaded,
-    journal: &mut Journal,
+    journal: &mut S,
     request: &Json,
     world: &mut W,
 ) -> Result<Json, String> {
     let opened = journal.read()?;
+    let epoch = journal.epoch();
     let mut instance = Instance::new(&loaded.module, Limits::NODE);
     let mut host = Run {
         world,
@@ -279,7 +304,7 @@ pub fn run<W: World>(
             request_length,
             journal_pointer,
             journal_length,
-            Value::I64(EPOCH),
+            Value::I64(epoch),
         ];
         let Some(Value::I64(packed)) = instance.invoke(&mut host, loaded.run, &args)? else {
             panic!("hl_run returns an i64");
@@ -299,12 +324,13 @@ pub fn run<W: World>(
 
 const EXPORT_IDLE: &str = "hl_idle";
 
-pub fn idle<W: World>(
+pub fn idle<W: World, S: Store>(
     loaded: &Loaded,
-    journal: &mut Journal,
+    journal: &mut S,
     world: &mut W,
 ) -> Result<Option<u64>, String> {
     let opened = journal.read()?;
+    let epoch = journal.epoch();
     let function = loaded
         .module
         .export_function(EXPORT_IDLE)
@@ -319,7 +345,7 @@ pub fn idle<W: World>(
         let journal_at = host.give(&mut instance, &opened)?;
         let [pointer, length] = words(journal_at);
         let Some(Value::I64(packed)) =
-            instance.invoke(&mut host, function, &[pointer, length, Value::I64(EPOCH)])?
+            instance.invoke(&mut host, function, &[pointer, length, Value::I64(epoch)])?
         else {
             panic!("hl_idle returns an i64");
         };

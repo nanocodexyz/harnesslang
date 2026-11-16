@@ -1455,4 +1455,7 @@ Event intake records (`"record":{"event":…}`, a steer or other event taken int
 
 
 `proved_external_once` mirrors the fixed host's epoch fence: a dispatch from an owner whose epoch is below the one that last dispatched the call is refused by the host (the trace answers it failed) and is not counted, as the interpreter's world does; and a second owner taking over inside a hook leaves the outer run's epoch, unflushed answer and per-run counts as they were when it returns.
+## 2026-11-16: a native host stores its journal through a Store
+
+`harnesslang::wasm::native::run` and `idle` take any `Store` (`read`, `append(epoch, bytes)`, `keep(length)`, `epoch`) instead of the jsonl `Journal`, and pass the store's epoch to `hl_run` and `hl_idle`. `Journal` is the jsonl store with one owner at epoch 0, so every caller that passes a `Journal` is unchanged. A store that fences takeovers (SQLite, Postgres) refuses an append whose epoch is no longer the session's, and the run stops there; that is the seam the SQL drills and the fixed native host's SQL storage plug into, now that native-sqlite and server-postgres ship compiled wasm.
 
