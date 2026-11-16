@@ -781,4 +781,14 @@ Suite 1 (`evals/suite.txt`, 20 tasks), one attempt per task and arm, `--model gp
 | hl-agent (low effort) | 20 | 19 | 95.0% (76.4-99.1%) | $0.457 | 154 s | 16.1 | 21.5 | 233997 | 5465 |
 | hl-agent (low effort, one gate turn) | 20 | 20 | 100.0% (83.9-100.0%) | $0.363 | 119 s | 13.6 | 19.9 | 202875 | 3890 |
 
+Three attempts per task and arm (60 attempts each, the first-attempt build: hl-agent at medium effort with two gate turns), `python3 evals/report.py out-full`:
+
+| Agent | Attempts | Passed | Pass rate (95% Wilson) | Cost/attempt | Wall/attempt | Requests/attempt |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| hl-agent | 60 | 60 | 100.0% (94.0-100.0%) | $0.647 | 205 s | 20.9 |
+| nanocode | 60 | 55 | 91.7% (81.9-96.4%) | $0.096 | 59 s | 6.4 |
+| Stock Codex | 60 | 54 | 90.0% (79.9-95.3%) | $0.122 | 56 s | 8.1 |
+
+Paired by task and attempt: hl-agent against stock Codex 6 to 0 (sign test p = 0.031), against nanocode 5 to 0 (p = 0.062); stock Codex against nanocode 4 to 5 (p = 1.0). hl-agent passes more on this model but costs 5.3x stock Codex and 6.7x nanocode per attempt at list rates; the low-effort and one-gate-turn rows above cut that to about 3x.
+
 Stock Codex failed pypi-server and kv-store-grpc (the server it started was gone at verification); hl-agent with low effort failed largest-eigenval's speedup test. No request returned anything but 200 and no attempt timed out.
