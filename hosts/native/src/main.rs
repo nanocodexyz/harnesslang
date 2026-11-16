@@ -20,7 +20,7 @@ use host::{Ran, Session, Setup, Spawn};
 
 pub const EXIT_HARNESS_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
-const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host wire --request <file.json> --scratch <dir>
+const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--escalate-model <id>] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host wire --request <file.json> --scratch <dir>
        hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
 const LABEL: &str = "hl-host";
 const HARNESS_CLAUDE: &str = "claude";
