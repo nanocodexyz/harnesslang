@@ -688,8 +688,14 @@ pub fn run(seeds: Range<u64>) -> Result<String, String> {
     Ok(summary)
 }
 
-pub fn probe_once(wire: Wire, input: &str) -> Result<String, String> {
+pub fn probe_once(wire: Wire, input: &str) -> Result<(String, String), String> {
     let module = module(wire)?;
     let mut probe = Probe::new(&module)?;
-    probe.ask(input)
+    let json = crate::run::json::decode(input)?;
+    let expected = if json.get("op").and_then(Json::as_str) == Some("request") {
+        request_rust(wire, &json)
+    } else {
+        decode_rust(wire, &json)
+    };
+    Ok((expected, probe.ask(input)?))
 }

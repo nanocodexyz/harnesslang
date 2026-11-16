@@ -205,7 +205,7 @@ pub fn messages(context: &Value, attached: &Attached<'_>) -> Result<Vec<Value>, 
     if let Some(Value::Object(entries)) = messages.last_mut()
         && let Some((_, Value::Array(blocks))) =
             entries.iter_mut().find(|(key, _)| key == "content")
-        && let Some(block) = blocks.last_mut()
+        && let Some(block @ Value::Object(_)) = blocks.last_mut()
     {
         block.insert("cache_control", ephemeral());
     }
