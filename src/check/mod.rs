@@ -385,7 +385,47 @@ fn wire_settings(program: &ir::Program, model: &ast::Model) -> Checked<()> {
             None => {}
         }
     }
-    Ok(())
+    wire_reply(program, model, word)
+}
+
+fn wire_reply(program: &ir::Program, model: &ast::Model, word: &ast::Name) -> Checked<()> {
+    let wire = ir::Wire::parse(&word.text).expect("the model pass parsed the wire");
+    let reply = &program.sums[ir::REPLY];
+    let calls =
+        |ty: &Type| matches!(ty, Type::List { element, .. } if **element == Type::Sum(ir::CALL));
+    let answer = |fields: &[Type]| match wire {
+        ir::Wire::Anthropic => fields == [Type::Text, Type::Text],
+        ir::Wire::Openai => fields == [Type::Text, Type::Text, Type::Bool],
+    };
+    let shaped = reply.variants.len() == 2
+        && reply
+            .variants
+            .iter()
+            .all(|variant| match variant.name.as_str() {
+                "calls" => {
+                    variant.fields.len() == 3
+                        && calls(&variant.fields[0])
+                        && variant.fields[1..] == [Type::Text, Type::Text]
+                }
+                name => name == wire.answer() && answer(&variant.fields),
+            })
+        && reply.variants[0].name != reply.variants[1].name;
+    if shaped {
+        return Ok(());
+    }
+    let shape = match wire {
+        ir::Wire::Anthropic => "answer(text, text) | calls(list<call, N>, text, text)",
+        ir::Wire::Openai => "message(text, text, bool) | calls(list<call, N>, text, text)",
+    };
+    error(
+        word.at,
+        format!(
+            "wire {} model '{}' replies {}: its reply type is {shape}, the words and the provider's content",
+            wire.name(),
+            model.name.text,
+            reply.name
+        ),
+    )
 }
 
 fn declared_reply(source: &ast::Program) -> Option<&ast::Name> {
