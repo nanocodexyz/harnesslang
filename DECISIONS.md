@@ -1456,6 +1456,16 @@ Event intake records (`"record":{"event":…}`, a steer or other event taken int
 
 `proved_external_once` mirrors the fixed host's epoch fence: a dispatch from an owner whose epoch is below the one that last dispatched the call is refused by the host (the trace answers it failed) and is not counted, as the interpreter's world does; and a second owner taking over inside a hook leaves the outer run's epoch, unflushed answer and per-run counts as they were when it returns.
 ## 2026-11-16: a native host stores its journal through a Store
+## 2026-11-16: the JavaScript source backend is gone; Cloudflare and Vercel are checked on their fixed hosts
+
+Cloudflare and Vercel already shipped `program.wasm` (Vercel as `program.mjs`) on `hosts/cloudflare.mjs` and `hosts/vercel.mjs`, so the emitted JavaScript (`src/emit/js`, 7,165 lines) only fed tests: `scripts/js-diff.sh`, `scripts/js-mutations.sh`, the engine differential of `scripts/js-sim-cell.mjs`, and the record codec that `scripts/js-sim.mjs` imported from a generated module even when it drove the fixed host.
+
+- `scripts/js-sim-records.mjs` decodes journal lines, deliveries and recovery answers and encodes JSON the way the module does (sorted keys, unsigned integers and 0.digits fractions only); `js-sim.mjs` reads the program's facts from the module's `hl_facts` and takes no `--runtime`.
+- `scripts/check.sh` runs `WASM_DIFF_HOST=platform scripts/wasm-diff.sh` (stage `wasm-diff-platform`, seeds 0..30, 0..300 with `HL_FULL=1`) on every example and snippet for cloudflare and vercel, where js-diff ran the examples plus keep, in_flight, side and fork; the census requires a fixed-host run of every example except two that fail there on master too (`cloudflare:examples/claude_code.hl`: the fixed host does not answer the `recover` world request; `vercel:examples/autoresearch.hl`: an event read inside a step). `scripts/host-mutations.sh` runs in check.sh.
+- `fn` equality compares the compiled wasm of each `fn` program and its written-out copy on all five targets.
+- `scripts/fuzz-one.sh` runs `wasm-diff.sh` per target (native host for the Rust targets, the fixed host for cloudflare and vercel); `WASM_DIFF_OUT` names its directory. The fuzz pipeline counts a case emitted when it compiles to wasm.
+- Lost with the backend: the JavaScript-only differential plants (bound_message, enum_unchecked, default_unfilled, text_after_kept, payment_unset, paid_outcome_original on cloudflare and vercel). Their wasm counterparts are not planted yet.
+- `src/generate/body.rs`'s statement cap is `GENERATED_STATEMENTS_MAX`, so docs-check no longer reads it as the language's `STATEMENTS_PER_HANDLER_MAX`.
 
 `harnesslang::wasm::native::run` and `idle` take any `Store` (`read`, `append(epoch, bytes)`, `keep(length)`, `epoch`) instead of the jsonl `Journal`, and pass the store's epoch to `hl_run` and `hl_idle`. `Journal` is the jsonl store with one owner at epoch 0, so every caller that passes a `Journal` is unchanged. A store that fences takeovers (SQLite, Postgres) refuses an append whose epoch is no longer the session's, and the run stops there; that is the seam the SQL drills and the fixed native host's SQL storage plug into, now that native-sqlite and server-postgres ship compiled wasm.
 
