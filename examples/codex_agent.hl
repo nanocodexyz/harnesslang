@@ -422,7 +422,9 @@ on prompt(input: text, rounds: u64) -> outcome
   start_turn(input, 0)
   loop round below rounds_max {
     if not finished {
-      if round >= pass_start and round - pass_start >= rounds { return exhausted }
+      if round >= pass_start {
+        if round - pass_start >= rounds { return exhausted }
+      }
       keep context blobs last images_kept
       if len(context) + 3 + calls_per_round_max + steers_per_turn_max > context_entries_max {
         compact_pending = true
