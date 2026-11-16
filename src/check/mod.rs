@@ -136,8 +136,7 @@ pub fn check_mutated(
     events(source, &mut program, &globals, &mut values)?;
     interrupts(source, &mut program)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
-    let expanded =
-        climb::expand(&expanded, &mut program, &globals, mutation)?.unwrap_or(expanded);
+    let expanded = climb::expand(&expanded, &mut program, &globals, mutation)?.unwrap_or(expanded);
     globals.hooks = hooks(&expanded, &program, &globals)?;
     let expanded = session_end(&expanded).unwrap_or(expanded);
     let expanded = idle(&expanded, &mut program, &globals)?.unwrap_or(expanded);
@@ -258,6 +257,30 @@ fn model(
                 ),
             );
         }
+        let wire = match &model.wire {
+            None => None,
+            Some(word) => match ir::Wire::parse(&word.text) {
+                Some(wire) => Some(wire),
+                None => {
+                    return error(
+                        word.at,
+                        format!(
+                            "model '{}' speaks wire '{}': a wire is anthropic or openai",
+                            model.name.text, word.text
+                        ),
+                    );
+                }
+            },
+        };
+        if let (Some(word), None) = (&model.wire, &model.window) {
+            return error(
+                word.at,
+                format!(
+                    "model '{}' speaks a wire only with a window: the HTTP answer decodes into attempt",
+                    model.name.text
+                ),
+            );
+        }
         globals.model = Some(model.name.text.clone());
         program.model = Some(ir::Model {
             name: model.name.text.clone(),
@@ -267,6 +290,7 @@ fn model(
             modes,
             settings: Vec::new(),
             interrupts: ir::Interrupts::default(),
+            wire,
         });
     }
     Ok(())
@@ -280,13 +304,15 @@ fn settings(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
         return Ok(());
     };
     let fields = params(program, globals, &model.settings)?;
+    let wired = model.wire.is_some();
     let mut settings = Vec::with_capacity(fields.len());
     for ((field, param), default) in fields
         .into_iter()
         .zip(&model.settings)
         .zip(&model.setting_defaults)
     {
-        if field.ty != Type::Bool && program.text_enum(&field.ty).is_none() {
+        let text = wired && field.ty == Type::Text;
+        if !text && field.ty != Type::Bool && program.text_enum(&field.ty).is_none() {
             return error(
                 param.ty.at(),
                 format!(
@@ -318,6 +344,47 @@ fn settings(source: &ast::Program, program: &mut ir::Program, globals: &Globals)
         .as_mut()
         .expect("the model pass declared the model")
         .settings = settings;
+    wire_settings(program, model)
+}
+
+fn wire_settings(program: &ir::Program, model: &ast::Model) -> Checked<()> {
+    let Some(word) = &model.wire else {
+        return Ok(());
+    };
+    let declared = &program
+        .model
+        .as_ref()
+        .expect("the model pass declared the model")
+        .settings;
+    let required = ir::Wire::SETTINGS
+        .iter()
+        .copied()
+        .chain(std::iter::once(ir::Wire::PREAMBLE));
+    for (index, name) in required.enumerate() {
+        match declared.iter().find(|setting| setting.name == name) {
+            Some(setting) if setting.ty == Type::Text => {}
+            Some(setting) => {
+                return error(
+                    word.at,
+                    format!(
+                        "setting '{name}' of wire model '{}' is {}: a wire setting is text",
+                        model.name.text,
+                        setting.ty.name(program)
+                    ),
+                );
+            }
+            None if index < ir::Wire::SETTINGS.len() => {
+                return error(
+                    word.at,
+                    format!(
+                        "wire model '{}' declares no setting '{name}': a wire model declares url, headers, head and tail as text settings",
+                        model.name.text
+                    ),
+                );
+            }
+            None => {}
+        }
+    }
     Ok(())
 }
 
