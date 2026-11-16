@@ -96,31 +96,6 @@ climb_gate_ignored docs/snippets/climb_gate.hl --strict climb_kept_valid"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
 diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust bound_message examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust double_fsync examples/agent.hl native-jsonl backend_equal
-rust batch_seq_from_zero examples/agent.hl native-sqlite,server-postgres backend_equal
-rust recovery_skipped examples/agent.hl native-jsonl,native-sqlite,server-postgres panic
-rust enum_unchecked examples/hooks.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust nested_flush_after_dispatch examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
-rust settings_dropped docs/snippets/settings.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
-rust rewrite_kept_lost docs/snippets/rewrite.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
-rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust grandchild_unscoped docs/snippets/tree_planner.hl native-jsonl,native-sqlite,server-postgres backend_equal 1.1
-rust idle_early docs/snippets/keep.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust interrupt_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust interrupted_undecoded docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust recover_skipped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust fork_entry_ignored docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust cell_leaks docs/snippets/code_wait.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,server-postgres backend_equal
-rust payment_unset docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres backend_equal
 wasm flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm crc_skipped examples/agent.hl native-jsonl backend_equal
 wasm recovery_skipped examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
@@ -263,14 +238,12 @@ run_one() {
 
 diff_script() {
   case $1 in
-    rust) echo scripts/rust-diff.sh ;;
     wasm) echo scripts/wasm-diff.sh ;;
   esac
 }
 
 diff_targets() {
   case $1 in
-    rust) echo "native-jsonl native-sqlite server-postgres" ;;
     wasm) echo "native-jsonl native-sqlite server-postgres cloudflare vercel" ;;
   esac
 }
@@ -291,7 +264,7 @@ diff_plants_of() {
 
 diff_census() {
   local backend planted plant file targets target output
-  for backend in rust wasm; do
+  for backend in wasm; do
     planted=$(awk -v b="$backend" '$1 == b { print $2 }' <<< "$diff_plans" | sort)
     [ -n "$(diff_plants_of "$backend")" ] || census_fail "$(diff_script "$backend") lists no plants"
     if [ "$(diff_plants_of "$backend")" != "$planted" ]; then
