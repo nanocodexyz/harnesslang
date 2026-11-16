@@ -215,6 +215,8 @@ fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (Path
         .unwrap_or_else(|| fail_usage("--journal is required"));
     std::fs::create_dir_all(&journal)
         .unwrap_or_else(|error| fail(&format!("{}: {error}", journal.display())));
+    let journal = std::fs::canonicalize(&journal)
+        .unwrap_or_else(|error| fail(&format!("{}: {error}", journal.display())));
     let cwd = flags.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
     let cwd = std::fs::canonicalize(&cwd)
         .unwrap_or_else(|error| fail_usage(&format!("--cwd {}: {error}", cwd.display())));
@@ -364,7 +366,7 @@ fn same(held: &Last, handler: &str, arguments: &Json) -> bool {
 fn planned_turn(path: &Path, handler: &str, arguments: &Json) -> Result<u64, String> {
     Ok(match last_turn(path)? {
         None => FIRST_TURN,
-        Some(held) if !held.finished && same(&held, handler, arguments) => held.turn,
+        Some(held) if same(&held, handler, arguments) => held.turn,
         Some(held) => held.turn + 1,
     })
 }
@@ -452,9 +454,7 @@ fn front(flags: Flags) {
     let held = last_turn(&path).unwrap_or_else(|error| fail(&error));
     let (configure_turn, mut prompt_turn) = match (flags.turn, held) {
         (Some(turn), _) => (Some(turn), turn + 1),
-        (None, Some(held)) if !held.finished && same(&held, PROMPT_HANDLER, &prompt) => {
-            (None, held.turn)
-        }
+        (None, Some(held)) if same(&held, PROMPT_HANDLER, &prompt) => (None, held.turn),
         (None, Some(held))
             if !held.finished && same(&held, host::CONFIGURE_HANDLER, &configure) =>
         {
