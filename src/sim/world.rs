@@ -995,7 +995,7 @@ impl World for SimWorld<'_> {
                 fields.push((crate::run::journal::MODEL_SETTINGS, settings.clone()));
             }
             if let Some(http) = request.http {
-                fields.push(("http", http.clone()));
+                fields.push(("http", http.get("http").cloned().unwrap_or(Json::Null)));
             }
             if let Some(answer) = &answer {
                 fields.push(("answer", answer.clone()));
