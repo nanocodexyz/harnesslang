@@ -26,7 +26,18 @@ def load_jsonl(path):
     return out
 
 
+TOOL_BLOCKS = ("tool_use", "function_call", "custom_tool_call")
+CODE_COMMAND = re.compile(r'\bcmd\s*:\s*("(?:[^"\\]|\\.)*")')
+
+
 def tool_input(block):
+    if block.get("type") == "custom_tool_call":
+        return {"input": block.get("input") or ""}
+    if block.get("type") == "function_call":
+        try:
+            return json.loads(block.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            return {}
     raw = block.get("input_json")
     if raw:
         try:
@@ -39,8 +50,25 @@ def tool_input(block):
 def command_of(name, args):
     if name == "Bash":
         return args.get("command", "")
+    if name == "exec_command":
+        return args.get("cmd", "")
     if name == "exec":
-        return args.get("code", "") or args.get("command", "")
+        code = args.get("code", "") or args.get("command", "") or args.get("input", "")
+        found = []
+        for literal in CODE_COMMAND.findall(code):
+            try:
+                found.append(json.loads(literal))
+            except json.JSONDecodeError:
+                pass
+        return "\n".join(found) or code
+    return ""
+
+
+def text_of(block):
+    if block.get("type") == "text":
+        return block.get("text", "")
+    if block.get("type") == "message":
+        return "".join(part.get("text", "") for part in block.get("content") or [] if part.get("type") == "output_text")
     return ""
 
 
@@ -59,7 +87,7 @@ def row_stats(row_dir):
     for resp in responses:
         stop = resp.get("stop_reason")
         stops[str(stop)] = stops.get(str(stop), 0) + 1
-        uses = [b for b in resp.get("content", []) if b.get("type") == "tool_use"]
+        uses = [b for b in resp.get("content", []) if b.get("type") in TOOL_BLOCKS]
         per_reply.append(len(uses))
         for b in uses:
             name = b.get("name")
@@ -89,9 +117,7 @@ def row_stats(row_dir):
     messages = [r.get("request", {}).get("messages", 0) for r in requests]
     shrinks = sum(1 for a, b in zip(messages, messages[1:]) if b < a)
     last = responses[-1] if responses else {}
-    final_text = "".join(
-        b.get("text", "") for b in last.get("content", []) if b.get("type") == "text"
-    )
+    final_text = "".join(text_of(b) for b in last.get("content", []))
     tail = commands[-3:]
     usage = [r.get("usage") or {} for r in requests]
     inp = sum(u.get("input_tokens", 0) or 0 for u in usage)

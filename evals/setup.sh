@@ -9,6 +9,8 @@ patchelf_sha256=ce84f2447fb7a8679e58bc54a20dc2b01b37b5802e12c57eece772a6f14bf3f0
 codex_version=0.169.0
 codex_url=https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-x86_64-unknown-linux-musl.tar.gz
 codex_sha256=9af4d751fce183faedea629437d5252dbf458eeb04130cf4f97be844621ea985
+codex_host_url=https://github.com/openai/codex/releases/download/rust-v$codex_version/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz
+codex_host_sha256=cbed6a8d25e8268792b757767fbc76d4c62e84bcf8ee4a63f97547f0de3aaceb
 mkdir -p "$out/src" "$out/tasks" "$out/tools"
 
 if [ ! -d "$out/src/nanoeval" ]; then git clone -q https://github.com/nanocodexyz/nanoeval "$out/src/nanoeval"; fi
@@ -61,6 +63,12 @@ if [ "${CODEX:-0}" = 1 ]; then
     echo "$codex_sha256  $codex_dir/codex.tgz" | sha256sum -c - >/dev/null
     tar -xzf "$codex_dir/codex.tgz" -C "$codex_dir"
   fi
+  if [ ! -x "$codex_dir/codex-code-mode-host-x86_64-unknown-linux-musl" ]; then
+    curl -fsSL -o "$codex_dir/host.tgz" "$codex_host_url"
+    echo "$codex_host_sha256  $codex_dir/host.tgz" | sha256sum -c - >/dev/null
+    tar -xzf "$codex_dir/host.tgz" -C "$codex_dir"
+  fi
   cp "$codex_dir/codex-x86_64-unknown-linux-musl" "$root/bin/codex"
+  cp "$codex_dir/codex-code-mode-host-x86_64-unknown-linux-musl" "$root/bin/codex-code-mode-host"
 fi
 ls -l "$root/bin"

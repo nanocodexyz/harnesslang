@@ -97,11 +97,22 @@ const ASTRA_LONG_CONTEXT: Rates = Rates {
     output: 75_000,
 };
 
+fn family(model: &str) -> Option<&'static str> {
+    ["sol", "terra", "luna", "astra"]
+        .into_iter()
+        .find(|family| model.ends_with(&format!("-{family}")))
+}
+
+pub fn default_effort(model: &str) -> Option<&'static str> {
+    match family(model)? {
+        "sol" | "terra" => Some("low"),
+        _ => None,
+    }
+}
+
 pub fn rates(model: &str, input_tokens: u64) -> Option<Rates> {
     let long = input_tokens > LONG_CONTEXT_THRESHOLD;
-    let family = ["sol", "terra", "luna", "astra"]
-        .into_iter()
-        .find(|family| model.ends_with(&format!("-{family}")))?;
+    let family = family(model)?;
     Some(match (family, long) {
         ("sol", false) => SOL_STANDARD,
         ("sol", true) => SOL_LONG_CONTEXT,

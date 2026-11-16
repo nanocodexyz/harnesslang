@@ -16,6 +16,10 @@ PROVIDERS = {
     "chatgpt": {"origin": "https://chatgpt.com", "key_env": "NANOEVAL_CHATGPT_LOGIN", "origin_env": "NANOEVAL_CHATGPT_UPSTREAM"},
 }
 CHATGPT_PREFIX = "/backend-api/codex"
+CHATGPT_MODELS_PATH = CHATGPT_PREFIX + "/models"
+CHATGPT_CLIENT_VERSION = "0.169.0"
+CHATGPT_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+CHATGPT_LITE_CONTEXT = "all_turns"
 CHATGPT_HALT_STATUSES = (401, 403, 429)
 CHATGPT_HALT_FILE = "chatgpt-halted.json"
 LOGIN_PRIVATE_MODE = 0o077
@@ -53,6 +57,30 @@ def route(rest):
     if head in PROVIDERS and head != DEFAULT_PROVIDER:
         return head, "/" + tail
     return DEFAULT_PROVIDER, "/" + rest
+
+
+def platform_models(path):
+    target = urllib.parse.urlsplit(path)
+    if target.path != CHATGPT_MODELS_PATH:
+        return path, False
+    query = urllib.parse.parse_qs(target.query)
+    if "client_version" in query:
+        return path, False
+    query["client_version"] = [CHATGPT_CLIENT_VERSION]
+    return target.path + "?" + urllib.parse.urlencode(query, doseq=True), True
+
+
+def platform_model_list(raw):
+    listed = json.loads(raw).get("models") or []
+    return json.dumps({"object": "list", "data": [{"id": model["slug"], "object": "model", "owned_by": "openai", "context_window": model.get("context_window")} for model in listed if model.get("slug")]}).encode()
+
+
+def lite_context(body):
+    try:
+        request = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(request, dict) and (request.get("reasoning") or {}).get("context") == CHATGPT_LITE_CONTEXT
 
 
 def chatgpt_login(path):
@@ -210,6 +238,9 @@ class Meter(http.server.BaseHTTPRequestHandler):
             return
         run = parts[2]
         provider, path = route(parts[3])
+        translated = False
+        if provider == "chatgpt" and self.command == "GET":
+            path, translated = platform_models(path)
         directory = os.path.join(self.runs, run)
         if not os.path.isdir(directory):
             self.send_error(404, "unknown run " + run)
@@ -222,6 +253,8 @@ class Meter(http.server.BaseHTTPRequestHandler):
             return
         started = time.time()
         headers = {name: value for name, value in self.headers.items() if name.lower() not in DROPPED_REQUEST_HEADERS}
+        if provider == "chatgpt" and not lite_context(body):
+            headers = {name: value for name, value in headers.items() if name.lower() != CHATGPT_LITE_HEADER}
         headers.update(credentials(provider, self.keys[provider]))
         headers["accept-encoding"] = "identity"
         headers["content-length"] = str(len(body))
@@ -232,6 +265,10 @@ class Meter(http.server.BaseHTTPRequestHandler):
         try:
             connection.request(self.command, path, body=body, headers=headers)
             response = connection.getresponse()
+            if translated and response.status == 200:
+                self.relay_translated(response)
+                record["status"] = response.status
+                return
             streaming = "text/event-stream" in (response.getheader("content-type") or "")
             self.send_response(response.status)
             for name, value in response.getheaders():
@@ -289,6 +326,15 @@ class Meter(http.server.BaseHTTPRequestHandler):
                 with open(os.path.join(directory, "last-request.json"), "wb") as handle:
                     handle.write(body)
 
+
+    def relay_translated(self, response):
+        data = platform_model_list(response.read())
+        self.send_response(response.status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        self.wfile.flush()
 
     def halt(self, status, run):
         with self.lock:

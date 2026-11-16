@@ -522,7 +522,11 @@ pub fn main(options: &Options) -> ! {
         std::process::exit(EXIT_HARNESS_ERROR)
     });
     let mut turn = options.turn;
-    if let Some(effort) = &options.effort_text {
+    let effort_text = options
+        .effort_text
+        .as_deref()
+        .or_else(|| openai::default_effort(&options.model));
+    if let Some(effort) = effort_text {
         let Some(level) = effort_of(effort) else {
             eprintln!("{LABEL}: --effort {effort} is not medium, low, high or xhigh");
             std::process::exit(crate::EXIT_USAGE);
@@ -541,6 +545,11 @@ pub fn main(options: &Options) -> ! {
         }
         turn += 1;
     }
+    let finish_checks = options.finish_checks.unwrap_or(FINISH_CHECKS_MAX);
+    if finish_checks > FINISH_CHECKS_MAX {
+        eprintln!("{LABEL}: --finish-checks {finish_checks} is above {FINISH_CHECKS_MAX}");
+        std::process::exit(crate::EXIT_USAGE);
+    }
     let mut input = instruction;
     let mut checks = 0;
     let ran = loop {
@@ -549,14 +558,14 @@ pub fn main(options: &Options) -> ! {
             arguments: Arguments::Prompt(input, options.rounds.min(program::ROUNDS_MAX)),
         };
         let ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
-        if checks >= FINISH_CHECKS_MAX || !ended_completed(&ran) {
+        if checks >= finish_checks || !ended_completed(&ran) {
             break ran;
         }
         checks += 1;
         turn += 1;
         input = FINISH_CHECK.to_owned();
     };
-    assert!(checks <= FINISH_CHECKS_MAX);
+    assert!(checks <= finish_checks);
     let mut ran = ran;
     let mut reviews = 0;
     while reviews < reviewer::REVIEWS_MAX && ended_completed(&ran) {

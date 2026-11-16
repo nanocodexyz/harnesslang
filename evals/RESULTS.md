@@ -768,3 +768,17 @@ errored: terminal-bench-2.1.pytorch-model-recovery.claude-code.1: no model reque
 errored: terminal-bench-2.1.pytorch-model-recovery.claude-code.2: no model request succeeded
 
 <!-- eval-confirm:end -->
+
+## Three Codex arms on gpt-5.6-sol through a ChatGPT plan
+
+Suite 1 (`evals/suite.txt`, 20 tasks), one attempt per task and arm, `--model gpt-5.6-sol --limits none --openai-route chatgpt`, every request through the meter to the ChatGPT backend with one plan's login, which the meter reads per request on the eval machine; the agents in the containers get a placeholder key. Stock Codex is `codex exec` 0.169.0 with its code-mode host; nanocode is its Codex backend through `NANOCODE_OPENAI_BASE_URL`; hl-agent runs `examples/codex_agent.hl`. Cost is gpt-5.6-sol's list price ($4 and $20 per million input and output tokens, $0.40 cached); the plan bills none. The ChatGPT backend refuses gpt-5.5 for plan accounts, so gpt-5.6-sol stands in. Rows `hl-agent (low effort)` and `hl-agent (low effort, one gate turn)` are reruns of the hl-agent arm with the fixes from docs/GAPS.md, Gaps measured against stock Codex.
+
+| Agent | Attempts | Passed | Pass rate (95% Wilson) | Cost/attempt | Wall/attempt | Requests/attempt | Tool calls/attempt | Input+cache tokens/attempt | Output tokens/attempt |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Stock Codex | 20 | 18 | 90.0% (69.9-97.2%) | $0.136 | 57 s | 8.5 | 7.5 | 138998 | 1939 |
+| nanocode | 20 | 20 | 100.0% (83.9-100.0%) | $0.095 | 56 s | 6.5 | 6.9 | 54605 | 2025 |
+| hl-agent | 20 | 20 | 100.0% (83.9-100.0%) | $0.618 | 198 s | 20.7 | 27.7 | 411414 | 7640 |
+| hl-agent (low effort) | 20 | 19 | 95.0% (76.4-99.1%) | $0.457 | 154 s | 16.1 | 21.5 | 233997 | 5465 |
+| hl-agent (low effort, one gate turn) | 20 | 20 | 100.0% (83.9-100.0%) | $0.363 | 119 s | 13.6 | 19.9 | 202875 | 3890 |
+
+Stock Codex failed pypi-server and kv-store-grpc (the server it started was gone at verification); hl-agent with low effort failed largest-eigenval's speedup test. No request returned anything but 200 and no attempt timed out.
