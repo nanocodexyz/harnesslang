@@ -207,6 +207,7 @@ pub struct Model {
     pub setting_defaults: Vec<Option<Expr>>,
     pub window: Option<Name>,
     pub interrupts: Vec<Name>,
+    pub wire: Option<Name>,
 }
 
 #[derive(Clone, Debug)]

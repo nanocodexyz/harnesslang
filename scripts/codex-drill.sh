@@ -15,10 +15,13 @@ cancel_polls="${CODEX_DRILL_CANCEL_POLLS:-400}"
 cancel_stream_ms="${CODEX_DRILL_CANCEL_STREAM_MS:-20000}"
 out=output/codex-drill
 [ "$plant" = none ] || out="$out-$plant"
-target=agent/target
-[ "$plant" = none ] || target=output/agent-target-$plant
-agent=$target/release/hl-agent
-mock=$target/release/mock-responses
+host="${DRILL_HOST:-hl-host}"
+[ "$host" = hl-host ] || { echo "codex-drill: unknown DRILL_HOST $host (hl-host)" >&2; exit 2; }
+target=hosts/native/target
+[ "$plant" = none ] || target=output/host-target-$plant
+manifest=hosts/native/Cargo.toml
+mock=scripts/fixtures/target/release/mock-responses
+agent=$target/release/$host
 killed_status=137
 
 finished=0
@@ -44,7 +47,8 @@ case "$plant" in
 esac
 
 cargo build --release --locked -j2 --quiet
-HL_AGENT_PLANT="$plant_text" CARGO_TARGET_DIR="$(pwd)/$target" HL_BIN="$(pwd)/target/release/hl" cargo build --release --locked -j2 --quiet --manifest-path agent/Cargo.toml
+HL_AGENT_PLANT="$plant_text" CARGO_TARGET_DIR="$(pwd)/$target" HL_BIN="$(pwd)/target/release/hl" cargo build --release --locked -j2 --quiet --manifest-path "$manifest"
+cargo build --release --locked -j2 --quiet --manifest-path scripts/fixtures/Cargo.toml
 
 start_mock() {
   local directory=$1
@@ -129,7 +133,7 @@ if [ "$status" != 0 ]; then
   set -e
 fi
 if [ "$status" -ne 0 ]; then
-  echo "codex-drill: hl-agent exited $status after $kills kills" >&2
+  echo "codex-drill: $host exited $status after $kills kills" >&2
   tail -n 20 "$out/agent.err" >&2
   exit 1
 fi
@@ -214,13 +218,15 @@ wait_for() {
   tail -n 20 "$control/agent.err" >&2
   exit 1
 }
+cancel_turn=3
+model_cancel_turn=5
 run_control 1 &
 pid=$!
 wait_for 'exec_command: sleep 2'
 "$agent" steer --journal "$control/journal" --text "also write steered.txt" > /dev/null
 wait "$pid"
 [ "$(cat "$control_ws/steered.txt")" = steered ] || { echo "codex-drill: the steer did not reach the model" >&2; exit 1; }
-run_control 4 &
+run_control "$cancel_turn" &
 pid=$!
 wait_for "exec_command: sleep $cancel_sleep"
 began=$(date +%s%N)
@@ -232,7 +238,7 @@ if pgrep -f "sleep $cancel_sleep; echo late" > /dev/null; then
   exit 1
 fi
 models_before=$(grep -c ' model ' "$control/agent.err")
-run_control 5 &
+run_control "$model_cancel_turn" &
 pid=$!
 for _ in $(seq 1 "$cancel_polls"); do
   [ "$(grep -c ' model ' "$control/agent.err")" -gt "$models_before" ] && break
@@ -255,7 +261,10 @@ for line in open(f"{control}/journal/journal.jsonl"):
         statuses[record["status"]["turn"]] = record["status"]["status"]["finished"]["result"]
     if "event" in record:
         events.append(record["event"])
-expected = {"1": {"completed": "Steered."}, "2": {"completed": "Checked: steered.txt is present."}, "3": {"completed": "Checked again."}, "4": "cancelled_turn", "5": "cancelled_turn"}
+prompted = statuses.get("2")
+if not (isinstance(prompted, dict) and "completed" in prompted):
+    sys.exit(f"codex-drill: the steered prompt turn finished {prompted}")
+expected = {"1": {"completed": ""}, "2": prompted, "3": {"completed": ""}, "4": "cancelled_turn", "5": {"completed": ""}, "6": "cancelled_turn"}
 if statuses != expected:
     sys.exit(f"codex-drill: control turns finished {statuses}, expected {expected}")
 if "late" in open(f"{control}/ws/effects.log").read():

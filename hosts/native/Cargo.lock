@@ -7,7 +7,7 @@ name = "harnesslang"
 version = "0.1.0"
 
 [[package]]
-name = "hl-agent"
+name = "hl-host"
 version = "0.1.0"
 dependencies = [
  "harnesslang",

@@ -370,6 +370,10 @@ class Instance {
         const event = seed.next("model", request.turn + "/" + request.seq);
         same("model call turn", event.turn, request.turn);
         same("model call seq", event.seq, request.seq);
+        if (request.http !== undefined) {
+          same("model http request", event.http, request.http);
+          return this.giveText(encodeJson(event.answer));
+        }
         same("model calls_max", event.calls_max, request.calls_max);
         same("model mode", event.mode ?? null, request.mode ?? null);
         same("model settings", event.settings ?? null, request.settings ?? null);

@@ -9,11 +9,13 @@ pub const COMMAND_BYTES_MAX: usize = 1024 * 1024;
 pub const DESCRIPTION_BYTES_MAX: usize = 1024;
 pub const STREAM_BYTES_MAX: usize = 30_000;
 pub const TIMEOUT_MAX_MS: u64 = 600_000;
+pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
 pub const ERROR_CHARS: usize = 10_000;
 pub const ERROR_CHARS_SLACK: usize = 1_024;
 pub const SHELL_SIGNAL_STATUS: i32 = 128;
 pub const TIMED_OUT_STATUS: i32 = SHELL_SIGNAL_STATUS + 15;
 pub const READ_BYTES_MAX: u64 = 262_144;
+pub const IMAGE_BYTES_MAX: u64 = 1_048_576;
 pub const READ_TOKENS_MAX: usize = 25_000;
 pub const BYTES_PER_TOKEN: usize = 4;
 pub const SELECTED_BYTES_PER_TOKEN: u64 = 128;
@@ -37,7 +39,6 @@ const ALLOW_LARGE_UNAVAILABLE: &str =
 const FILE_STATE: &str =
     " (file state is current in your context \u{2014} no need to Read it back)";
 const BACKGROUND_STARTED: &str = "Command running in background";
-const UNKNOWN_OUTCOME: &str = "Tool execution interrupted by a host crash; outcome unknown. Do not assume it did not run or automatically repeat it.";
 const BINARY_EXTENSIONS: [&str; 87] = [
     ".ico", ".tiff", ".tif", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
     ".mpeg", ".mpg", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".aiff", ".opus",
@@ -77,22 +78,6 @@ pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
         && bytes.get(WEBP_SIGNATURE_AT..WEBP_SIGNATURE_AT + WEBP_SIGNATURE.len())
             == Some(WEBP_SIGNATURE);
     webp.then_some("image/webp")
-}
-
-pub fn unknown_outcome() -> &'static str {
-    UNKNOWN_OUTCOME
-}
-
-pub fn unavailable(name: &str, offered: &[&str]) -> String {
-    let hint = match name {
-        "Grep" => ". Grep is not available in this session \u{2014} search file contents with `grep` via the Bash tool instead.".to_owned(),
-        "Glob" => ". Glob is not available in this session \u{2014} find files with `find` via the Bash tool instead.".to_owned(),
-        _ => match offered.iter().filter(|tool| tool.eq_ignore_ascii_case(name)).collect::<Vec<_>>()[..] {
-            [tool] => format!(". Tool names are case-sensitive: call {tool} instead."),
-            _ => String::new(),
-        },
-    };
-    format!("<tool_use_error>Error: No such tool available: {name}{hint}</tool_use_error>")
 }
 
 pub struct Workspace {
@@ -135,6 +120,7 @@ fn u64_field(input: &Value, key: &str) -> Result<u64, String> {
 fn bool_field(input: &Value, key: &str) -> Result<bool, String> {
     match input.get(key) {
         Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(false),
         _ => Err(format!("invalid {key}")),
     }
 }
@@ -149,10 +135,7 @@ impl Workspace {
             "Read" => self.read(input),
             "Edit" => self.edit(input).map(Ran::Ok),
             "Write" => self.write(input).map(Ran::Ok),
-            other => Ok(Ran::Failed(unavailable(
-                other,
-                &["Read", "Edit", "Write", "Bash"],
-            ))),
+            other => Ok(Ran::Failed(format!("no syscall {other}"))),
         };
         match outcome {
             Ok(ran) => ran,
@@ -186,7 +169,7 @@ impl Workspace {
         };
         let path = self.receipt(turn, seq, RECEIPT_DONE);
         if let Err(error) = atomic_write(&path, &value.encode()) {
-            eprintln!("hl-agent: {}: {error}", path.display());
+            eprintln!("hl-host: {}: {error}", path.display());
         }
     }
 
@@ -420,10 +403,19 @@ impl Workspace {
                 "command must be nonblank and at most {COMMAND_BYTES_MAX} bytes"
             ));
         }
-        if text_field(input, "description")?.len() > DESCRIPTION_BYTES_MAX {
+        if input
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .len()
+            > DESCRIPTION_BYTES_MAX
+        {
             return Err(format!("description exceeds {DESCRIPTION_BYTES_MAX} bytes"));
         }
-        let requested = u64_field(input, "timeout")?;
+        let requested = match input.get("timeout") {
+            None => TIMEOUT_DEFAULT_MS,
+            Some(_) => u64_field(input, "timeout")?,
+        };
         if requested == 0 {
             return Err("timeout must be at least 1 millisecond".into());
         }
@@ -759,7 +751,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         .file_name()
         .ok_or("file has no name")?
         .to_string_lossy();
-    let temporary = path.with_file_name(format!(".{name}.hl-agent-write"));
+    let temporary = path.with_file_name(format!(".{name}.hl-host-write"));
     std::fs::write(&temporary, content).map_err(|error| format!("write: {error}"))?;
     if let Ok(metadata) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&temporary, metadata.permissions());

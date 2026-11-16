@@ -1,5 +1,6 @@
 /target
 /output
 /oracle/target
-/agent/target
+/hosts/native/target
+/scripts/fixtures/target
 __pycache__/

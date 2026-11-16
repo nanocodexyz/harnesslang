@@ -3,32 +3,18 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
-use crate::anthropic::Client;
-use crate::json::Value;
-use crate::{Agent, Ledger, child_harness, harness, host, now_ms, tools};
+use harnesslang::wasm::js::Json;
 
-pub const SPAWN_TOOL: &str = "spawn_agent";
-pub const LIST_TOOL: &str = "list_agents";
-pub const SUBMIT_TOOL: &str = "submit_result";
+use crate::host::{self, Ran, Session, Setup};
+use crate::json::Value;
+use crate::tools;
+
 pub const RUNNING_MAX: usize = 16;
-const LISTED_MAX: u64 = harness::ROUNDS_MAX * harness::CALLS_PER_ROUND_MAX;
-const CHILD_HANDLER: &str = "delegated";
-const CHILD_TURN: u64 = 1;
+pub const LISTED_MAX: u64 = 4096;
 const DIRECTORY: &str = "children";
 const SPAWN_FILE: &str = "spawn.json";
-const JOURNAL_FILE: &str = "journal.jsonl";
-const LEDGER_FILE: &str = "usage.jsonl";
-
-#[derive(Clone)]
-pub struct Setup {
-    pub base_url: String,
-    pub key: String,
-    pub model: String,
-    pub max_tokens: u64,
-    pub system: Value,
-    pub tools: Value,
-    pub cwd: PathBuf,
-}
+const CONFIGURE_TURN: u64 = 1;
+const NO_HANDLER: &str = "no handler";
 
 enum Child {
     Running(JoinHandle<Result<String, String>>),
@@ -38,6 +24,7 @@ enum Child {
 pub struct Children {
     directory: PathBuf,
     setup: Setup,
+    cancel: PathBuf,
     started: BTreeMap<String, Child>,
 }
 
@@ -54,7 +41,7 @@ fn is_key(key: &str) -> bool {
         .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-fn write_durably(path: &Path, text: &str) -> Result<(), String> {
+pub fn write_durably(path: &Path, text: &str) -> Result<(), String> {
     let temporary = path.with_extension("new");
     let mut file = std::fs::File::create(&temporary)
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
@@ -62,43 +49,18 @@ fn write_durably(path: &Path, text: &str) -> Result<(), String> {
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
     std::fs::rename(&temporary, path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let parent = path
-        .parent()
-        .expect("a child's file is inside its directory");
+    let parent = path.parent().expect("a durable file is inside a directory");
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("{}: {error}", parent.display()))
 }
 
-pub fn submitted(input: &Value) -> tools::Ran {
-    match input.get("output").and_then(Value::as_str) {
-        Some(output) => tools::Ran::Ok(output.to_owned()),
-        None => tools::Ran::Failed("submit_result needs output, a string".to_owned()),
-    }
-}
-
-pub fn ledgers(journal: &Path) -> Result<Vec<PathBuf>, String> {
-    let directory = journal.join(DIRECTORY);
-    let Ok(entries) = std::fs::read_dir(&directory) else {
-        return Ok(Vec::new());
-    };
-    let mut found = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
-        let ledger = entry.path().join(LEDGER_FILE);
-        if ledger.exists() {
-            found.push(ledger);
-        }
-    }
-    found.sort();
-    Ok(found)
-}
-
 impl Children {
-    pub fn new(journal: &Path, setup: Setup) -> Self {
+    pub fn new(session: &Path, setup: Setup, cancel: &Path) -> Self {
         Self {
-            directory: journal.join(DIRECTORY),
+            directory: session.join(DIRECTORY),
             setup,
+            cancel: cancel.to_path_buf(),
             started: BTreeMap::new(),
         }
     }
@@ -110,7 +72,15 @@ impl Children {
             .count()
     }
 
-    pub fn spawn(&mut self, turn: u64, seq: u64, input: &Value) -> tools::Ran {
+    pub fn spawn(
+        &mut self,
+        turn: u64,
+        seq: u64,
+        program: &str,
+        handler: &str,
+        input: &Value,
+        configure: Option<Json>,
+    ) -> tools::Ran {
         let key = format!("{turn}{}{seq}", harnesslang::ir::SPAWN_KEY_SEPARATOR);
         assert!(
             is_key(&key),
@@ -118,13 +88,9 @@ impl Children {
         );
         if self.running() >= RUNNING_MAX {
             return tools::Ran::Failed(format!(
-                "{RUNNING_MAX} subagents are already running; wait for one with wait_agent before starting another"
+                "{RUNNING_MAX} subagents are already running; wait for one before starting another"
             ));
         }
-        let fields = ["role", "task"].map(|name| input.get(name).and_then(Value::as_str));
-        let [Some(role), Some(task)] = fields else {
-            return tools::Ran::Failed("spawn_agent needs role and task, both strings".to_owned());
-        };
         let directory = self.directory.join(&key);
         if directory.join(SPAWN_FILE).exists() {
             return tools::Ran::Failed(format!(
@@ -132,18 +98,23 @@ impl Children {
                 directory.display()
             ));
         }
-        let spawn = Value::object([("role", Value::text(role)), ("task", Value::text(task))]);
+        let configure = configure.map_or(Value::Null, |json| host::to_value(&json));
+        let spawn = Value::object([
+            ("program", Value::text(program)),
+            ("handler", Value::text(handler)),
+            ("arguments", input.clone()),
+            ("configure", configure),
+        ]);
         if let Err(error) = std::fs::create_dir_all(&directory)
             .map_err(|error| format!("{}: {error}", directory.display()))
             .and_then(|()| write_durably(&directory.join(SPAWN_FILE), &spawn.encode()))
         {
             return tools::Ran::Failed(error);
         }
-        let setup = self.setup.clone();
-        let thread_key = key.clone();
+        let (setup, cancel, thread_key) = (self.setup.clone(), self.cancel.clone(), key.clone());
         let started = std::thread::Builder::new()
             .name(key.clone())
-            .spawn(move || run(&setup, &directory, &thread_key));
+            .spawn(move || run(&setup, &directory, &thread_key, &cancel));
         match started {
             Ok(handle) => {
                 self.started.insert(key.clone(), Child::Running(handle));
@@ -169,7 +140,7 @@ impl Children {
     pub fn join(&mut self, key: &str) -> Option<String> {
         if !is_key(key) {
             return Some(failed(&format!(
-                "{key:?} is not an agent ID that spawn_agent returned"
+                "{key:?} is not an agent ID that a spawn returned"
             )));
         }
         let directory = self.directory.join(key);
@@ -177,14 +148,14 @@ impl Children {
             if !directory.join(SPAWN_FILE).exists() {
                 return Some(failed(&format!("no subagent has the ID {key}")));
             }
-            let ended = run(&self.setup, &directory, key);
+            let ended = run(&self.setup, &directory, key, &self.cancel);
             self.started.insert(key.to_owned(), Child::Ended(ended));
         }
         self.settle(key);
         match self.started.get(key) {
             Some(Child::Ended(Ok(answer))) => Some(answer.clone()),
             Some(Child::Ended(Err(error))) => {
-                eprintln!("hl-agent: subagent {key} did not finish: {error}");
+                eprintln!("hl-host: subagent {key} did not finish: {error}");
                 self.started.remove(key);
                 None
             }
@@ -208,7 +179,7 @@ impl Children {
         }
         if keys.len() as u64 > LISTED_MAX {
             return tools::Ran::Failed(format!(
-                "{} children, more than a turn can start (LISTED_MAX, {LISTED_MAX})",
+                "{} children, more than LISTED_MAX ({LISTED_MAX})",
                 keys.len()
             ));
         }
@@ -232,7 +203,13 @@ impl Children {
         let role = std::fs::read_to_string(self.directory.join(key).join(SPAWN_FILE))
             .ok()
             .and_then(|text| Value::decode(&text).ok())
-            .and_then(|spawn| spawn.get("role").and_then(Value::as_str).map(str::to_owned))
+            .and_then(|spawn| {
+                spawn
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("role"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
             .unwrap_or_default();
         let status = match self.started.get(key) {
             Some(Child::Running(_)) => Value::object([("state", Value::text("running"))]),
@@ -262,13 +239,13 @@ impl Children {
             .map(|(key, _)| key.clone())
             .collect();
         for key in running {
-            eprintln!("hl-agent: waiting for subagent {key}, whose result the turn did not read");
+            eprintln!("hl-host: waiting for subagent {key}, whose result the turn did not read");
             self.settle(&key);
         }
     }
 }
 
-fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
+fn run(setup: &Setup, directory: &Path, key: &str, cancel: &Path) -> Result<String, String> {
     let spawn_path = directory.join(SPAWN_FILE);
     let spawn = std::fs::read_to_string(&spawn_path)
         .map_err(|error| format!("{}: {error}", spawn_path.display()))
@@ -282,64 +259,52 @@ fn run(setup: &Setup, directory: &Path, key: &str) -> Result<String, String> {
             .map(str::to_owned)
             .ok_or_else(|| format!("{} has no {name}", spawn_path.display()))
     };
-    let (role, task) = (field("role")?, field("task")?);
-    let state = directory.join("state");
-    std::fs::create_dir_all(&state).map_err(|error| format!("{}: {error}", state.display()))?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join(LEDGER_FILE))
-        .map_err(|error| format!("{}: {error}", directory.display()))?;
-    let mut agent = Agent {
-        client: Client {
-            base_url: setup.base_url.clone(),
-            key: setup.key.clone(),
-            model: setup.model.clone(),
-            max_tokens: setup.max_tokens,
-            system: setup.system.clone(),
-            tools: setup.tools.clone(),
-            scratch: state.clone(),
-        },
-        workspace: tools::Workspace {
-            root: setup.cwd.clone(),
-            state,
-            image_bytes_max: child_harness::READ_BYTES_MAX,
-        },
-        ledger: Ledger { file },
-        children: None,
-        label: format!("hl-agent[{key}]"),
-        jobs: crate::jobs::Jobs::default(),
-    };
-    let mark = |agent: &mut Agent, kind: &str| {
-        agent.ledger.append(Value::object([
-            ("kind", Value::text(kind)),
-            ("at_ms", Value::number(now_ms())),
-        ]));
-    };
-    mark(&mut agent, "start");
-    let journal = directory.join(JOURNAL_FILE);
-    let mut disk = harnesslang::wasm::native::Journal::open(&journal)?;
-    let loaded = host::load(child_harness::MODULE);
-    let request = host::request(
-        CHILD_HANDLER,
-        CHILD_TURN,
-        Value::object([("role", Value::text(&role)), ("task", Value::text(&task))]),
-    );
-    let ran = host::run(&loaded, &mut agent, &mut disk, &request);
-    mark(&mut agent, "end");
+    let (program, handler) = (field("program")?, field("handler")?);
+    let arguments = spawn
+        .get("arguments")
+        .map(host::to_json)
+        .ok_or_else(|| format!("{} has no arguments", spawn_path.display()))?;
+    let loaded = host::load_program(setup.module_dir.as_deref(), &program)?;
+    let label = format!("hl-host[{key}]");
+    let mut session = Session::open(setup.clone(), directory, &label, cancel)?;
+    session.ledger.mark("start", crate::now_ms());
+    let mut turn = CONFIGURE_TURN;
+    if let Some(configure) = spawn
+        .get("configure")
+        .filter(|value| !matches!(value, Value::Null))
+    {
+        let configure = host::to_json(configure);
+        session.remember_configure(&configure)?;
+        let request = host::request(host::CONFIGURE_HANDLER, CONFIGURE_TURN, configure);
+        match host::run_turn(&loaded, &mut session, &request) {
+            Ok(Ran::Finished(finish)) if finish.completed => turn += 1,
+            Ok(Ran::Finished(finish)) => {
+                session.close();
+                return Err(format!("configure ended {}", finish.result.encode()));
+            }
+            Err(error) if error.contains(NO_HANDLER) => {}
+            Ok(Ran::Suspended { seq, .. }) => {
+                session.close();
+                return Err(format!("configure suspended at {seq}"));
+            }
+            Ok(Ran::NotDue) => {}
+            Err(error) => {
+                session.close();
+                return Err(error);
+            }
+        }
+    }
+    let request = host::request(&handler, turn, arguments);
+    let ran = host::run_turn(&loaded, &mut session, &request);
+    session.close();
+    session.ledger.mark("end", crate::now_ms());
     match ran {
-        Ok(host::Ran::Finished(finish)) => {
-            eprintln!("{}: finished {}", agent.label, finish.result.encode());
+        Ok(Ran::Finished(finish)) => {
+            eprintln!("{label}: finished {}", finish.result.encode());
             Ok(finish.result.encode())
         }
-        Ok(host::Ran::Suspended { .. }) => {
-            panic!("the child harness declares no suspend, so its turn never waits")
-        }
-        Ok(host::Ran::NotDue) => {
-            panic!(
-                "the child harness declares no idle handler, so its prompt is never refused as not due"
-            )
-        }
+        Ok(Ran::Suspended { seq, .. }) => Err(format!("the child turn waits on suspend {seq}")),
+        Ok(Ran::NotDue) => Err("the child turn was refused as not due".to_owned()),
         Err(error) => Err(error),
     }
 }
