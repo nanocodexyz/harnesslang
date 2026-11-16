@@ -15,10 +15,9 @@ caught() {
   dir="$out/$mutation-$name"
   mkdir -p "$dir/host"
   "$hl" emit --target vercel --format mjs "$file" > "$dir/host/program.mjs"
-  "$hl" emit --format source --target vercel "$file" > "$dir/generated.mjs"
   "$hl" sim --target vercel --seeds "$seeds" --trace "$dir/trace.jsonl" "$file" > /dev/null
   node oracle/cloudflare/mutate.mjs "$mutation" hosts/vercel.mjs "$dir/host/vercel.mjs"
-  if node scripts/js-sim.mjs --target vercel --module "$dir/host/vercel.mjs" --runtime "$dir/generated.mjs" --trace "$dir/trace.jsonl" > "$dir/log" 2>&1; then
+  if node scripts/js-sim.mjs --target vercel --module "$dir/host/vercel.mjs" --trace "$dir/trace.jsonl" > "$dir/log" 2>&1; then
     echo "host mutations: $mutation survived $file on the fixed Vercel host" >&2
     exit 1
   fi
