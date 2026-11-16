@@ -19,25 +19,12 @@ plant="${AGENT_DRILL_PLANT:-none}"
 seed="${AGENT_DRILL_SEED:-1}"
 out=output/agent-drill-$mode
 [ "$plant" = none ] || out="$out-$plant"
-host="${DRILL_HOST:-hl-agent}"
-case "$host" in
-  hl-agent)
-    target=agent/target
-    [ "$plant" = none ] || target=output/agent-target-$plant
-    manifest=agent/Cargo.toml
-    mock=$target/release/mock-messages
-    ;;
-  hl-host)
-    target=hosts/native/target
-    [ "$plant" = none ] || target=output/host-target-$plant
-    manifest=hosts/native/Cargo.toml
-    mock=scripts/fixtures/target/release/mock-messages
-    ;;
-  *)
-    echo "agent-drill: unknown DRILL_HOST $host (hl-agent, hl-host)" >&2
-    exit 2
-    ;;
-esac
+host="${DRILL_HOST:-hl-host}"
+[ "$host" = hl-host ] || { echo "agent-drill: unknown DRILL_HOST $host (hl-host)" >&2; exit 2; }
+target=hosts/native/target
+[ "$plant" = none ] || target=output/host-target-$plant
+manifest=hosts/native/Cargo.toml
+mock=scripts/fixtures/target/release/mock-messages
 agent=$target/release/$host
 killed_status=137
 
@@ -65,7 +52,7 @@ esac
 
 cargo build --release --locked -j2 --quiet
 HL_AGENT_PLANT="$wasm_plant" CARGO_TARGET_DIR="$(pwd)/$target" cargo build --release --locked -j2 --quiet --manifest-path "$manifest"
-[ "$host" = hl-agent ] || cargo build --release --locked -j2 --quiet --manifest-path scripts/fixtures/Cargo.toml
+cargo build --release --locked -j2 --quiet --manifest-path scripts/fixtures/Cargo.toml
 
 rm -rf "$out"
 mkdir -p "$out/ws"

@@ -15,25 +15,12 @@ cancel_polls="${CODEX_DRILL_CANCEL_POLLS:-400}"
 cancel_stream_ms="${CODEX_DRILL_CANCEL_STREAM_MS:-20000}"
 out=output/codex-drill
 [ "$plant" = none ] || out="$out-$plant"
-host="${DRILL_HOST:-hl-agent}"
-case "$host" in
-  hl-agent)
-    target=agent/target
-    [ "$plant" = none ] || target=output/agent-target-$plant
-    manifest=agent/Cargo.toml
-    mock=$target/release/mock-responses
-    ;;
-  hl-host)
-    target=hosts/native/target
-    [ "$plant" = none ] || target=output/host-target-$plant
-    manifest=hosts/native/Cargo.toml
-    mock=scripts/fixtures/target/release/mock-responses
-    ;;
-  *)
-    echo "codex-drill: unknown DRILL_HOST $host (hl-agent, hl-host)" >&2
-    exit 2
-    ;;
-esac
+host="${DRILL_HOST:-hl-host}"
+[ "$host" = hl-host ] || { echo "codex-drill: unknown DRILL_HOST $host (hl-host)" >&2; exit 2; }
+target=hosts/native/target
+[ "$plant" = none ] || target=output/host-target-$plant
+manifest=hosts/native/Cargo.toml
+mock=scripts/fixtures/target/release/mock-responses
 agent=$target/release/$host
 killed_status=137
 
@@ -61,7 +48,7 @@ esac
 
 cargo build --release --locked -j2 --quiet
 HL_AGENT_PLANT="$plant_text" CARGO_TARGET_DIR="$(pwd)/$target" HL_BIN="$(pwd)/target/release/hl" cargo build --release --locked -j2 --quiet --manifest-path "$manifest"
-[ "$host" = hl-agent ] || cargo build --release --locked -j2 --quiet --manifest-path scripts/fixtures/Cargo.toml
+cargo build --release --locked -j2 --quiet --manifest-path scripts/fixtures/Cargo.toml
 
 start_mock() {
   local directory=$1
@@ -231,12 +218,8 @@ wait_for() {
   tail -n 20 "$control/agent.err" >&2
   exit 1
 }
-cancel_turn=4
+cancel_turn=3
 model_cancel_turn=5
-if [ "$host" = hl-host ]; then
-  cancel_turn=3
-  model_cancel_turn=5
-fi
 run_control 1 &
 pid=$!
 wait_for 'exec_command: sleep 2'
@@ -267,9 +250,9 @@ began=$(date +%s%N)
 wait "$pid"
 model_cancel_ms=$(( ($(date +%s%N) - began) / 1000000 ))
 stop_mock
-python3 - "$control" "$tool_cancel_ms" "$model_cancel_ms" "$host" <<'EOF'
+python3 - "$control" "$tool_cancel_ms" "$model_cancel_ms" <<'EOF'
 import json, sys
-control, tool_ms, model_ms, host = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+control, tool_ms, model_ms = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 statuses = {}
 events = []
 for line in open(f"{control}/journal/journal.jsonl"):
@@ -278,12 +261,10 @@ for line in open(f"{control}/journal/journal.jsonl"):
         statuses[record["status"]["turn"]] = record["status"]["status"]["finished"]["result"]
     if "event" in record:
         events.append(record["event"])
-expected = {"1": {"completed": "Steered."}, "2": {"completed": "Checked: steered.txt is present."}, "3": {"completed": "Checked again."}, "4": "cancelled_turn", "5": "cancelled_turn"}
-if host == "hl-host":
-    prompted = statuses.get("2")
-    if not (isinstance(prompted, dict) and "completed" in prompted):
-        sys.exit(f"codex-drill: the steered prompt turn finished {prompted}")
-    expected = {"1": {"completed": ""}, "2": prompted, "3": {"completed": ""}, "4": "cancelled_turn", "5": {"completed": ""}, "6": "cancelled_turn"}
+prompted = statuses.get("2")
+if not (isinstance(prompted, dict) and "completed" in prompted):
+    sys.exit(f"codex-drill: the steered prompt turn finished {prompted}")
+expected = {"1": {"completed": ""}, "2": prompted, "3": {"completed": ""}, "4": "cancelled_turn", "5": {"completed": ""}, "6": "cancelled_turn"}
 if statuses != expected:
     sys.exit(f"codex-drill: control turns finished {statuses}, expected {expected}")
 if "late" in open(f"{control}/ws/effects.log").read():

@@ -380,14 +380,16 @@ drill() {
 }
 
 agent() {
-  if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' agent/src agent/build.rs; then
-    echo "agent/ has comments or test functions" >&2
+  if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' hosts/native/src hosts/native/build.rs scripts/fixtures/src; then
+    echo "hosts/native or scripts/fixtures has comments or test functions" >&2
     exit 1
   fi
-  rustfmt --edition 2024 --check agent/build.rs agent/src/*.rs agent/src/bin/*.rs
+  rustfmt --edition 2024 --check hosts/native/build.rs hosts/native/src/*.rs scripts/fixtures/src/*.rs scripts/fixtures/src/bin/*.rs
+  scripts/fixtures/host-probe.sh
+  scripts/fixtures/wire-probe.sh
   AGENT_DRILL_SEED=1 scripts/agent-drill.sh
   if AGENT_DRILL_SEED=1 AGENT_DRILL_PLANT=batch_flush_after_dispatch scripts/agent-drill.sh > "$scratch/agent-drill-plant.log" 2>&1; then
-    echo "agent: batch_flush_after_dispatch survived the hl-agent kill -9 drill" >&2
+    echo "agent: batch_flush_after_dispatch survived the hl-host kill -9 drill" >&2
     exit 1
   fi
   if ! grep -q 'external calls dispatched more than once' "$scratch/agent-drill-plant.log"; then
@@ -405,8 +407,8 @@ agent() {
     cat "$scratch/codex-drill-plant.log" >&2
     exit 1
   fi
-  echo "agent: hl-agent survives kill -9 against the local mock without repeating an external call, and batch_flush_after_dispatch is caught"
-  echo "agent: codex_agent.hl on hl-agent survives kill -9 against the fake Responses API, steers and cancels, and batch_flush_after_dispatch is caught"
+  echo "agent: hl-host survives kill -9 against the local mock without repeating an external call, and batch_flush_after_dispatch is caught"
+  echo "agent: codex_agent.hl on hl-host survives kill -9 against the fake Responses API, steers and cancels, and batch_flush_after_dispatch is caught"
 }
 
 stage build build

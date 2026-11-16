@@ -3,7 +3,7 @@ import re
 import sys
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
-PROMPTS = ROOT + "/agent/prompts/"
+PROMPTS = ROOT + "/scripts/fixtures/prompts/"
 CHUNK = 24000
 
 
@@ -232,12 +232,7 @@ def claude_generated(side, levels):
 
 
 def codex_texts():
-    source = read(ROOT + "/agent/src/codex_host.rs")
-    texts = {}
-    for name in ["FINISH_CHECK", "REVIEWED"]:
-        match = re.search(r"const " + name + r': &str = "((?:[^"\\]|\\.)*)";', source)
-        texts[name] = json.loads(Q + match.group(1) + Q)
-    return texts
+    return json.loads(read("codex-texts.json"))
 
 
 def message_open():
