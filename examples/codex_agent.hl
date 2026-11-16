@@ -63,6 +63,7 @@ state {
   escalated: bool
   checking: bool
   verdict_pass: bool
+  verdict_rest: text
   review_setting: text
   checks_wanted: u64
   checks_left: u64
@@ -344,14 +345,14 @@ fn turn_done(words: text, round: u64) {
 
 fn verdict(words: text) {
   let mark = "\nVERDICT: PASS"
-  let report = "\n" ++ trim(words)
-  verdict_pass = contains(report, mark)
+  verdict_rest = "\n" ++ trim(words)
+  verdict_pass = contains(verdict_rest, mark)
   loop line below verdict_lines_max {
-    if contains(report, mark) {
-      report = after(report, mark)
+    if contains(verdict_rest, mark) {
+      verdict_rest = after(verdict_rest, mark)
     }
   }
-  verdict_pass = verdict_pass and report == ""
+  verdict_pass = verdict_pass and verdict_rest == ""
 }
 
 fn escalate() {
@@ -451,7 +452,6 @@ on configure(model_name: text, requested_effort: effort_choice, finish_checks: f
     "xhigh" => { effort = "xhigh" }
   }
   escalate_id = escalate_model
-  escalated = false
   select_model()
   match finish_checks {
     "2" => { checks_wanted = 2 }
@@ -475,11 +475,6 @@ on prompt(input: text, rounds: u64) -> outcome
   task_text = input
   checks_left = checks_wanted
   checking = false
-  if escalated {
-    escalated = false
-    select_model()
-    compose()
-  }
   reviews = 0
   final_words = ""
   finished = false
