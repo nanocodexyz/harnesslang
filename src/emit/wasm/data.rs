@@ -21,6 +21,9 @@ pub const KIND_DENY: u32 = 10;
 const INTERRUPT_CANCEL: u32 = 1;
 const INTERRUPT_STEER: u32 = 2;
 const MODEL_TRAP: u32 = 0;
+const WIRE_NONE: u32 = 0;
+const WIRE_ANTHROPIC: u32 = 1;
+const WIRE_OPENAI: u32 = 2;
 const MODEL_KNOWN: u32 = 1;
 const MODEL_ATTEMPT: u32 = 2;
 pub const KIND_LISTING: u32 = 5;
@@ -279,7 +282,7 @@ impl<'p> Tables<'p> {
 
     fn model(&mut self) -> Result<(), String> {
         let Some(model) = &self.program.model else {
-            writeln!(self.out, "(words $model {MODEL_TRAP} 0 0 0)")
+            writeln!(self.out, "(words $model {MODEL_TRAP} 0 0 0 0)")
                 .expect("writing to a string succeeds");
             return Ok(());
         };
@@ -302,9 +305,14 @@ impl<'p> Tables<'p> {
         }
         writeln!(self.out, "(words $model_settings {})", settings.join(" "))
             .expect("writing to a string succeeds");
+        let wire = match model.wire {
+            None => WIRE_NONE,
+            Some(ir::Wire::Anthropic) => WIRE_ANTHROPIC,
+            Some(ir::Wire::Openai) => WIRE_OPENAI,
+        };
         writeln!(
             self.out,
-            "(words $model {outcome} {tokens} {} $model_settings)",
+            "(words $model {outcome} {tokens} {} $model_settings {wire})",
             settings.len()
         )
         .expect("writing to a string succeeds");
