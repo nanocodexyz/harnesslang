@@ -117,7 +117,7 @@ Built: the parser, checker and prover; the replay interpreter; the simulator
 with every target's faults and planted bugs; code generation for all five
 targets; an oracle that folds harnesslang journals with nanocode's own
 `nanocode-turnlog`; a kill -9 drill of the generated `native-jsonl` code;
-`hl-agent` (`agent/`), nanocode's Claude harness written in harnesslang
+`hl-host` (`hosts/native/`), the fixed native host, running nanocode's Claude harness written in harnesslang
 (`examples/claude_code.hl`) and run as a coding agent against the Anthropic
 API, starting subagents (`examples/claude_code_child.hl`) as child sessions;
 with an OpenAI model it runs Codex's harness (`examples/codex_agent.hl`)
@@ -143,8 +143,8 @@ and the nanocode oracle cover it.
     target/release/hl sim --target cloudflare --seeds 0..1000 examples/agent.hl
     target/release/hl emit --format source --target native-jsonl examples/agent.hl
     scripts/check.sh
-    cargo build --release --manifest-path agent/Cargo.toml
-    agent/target/release/hl-agent run --instruction task.md --cwd . --model claude-haiku-4-5 --journal output/run
+    cargo build --release --manifest-path hosts/native/Cargo.toml
+    hosts/native/target/release/hl-host run --instruction task.md --cwd . --model claude-haiku-4-5 --journal output/run
 
 - [docs/LANGUAGE.md](docs/LANGUAGE.md): the language reference and a tutorial
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the design, journal and proofs

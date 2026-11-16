@@ -1514,6 +1514,19 @@ The same smoke on the pull request that moves `codex_agent.hl` onto compiler-emi
 - Modules come from `--module-dir`, else beside the binary, else the three embedded at build time from `examples/`.
 - The mock servers move to `scripts/fixtures` (own crate). `DRILL_HOST=hl-host` points both drills at hl-host; the default stays hl-agent until `agent/` is deleted.
 - Checked: `cargo test` and clippy in `hosts/native`; `scripts/fixtures/wire-probe.sh` sends Messages and Responses wire requests to the mocks (events split, `:-` default, unset name, refused port); fixture programs `scripts/fixtures/programs/syscalls*.hl` exercise Write, Edit, apply_patch, Bash, an unknown syscall and a spawn with join through `hl-host run`. The drills under `DRILL_HOST=hl-host` need the wire models (lane1-wire).
+
+## 2026-11-16: agent/ is deleted; hl-host runs the drills and the evals
+
+`agent/` (hl-agent, the per-program host with its generated Rust and wasm hosting code) is gone. What still mattered moved:
+
+- `agent/prompts` moved to `scripts/fixtures/prompts`, and the codex FINISH_CHECK and REVIEWED texts that `scripts/program-literals.py` read out of `agent/src/codex_host.rs` are now `scripts/fixtures/prompts/codex-texts.json`. The script regenerates the three programs' literals byte for byte from them.
+- `scripts/agent-drill.sh` and `scripts/codex-drill.sh` run only on hl-host (`DRILL_HOST` defaults to `hl-host` and refuses anything else); a plant builds hl-host into `output/host-target-<plant>`. The codex drill's control check keeps hl-host's expectations only: the cancel lands on turn 3.
+- `scripts/check.sh` checks `hosts/native` and `scripts/fixtures` for comments, tests and rustfmt, and runs `scripts/fixtures/host-probe.sh` and `wire-probe.sh`. hl-host's `wire.rs` lost its `#[cfg(test)]` module: the repository has no test functions, and wire-probe covers the same expansion (`${NAME}`, `${NAME:-default}`, unset names) and event splitting against the mock servers.
+- The evals keep calling a binary named `hl-agent` with hl-agent's flags; hl-host's front takes them (`--instruction --cwd --model --journal --max-turns --effort --finish-checks --reviewer-relay --keep-warm`), so an eval root is built from hl-host: `cargo build --release --manifest-path hosts/native/Cargo.toml`, then `evals/agent-root.sh hosts/native/target/release/hl-host <root>` (or `HL_AGENT=hosts/native/target/release/hl-host evals/setup.sh`), which installs it as `bin/hl-agent`. `--fork-from` left with agent/: the fixed host does not fork yet.
+- The front keeps `--spawn tool=program:handler`: a compiled spawn request carries only the spawn key, not the child's program and handler, so the host still needs to be told which module a spawn tool runs. Every run starts with the program's `configure` handler, and a child's `configure` gets the parent's arguments.
+- gate.txt: `host_lines_beyond_fixed` 8448 to 0 and `programs_not_on_wasm` 91 to 10 with agent/ gone. `emitted_source_lines` rose from 967299 to 973580 because the wire programs (lane1-wire, lane1-programs) are larger in the source backends; master's programs measure 967299 with this branch's compiler, so the rise is the programs, and gate.txt takes the new number by hand.
+- LANGUAGE.md gains a Wire models section (`docs/snippets/wire.hl`), `wire` in the contextual words and `[ "wire" name ]` in the model grammar, so `scripts/docs-check.sh` passes again.
+
 ## 2026-11-16: codex_agent.hl escalates a failed finish check to a second model
 
 Escalation from Luna to Terra comes back as an option of the harness, not the host: `configure` gains `escalate_model: text` as its last parameter, `""` for none, and the hl-agent compatible front passes `--escalate-model <model>` through it. It reproduces the unpushed binary behind the 80.0% baseline, as reconstructed from its rows:
