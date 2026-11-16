@@ -90,10 +90,10 @@ def probe_fns(call_of, recoverable, codex):
         "      agents_more = false",
         f"      match {call_of(command)} {{",
         "        ok(out) => { probed_output(out, chunk) }",
-        '        failed(error) => { return failed("the environment probe failed: " ++ error) }',
+        "        failed(_) => { probe_lost() }",
     ]
     if recoverable:
-        out.append('        unknown => { return failed("the environment probe ended unknown") }')
+        out.append("        unknown => { probe_lost() }")
     out += [
         "      }",
         "    }",
@@ -101,14 +101,25 @@ def probe_fns(call_of, recoverable, codex):
         "  if agents_more {",
         '    return failed("AGENTS.md is longer than the environment probe reads")',
         "  }",
-        "  probed = true",
+        "}",
+        "",
+        "fn probe_lost() {",
+        "  agents_more = false",
+        "  agents_present = false",
+        '  agents_text = ""',
         "}",
         "",
         "fn probed_output(out: text, chunk: u64) {",
         '  if not contains(out, "@@hl-end@@") {',
-        '    return failed("the environment probe printed no end marker: " ++ out)',
+        "    probe_lost()",
+        "  } else {",
+        "    probed_fields(out, chunk)",
         "  }",
+        "}",
+        "",
+        "fn probed_fields(out: text, chunk: u64) {",
         "  if chunk == 0 {",
+        "    probed = true",
     ]
     names = ["cwd", "git", "platform", "shell", "os", "date"] + (["zone", "key", "base", "normal"] if codex else [])
     for name in names:
@@ -155,17 +166,16 @@ BLOCK = "{" + J("type") + ":" + J("text") + "," + J("text") + ":" + Q
 
 
 def claude_generated(side, levels):
-    out = ["fn model_table(model_name: text) {", "  model_known = false", "  adaptive = false"]
-    first = True
+    variants = " | ".join(L(name) for name in CLAUDE_MODELS_128K + CLAUDE_MODELS_64K)
+    out = ["type claude_model = " + variants, "", "fn model_table(model_name: claude_model) {", "  adaptive = false", "  match model_name {"]
     for name in CLAUDE_MODELS_128K + CLAUDE_MODELS_64K:
         tokens = "128000" if name in CLAUDE_MODELS_128K else "64000"
-        keyword = "if" if first else "} else if"
-        out.append(f"  {keyword} model_name == {L(name)} {{")
-        out.append("    model_known = true")
-        out.append(f"    max_tokens_text = {L(tokens)}")
+        out.append(f"    {L(name)} => {{")
+        out.append(f"      model_id = {L(name)}")
+        out.append(f"      max_tokens_text = {L(tokens)}")
         if name in CLAUDE_ADAPTIVE:
-            out.append("    adaptive = true")
-        first = False
+            out.append("      adaptive = true")
+        out.append("    }")
     out += ["  }", "}", ""]
     description = L("Read the environment for the system prompt")
     out += probe_fns(lambda command: f"Bash({command}, probe_timeout_ms, {description}, false, false)", True, False)
@@ -323,6 +333,15 @@ def splice(path, fns):
     if current:
         blocks.append(current)
     for block in blocks:
+        if block[0].startswith("type "):
+            prefix = block[0][:block[0].index("=") + 1]
+            at = next((i for i, line in enumerate(lines) if line.startswith(prefix)), None)
+            if at is None:
+                at = next(i for i, line in enumerate(lines) if line.startswith("type "))
+                lines[at:at] = block
+            else:
+                lines[at] = block[0]
+            continue
         name = re.match(r"fn ([a-z_]+)\(", block[0]).group(1)
         start = next((i for i, line in enumerate(lines) if line.startswith("fn " + name + "(")), None)
         if start is None:
