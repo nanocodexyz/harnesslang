@@ -439,7 +439,7 @@ impl World for Session {
 
     fn model(&mut self, request: &Json) -> Result<Json, String> {
         let http = request.get("http");
-        if matches!(http, Json::Null) {
+        if !matches!(http, Json::Object(_)) {
             return Err(format!(
                 "hl-host answers only wire model requests, which carry an http request: {}",
                 request.get("seq").encode()
