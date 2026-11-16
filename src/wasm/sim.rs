@@ -235,14 +235,7 @@ impl<'e> Seed<'e> {
 
     fn flushed(&mut self, context: &mut Context, bytes: &str) -> Result<(), Stop> {
         self.unflushed = None;
-        self.run_records += bytes
-            .lines()
-            .filter(|line| {
-                !line.is_empty()
-                    && !line.starts_with("{\"event\":")
-                    && !line.contains("\"record\":{\"event\":")
-            })
-            .count() as u64;
+        self.run_records += bytes.lines().filter(|line| !line.is_empty()).count() as u64;
         context.stats.records_max = context.stats.records_max.max(self.run_records);
         if let Some(bound) = context.bounds.records_per_run.get(&self.handler)
             && self.run_records > *bound

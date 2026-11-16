@@ -571,7 +571,7 @@ the turn finishes `failed` before its body runs, so state is unchanged.
 | `no_overflow` | every `+`, `-` and `*` on `u64`, in `requires` too, stays in range |
 | `push_bound` | every `push` finds its list below capacity |
 | `invariant_initial`, `invariant_preserved` | invariants hold in the zero state, at every `return`, and where a model reply fails to decode: the one trap left once `no_overflow` and `push_bound` hold |
-| `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target; outbound requests per invocation, counted on the plan with every nested call of a cell as one, are within the target's limit |
+| `worst_case` | journal records per run, counted on the lowered plan, equal the IR's count on every target, plus the event records a turn takes in (its cancel, steers and job notices, each within its declared bound); outbound requests per invocation, counted on the plan with every nested call of a cell as one, are within the target's limit |
 | `header_before_wait` | a cell waits on a timer only after its header is durable (C2) |
 | `durable_before_wait` | a top-level `wait` sleeps only when nothing is buffered and its own `call` record, with its deadline, is flushed |
 | `suspend_durable` | a `suspend` ends the run only when nothing is buffered and its `call` is durable, and never after the turn's `status`; a suspend replayed from its recorded answer appends nothing (`seq_unique`) |

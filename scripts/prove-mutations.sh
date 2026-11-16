@@ -13,6 +13,7 @@ pay_files="docs/snippets/payments.hl docs/snippets/paid_lanes.hl examples/mpp_ag
 plain_files="examples/agent.hl examples/reviewer.hl"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 usage_exit=2
+intake_seeds=0..40
 mkdir -p "$scratch"
 
 [ -x "$hl" ] || cargo build --release --locked
@@ -55,6 +56,43 @@ for file in examples/*.hl examples/sound/*.hl; do
   fi
 done
 echo "prove: every example and every sound adversarial example proves on every target"
+
+intake_bound() {
+  local target=$1 file=docs/snippets/events.hl dir="$scratch/intake-$1" proved planned reached
+  mkdir -p "$dir"
+  "$hl" prove --target "$target" "$file" > "$dir/prove.log"
+  proved=$(sed -nE "s/^  proved handler run on $target: worst_case: ([0-9]+) journal records per run with its event intake: ([0-9]+) .*/\1/p" "$dir/prove.log")
+  planned=$(sed -nE "s/^  proved handler run on $target: worst_case: ([0-9]+) journal records per run with its event intake: ([0-9]+) .*/\2/p" "$dir/prove.log")
+  if [ -z "$proved" ] || [ -z "$planned" ]; then
+    echo "prove: $file on $target has no worst case of journal records with its event intake:" >&2
+    cat "$dir/prove.log" >&2
+    return 1
+  fi
+  "$hl" emit --target "$target" --format wasm "$file" > "$dir/harness.wasm"
+  "$hl" sim --target "$target" --seeds "$intake_seeds" --trace "$dir/trace.jsonl" "$file" > "$dir/sim.log"
+  if ! "$hl" wasm-sim --target "$target" --module "$dir/harness.wasm" --trace "$dir/trace.jsonl" --records-max "run=$proved" > "$dir/wasm.log" 2>&1; then
+    echo "prove: the wasm module of $file on $target writes more journal records in a run than the $proved proved:" >&2
+    cat "$dir/wasm.log" >&2
+    return 1
+  fi
+  reached=$(sed -nE 's/.* records_per_run_max=([0-9]+) .*/\1/p' "$dir/wasm.log")
+  if [ "$reached" -le "$planned" ]; then
+    echo "prove: seeds $intake_seeds of $file on $target take in no event past the plan's $planned records (at most $reached in a run)" >&2
+    return 1
+  fi
+  if "$hl" wasm-sim --target "$target" --module "$dir/harness.wasm" --trace "$dir/trace.jsonl" --records-max "run=$planned" > "$dir/planned.log" 2>&1 \
+    || ! grep -q 'FAIL invariant=proved_worst_case' "$dir/planned.log"; then
+    echo "prove: hl wasm-sim does not count the event records of $file on $target against the plan's $planned:" >&2
+    cat "$dir/planned.log" >&2
+    return 1
+  fi
+  rm -f "$dir/trace.jsonl"
+  echo "prove: $file on $target writes up to $reached journal records in a run with its events, over the plan's $planned and within the $proved proved"
+}
+
+for target in $targets; do
+  intake_bound "$target" || exit 1
+done
 
 set +e
 usage=$("$hl" prove 2>&1)

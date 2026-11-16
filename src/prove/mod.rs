@@ -740,14 +740,51 @@ fn records(program: &Program, plan: &Plan, mutation: Mutation, report: &mut Repo
                 "the IR's journal record worst case is a path of the plan"
             );
         }
+        let intake = program.events.records_max();
+        let Some(total) = planned.checked_add(intake) else {
+            report.add(Finding {
+                handler: handler.name.clone(),
+                target: Some(model.target),
+                property: "worst_case",
+                message: "the worst case of journal records with event intake overflows u64"
+                    .to_owned(),
+                path: counted.describe_loops(),
+                counterexample: None,
+            });
+            continue;
+        };
+        let path = format!(
+            "on the plan's longest path, as hl check counts ({})",
+            counted.describe_loops()
+        );
+        let counted_as = if intake == 0 {
+            path
+        } else {
+            format!(
+                "with its event intake: {planned} {path}, plus {}",
+                intake_records(&program.events)
+            )
+        };
         report.proved.push(format!(
-            "handler {} on {}: worst_case: {} journal records per run on the plan's longest path, as hl check counts ({})",
+            "handler {} on {}: worst_case: {total} journal records per run {counted_as}",
             handler.name,
             model.target.name(),
-            planned,
-            counted.describe_loops()
         ));
     }
+}
+
+fn intake_records(events: &crate::ir::Events) -> String {
+    let steers = events.steers.as_ref().map_or_else(String::new, |bound| {
+        format!(", {} ({}) steer(s)", bound.name, bound.value)
+    });
+    let jobs = events.jobs.as_ref().map_or_else(String::new, |bound| {
+        format!(", {} ({}) job notice(s)", bound.name, bound.value)
+    });
+    format!(
+        "at most {} event record(s) per turn ({} cancel{steers}{jobs})",
+        events.records_max(),
+        u64::from(events.cancel)
+    )
 }
 
 fn bounds(program: &Program, plan: &Plan, report: &mut Report) {
