@@ -737,14 +737,13 @@ planted program in `scripts/strict.sh`. Under `--strict`, a run that went past
 its handler's worst case is reported as `worst_case` before the journal is
 checked, since the overrun is the cause of whatever the journal shows later.
 
-The differential runs have planted bugs of their own: `RUST_DIFF_PLANT` and
-`JS_DIFF_PLANT` edit the emitted code with sed (a flush skipped, a decode
-message changed, a second fsync, a batch's sequence numbers off by one, the
-recovery skipped, the enum check removed), and `scripts/mutations.sh --diff`
-requires each to fail on every target it changes with the invariant its plan
-names. A plant that leaves a target's code unchanged needs no plan there; one
+The differential runs have planted bugs of their own: `WASM_DIFF_PLANT`
+(`hl emit --plant`) compiles the module with one lowering changed (a flush
+skipped, an event acknowledged early, the recovery skipped, a fold's arms
+flipped), and `scripts/mutations.sh --diff` requires each to fail on every
+target it changes with the invariant its plan names. A plant that leaves a target's code unchanged needs no plan there; one
 that changes it without failing needs an exemption with its reason.
-`scripts/check.sh` runs every example through both differential runs, and its
+`scripts/check.sh` runs every example through the differential runs on every host, and its
 census fails when an example was not swept by `hl sim` or by a differential
 run on any target. It runs its independent steps in a pool of `CHECK_JOBS`
 jobs (`nproc` by default), each in its own process group, stops the rest at
