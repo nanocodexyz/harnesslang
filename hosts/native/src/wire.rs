@@ -31,7 +31,9 @@ pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Str
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
         if !valid {
-            return Err(format!("{OPEN}{inner}}} does not name an environment variable"));
+            return Err(format!(
+                "{OPEN}{inner}}} does not name an environment variable"
+            ));
         }
         match (lookup(name).filter(|value| !value.is_empty()), default) {
             (Some(value), _) => out.push_str(&value),
@@ -153,10 +155,16 @@ pub fn request(http: &Json, lookup: &dyn Fn(&str) -> Option<String>) -> Result<R
     let mut headers = Vec::with_capacity(listed.len());
     for pair in listed {
         let Json::Array(parts) = pair else {
-            return Err(format!("a header is not a [name, value] pair: {}", pair.encode()));
+            return Err(format!(
+                "a header is not a [name, value] pair: {}",
+                pair.encode()
+            ));
         };
         let [name, value] = parts.as_slice() else {
-            return Err(format!("a header is not a [name, value] pair: {}", pair.encode()));
+            return Err(format!(
+                "a header is not a [name, value] pair: {}",
+                pair.encode()
+            ));
         };
         headers.push((
             expand(text_of(name, "a header's name")?, lookup)?,
@@ -209,7 +217,10 @@ mod tests {
     #[test]
     fn expands_names_and_defaults() {
         assert_eq!(expand("a ${KEY} b", &lookup).unwrap(), "a secret b");
-        assert_eq!(expand("${NONE:-http://x}/v1", &lookup).unwrap(), "http://x/v1");
+        assert_eq!(
+            expand("${NONE:-http://x}/v1", &lookup).unwrap(),
+            "http://x/v1"
+        );
         assert_eq!(expand("${EMPTY:-d}", &lookup).unwrap(), "d");
         assert_eq!(expand("${KEY:-d}", &lookup).unwrap(), "secret");
         assert!(expand("${NONE}", &lookup).is_err());

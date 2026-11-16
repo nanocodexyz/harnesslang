@@ -14,6 +14,7 @@ pub const ERROR_CHARS_SLACK: usize = 1_024;
 pub const SHELL_SIGNAL_STATUS: i32 = 128;
 pub const TIMED_OUT_STATUS: i32 = SHELL_SIGNAL_STATUS + 15;
 pub const READ_BYTES_MAX: u64 = 262_144;
+pub const IMAGE_BYTES_MAX: u64 = 1_048_576;
 pub const READ_TOKENS_MAX: usize = 25_000;
 pub const BYTES_PER_TOKEN: usize = 4;
 pub const SELECTED_BYTES_PER_TOKEN: u64 = 128;
@@ -37,7 +38,6 @@ const ALLOW_LARGE_UNAVAILABLE: &str =
 const FILE_STATE: &str =
     " (file state is current in your context \u{2014} no need to Read it back)";
 const BACKGROUND_STARTED: &str = "Command running in background";
-const UNKNOWN_OUTCOME: &str = "Tool execution interrupted by a host crash; outcome unknown. Do not assume it did not run or automatically repeat it.";
 const BINARY_EXTENSIONS: [&str; 87] = [
     ".ico", ".tiff", ".tif", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
     ".mpeg", ".mpg", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".aiff", ".opus",
@@ -77,22 +77,6 @@ pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
         && bytes.get(WEBP_SIGNATURE_AT..WEBP_SIGNATURE_AT + WEBP_SIGNATURE.len())
             == Some(WEBP_SIGNATURE);
     webp.then_some("image/webp")
-}
-
-pub fn unknown_outcome() -> &'static str {
-    UNKNOWN_OUTCOME
-}
-
-pub fn unavailable(name: &str, offered: &[&str]) -> String {
-    let hint = match name {
-        "Grep" => ". Grep is not available in this session \u{2014} search file contents with `grep` via the Bash tool instead.".to_owned(),
-        "Glob" => ". Glob is not available in this session \u{2014} find files with `find` via the Bash tool instead.".to_owned(),
-        _ => match offered.iter().filter(|tool| tool.eq_ignore_ascii_case(name)).collect::<Vec<_>>()[..] {
-            [tool] => format!(". Tool names are case-sensitive: call {tool} instead."),
-            _ => String::new(),
-        },
-    };
-    format!("<tool_use_error>Error: No such tool available: {name}{hint}</tool_use_error>")
 }
 
 pub struct Workspace {
@@ -149,10 +133,7 @@ impl Workspace {
             "Read" => self.read(input),
             "Edit" => self.edit(input).map(Ran::Ok),
             "Write" => self.write(input).map(Ran::Ok),
-            other => Ok(Ran::Failed(unavailable(
-                other,
-                &["Read", "Edit", "Write", "Bash"],
-            ))),
+            other => Ok(Ran::Failed(format!("no syscall {other}"))),
         };
         match outcome {
             Ok(ran) => ran,

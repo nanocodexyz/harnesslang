@@ -60,7 +60,11 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
         quoted(request.method)
     );
     for (name, value) in request.headers {
-        config.push_str(&format!("header = \"{}: {}\"\n", quoted(name), quoted(value)));
+        config.push_str(&format!(
+            "header = \"{}: {}\"\n",
+            quoted(name),
+            quoted(value)
+        ));
     }
     config.push_str(&format!(
         "data-binary = \"@{}\"\noutput = \"{}\"\ndump-header = \"{}\"\n",
@@ -135,7 +139,8 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
             "response exceeds RESPONSE_BYTES_MAX ({RESPONSE_BYTES_MAX} bytes)"
         ));
     }
-    let bytes = std::fs::read(request.partial).map_err(|error| format!("read response: {error}"))?;
+    let bytes =
+        std::fs::read(request.partial).map_err(|error| format!("read response: {error}"))?;
     let head = std::fs::read_to_string(&headers).unwrap_or_default();
     let last = head
         .replace("\r\n", "\n")
@@ -177,7 +182,10 @@ fn plain(rest: &str, request: &Post<'_>) -> Result<Sent, String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(STREAM_IDLE_SECONDS_MAX)))
         .map_err(|error| error.to_string())?;
-    let mut head = format!("{} {path} HTTP/1.1\r\nHost: {authority}\r\n", request.method);
+    let mut head = format!(
+        "{} {path} HTTP/1.1\r\nHost: {authority}\r\n",
+        request.method
+    );
     for (name, value) in request.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
