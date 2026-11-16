@@ -295,13 +295,17 @@
   (local.set $sum (i64.add (local.get $left) (local.get $right)))
   (if (i64.lt_u (local.get $sum) (local.get $left)) (then (return (global.get $U64_MAX))))
   (local.get $sum))
+(func $w_multiply (param $left i64) (param $right i64) (result i64)
+  (if (i64.eqz (local.get $left)) (then (return (i64.const 0))))
+  (if (i64.gt_u (local.get $right) (i64.div_u (global.get $U64_MAX) (local.get $left))) (then (return (global.get $U64_MAX))))
+  (i64.mul (local.get $left) (local.get $right)))
 (func $w_digit (param $byte i32) (result i32)
   (i32.lt_u (i32.sub (local.get $byte) (global.get $ASCII_ZERO)) (i32.const 10)))
 (func $w_digits (param $text i32) (param $from i32) (param $to i32) (result i64) (local $value i64)
   block $done
     loop $next
       (br_if $done (i32.ge_u (local.get $from) (local.get $to)))
-      (local.set $value (call $w_saturating_add (call $u64_saturating_multiply (local.get $value) (global.get $DECIMAL_BASE))
+      (local.set $value (call $w_saturating_add (call $w_multiply (local.get $value) (global.get $DECIMAL_BASE))
         (i64.extend_i32_u (i32.sub (call $text_byte (local.get $text) (local.get $from)) (global.get $ASCII_ZERO)))))
       (local.set $from (i32.add (local.get $from) (i32.const 1)))
       br $next
@@ -860,7 +864,7 @@
   (local.set $ms (call $w_whole (call $w_header (local.get $headers) (i32.const $wt_retry_after_ms))))
   (if (global.get $w_u64_ok) (then (return (local.get $ms))))
   (local.set $ms (call $w_whole (call $w_header (local.get $headers) (i32.const $wt_retry_after))))
-  (if (global.get $w_u64_ok) (then (return (call $u64_saturating_multiply (local.get $ms) (global.get $WIRE_MILLISECONDS_PER_SECOND)))))
+  (if (global.get $w_u64_ok) (then (return (call $w_multiply (local.get $ms) (global.get $WIRE_MILLISECONDS_PER_SECOND)))))
   (i64.const 0))
 (func $w_ok_empty (result i32)
   (call $w_ok (call $json_one (i32.const $wt_answer) (call $w_arr2 (call $w_string (i32.const $s_empty)) (call $w_string (i32.const $s_empty))))

@@ -667,7 +667,12 @@ pub fn run(seeds: Range<u64>) -> Result<String, String> {
             let expected = [request_rust(wire, &request), decode_rust(wire, &decode)];
             for (input, expected) in [&request, &decode].into_iter().zip(expected) {
                 let encoded = input.encode();
-                let actual = probe.ask(&encoded)?;
+                let actual = probe.ask(&encoded).map_err(|error| {
+                    format!("{error}
+  wire: {}
+  seed: {seed}
+  input: {encoded}", wire.name())
+                })?;
                 if actual != expected {
                     return Err(format!(
                         "wire-diff: {} seed {seed} differs\n  input: {encoded}\n  rust:  {expected}\n  wasm:  {actual}",
@@ -681,4 +686,10 @@ pub fn run(seeds: Range<u64>) -> Result<String, String> {
             .expect("writing to a string succeeds");
     }
     Ok(summary)
+}
+
+pub fn probe_once(wire: Wire, input: &str) -> Result<String, String> {
+    let module = module(wire)?;
+    let mut probe = Probe::new(&module)?;
+    probe.ask(input)
 }
