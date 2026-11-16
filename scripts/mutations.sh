@@ -104,43 +104,23 @@ rust enum_unchecked examples/hooks.hl native-jsonl,native-sqlite,server-postgres
 rust nested_flush_after_dispatch examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust timeout_rides examples/code_agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust nested_enum_unchecked examples/code_tasks.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js flush_after_dispatch examples/agent.hl vercel backend_equal
-js bound_message examples/agent.hl cloudflare,vercel backend_equal
-js enum_unchecked examples/hooks.hl cloudflare,vercel backend_equal|panic|liveness
 rust default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust mode_dropped docs/snippets/modes.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
 rust settings_dropped docs/snippets/settings.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
 rust rewrite_kept_lost docs/snippets/rewrite.hl native-jsonl,native-sqlite,server-postgres backend_equal|panic
 rust text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js default_unfilled docs/snippets/defaults.hl cloudflare,vercel backend_equal
-js mode_dropped docs/snippets/modes.hl cloudflare,vercel backend_equal|panic
-js settings_dropped docs/snippets/settings.hl cloudflare,vercel backend_equal|panic
-js rewrite_kept_lost docs/snippets/rewrite.hl cloudflare,vercel backend_equal|panic
-js text_after_kept docs/snippets/text.hl cloudflare,vercel backend_equal
 rust blob_unjournaled docs/snippets/images.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js blob_unjournaled docs/snippets/images.hl cloudflare,vercel backend_equal
 rust grandchild_unscoped docs/snippets/tree_planner.hl native-jsonl,native-sqlite,server-postgres backend_equal 1.1
-js grandchild_unscoped docs/snippets/tree_planner.hl cloudflare,vercel backend_equal 1.1
 rust idle_early docs/snippets/keep.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js idle_early docs/snippets/keep.hl cloudflare,vercel backend_equal
 rust interrupt_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust interrupted_undecoded docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust recover_skipped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js interrupt_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
-js interrupted_undecoded docs/snippets/in_flight.hl cloudflare,vercel backend_equal
-js recover_reply_ignored docs/snippets/in_flight.hl cloudflare,vercel backend_equal
-js job_unopened docs/snippets/in_flight.hl cloudflare,vercel backend_equal
 rust fork_hook_skipped docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
 rust fork_entry_ignored docs/snippets/fork.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js fork_hook_skipped docs/snippets/fork.hl cloudflare,vercel backend_equal
 rust cell_leaks docs/snippets/code_wait.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js cell_leaks docs/snippets/code_wait.hl cloudflare,vercel backend_equal
 rust cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js cell_cancel_ignored docs/snippets/code_stop.hl cloudflare,vercel backend_equal
 rust payment_unset docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres backend_equal
-js payment_unset docs/snippets/payments.hl cloudflare,vercel backend_equal
-js paid_outcome_original docs/snippets/payments.hl cloudflare,vercel backend_equal
 wasm flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm crc_skipped examples/agent.hl native-jsonl backend_equal
 wasm recovery_skipped examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
@@ -179,8 +159,7 @@ wasm cell_cancel_ignored docs/snippets/code_stop.hl native-jsonl,native-sqlite,s
 wasm nested_recovery_skipped examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
 wasm nested_result_unjournaled examples/code_agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm fold_arms_flipped examples/minimal.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal"
-diff_exempt="js flush_after_dispatch cloudflare: the output gate flushes before every outbound request, so the planted skip changes no flush the trace can see
-wasm crc_skipped native-sqlite: only native-jsonl writes a checksum per line, so the planted change runs on no other target
+diff_exempt="wasm crc_skipped native-sqlite: only native-jsonl writes a checksum per line, so the planted change runs on no other target
 wasm crc_skipped server-postgres: only native-jsonl writes a checksum per line, so the planted change runs on no other target
 wasm crc_skipped cloudflare: only native-jsonl writes a checksum per line, so the planted change runs on no other target
 wasm crc_skipped vercel: only native-jsonl writes a checksum per line, so the planted change runs on no other target
@@ -285,7 +264,6 @@ run_one() {
 diff_script() {
   case $1 in
     rust) echo scripts/rust-diff.sh ;;
-    js) echo scripts/js-diff.sh ;;
     wasm) echo scripts/wasm-diff.sh ;;
   esac
 }
@@ -293,7 +271,6 @@ diff_script() {
 diff_targets() {
   case $1 in
     rust) echo "native-jsonl native-sqlite server-postgres" ;;
-    js) echo "cloudflare vercel" ;;
     wasm) echo "native-jsonl native-sqlite server-postgres cloudflare vercel" ;;
   esac
 }
@@ -314,7 +291,7 @@ diff_plants_of() {
 
 diff_census() {
   local backend planted plant file targets target output
-  for backend in rust js wasm; do
+  for backend in rust wasm; do
     planted=$(awk -v b="$backend" '$1 == b { print $2 }' <<< "$diff_plans" | sort)
     [ -n "$(diff_plants_of "$backend")" ] || census_fail "$(diff_script "$backend") lists no plants"
     if [ "$(diff_plants_of "$backend")" != "$planted" ]; then

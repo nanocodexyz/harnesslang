@@ -15,7 +15,7 @@ if [ -n "$scope" ]; then
   suffix=-scoped
 fi
 hl=target/release/hl
-out=output/wasm-diff/$plant/$host
+out="${WASM_DIFF_OUT:-output/wasm-diff/$plant/$host}"
 mkdir -p "$out"
 
 [ -x "$hl" ] || cargo build --release --locked
@@ -37,7 +37,7 @@ proved_bounds() {
 
 diff_one() {
   local file=$1 target=$2
-  local dir started ended runner
+  local dir started ended runner fields
   dir="$out/$target-$(basename "$file" .hl)$suffix"
   mkdir -p "$dir"
   "$hl" emit --target "$target" --format wasm --plant "$plant" "$file" > "$dir/harness.wasm"
@@ -69,8 +69,7 @@ diff_one() {
       else
         cp "$dir/harness.wasm" "$dir/host/program.wasm"
       fi
-      "$hl" emit --format source --target "$target" "$file" > "$dir/generated.mjs"
-      runner=(node scripts/js-sim.mjs --target "$target" --module "$dir/host/$target.mjs" --runtime "$dir/generated.mjs" --trace "$dir/trace.jsonl")
+      runner=(node scripts/js-sim.mjs --target "$target" --module "$dir/host/$target.mjs" --trace "$dir/trace.jsonl")
       ;;
     *) echo "wasm-diff: unknown host $host" >&2; return 1 ;;
   esac
@@ -81,7 +80,9 @@ diff_one() {
   fi
   ended=$(date +%s%N)
   rm -f "$dir/trace.jsonl"
-  echo "ok backend=wasm host=$host file=$file $(cut -d' ' -f3- "$dir/$host.log") wall_ms=$(( (ended - started) / 1000000 ))"
+  fields=3
+  [ "$host" = platform ] && fields=2
+  echo "ok backend=wasm host=$host file=$file $(cut -d' ' -f"$fields"- "$dir/$host.log") wall_ms=$(( (ended - started) / 1000000 ))"
 }
 
 pids=()
