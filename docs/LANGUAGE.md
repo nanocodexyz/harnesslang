@@ -457,17 +457,14 @@ $ hl run examples/agent.hl --handler prompt --arg hello | head -n 1
 ```
 
 `hl emit` prints the program for a target as a WebAssembly module (`--format
-wat` prints its text), which the platform's fixed host runs; `--format source`
-prints it as source instead. For `native-jsonl` that is one Rust file using
-only std, which a host drives through `run_jsonl`:
+wat` prints its text, `--format mjs` an ES module holding its bytes), which
+the platform's fixed host runs. The compiler writes the bytes itself, and the
+host is the same for every program; a host drives a turn through the module's
+exports:
 
 ```console
-$ hl emit --format source --target native-jsonl examples/agent.hl | grep -E -A 4 '^pub fn run_jsonl'
-pub fn run_jsonl<H: Host>(
-    host: &mut H,
-    disk: &mut dyn Disk,
-    request: &TurnRequest,
-) -> Result<Ran, RunError> {
+$ hl emit --format wat --target native-jsonl examples/agent.hl | grep -oE '\(export "[a-z_]+"' | cut -d'"' -f2 | paste -sd' '
+memory hl_alloc hl_side hl_run hl_facts hl_check hl_idle
 ```
 
 [Targets](#targets) lists what every target generates.
@@ -637,7 +634,7 @@ Notes the grammar leaves out:
 ### harness
 
 `harness name` opens the file. The name labels the journal's checkpoints and
-the generated code.
+the compiled module.
 
 ### const
 
@@ -2440,7 +2437,7 @@ included.
   field in a checkpoint and a tool's result are JSON strings.
 - Every boundary checks the value and never falls back to another one. An
   argument, or a value read back from the journal, that is not one of the
-  values is refused: `hl run` and the generated code's argument decoding
+  values is refused: `hl run` and the compiled module's argument decoding
   reject it, and a journal holding one is corrupt. A tool result that is not
   one of them is recorded as the call's failure, `TOOL returned JSON, which is
   not a value of TYPE`, so the program meets it in its `failed` arm. The same
@@ -4266,7 +4263,7 @@ replay: hl sim --target native-jsonl --seeds 0..1 --mutation spawn_key_unscoped 
 
 `children` counts the child sessions started, `joined` the joins resumed with
 a child's result and `child_crashes` the crashes inside children. The
-generated code needs nothing new for a spawn beyond recording the key: the
+compiled module needs nothing new for a spawn beyond recording the key: the
 child is the host's, and the completion is a resume, so the differential runs
 of `examples/subagents.hl` on every target replay the same answers.
 `examples/subagents.hl` ports nanocode's subagent runtime: `spawn_agent` starts
@@ -4350,8 +4347,7 @@ on plan_change(change: text) -> verdict {
 - Keys are scoped. A session spawned under key `K` records its own children
   as `K/T.S`, so every key of a family names one session and a host can keep
   each session under its key alone. The host tells a session its key:
-  `Host::scope` in the generated Rust, and the turn request's `scope` field on
-  Cloudflare and Vercel. A root session's scope is empty, so its keys stay
+  the turn request's `scope` field, on every host. A root session's scope is empty, so its keys stay
   `T.S`.
 - A spawn whose child spawns says how many sessions one call may start, the
   child's and every descendant's: `sessions at most c`. `hl check` computes
@@ -4427,7 +4423,7 @@ replay: hl sim --target native-jsonl --seeds 1..2 --mutation family_one_level do
 ```
 
 `hl sim --scope K` runs a harness as if it were spawned under `K`, and the
-differential runs use it, so generated Rust and JavaScript record scoped keys
+differential runs use it, so the compiled module records scoped keys
 as the interpreter does (`scripts/check.sh` runs `docs/snippets/tree_planner.hl`
 under `1.1` on every target).
 
@@ -4582,9 +4578,8 @@ on side run(command: text) -> text {
 Each backend runs a side question as a scratch run: a fresh engine over a copy
 of the snapshot whose flushes are discarded. The interpreter answers through
 `run::side::answer` between runs and through `World::side`, which a running
-turn polls before each effect it runs fresh. Generated Rust has
-`JsonlJournal::side`, `sql_side` (which loads the rows without acquiring the
-session) and `Host::side`; the Durable Object answers `POST /side` with
+turn polls before each effect it runs fresh. The module exports `hl_side`,
+which a host calls over the session's journal without acquiring it; the Durable Object answers `POST /side` with
 `{"handler", "arguments"}` from its rows, without queueing behind a running turn
 or writing storage, its output gate holding the answer until rows a finishing
 turn inserted commit; Vercel exports `harnessSide(lines, request)`, which folds
@@ -4614,7 +4609,7 @@ replay: hl sim --target native-jsonl --seeds 0..1 --mutation side_journaled docs
 ```
 
 `side_questions` counts the questions asked, printed only when there are some.
-The differential runs carry them too: generated Rust and JavaScript answer
+The differential runs carry them too: the compiled module answers
 every question the interpreter asks, mid-turn and between runs, with the same
 requests and answers.
 
@@ -4645,8 +4640,7 @@ that is neither `0` nor a finished turn is the call's `failed("no finished
 turn N to fork from")` and never reaches the host. The same function, a
 `fork_entry` over a session's records, a turn or `latest` and the origin,
 lets a host fork a session it holds without a tool call: the interpreter's
-`run::fork::fork_entry`, the generated Rust's `fork_entry(start, records, at,
-origin)`, which returns the two records or `ForkRefused`, and Vercel's
+`run::fork::fork_entry`, which returns the two records or `ForkRefused`, and Vercel's
 `harness.fork(lines, at, origin)`. Vercel's `harnessSession` takes the
 forked lines as its third argument, and a Durable Object loads the two rows a
 host wrote before the first turn.
@@ -4780,8 +4774,7 @@ every target, and a fork never sees a turn a crash could roll back. A harness
 with blobs cannot fork, since a checkpoint holds no blob's bytes.
 
 A host forks a session it holds through the same `fork_entry` (the
-interpreter's, the generated Rust runtime's, or the generated JavaScript's
-`forkEntry`), so `on forked` needs no fork tool. The fixed
+interpreter's, or the fixed host's), so `on forked` needs no fork tool. The fixed
 native host does not fork yet: the per-program host's `--fork-from J [--at T]`,
 which wrote the two records from journal `J` at its latest finished turn, or at
 turn `T`, as the first records of a new journal, left with it; `hl-host run
@@ -4967,10 +4960,10 @@ replay: hl sim --target native-jsonl --seeds 4..5 --mutation idle_early docs/sni
 ```
 
 `idle_turns` counts the idle turns admitted and `idle_refused` the requests
-the runtime refused. The generated Rust and JavaScript make the same
+the runtime refused. The compiled module makes the same
 admission, so the differential runs refuse and admit the same requests as the
-interpreter; their plants `rust idle_early` and `js idle_early` remove the
-clock check and are caught as `backend_equal` on every target.
+interpreter; the plant `wasm idle_early` removes the clock check and is caught
+as `backend_equal` on every target.
 `examples/claude_code.hl` keeps nanocode's five-minute `CACHE_LIFETIME`
 (`cache_lifetime_ms`) and the twelve refreshes `ClaudeModel::cache_refreshes`
 allows for it (`cache_refreshes`: a five-minute cache write costs 1.25 times
@@ -5148,13 +5141,12 @@ second time after a takeover.
 
 #### Hosts
 
-In the generated Rust, `Host` gains `recover(request)` (answering `Recovered::Reply`,
-`NotDispatched` or `Unknown`), `jobs(turn, open)` (the keys of open jobs it no longer
-runs) and `hold(turn, seq, until_ms)`, each with a default for a host that uses
-none of them; `ToolRequest` carries `job` (the tool has room for a job) and,
-with `ModelRequest`, `interrupts`, the events that abandon it, which the host
-watches in its inbox. Job notices reach the runtime through `Host::inbox` as
-`Inbound::Job`. The Durable Object and the Vercel binding ask the host at
+The module asks its host through the `world` import for `recover` (answered
+with a reply, `not_dispatched` or `unknown`), `jobs` (the keys of open jobs it no
+longer runs) and `hold`, and a host that uses none of them answers each with its
+default; a tool request carries `job` (the tool has room for a job) and, with a
+model request, `interrupts`, the events that abandon it, which the host
+watches in its inbox. Job notices reach the module as `job` events. The Durable Object and the Vercel binding ask the host at
 `HL_RECOVER_URL` and `HL_JOBS_URL`, abort an interruptible request's `fetch`
 with an `AbortSignal` when a cancel or steer is posted, and take job notices
 posted without a turn. `hl-agent` uses all of it for `examples/claude_code.hl`:
@@ -5584,8 +5576,8 @@ still covers a whole cycle at its caps, so `spent` never passes `cost`. With
 `on cancel` a recorded cancel stops the climb between trials.
 
 The checker lowers a climb into ordinary statements over hidden state fields
-(names starting with `_climb_`), so the interpreter, the generated Rust and
-JavaScript and every proof see plain loops: `cycles x candidates x trials`
+(names starting with `_climb_`), so the interpreter, the compiled module and
+every proof see plain loops: `cycles x candidates x trials`
 bounds the worst case, and the prover shows the climb's counters stay in range
 and its pushes fit:
 
@@ -5993,27 +5985,24 @@ What the proofs assume and leave out is in
 
 ## Targets
 
-| Target | Runs in | Journal | Atomic unit | Who else may run | Recovery | Limits checked | Generated code |
+| Target | Runs in | Journal | Atomic unit | Who else may run | Recovery | Limits checked | Ships |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `native-jsonl` | a process | an append-only JSONL file per session, a CRC-32 per line | one line | nobody | at load | the program's own | one std-only Rust file; the host implements `Host` (tools, model, clock, randomness, acknowledgement) and `Disk`, and calls `run_jsonl` per turn |
-| `native-sqlite` | a process | SQLite rows through the host's `Sql` | one transaction | nobody | at load | the program's own | one std-only Rust file; the host implements `Host` and `Sql` and calls `run_sql` |
-| `server-postgres` | a server pool | Postgres rows through the host's `Sql` | one transaction, fenced by owner epoch | a second owner after a lease expires | at load, by the new owner | the program's own | as `native-sqlite`, with the epoch fence in every flush |
+| `native-jsonl` | a process | an append-only JSONL file per session, a CRC-32 per line | one line | nobody | at load | the program's own | `program.wasm`, run by the fixed native host (`harnesslang::wasm::native`), which answers its imports (tools, model, clock, randomness, acknowledgement) and stores the journal through a `Store` |
+| `native-sqlite` | a process | SQLite rows through the host's `Sql` | one transaction | nobody | at load | the program's own | `program.wasm` on the native host, with a SQL `Store` |
+| `server-postgres` | a server pool | Postgres rows through the host's `Sql` | one transaction, fenced by owner epoch | a second owner after a lease expires | at load, by the new owner | the program's own | as `native-sqlite`; the store refuses a flush whose epoch no longer owns the session |
 | `cloudflare` | a Durable Object | the object's SQLite | one event | nobody; an alarm restarts the object after a reset | at load | outbound requests per invocation | `program.wasm`, run by the fixed host `hosts/cloudflare.mjs`: the `HarnessObject` Durable Object class and a Worker whose `fetch` routes each session to its object |
 | `vercel` | a Function driving a Workflow run | the run's event log | one step | a retried step | in the step, by attempt number | none yet (duration is reported) | `program.mjs` (the module's bytes as an ES module), run by the fixed host `hosts/vercel.mjs` and its `"use workflow"` session and `"use step"` step in `hosts/vercel-session.mjs` |
 
 ```console
-$ hl emit --format source --target server-postgres examples/agent.hl | grep -E '^pub fn run_sql|^pub trait Sql'
-pub trait Sql {
-pub fn run_sql<H: Host>(host: &mut H, sql: &mut dyn Sql, journal: &mut SqlJournal, request: &TurnRequest) -> Result<Ran, RunError> {
 $ hl emit --format wat --target cloudflare examples/agent.hl | grep -oE '^\(import "hl" "[a-z]+"' | cut -d'"' -f4 | paste -sd' '
 fail hook flush keep tool model now random attempt acknowledge world
 ```
 
-Generated programs use only their language's standard library and the
-platform's own API. Every target's lowering is simulated by `hl sim` with its
+A compiled module imports only the host functions above, and each fixed host
+uses only its platform's own API. Every target's lowering is simulated by `hl sim` with its
 own faults; `scripts/check.sh` sweeps every example on every target and runs
 every planted bug, and `HL_ORACLE=1` and `HL_DRILL=1` add the nanocode oracle
-and the kill -9 drill of generated code.
+and the kill -9 drills of the compiled module on real files, SQLite and Postgres.
 
 ## Commands
 

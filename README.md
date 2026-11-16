@@ -141,7 +141,7 @@ on every fixed host and the nanocode oracle cover it.
     target/release/hl check examples/agent.hl
     target/release/hl prove --target vercel examples/reviewer.hl
     target/release/hl sim --target cloudflare --seeds 0..1000 examples/agent.hl
-    target/release/hl emit --format source --target native-jsonl examples/agent.hl
+    target/release/hl emit --format wat --target native-jsonl examples/agent.hl
     scripts/check.sh
     cargo build --release --manifest-path hosts/native/Cargo.toml
     hosts/native/target/release/hl-host run --instruction task.md --cwd . --model claude-haiku-4-5 --journal output/run

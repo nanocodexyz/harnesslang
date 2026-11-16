@@ -5,7 +5,6 @@ cd "$(dirname "$0")/.."
 
 seeds="${SEEDS:-0..2000}"
 twice_seeds="${TWICE_SEEDS:-0..300}"
-rust_diff_seeds="${RUST_DIFF_SEEDS:-0..300}"
 wasm_diff_seeds="${WASM_DIFF_SEEDS:-0..100}"
 wasm_native_diff_seeds="${WASM_NATIVE_DIFF_SEEDS:-0..30}"
 wasm_platform_diff_seeds="${WASM_PLATFORM_DIFF_SEEDS:-0..30}"
@@ -13,11 +12,10 @@ if [ "${HL_LONG:-0}" = 1 ]; then
   wasm_diff_seeds="${WASM_DIFF_SEEDS:-0..2000}"
   wasm_native_diff_seeds="${WASM_NATIVE_DIFF_SEEDS:-0..2000}"
   wasm_platform_diff_seeds="${WASM_PLATFORM_DIFF_SEEDS:-0..300}"
-  rust_diff_seeds="${RUST_DIFF_SEEDS:-0..2000}"
 fi
 jobs="${CHECK_JOBS:-$(nproc)}"
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
-rust_targets="native-jsonl native-sqlite server-postgres"
+native_targets="native-jsonl native-sqlite server-postgres"
 platform_targets="cloudflare vercel"
 platform_pending="
   cloudflare:examples/claude_code.hl
@@ -299,10 +297,6 @@ sim_twice() {
   "$hl" sim --target "$1" --seeds "$twice_seeds" --twice examples/agent.hl
 }
 
-rust_diff_one() {
-  RUST_DIFF_SEEDS=$rust_diff_seeds RUST_DIFF_TARGETS=$1 RUST_DIFF_FILES=$2 scripts/rust-diff.sh
-}
-
 wasm_diff_one() {
   WASM_DIFF_SEEDS=$wasm_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$2 scripts/wasm-diff.sh
 }
@@ -325,9 +319,10 @@ wasm_lowered() {
 
 scoped_diff_one() {
   local file=docs/snippets/tree_planner.hl scope=1.1
+  WASM_DIFF_SEEDS=$wasm_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$file WASM_DIFF_SCOPE=$scope scripts/wasm-diff.sh
   case $1 in
-    cloudflare | vercel) WASM_DIFF_SEEDS=$wasm_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$file WASM_DIFF_SCOPE=$scope scripts/wasm-diff.sh ;;
-    *) RUST_DIFF_SEEDS=$rust_diff_seeds RUST_DIFF_TARGETS=$1 RUST_DIFF_FILES=$file RUST_DIFF_SCOPE=$scope scripts/rust-diff.sh ;;
+    cloudflare | vercel) ;;
+    *) WASM_DIFF_HOST=native WASM_DIFF_SEEDS=$wasm_native_diff_seeds WASM_DIFF_TARGETS=$1 WASM_DIFF_FILES=$file WASM_DIFF_SCOPE=$scope scripts/wasm-diff.sh ;;
   esac
 }
 
@@ -346,9 +341,9 @@ census_examples() {
         missing=1
       fi
     done
-    for target in $rust_targets; do
-      if ! grep -q "^ok backend=rust target=$target harness=$name seeds=" "$scratch/sweeps.log"; then
-        echo "census: $file had no Rust differential run on $target" >&2
+    for target in $native_targets; do
+      if ! grep -q "^ok backend=wasm host=native file=$file target=$target " "$scratch/sweeps.log"; then
+        echo "census: $file had no differential run on the native wasm host on $target" >&2
         missing=1
       fi
     done
@@ -376,7 +371,7 @@ census_examples() {
     done
   done
   [ "$missing" -eq 0 ] || exit 1
-  echo "census: all $(wc -w <<< "$examples") examples are swept by hl sim on every target and by the differential runs on every Rust target and on the fixed Cloudflare and Vercel hosts, except $platform_pending"
+  echo "census: all $(wc -w <<< "$examples") examples are swept by hl sim on every target and by the differential runs on the native wasm host on every native target and on the fixed Cloudflare and Vercel hosts, except $platform_pending"
   echo "census: every example lowered to wasm had a wasm differential run on every target; $pending example-target pairs use a feature not yet lowered"
 }
 
@@ -460,11 +455,6 @@ done
 for target in $targets; do
   queue sim-twice sim_twice "$target"
 done
-for file in $examples docs/snippets/keep.hl docs/snippets/in_flight.hl; do
-  for target in $rust_targets; do
-    queue rust-diff rust_diff_one "$target" "$file"
-  done
-done
 for target in $targets; do
   queue scoped-diff scoped_diff_one "$target"
 done
@@ -476,10 +466,6 @@ for file in $examples docs/snippets/*.hl; do
   for target in $platform_targets; do
     platform_ready "$target" "$file" && wasm_lowered "$target" "$file" && queue wasm-diff-platform wasm_platform_diff_one "$target" "$file"
   done
-done
-for target in $rust_targets; do
-  queue rust-diff rust_diff_one "$target" docs/snippets/side.hl
-  queue rust-diff rust_diff_one "$target" docs/snippets/fork.hl
 done
 for mutation in $(scripts/mutations.sh --plans); do
   queue mutations mutation_one "$mutation"
