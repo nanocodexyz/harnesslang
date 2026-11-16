@@ -82,7 +82,10 @@ impl Children {
         configure: Option<Json>,
     ) -> tools::Ran {
         let key = format!("{turn}{}{seq}", harnesslang::ir::SPAWN_KEY_SEPARATOR);
-        assert!(is_key(&key), "a spawn's key is its call's turn and sequence number");
+        assert!(
+            is_key(&key),
+            "a spawn's key is its call's turn and sequence number"
+        );
         if self.running() >= RUNNING_MAX {
             return tools::Ran::Failed(format!(
                 "{RUNNING_MAX} subagents are already running; wait for one before starting another"
@@ -266,7 +269,10 @@ fn run(setup: &Setup, directory: &Path, key: &str, cancel: &Path) -> Result<Stri
     let mut session = Session::open(setup.clone(), directory, &label, cancel)?;
     session.ledger.mark("start", crate::now_ms());
     let mut turn = CONFIGURE_TURN;
-    if let Some(configure) = spawn.get("configure").filter(|value| !matches!(value, Value::Null)) {
+    if let Some(configure) = spawn
+        .get("configure")
+        .filter(|value| !matches!(value, Value::Null))
+    {
         let configure = host::to_json(configure);
         session.remember_configure(&configure)?;
         let request = host::request(host::CONFIGURE_HANDLER, CONFIGURE_TURN, configure);

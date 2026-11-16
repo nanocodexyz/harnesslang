@@ -54,23 +54,6 @@ impl Value {
         }
     }
 
-    pub fn as_array(&self) -> Option<&[Value]> {
-        match self {
-            Self::Array(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    pub fn insert(&mut self, key: &str, value: Value) {
-        let Self::Object(entries) = self else {
-            panic!("insert into a JSON object only");
-        };
-        match entries.iter_mut().find(|(name, _)| name == key) {
-            Some(entry) => entry.1 = value,
-            None => entries.push((key.to_owned(), value)),
-        }
-    }
-
     pub fn encode(&self) -> String {
         let mut out = String::new();
         self.encode_into(&mut out);

@@ -137,7 +137,12 @@ pub fn submitted(input: &Value) -> tools::Ran {
 }
 
 impl Session {
-    pub fn open(setup: Setup, directory: &Path, label: &str, cancel: &Path) -> Result<Self, String> {
+    pub fn open(
+        setup: Setup,
+        directory: &Path,
+        label: &str,
+        cancel: &Path,
+    ) -> Result<Self, String> {
         let state = directory.join(STATE_DIRECTORY);
         std::fs::create_dir_all(&state).map_err(|error| format!("{}: {error}", state.display()))?;
         let ledger = Ledger::open(&directory.join(ledger::LEDGER_FILE))?;
@@ -192,10 +197,9 @@ impl Session {
 
     fn spawn_of(&self, request: &Json, tool: &str) -> Option<(String, String)> {
         let declared = request.get("spawn");
-        if let (Some(program), Some(handler)) = (
-            text(declared.get("program")),
-            text(declared.get("handler")),
-        ) {
+        if let (Some(program), Some(handler)) =
+            (text(declared.get("program")), text(declared.get("handler")))
+        {
             return Some((program.to_owned(), handler.to_owned()));
         }
         self.setup
@@ -224,18 +228,24 @@ impl Session {
             ("tool", Value::text(&tool)),
             ("call", Value::text(&call)),
         ]));
-        let shown = ["description", "file_path", "command", "cmd", "chars", "path"]
-            .iter()
-            .find_map(|key| input.get(key).and_then(Value::as_str))
-            .unwrap_or("");
+        let shown = [
+            "description",
+            "file_path",
+            "command",
+            "cmd",
+            "chars",
+            "path",
+        ]
+        .iter()
+        .find_map(|key| input.get(key).and_then(Value::as_str))
+        .unwrap_or("");
         eprintln!("{}: {call} {tool}: {shown}", self.label);
         let stop = self.stop(CANCELLABLE_TOOLS.contains(&tool.as_str()));
         let configured = self.configured();
         let ran = match (tool.as_str(), self.spawn_of(request, &tool)) {
-            (_, Some((program, handler))) => {
-                self.children
-                    .spawn(turn, seq, &program, &handler, &input, configured)
-            }
+            (_, Some((program, handler))) => self
+                .children
+                .spawn(turn, seq, &program, &handler, &input, configured),
             (LIST_TOOL, None) => self.children.list(&input),
             (SUBMIT_TOOL, None) => submitted(&input),
             ("Bash", None) if room => self.bash_job(turn, seq, &input),
@@ -263,7 +273,10 @@ impl Session {
                     .is_some_and(|value| matches!(value, Value::Bool(true)));
                 let command = input.get("command").and_then(Value::as_str).unwrap_or("");
                 self.jobs.start(&key, started, command, held);
-                eprintln!("{}: {turn}/{seq} Bash became background job {key}", self.label);
+                eprintln!(
+                    "{}: {turn}/{seq} Bash became background job {key}",
+                    self.label
+                );
                 tools::Ran::Job(jobs::started_text(&key, &message, held))
             }
         }
@@ -273,9 +286,12 @@ impl Session {
         loop {
             self.jobs.poll();
             let now = now_ms();
-            let steered = control::deliveries(&self.control).len() > 0;
+            let steered = !control::deliveries(&self.control).is_empty();
             if self.jobs.pending() || !self.jobs.holding() || steered || now >= until_ms {
-                return object(vec![("answer", Json::text("ok")), ("clock", Json::int(now))]);
+                return object(vec![
+                    ("answer", Json::text("ok")),
+                    ("clock", Json::int(now)),
+                ]);
             }
             std::thread::sleep(jobs::JOB_POLL);
         }
@@ -386,9 +402,11 @@ impl Session {
         let turn = number(request.get("turn"), "a resume's turn")?;
         let seq = number(request.get("seq"), "a resume's seq")?;
         let key = self.suspend_key(turn, seq)?;
-        let configured = self.configured();
         Ok(match self.children.join(&key) {
-            Some(answer) => object(vec![("answer", Json::Text(answer)), ("key", Json::Text(key))]),
+            Some(answer) => object(vec![
+                ("answer", Json::Text(answer)),
+                ("key", Json::Text(key)),
+            ]),
             None => Json::Null,
         })
     }
