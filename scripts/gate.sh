@@ -33,7 +33,12 @@ emitted_source_lines() {
   source_backend || { echo 0; return; }
   for file in $programs; do
     for target in $targets; do
-      lines=$("$hl" emit --format source --target "$target" "$file" | wc -l) || fail "hl emit --format source failed on $file for $target"
+      if ! "$hl" emit --format source --target "$target" "$file" > "$scratch/source.txt" 2> "$scratch/source.err"; then
+        grep -q 'has no source form' "$scratch/source.err" && continue
+        cat "$scratch/source.err" >&2
+        fail "hl emit --format source failed on $file for $target"
+      fi
+      lines=$(wc -l < "$scratch/source.txt")
       total=$((total + lines))
     done
   done
@@ -72,8 +77,11 @@ programs_not_on_wasm() {
       fi
     done
   done
-  agent_sources=$(grep -E 'emit_source\(' agent/build.rs | grep -cvE '^fn emit_source' || true)
-  grep -nE 'emit_source\(' agent/build.rs | grep -vE '^[0-9]+:fn emit_source' | sed 's#^#agent/build.rs:#' >> "$scratch/not_on_wasm.txt" || true
+  agent_sources=0
+  if [ -f agent/build.rs ]; then
+    agent_sources=$(grep -E 'emit_source\(' agent/build.rs | grep -cvE '^fn emit_source' || true)
+    grep -nE 'emit_source\(' agent/build.rs | grep -vE '^[0-9]+:fn emit_source' | sed 's#^#agent/build.rs:#' >> "$scratch/not_on_wasm.txt" || true
+  fi
   echo $((pairs + agent_sources))
 }
 
