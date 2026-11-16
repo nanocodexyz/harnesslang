@@ -69,8 +69,7 @@ diff_one() {
       else
         cp "$dir/harness.wasm" "$dir/host/program.wasm"
       fi
-      "$hl" emit --format source --target "$target" "$file" > "$dir/generated.mjs"
-      runner=(node scripts/js-sim.mjs --target "$target" --module "$dir/host/$target.mjs" --runtime "$dir/generated.mjs" --trace "$dir/trace.jsonl")
+      runner=(node scripts/js-sim.mjs --target "$target" --module "$dir/host/$target.mjs" --trace "$dir/trace.jsonl")
       ;;
     *) echo "wasm-diff: unknown host $host" >&2; return 1 ;;
   esac

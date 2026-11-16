@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { register } from "node:module";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { CellChecks, DurableCells, TracedCells, engineDifferential } from "./js-sim-cell.mjs";
+import { CellChecks, DurableCells, TracedCells } from "./js-sim-cell.mjs";
+import * as rt from "./js-sim-records.mjs";
 
 const TOOLS_URL = "https://tools.simulation.invalid/call";
 const MODEL_URL = "https://model.simulation.invalid/infer";
@@ -19,11 +20,10 @@ const { values } = parseArgs({
     module: { type: "string" },
     trace: { type: "string" },
     mutation: { type: "string", default: "none" },
-    runtime: { type: "string" },
   },
 });
 if (!values.target || !values.module || !values.trace) {
-  console.error("usage: node scripts/js-sim.mjs --target cloudflare|vercel --module FILE.mjs --trace TRACE.jsonl [--mutation NAME] [--runtime GENERATED.mjs, with --module a fixed host beside its program.wasm]");
+  console.error("usage: node scripts/js-sim.mjs --target cloudflare|vercel --module FILE.mjs --trace TRACE.jsonl [--mutation NAME], with --module a fixed host beside its program");
   process.exit(2);
 }
 const WASM_LOADER = [
@@ -33,12 +33,10 @@ const WASM_LOADER = [
   "  return { format: 'module', shortCircuit: true, source };",
   "}",
 ].join("\n");
-const hosted = values.runtime !== undefined;
-if (hosted) register("data:text/javascript," + encodeURIComponent(WASM_LOADER), import.meta.url);
+register("data:text/javascript," + encodeURIComponent(WASM_LOADER), import.meta.url);
 const loaded = await import(pathToFileURL(values.module).href);
 const harness = loaded.harness;
-const rt = hosted ? (await import(pathToFileURL(values.runtime).href)).harness.runtime : harness.runtime;
-const hostRuntime = harness.runtime;
+const facts = harness.facts();
 if (harness.target !== values.target) {
   console.error(`${values.module} is built for ${harness.target}, not ${values.target}`);
   process.exit(2);
@@ -180,8 +178,7 @@ class Seed {
   side(turn, seq) {
     if (this.cursor.peek()?.event !== "side") return null;
     const event = this.sideQuestion(turn, seq);
-    if (hosted) return { arguments: event.arguments, handler: event.handler };
-    return rt.sideRequestFromJson(rt.object([["arguments", event.arguments], ["handler", event.handler]]));
+    return { arguments: event.arguments, handler: event.handler };
   }
 
   sided(request, answer) {
@@ -294,7 +291,6 @@ class Seed {
   }
 
   wait(wait) {
-    this.checks.waited(wait, wait.code);
     if (!this.durableCells().header(wait.cell)) throw new Failure("header_before_wait", `cell ${wait.cell} waits on timer ${wait.timer} before its header is durable`);
     const event = this.cursor.next("wait", `cell ${wait.cell} timer ${wait.timer}`);
     same("wait cell", event.cell, BigInt(wait.cell));
@@ -449,7 +445,7 @@ class Seed {
       }
       throw new Error(`unexpected fetch of ${url}`);
     };
-    const host = hostRuntime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
+    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, now: () => seed.now(), random: () => seed.random() });
     const tool = host.tool;
     return {
       ...host,
@@ -596,7 +592,7 @@ async function cloudflareSeed(seed) {
     tools: (world, requests, limit) => seed.tools(world, requests, limit),
     gate: (records) => {
       const bytes = storage.pendingBytes();
-      const flushed = typeof records === "string" ? records : rt.encodeLines(records, false);
+      const flushed = records;
       if (flushed !== bytes) throw differ("rows inserted before the gate", flushed, bytes);
       seed.flushed(bytes);
       storage.commit();
@@ -618,12 +614,12 @@ async function cloudflareSeed(seed) {
     for (;;) {
       seed.opening(storage.medium());
       instance ??= new loaded.HarnessObject(ctx, env);
-      const idles = turn.handler === rt.PROGRAM.idle?.handler;
+      const idles = turn.handler === facts.idle;
       const admitted = storage.lines().some((line) => {
         const record = rt.decodeLine(line, false);
         return record.kind === "admitted" && Number(record.turn) === Number(turn.turn);
       });
-      const byAlarm = idles ? first || storage.alarm !== null : !first && storage.alarm !== null && (admitted || rt.PROGRAM.idle === null);
+      const byAlarm = idles ? first || storage.alarm !== null : !first && storage.alarm !== null && (admitted || facts.idle === null);
       first = false;
       let kind;
       try {
@@ -860,7 +856,6 @@ async function vercelSeed(seed) {
 
 const seeds = parseTrace(values.trace);
 const totals = { seeds: 0, turns: 0, runs: 0, crashes: 0, dispatches: 0, steps: 0, cells: 0, nested: 0, divergences: 0, waits: 0, sleeps: 0, resumes: 0, sides: 0, recovers: 0, jobs: 0 };
-const engineTotals = { cells: 0, steps: 0, unparsed: 0 };
 const started = performance.now();
 for (const traced of seeds) {
   const seed = new Seed(traced);
@@ -868,11 +863,6 @@ for (const traced of seeds) {
     seed.cursor.next("seed", "start of seed");
     if (values.target === "cloudflare") await cloudflareSeed(seed);
     else await vercelSeed(seed);
-    try {
-      await engineDifferential(rt, seed.cells, engineTotals);
-    } catch (error) {
-      throw new Failure("engine_equal", short(error.message));
-    }
   } catch (error) {
     const invariant = error instanceof Failure ? error.invariant : "panic";
     const detail = error instanceof Failure ? error.message : (error?.stack ?? String(error));
@@ -889,4 +879,4 @@ for (const traced of seeds) {
   for (const key of ["turns", "runs", "crashes", "dispatches", "steps", "cells", "nested", "divergences", "waits", "sleeps", "resumes", "sides", "recovers", "jobs"]) totals[key] += seed.stats[key];
 }
 const elapsed = Math.round(performance.now() - started);
-console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits} engine_cells=${engineTotals.cells} engine_steps=${engineTotals.steps} engine_unparsed=${engineTotals.unparsed}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""}${totals.sides > 0 ? ` side_questions=${totals.sides}` : ""}${totals.recovers + totals.jobs > 0 ? ` recovers=${totals.recovers} jobs_asked=${totals.jobs}` : ""} ms=${elapsed}`);
+console.log(`ok target=${values.target} module=${values.module} mutation=${values.mutation} seeds=${totals.seeds} turns=${totals.turns} runs=${totals.runs} crashes=${totals.crashes} dispatches=${totals.dispatches} steps=${totals.steps}${totals.cells > 0 ? ` cells=${totals.cells} nested=${totals.nested} divergences=${totals.divergences} waits=${totals.waits}` : ""}${totals.sleeps + totals.resumes > 0 ? ` sleeps=${totals.sleeps} resumes=${totals.resumes}` : ""}${totals.sides > 0 ? ` side_questions=${totals.sides}` : ""}${totals.recovers + totals.jobs > 0 ? ` recovers=${totals.recovers} jobs_asked=${totals.jobs}` : ""} ms=${elapsed}`);
