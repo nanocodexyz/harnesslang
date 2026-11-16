@@ -9,6 +9,7 @@ pub const COMMAND_BYTES_MAX: usize = 1024 * 1024;
 pub const DESCRIPTION_BYTES_MAX: usize = 1024;
 pub const STREAM_BYTES_MAX: usize = 30_000;
 pub const TIMEOUT_MAX_MS: u64 = 600_000;
+pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
 pub const ERROR_CHARS: usize = 10_000;
 pub const ERROR_CHARS_SLACK: usize = 1_024;
 pub const SHELL_SIGNAL_STATUS: i32 = 128;
@@ -119,6 +120,7 @@ fn u64_field(input: &Value, key: &str) -> Result<u64, String> {
 fn bool_field(input: &Value, key: &str) -> Result<bool, String> {
     match input.get(key) {
         Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(false),
         _ => Err(format!("invalid {key}")),
     }
 }
@@ -401,10 +403,19 @@ impl Workspace {
                 "command must be nonblank and at most {COMMAND_BYTES_MAX} bytes"
             ));
         }
-        if text_field(input, "description")?.len() > DESCRIPTION_BYTES_MAX {
+        if input
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .len()
+            > DESCRIPTION_BYTES_MAX
+        {
             return Err(format!("description exceeds {DESCRIPTION_BYTES_MAX} bytes"));
         }
-        let requested = u64_field(input, "timeout")?;
+        let requested = match input.get("timeout") {
+            None => TIMEOUT_DEFAULT_MS,
+            Some(_) => u64_field(input, "timeout")?,
+        };
         if requested == 0 {
             return Err("timeout must be at least 1 millisecond".into());
         }

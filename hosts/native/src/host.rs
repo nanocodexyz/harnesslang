@@ -35,7 +35,7 @@ pub struct Spawn {
 
 #[derive(Clone)]
 pub struct Setup {
-    pub module_dir: PathBuf,
+    pub module_dir: Option<PathBuf>,
     pub cwd: PathBuf,
     pub spawns: Vec<Spawn>,
 }
@@ -66,8 +66,28 @@ pub struct Session {
     finish: Option<Json>,
 }
 
+include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
+
 pub fn module_path(module_dir: &Path, program: &str) -> PathBuf {
     module_dir.join(format!("{program}.{MODULE_EXTENSION}"))
+}
+
+pub fn load_program(module_dir: Option<&Path>, program: &str) -> Result<Loaded, String> {
+    if let Some(module_dir) = module_dir {
+        return load(&module_path(module_dir, program));
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| module_path(dir, program)))
+        .filter(|path| path.exists());
+    if let Some(path) = beside {
+        return load(&path);
+    }
+    let (_, bytes) = EMBEDDED
+        .iter()
+        .find(|(name, _)| *name == program)
+        .ok_or_else(|| format!("no module {program}.{MODULE_EXTENSION}: give --module-dir"))?;
+    harnesslang::wasm::sim::load(bytes).map_err(|error| format!("{program}: {error}"))
 }
 
 pub fn load(path: &Path) -> Result<Loaded, String> {

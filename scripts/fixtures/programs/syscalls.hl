@@ -1,0 +1,68 @@
+harness syscalls
+
+const bash_timeout_ms: u64 = 120000
+const workers_max: u64 = 4
+
+type outcome = done(text) | broke(text)
+
+tool Bash(command: text, timeout: u64 = bash_timeout_ms, description: text = "", run_in_background: bool = false, dangerouslyDisableSandbox: bool = false) -> text effect external
+tool Write(file_path: text, content: text) -> text effect external
+tool Edit(file_path: text, old_string: text, new_string: text, replace_all: bool = false) -> text effect external
+tool apply_patch(input: text) -> text effect external recoverable
+tool mystery(clue: text) -> text effect none
+
+spawn worker runs work from "syscalls_child.hl"
+
+on resume
+
+state {
+  started: list<text, workers_max>
+}
+
+invariant started_bounded: len(started) <= workers_max
+
+on subagent start(agent: text) {
+  push started agent
+}
+
+on files(dir: text) -> outcome {
+  let path = dir ++ "/note.txt"
+  match Write(path, "alpha\n") {
+    ok(written) => {}
+    failed(error) => { return broke("Write: " ++ error) }
+    unknown => { return broke("Write: unknown") }
+  }
+  match Edit(path, "alpha", "beta", false) {
+    ok(edited) => {}
+    failed(error) => { return broke("Edit: " ++ error) }
+    unknown => { return broke("Edit: unknown") }
+  }
+  match apply_patch("*** Begin Patch\n*** Add File: " ++ dir ++ "/patched.txt\n+gamma\n*** End Patch\n") {
+    ok(patched) => {}
+    failed(error) => { return broke("apply_patch: " ++ error) }
+    unknown => { return broke("apply_patch: unknown") }
+  }
+  match Bash("cat note.txt patched.txt", bash_timeout_ms, "", false, false) {
+    ok(shown) => {
+      match mystery("x") {
+        ok(said) => { return broke("mystery answered " ++ said) }
+        failed(error) => { return done(shown ++ "|" ++ error) }
+      }
+    }
+    failed(error) => { return broke("Bash: " ++ error) }
+    unknown => { return broke("Bash: unknown") }
+  }
+}
+
+on delegate(task: text) -> outcome
+  requires len(started) < workers_max
+{
+  match worker(task) {
+    ok(agent) => {
+      let answer = join(agent)
+      return done(answer)
+    }
+    failed(error) => { return broke(error) }
+    unknown => { return broke("the spawn's outcome is unknown") }
+  }
+}
