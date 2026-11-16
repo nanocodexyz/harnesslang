@@ -668,10 +668,10 @@ pub fn run(seeds: Range<u64>) -> Result<String, String> {
             for (input, expected) in [&request, &decode].into_iter().zip(expected) {
                 let encoded = input.encode();
                 let actual = probe.ask(&encoded).map_err(|error| {
-                    format!("{error}
-  wire: {}
-  seed: {seed}
-  input: {encoded}", wire.name())
+                    format!(
+                        "{error}\n  wire: {}\n  seed: {seed}\n  input: {encoded}",
+                        wire.name()
+                    )
                 })?;
                 if actual != expected {
                     return Err(format!(
@@ -686,16 +686,4 @@ pub fn run(seeds: Range<u64>) -> Result<String, String> {
             .expect("writing to a string succeeds");
     }
     Ok(summary)
-}
-
-pub fn probe_once(wire: Wire, input: &str) -> Result<(String, String), String> {
-    let module = module(wire)?;
-    let mut probe = Probe::new(&module)?;
-    let json = crate::run::json::decode(input)?;
-    let expected = if json.get("op").and_then(Json::as_str) == Some("request") {
-        request_rust(wire, &json)
-    } else {
-        decode_rust(wire, &json)
-    };
-    Ok((expected, probe.ask(input)?))
 }
