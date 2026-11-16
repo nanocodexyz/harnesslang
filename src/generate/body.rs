@@ -4,7 +4,7 @@ use crate::generate::names::fresh;
 use crate::generate::{CALL, Decls, ENTRY, REPLY, Ty, chance, weighted};
 use crate::sim::rng::Rng;
 
-const STATEMENTS_PER_HANDLER_MAX: u64 = 40;
+const GENERATED_STATEMENTS_MAX: u64 = 40;
 const STATEMENTS_PER_BLOCK_MAX: u64 = 6;
 const LET_EFFECT_PERCENT: u64 = 70;
 const BLOCK_DEPTH_MAX: u32 = 4;
@@ -264,7 +264,7 @@ pub fn handler(
         names: 0,
         pushes: std::collections::BTreeMap::new(),
         multiplier: 1,
-        statements_left: STATEMENTS_PER_HANDLER_MAX,
+        statements_left: GENERATED_STATEMENTS_MAX,
         loops: 0,
         returns: returns.clone(),
         lines: Vec::new(),

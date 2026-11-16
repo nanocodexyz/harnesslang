@@ -176,7 +176,7 @@ pub fn pipeline(bytes: &[u8], case: u64, stats: &mut Stats) {
     }
     for target in Target::ALL {
         crate::target::check_limits(&program, &crate::target::model(target));
-        if crate::emit::emit(&program, target).is_ok() {
+        if crate::emit::wasm::emit(&program, target).is_ok() {
             stats.emitted += 1;
         }
     }
