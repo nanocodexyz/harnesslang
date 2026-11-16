@@ -1341,8 +1341,519 @@
       (return (call $an_interpret (local.get $value)))))
   (local.set $text (call $an_error_text (local.get $status) (call $w_or (local.get $body) (i32.const $s_empty))))
   (call $an_error_attempt (i32.const 1) (local.get $status) (global.get $w_kind) (local.get $text) (local.get $retry)))
-(text $wt_oa_unbuilt "the openai wire codec is not built")
-(func $openai_render (param $context i32) (result i32)
-  (call $w_fail (i32.const $wt_oa_unbuilt)))
-(func $openai_decode (param $status i64) (param $headers i32) (param $events i32) (param $body i32) (result i32)
-  (call $wire_transient (i32.const $wt_oa_unbuilt)))
+(func $oa_message (param $role i32) (param $kind i32) (param $key i32) (param $value i32) (result i32)
+  (call $w_obj3
+    (i32.const $wt_type) (call $w_string (i32.const $wt_message))
+    (i32.const $wt_role) (call $w_string (local.get $role))
+    (i32.const $wt_content) (call $w_arr1 (call $w_obj2 (i32.const $wt_type) (call $w_string (local.get $kind)) (local.get $key) (local.get $value)))))
+(func $oa_user (param $text i32) (result i32)
+  (call $oa_message (i32.const $wt_user) (i32.const $wt_input_text) (i32.const $wt_text) (call $w_string (local.get $text))))
+(func $oa_assistant (param $text i32) (result i32)
+  (call $oa_message (i32.const $wt_assistant) (i32.const $wt_output_text) (i32.const $wt_text) (call $w_string (local.get $text))))
+(func $oa_image (result i32) (local $buffer i32)
+  (local.set $buffer (call $buf_new))
+  (call $buf_text (local.get $buffer) (i32.const $wt_data_scheme))
+  (call $buf_text (local.get $buffer) (global.get $w_media))
+  (call $buf_text (local.get $buffer) (i32.const $wt_base64_marker))
+  (call $buf_text (local.get $buffer) (global.get $w_data))
+  (call $oa_message (i32.const $wt_user) (i32.const $wt_input_image) (i32.const $wt_image_url) (call $w_string (call $buf_finish (local.get $buffer)))))
+(func $oa_copied (param $item i32) (param $k1 i32) (param $k2 i32) (param $k3 i32) (param $k4 i32) (result i32) (local $entries i32)
+  (local.set $entries (call $vec_new (i32.const 8)))
+  (call $w_object_entries (local.get $entries) (local.get $k1) (call $w_get (local.get $item) (local.get $k1)))
+  (call $w_object_entries (local.get $entries) (local.get $k2) (call $w_get (local.get $item) (local.get $k2)))
+  (call $w_object_entries (local.get $entries) (local.get $k3) (call $w_get (local.get $item) (local.get $k3)))
+  (if (local.get $k4)
+    (then (call $w_object_entries (local.get $entries) (local.get $k4) (call $w_get (local.get $item) (local.get $k4)))))
+  (call $w_vec_object (local.get $entries)))
+(func $oa_input_item (param $item i32) (result i32) (local $type i32) (local $kept i32) (local $content i32) (local $parts i32) (local $index i32) (local $part i32) (local $kind i32)
+  (local.set $type (call $w_text (local.get $item) (i32.const $wt_type)))
+  (if (i32.eqz (local.get $type)) (then (return (i32.const 0))))
+  (if (call $text_eq (local.get $type) (i32.const $wt_reasoning))
+    (then
+      (if (i32.eqz (call $w_text (local.get $item) (i32.const $wt_encrypted_content))) (then (return (i32.const 0))))
+      (local.set $kept (call $oa_copied (local.get $item) (i32.const $wt_type) (i32.const $wt_id) (i32.const $wt_summary) (i32.const $wt_encrypted_content)))
+      (if (i32.eqz (call $json_get (local.get $kept) (i32.const $wt_summary)))
+        (then (call $raw_insert (local.get $kept) (i32.const $wt_summary) (call $json_array (i32.const 0)))))
+      (return (local.get $kept))))
+  (if (call $text_eq (local.get $type) (i32.const $wt_message))
+    (then
+      (local.set $content (call $w_get (local.get $item) (i32.const $wt_content)))
+      (local.set $parts (call $vec_new (i32.const 4)))
+      block $done
+        loop $next
+          (br_if $done (i32.ge_u (local.get $index) (call $w_count (local.get $content))))
+          (local.set $part (call $json_item (local.get $content) (local.get $index)))
+          (local.set $kind (call $w_text (local.get $part) (i32.const $wt_type)))
+          (if (i32.or (call $w_eq (local.get $kind) (i32.const $wt_output_text)) (call $w_eq (local.get $kind) (i32.const $wt_refusal)))
+            (then (call $w_push (local.get $parts) (call $oa_copied (local.get $part) (i32.const $wt_type) (i32.const $wt_text) (i32.const $wt_refusal) (i32.const 0)))))
+          (local.set $index (i32.add (local.get $index) (i32.const 1)))
+          br $next
+        end
+      end
+      (if (i32.eqz (call $vec_count (local.get $parts))) (then (return (i32.const 0))))
+      (return (call $w_obj3
+        (i32.const $wt_type) (call $w_string (i32.const $wt_message))
+        (i32.const $wt_role) (call $w_string (i32.const $wt_assistant))
+        (i32.const $wt_content) (call $w_vec_array (local.get $parts))))))
+  (if (call $text_eq (local.get $type) (i32.const $wt_function_call))
+    (then (return (call $oa_copied (local.get $item) (i32.const $wt_type) (i32.const $wt_call_id) (i32.const $wt_name) (i32.const $wt_arguments)))))
+  (if (call $text_eq (local.get $type) (i32.const $wt_custom_tool_call))
+    (then (return (call $oa_copied (local.get $item) (i32.const $wt_type) (i32.const $wt_call_id) (i32.const $wt_name) (i32.const $wt_input)))))
+  (i32.const 0))
+(func $oa_is_custom (param $id i32) (result i32) (local $index i32)
+  block $absent
+    loop $next
+      (br_if $absent (i32.ge_u (local.get $index) (call $vec_count (global.get $oa_custom))))
+      (if (call $text_eq (i32.load (call $vec_at (global.get $oa_custom) (local.get $index))) (local.get $id)) (then (return (i32.const 1))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (i32.const 0))
+(func $oa_output (param $call i32) (param $text i32) (result i32) (local $id i32) (local $kind i32)
+  (local.set $id (call $w_text (local.get $call) (i32.const $wt_id)))
+  (if (i32.eqz (local.get $id)) (then (return (call $w_fail (i32.const $wt_call_no_id)))))
+  (local.set $kind (select (i32.const $wt_custom_tool_call_output) (i32.const $wt_function_call_output) (call $oa_is_custom (local.get $id))))
+  (call $w_push (global.get $oa_items) (call $w_obj3
+    (i32.const $wt_type) (call $w_string (local.get $kind))
+    (i32.const $wt_call_id) (call $w_string (local.get $id))
+    (i32.const $wt_output) (call $w_string (local.get $text))))
+  (i32.const 1))
+(func $oa_function_call (param $call i32) (result i32)
+  (call $w_obj4
+    (i32.const $wt_type) (call $w_string (i32.const $wt_function_call))
+    (i32.const $wt_call_id) (call $w_string (call $w_text_or_empty (local.get $call) (i32.const $wt_id)))
+    (i32.const $wt_name) (call $w_string (call $w_text_or_empty (local.get $call) (i32.const $wt_tool)))
+    (i32.const $wt_arguments) (call $w_string (call $w_text_or_empty (local.get $call) (i32.const $wt_input)))))
+(func $oa_reply (param $reply i32) (result i32) (local $name i32) (local $fields i32) (local $words i32) (local $raw i32) (local $calls i32) (local $index i32) (local $decoded i32) (local $kept i32) (local $id i32)
+  (local.set $name (call $w_tagged (local.get $reply)))
+  (if (i32.eqz (local.get $name)) (then (return (call $w_fail (i32.const $wt_no_reply)))))
+  (local.set $fields (global.get $w_payload))
+  (if (i32.eqz (call $w_is (local.get $fields) (global.get $JSON_ARRAY))) (then (return (call $w_fail (i32.const $wt_reply_fields)))))
+  (if (call $text_eq (local.get $name) (i32.const $wt_message))
+    (then
+      (local.set $words (call $w_at (local.get $fields) (i32.const 0)))
+      (local.set $raw (call $w_at (local.get $fields) (i32.const 1))))
+    (else
+      (if (i32.eqz (call $text_eq (local.get $name) (i32.const $wt_calls))) (then (return (call $w_fail (i32.const $wt_reply_unknown)))))
+      (local.set $words (call $w_at (local.get $fields) (i32.const 1)))
+      (local.set $raw (call $w_at (local.get $fields) (i32.const 2)))))
+  (local.set $raw (call $w_or (call $w_as_text (local.get $raw)) (i32.const $s_empty)))
+  (if (call $w_empty (local.get $raw))
+    (then
+      (local.set $words (call $w_or (call $w_as_text (local.get $words)) (i32.const $s_empty)))
+      (if (i32.eqz (call $w_empty (local.get $words))) (then (call $w_push (global.get $oa_items) (call $oa_assistant (local.get $words)))))
+      (if (call $text_eq (local.get $name) (i32.const $wt_calls))
+        (then
+          (local.set $calls (call $w_at (local.get $fields) (i32.const 0)))
+          block $done
+            loop $next
+              (br_if $done (i32.ge_u (local.get $index) (call $w_count (local.get $calls))))
+              (call $w_push (global.get $oa_items) (call $oa_function_call (call $json_item (local.get $calls) (local.get $index))))
+              (local.set $index (i32.add (local.get $index) (i32.const 1)))
+              br $next
+            end
+          end))
+      (return (i32.const 1))))
+  (local.set $decoded (call $raw_parse (local.get $raw)))
+  (if (i32.eqz (local.get $decoded)) (then (return (call $w_fail (i32.const $wt_items_json)))))
+  (if (i32.eqz (call $w_is (local.get $decoded) (global.get $JSON_ARRAY))) (then (return (call $w_fail (i32.const $wt_items_list)))))
+  block $items
+    loop $next
+      (br_if $items (i32.ge_u (local.get $index) (call $json_count (local.get $decoded))))
+      (local.set $kept (call $oa_input_item (call $json_item (local.get $decoded) (local.get $index))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      (br_if $next (i32.eqz (local.get $kept)))
+      (if (call $w_eq (call $w_text (local.get $kept) (i32.const $wt_type)) (i32.const $wt_custom_tool_call))
+        (then
+          (local.set $id (call $w_text (local.get $kept) (i32.const $wt_call_id)))
+          (if (local.get $id) (then (call $w_push (global.get $oa_custom) (local.get $id))))))
+      (call $w_push (global.get $oa_items) (local.get $kept))
+      br $next
+    end
+  end
+  (i32.const 1))
+(func $oa_entry (param $entry i32) (result i32) (local $name i32) (local $payload i32) (local $text i32)
+  (local.set $name (call $w_tagged (local.get $entry)))
+  (if (i32.eqz (local.get $name)) (then (return (call $w_fail (i32.const $wt_not_variant)))))
+  (local.set $payload (global.get $w_payload))
+  (if (call $text_eq (local.get $name) (i32.const $wt_user))
+    (then
+      (local.set $text (call $w_as_text (local.get $payload)))
+      (if (i32.eqz (local.get $text)) (then (return (call $w_fail (i32.const $wt_user_no_text)))))
+      (call $w_push (global.get $oa_items) (call $oa_user (local.get $text)))
+      (return (i32.const 1))))
+  (if (call $text_eq (local.get $name) (i32.const $wt_notice))
+    (then
+      (local.set $text (call $w_as_text (local.get $payload)))
+      (if (i32.eqz (local.get $text)) (then (return (call $w_fail (i32.const $wt_notice_no_text)))))
+      (call $w_push (global.get $oa_items) (call $oa_user (local.get $text)))
+      (return (i32.const 1))))
+  (if (call $text_eq (local.get $name) (i32.const $wt_assistant))
+    (then
+      (if (i32.eqz (local.get $payload)) (then (return (call $w_fail (i32.const $wt_no_reply)))))
+      (return (call $oa_reply (local.get $payload)))))
+  (if (i32.or (call $text_eq (local.get $name) (i32.const $wt_result)) (call $text_eq (local.get $name) (i32.const $wt_error)))
+    (then
+      (if (i32.eqz (call $w_entry_pair (local.get $name) (local.get $payload))) (then (return (i32.const 0))))
+      (return (call $oa_output (global.get $w_first) (call $w_or (call $w_as_text (global.get $w_second)) (i32.const $s_empty))))))
+  (if (call $text_eq (local.get $name) (i32.const $wt_attached))
+    (then
+      (if (i32.eqz (call $w_entry_pair (local.get $name) (local.get $payload))) (then (return (i32.const 0))))
+      (local.set $payload (global.get $w_first))
+      (if (i32.eqz (call $w_attached_digest (global.get $w_second))) (then (return (i32.const 0))))
+      (if (i32.eqz (call $oa_output (local.get $payload) (i32.const $wt_image_attached))) (then (return (i32.const 0))))
+      (call $w_push (global.get $oa_items) (call $oa_image))
+      (return (i32.const 1))))
+  (if (call $text_eq (local.get $name) (i32.const $wt_unknown))
+    (then
+      (if (i32.eqz (local.get $payload)) (then (return (call $w_fail (i32.const $wt_no_call)))))
+      (return (call $oa_output (local.get $payload) (i32.const $wt_unknown_outcome)))))
+  (call $w_fail (i32.const $wt_entry_unknown)))
+(func $openai_render (param $context i32) (result i32) (local $index i32)
+  (if (i32.eqz (call $w_is (local.get $context) (global.get $JSON_ARRAY))) (then (return (call $w_fail (i32.const $wt_not_list)))))
+  (global.set $oa_items (call $vec_new (i32.const 4)))
+  (global.set $oa_custom (call $vec_new (i32.const 4)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (call $json_count (local.get $context))))
+      (if (i32.eqz (call $oa_entry (call $json_item (local.get $context) (local.get $index)))) (then (return (i32.const 0))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (global.get $oa_items))
+(func $oa_hinted_ms (param $message i32) (result i64) (local $lower i32) (local $at i32) (local $start i32) (local $end i32) (local $dot i32) (local $byte i32) (local $unit i32) (local $scale i64) (local $kept i32) (local $ms i64) (local $place i64) (local $fraction i32) (local $index i32)
+  (local.set $lower (call $w_lower (local.get $message)))
+  (local.set $at (call $text_find (local.get $lower) (i32.const $wt_retry_hint)))
+  (if (i32.lt_s (local.get $at) (i32.const 0)) (then (return (i64.const 0))))
+  (local.set $start (call $w_skip_space (local.get $lower) (i32.add (local.get $at) (call $text_len (i32.const $wt_retry_hint)))))
+  (local.set $end (local.get $start))
+  (local.set $dot (i32.const -1))
+  block $scanned
+    loop $next
+      (br_if $scanned (i32.ge_u (local.get $end) (call $text_len (local.get $lower))))
+      (local.set $byte (call $text_byte (local.get $lower) (local.get $end)))
+      (if (i32.eq (local.get $byte) (i32.const 46))
+        (then
+          (if (i32.ge_s (local.get $dot) (i32.const 0)) (then (local.set $fraction (i32.const 1))))
+          (if (i32.lt_s (local.get $dot) (i32.const 0)) (then (local.set $dot (local.get $end))))
+          (local.set $end (i32.add (local.get $end) (i32.const 1)))
+          (br $next)))
+      (br_if $scanned (i32.eqz (call $w_digit (local.get $byte))))
+      (local.set $end (i32.add (local.get $end) (i32.const 1)))
+      br $next
+    end
+  end
+  (if (local.get $fraction) (then (return (i64.const 0))))
+  (if (i32.lt_s (local.get $dot) (i32.const 0)) (then (local.set $dot (local.get $end))))
+  (if (i32.eq (i32.sub (local.get $end) (local.get $start)) (select (i32.const 1) (i32.const 0) (i32.lt_u (local.get $dot) (local.get $end))))
+    (then (return (i64.const 0))))
+  (local.set $unit (call $w_skip_space (local.get $lower) (local.get $end)))
+  (if (call $w_starts (local.get $lower) (local.get $unit) (i32.const $wt_ms))
+    (then (local.set $scale (i64.const 1)))
+    (else
+      (if (i32.and (i32.lt_u (local.get $unit) (call $text_len (local.get $lower))) (i32.eq (call $text_byte (local.get $lower) (local.get $unit)) (i32.const 115)))
+        (then (local.set $scale (global.get $WIRE_MILLISECONDS_PER_SECOND)))
+        (else (return (i64.const 0))))))
+  (local.set $fraction (select (i32.add (local.get $dot) (i32.const 1)) (local.get $end) (i32.lt_u (local.get $dot) (local.get $end))))
+  (local.set $kept (i32.const 0))
+  (if (i64.ne (local.get $scale) (i64.const 1))
+    (then
+      (local.set $kept (i32.sub (local.get $end) (local.get $fraction)))
+      (if (i32.gt_u (local.get $kept) (global.get $WIRE_FRACTION_KEPT_MAX)) (then (local.set $kept (global.get $WIRE_FRACTION_KEPT_MAX))))))
+  (local.set $ms (call $w_multiply (call $w_digits (local.get $lower) (local.get $start) (local.get $dot)) (local.get $scale)))
+  (local.set $place (local.get $scale))
+  (local.set $index (i32.const 0))
+  block $digits
+    loop $next
+      (br_if $digits (i32.ge_u (local.get $index) (local.get $kept)))
+      (local.set $place (i64.div_u (local.get $place) (global.get $DECIMAL_BASE)))
+      (local.set $ms (call $w_saturating_add (local.get $ms)
+        (i64.mul (i64.extend_i32_u (i32.sub (call $text_byte (local.get $lower) (i32.add (local.get $fraction) (local.get $index))) (global.get $ASCII_ZERO))) (local.get $place))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (local.set $index (i32.add (local.get $fraction) (local.get $kept)))
+  block $rest
+    loop $next
+      (br_if $rest (i32.ge_u (local.get $index) (local.get $end)))
+      (if (i32.ne (call $text_byte (local.get $lower) (local.get $index)) (global.get $ASCII_ZERO))
+        (then
+          (local.set $ms (call $w_saturating_add (local.get $ms) (i64.const 1)))
+          (br $rest)))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (local.get $ms))
+(func $w_in (param $code i32) (param $a i32) (param $b i32) (param $c i32) (param $d i32) (param $e i32) (result i32)
+  (if (call $text_eq (local.get $code) (local.get $a)) (then (return (i32.const 1))))
+  (if (call $text_eq (local.get $code) (local.get $b)) (then (return (i32.const 1))))
+  (if (call $text_eq (local.get $code) (local.get $c)) (then (return (i32.const 1))))
+  (if (call $text_eq (local.get $code) (local.get $d)) (then (return (i32.const 1))))
+  (if (local.get $e) (then (return (call $text_eq (local.get $code) (local.get $e)))))
+  (i32.const 0))
+(func $oa_classify (param $known i32) (param $status i64) (param $code i32) (param $message i32) (param $retry i64) (result i32) (local $text i32) (local $after i64)
+  (if (local.get $known)
+    (then (local.set $text (call $w_http_status_text (local.get $status) (local.get $code) (local.get $message))))
+    (else (local.set $text (call $w_cat4 (i32.const $wt_response_failed) (local.get $code) (i32.const $wt_colon) (local.get $message)))))
+  (if (i32.or (call $text_eq (local.get $code) (i32.const $wt_context_length))
+        (i32.and (local.get $known) (i64.eq (local.get $status) (global.get $WIRE_HTTP_TOO_LARGE))))
+    (then
+      (return (call $w_ok
+        (call $json_one (i32.const $wt_message) (call $w_arr3 (call $w_string (i32.const $s_empty)) (call $w_string (i32.const $s_empty)) (i32.const $json_true)))
+        (i32.const $wt_context_exceeded) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))))
+  (if (i32.or
+        (call $w_in (local.get $code) (i32.const $wt_insufficient_quota) (i32.const $wt_credit_exhausted) (i32.const $wt_organization_limit) (i32.const $wt_project_limit) (i32.const $wt_usage_not_included))
+        (call $w_in (local.get $code) (i32.const $wt_invalid_prompt) (i32.const $wt_content_policy) (i32.const $wt_cyber_policy) (i32.const $wt_bio_policy) (i32.const $wt_budget_reached)))
+    (then (return (call $w_rejected (local.get $text)))))
+  (local.set $after (local.get $retry))
+  (if (i64.eqz (local.get $after)) (then (local.set $after (call $oa_hinted_ms (local.get $message)))))
+  (if (i32.or
+        (call $w_in (local.get $code) (i32.const $wt_rate_limit_exceeded) (i32.const $wt_slow_down) (i32.const $wt_server_overloaded) (i32.const $wt_capacity_unavailable) (i32.const 0))
+        (i32.and (local.get $known) (i64.eq (local.get $status) (global.get $WIRE_HTTP_TOO_MANY))))
+    (then (return (call $w_throttled (local.get $text) (local.get $after)))))
+  (if (i32.eqz (local.get $known)) (then (return (call $w_transient (local.get $text) (local.get $after)))))
+  (if (i32.or (i32.or (i64.eq (local.get $status) (global.get $WIRE_HTTP_REQUEST_TIMEOUT)) (i64.eq (local.get $status) (global.get $WIRE_HTTP_CONFLICT)))
+        (i64.ge_u (local.get $status) (global.get $WIRE_HTTP_SERVER_ERROR)))
+    (then (return (call $w_transient (local.get $text) (local.get $after)))))
+  (call $w_rejected (local.get $text)))
+(func $oa_error_fields (param $error i32)
+  (global.set $w_code (call $w_text_or_empty (local.get $error) (i32.const $wt_code)))
+  (if (call $w_empty (global.get $w_code)) (then (global.set $w_code (call $w_text_or_empty (local.get $error) (i32.const $wt_type)))))
+  (global.set $w_message (call $w_text_or_empty (local.get $error) (i32.const $wt_message))))
+(func $oa_usage_path (param $usage i32) (param $first i32) (param $second i32) (result i64) (local $at i32) (local $value i64)
+  (local.set $at (call $w_get (local.get $usage) (local.get $first)))
+  (if (local.get $second) (then (local.set $at (call $w_get (local.get $at) (local.get $second)))))
+  (local.set $value (call $w_u64 (local.get $at)))
+  (select (local.get $value) (i64.const 0) (global.get $w_u64_ok)))
+(func $oa_call_input (param $arguments i32) (result i32) (local $value i32) (local $index i32) (local $item i32) (local $tag i32)
+  (local.set $value (call $raw_parse (local.get $arguments)))
+  (if (i32.eqz (call $w_is (local.get $value) (global.get $JSON_OBJECT))) (then (return (local.get $arguments))))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (call $json_count (local.get $value))))
+      (local.set $item (call $json_value (local.get $value) (local.get $index)))
+      (local.set $tag (call $json_tag (local.get $item)))
+      (if (i32.or (i32.eq (local.get $tag) (global.get $JSON_ARRAY)) (i32.eq (local.get $tag) (global.get $JSON_OBJECT)))
+        (then (call $json_object_set (local.get $value) (local.get $index) (call $json_key (local.get $value) (local.get $index)) (call $w_string (call $raw_encode (local.get $item))))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (call $raw_encode (local.get $value)))
+(func $oa_reply_of (param $items i32) (param $end_turn i32) (param $incomplete i32) (result i32) (local $words i32) (local $refused i32) (local $calls i32) (local $index i32) (local $item i32) (local $type i32) (local $content i32) (local $part_index i32) (local $part i32) (local $kind i32) (local $arguments i32) (local $kept i32) (local $raw i32) (local $reply i32)
+  (local.set $words (call $buf_new))
+  (local.set $calls (call $vec_new (i32.const 4)))
+  (local.set $kept (call $vec_new (i32.const 4)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (call $vec_count (local.get $items))))
+      (local.set $item (i32.load (call $vec_at (local.get $items) (local.get $index))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      (local.set $type (call $w_text (local.get $item) (i32.const $wt_type)))
+      (if (call $w_eq (local.get $type) (i32.const $wt_message))
+        (then
+          (local.set $content (call $w_get (local.get $item) (i32.const $wt_content)))
+          (local.set $part_index (i32.const 0))
+          block $parts
+            loop $part_next
+              (br_if $parts (i32.ge_u (local.get $part_index) (call $w_count (local.get $content))))
+              (local.set $part (call $json_item (local.get $content) (local.get $part_index)))
+              (local.set $kind (call $w_text (local.get $part) (i32.const $wt_type)))
+              (if (call $w_eq (local.get $kind) (i32.const $wt_output_text))
+                (then (call $buf_text (local.get $words) (call $w_text_or_empty (local.get $part) (i32.const $wt_text)))))
+              (if (call $w_eq (local.get $kind) (i32.const $wt_refusal))
+                (then
+                  (local.set $refused (i32.const 1))
+                  (call $buf_text (local.get $words) (call $w_text_or_empty (local.get $part) (i32.const $wt_refusal)))))
+              (local.set $part_index (i32.add (local.get $part_index) (i32.const 1)))
+              br $part_next
+            end
+          end))
+      (if (call $w_eq (local.get $type) (i32.const $wt_function_call))
+        (then
+          (local.set $arguments (call $w_or (call $w_text (local.get $item) (i32.const $wt_arguments)) (i32.const $wt_empty_object)))
+          (call $w_push (local.get $calls) (call $w_call
+            (call $w_text_or_empty (local.get $item) (i32.const $wt_call_id))
+            (call $w_text_or_empty (local.get $item) (i32.const $wt_name))
+            (call $oa_call_input (local.get $arguments))))))
+      (if (call $w_eq (local.get $type) (i32.const $wt_custom_tool_call))
+        (then
+          (call $w_push (local.get $calls) (call $w_call
+            (call $w_text_or_empty (local.get $item) (i32.const $wt_call_id))
+            (call $w_text_or_empty (local.get $item) (i32.const $wt_name))
+            (call $raw_encode (call $json_one (i32.const $wt_input) (call $w_string (call $w_text_or_empty (local.get $item) (i32.const $wt_input)))))))))
+      (local.set $item (call $oa_input_item (local.get $item)))
+      (if (local.get $item) (then (call $w_push (local.get $kept) (local.get $item))))
+      br $next
+    end
+  end
+  (local.set $raw (call $w_string (call $raw_encode (call $w_vec_array (local.get $kept)))))
+  (if (local.get $incomplete)
+    (then
+      (global.set $w_stop (i32.const $wt_pause))
+      (if (call $text_eq (local.get $incomplete) (i32.const $wt_max_output_tokens)) (then (global.set $w_stop (i32.const $wt_max_tokens))))
+      (if (call $text_eq (local.get $incomplete) (i32.const $wt_content_filter)) (then (global.set $w_stop (i32.const $wt_refusal)))))
+    (else
+      (global.set $w_stop (i32.const $wt_tool_use))
+      (if (i32.eqz (call $vec_count (local.get $calls))) (then (global.set $w_stop (i32.const $wt_end))))
+      (if (local.get $refused) (then (global.set $w_stop (i32.const $wt_refusal))))))
+  (local.set $words (call $w_string (call $buf_finish (local.get $words))))
+  (if (call $vec_count (local.get $calls))
+    (then (return (call $json_one (i32.const $wt_calls) (call $w_arr3 (call $w_vec_array (local.get $calls)) (local.get $words) (local.get $raw))))))
+  (call $json_one (i32.const $wt_message) (call $w_arr3 (local.get $words) (local.get $raw) (call $json_bool (local.get $end_turn)))))
+(func $oa_assemble (param $events i32) (param $count i32) (result i32) (local $index i32) (local $data i32) (local $event i32) (local $type i32) (local $at i64) (local $item i32) (local $entry i32) (local $error i32)
+  (global.set $oa_sorted (call $vec_new (i32.const 16)))
+  (global.set $oa_terminal (i32.const 0))
+  (global.set $oa_failed (i32.const 0))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (local.get $count)))
+      (local.set $data (call $w_trim (i32.load (call $vec_at (local.get $events) (local.get $index)))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      (br_if $next (call $w_empty (local.get $data)))
+      (br_if $next (call $text_eq (local.get $data) (i32.const $wt_done)))
+      (local.set $event (call $raw_parse (local.get $data)))
+      (if (i32.eqz (local.get $event)) (then (return (call $w_fail (i32.const $wt_event_json)))))
+      (local.set $type (call $w_text (local.get $event) (i32.const $wt_type)))
+      (if (call $w_eq (local.get $type) (i32.const $wt_item_done))
+        (then
+          (local.set $at (call $w_u64 (call $w_get (local.get $event) (i32.const $wt_output_index))))
+          (if (i32.eqz (global.get $w_u64_ok)) (then (local.set $at (i64.extend_i32_u (call $vec_count (global.get $oa_sorted))))))
+          (local.set $item (call $w_get (local.get $event) (i32.const $wt_item)))
+          (if (i32.eqz (local.get $item)) (then (return (call $w_fail (i32.const $wt_item_missing)))))
+          (local.set $entry (call $vec_push (global.get $oa_sorted)))
+          (i64.store (local.get $entry) (local.get $at))
+          (i32.store offset=8 (local.get $entry) (local.get $item))))
+      (if (i32.or (call $w_eq (local.get $type) (i32.const $wt_completed)) (call $w_eq (local.get $type) (i32.const $wt_incomplete)))
+        (then (global.set $oa_terminal (local.get $event))))
+      (if (call $w_eq (local.get $type) (i32.const $wt_failed))
+        (then (global.set $oa_failed (call $w_or (call $w_get (call $w_get (local.get $event) (i32.const $wt_response)) (i32.const $wt_error)) (i32.const $json_null)))))
+      (if (call $w_eq (local.get $type) (i32.const $wt_error))
+        (then (global.set $oa_failed (call $w_or (call $w_get (local.get $event) (i32.const $wt_error)) (local.get $event)))))
+      br $next
+    end
+  end
+  (call $oa_sort)
+  (i32.const 1))
+(func $oa_sort (local $index i32) (local $back i32) (local $at i64) (local $item i32) (local $slot i32)
+  (local.set $index (i32.const 1))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (call $vec_count (global.get $oa_sorted))))
+      (local.set $slot (call $vec_at (global.get $oa_sorted) (local.get $index)))
+      (local.set $at (i64.load (local.get $slot)))
+      (local.set $item (i32.load offset=8 (local.get $slot)))
+      (local.set $back (local.get $index))
+      block $placed
+        loop $shift
+          (br_if $placed (i32.eqz (local.get $back)))
+          (br_if $placed (i64.le_u (i64.load (call $vec_at (global.get $oa_sorted) (i32.sub (local.get $back) (i32.const 1)))) (local.get $at)))
+          (memory.copy (call $vec_at (global.get $oa_sorted) (local.get $back)) (call $vec_at (global.get $oa_sorted) (i32.sub (local.get $back) (i32.const 1))) (i32.const 16))
+          (local.set $back (i32.sub (local.get $back) (i32.const 1)))
+          br $shift
+        end
+      end
+      (local.set $slot (call $vec_at (global.get $oa_sorted) (local.get $back)))
+      (i64.store (local.get $slot) (local.get $at))
+      (i32.store offset=8 (local.get $slot) (local.get $item))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end)
+(func $oa_interpret (param $events i32) (param $count i32) (result i32) (local $terminal i32) (local $response i32) (local $usage i32) (local $input i64) (local $cached i64) (local $incomplete i32) (local $items i32) (local $output i32) (local $index i32) (local $end_turn i32) (local $reply i32)
+  (if (i32.eqz (call $oa_assemble (local.get $events) (local.get $count))) (then (return (call $wire_transient (global.get $wire_error)))))
+  (if (global.get $oa_failed)
+    (then
+      (call $oa_error_fields (global.get $oa_failed))
+      (return (call $oa_classify (i32.const 0) (i64.const 0) (global.get $w_code) (global.get $w_message) (i64.const 0)))))
+  (local.set $terminal (global.get $oa_terminal))
+  (if (i32.eqz (local.get $terminal)) (then (return (call $wire_transient (i32.const $wt_closed)))))
+  (local.set $response (call $w_get (local.get $terminal) (i32.const $wt_response)))
+  (local.set $usage (call $w_get (local.get $response) (i32.const $wt_usage)))
+  (local.set $input (call $oa_usage_path (local.get $usage) (i32.const $wt_input_tokens) (i32.const 0)))
+  (local.set $cached (call $oa_usage_path (local.get $usage) (i32.const $wt_input_tokens_details) (i32.const $wt_cached_tokens)))
+  (if (call $w_eq (call $w_text (local.get $terminal) (i32.const $wt_type)) (i32.const $wt_incomplete))
+    (then (local.set $incomplete (call $w_or (call $w_text (call $w_get (local.get $response) (i32.const $wt_incomplete_details)) (i32.const $wt_reason)) (i32.const $wt_unknown)))))
+  (local.set $items (call $vec_new (i32.const 4)))
+  (if (call $vec_count (global.get $oa_sorted))
+    (then
+      block $sorted
+        loop $next
+          (br_if $sorted (i32.ge_u (local.get $index) (call $vec_count (global.get $oa_sorted))))
+          (call $w_push (local.get $items) (i32.load offset=8 (call $vec_at (global.get $oa_sorted) (local.get $index))))
+          (local.set $index (i32.add (local.get $index) (i32.const 1)))
+          br $next
+        end
+      end)
+    (else
+      (local.set $output (call $w_get (local.get $response) (i32.const $wt_output)))
+      block $listed
+        loop $next
+          (br_if $listed (i32.ge_u (local.get $index) (call $w_count (local.get $output))))
+          (call $w_push (local.get $items) (call $json_item (local.get $output) (local.get $index)))
+          (local.set $index (i32.add (local.get $index) (i32.const 1)))
+          br $next
+        end
+      end))
+  (local.set $end_turn (i32.eqz (call $w_is (call $w_get (local.get $response) (i32.const $wt_end_turn)) (global.get $JSON_FALSE))))
+  (local.set $reply (call $oa_reply_of (local.get $items) (local.get $end_turn) (local.get $incomplete)))
+  (call $w_ok (local.get $reply) (global.get $w_stop)
+    (select (i64.const 0) (i64.sub (local.get $input) (local.get $cached)) (i64.lt_u (local.get $input) (local.get $cached)))
+    (call $oa_usage_path (local.get $usage) (i32.const $wt_output_tokens) (i32.const 0))
+    (local.get $cached)
+    (i64.const 0)))
+(func $oa_body_lines (param $body i32) (result i32) (local $lines i32) (local $start i32) (local $at i32) (local $end i32) (local $length i32) (local $line i32)
+  (local.set $lines (call $vec_new (i32.const 4)))
+  (local.set $length (call $text_len (local.get $body)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $start) (local.get $length)))
+      (local.set $at (local.get $start))
+      block $found
+        loop $scan
+          (br_if $found (i32.ge_u (local.get $at) (local.get $length)))
+          (br_if $found (i32.eq (call $text_byte (local.get $body) (local.get $at)) (global.get $ASCII_NEWLINE)))
+          (local.set $at (i32.add (local.get $at) (i32.const 1)))
+          br $scan
+        end
+      end
+      (local.set $end (local.get $at))
+      (if (i32.gt_u (local.get $end) (local.get $start))
+        (then
+          (if (i32.eq (call $text_byte (local.get $body) (i32.sub (local.get $end) (i32.const 1))) (global.get $ASCII_RETURN))
+            (then (local.set $end (i32.sub (local.get $end) (i32.const 1)))))))
+      (local.set $line (call $text_slice (local.get $body) (local.get $start) (local.get $end)))
+      (if (call $w_starts (local.get $line) (i32.const 0) (i32.const $wt_data_scheme))
+        (then (call $w_push (local.get $lines) (call $text_slice (local.get $line) (call $text_len (i32.const $wt_data_scheme)) (call $text_len (local.get $line))))))
+      (local.set $start (i32.add (local.get $at) (i32.const 1)))
+      br $next
+    end
+  end
+  (local.get $lines))
+(func $oa_event_texts (param $events i32) (result i32) (local $texts i32) (local $index i32)
+  (local.set $texts (call $vec_new (i32.const 4)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (call $json_count (local.get $events))))
+      (call $w_push (local.get $texts) (call $json_text (call $json_item (call $json_item (local.get $events) (local.get $index)) (i32.const 1))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (local.get $texts))
+(func $openai_decode (param $status i64) (param $headers i32) (param $events i32) (param $body i32) (result i32) (local $texts i32) (local $text i32) (local $value i32)
+  (if (i64.eq (local.get $status) (global.get $WIRE_HTTP_OK))
+    (then
+      (if (local.get $events)
+        (then (local.set $texts (call $oa_event_texts (local.get $events))))
+        (else (local.set $texts (call $oa_body_lines (local.get $body)))))
+      (return (call $oa_interpret (local.get $texts) (call $vec_count (local.get $texts))))))
+  (local.set $text (call $w_or (local.get $body) (i32.const $s_empty)))
+  (local.set $value (call $raw_parse (local.get $text)))
+  (call $oa_error_fields (call $w_get (local.get $value) (i32.const $wt_error)))
+  (if (call $w_empty (global.get $w_message)) (then (global.set $w_message (local.get $text))))
+  (call $oa_classify (i32.const 1) (local.get $status) (global.get $w_code) (global.get $w_message) (call $w_retry_after_ms (local.get $headers))))
