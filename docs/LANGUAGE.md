@@ -496,7 +496,7 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `with` `within` `yield`
+Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `wire` `with` `within` `yield`
 
 Builtin functions, whose names declarations may not take:
 
@@ -556,7 +556,7 @@ tool_param = name ":" type_expr [ "=" expr ] ;
 effect_class = "none" | "idempotent" | "external" ;
 listing    = "tools" "from" "listing" "(" name "," bound ")" tool_params "effect" effect_class [ paid ] ;
 code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
-model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] ;
+model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] [ "wire" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
 function   = "fn" name params block ;
@@ -1317,6 +1317,78 @@ session settings do: `set_effort` stores it between turns, each `prompt` turn
 pins the effort in effect when it starts, and its requests and prompt cache
 refreshes send the pinned value, which hl-agent puts in the request's
 `output_config`.
+
+### Wire models
+
+`wire anthropic` or `wire openai` at the end of a model declaration makes
+the program, not the host, build the model's HTTP request. The call sends
+`head`, the context rendered as the API's messages (Messages for
+`anthropic`, Responses input for `openai`) and `tail` to `url` with
+`headers`, all four `text` settings the program sets, and decodes the
+answer into the model's reply itself. The host only moves bytes: it
+substitutes `${NAME}` in headers from its environment, sends the request
+and hands back the status, headers and body. A wire model's reply type must
+have the shape its wire decodes, and its settings must name those four
+fields. The interpreter, the simulator and the compiled targets share one
+codec (`src/wire`, mirrored in the WebAssembly runtime), so the request a
+journal records is the request every backend would send:
+
+```hl docs/snippets/wire.hl
+harness wired
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+const window_tokens: u64 = 200000
+const image_bytes_max: u64 = 1048576
+
+type outcome = done(text) | failed(text) | exhausted
+type claude_reply = answer(text, text) | calls(list<call, calls_max>, text, text)
+
+tool read(path: text) -> text or blob<image_bytes_max> effect none
+tool bash(command: text) -> text effect external
+
+model claude calls calls_max reply claude_reply window window_tokens settings(url: text = "https://api.anthropic.com/v1/messages", headers: text = "[[\"x-api-key\",\"${ANTHROPIC_API_KEY}\"],[\"anthropic-version\",\"2023-06-01\"]]", head: text = "{\"model\":\"claude-opus-5-5\",\"max_tokens\":32000,\"stream\":true,\"messages\":", tail: text = "}") wire anthropic
+
+state {
+  context: list<entry, context_max>
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    match claude(context) {
+      throttled(error, _) => { return failed(error) }
+      transient(error, _) => { return failed(error) }
+      rejected(error) => { return failed(error) }
+      ok(reply, _, _, _, _, _) => {
+        push context assistant(reply)
+        match reply {
+          answer(words, _) => { return done(words) }
+          calls(requested, _, _) => {
+            for call in requested {
+              match dispatch(call) {
+                ok(output) => { push context result(call, output) }
+                blob(image) => { push context attached(call, image) }
+                failed(error) => { push context error(call, error) }
+                unknown => { push context unknown(call) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
+
+`examples/claude_code.hl` and `examples/claude_code_child.hl` are
+`wire anthropic` programs and `examples/codex_agent.hl` a `wire openai`
+one; each sets its request's settings in a `configure` handler the host runs
+before every prompt.
 
 ### state
 
