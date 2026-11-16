@@ -496,6 +496,12 @@ impl<'a> Parser<'a> {
             (Vec::new(), Vec::new())
         };
         let interrupts = self.interrupts()?;
+        let wire = if self.is_word("wire") {
+            self.advance();
+            Some(self.name("the wire a model speaks: anthropic or openai")?)
+        } else {
+            None
+        };
         Ok(Model {
             name,
             calls,
@@ -505,6 +511,7 @@ impl<'a> Parser<'a> {
             setting_defaults,
             window,
             interrupts,
+            wire,
         })
     }
 

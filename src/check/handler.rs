@@ -630,8 +630,14 @@ impl Checker<'_> {
             }
         }
         let checked = declared.and_then(|()| self.block(body));
-        self.scopes.pop().expect("the scoped block's own scope is popped");
-        assert_eq!(self.scopes.len(), depth, "a scoped block leaves its caller's scopes");
+        self.scopes
+            .pop()
+            .expect("the scoped block's own scope is popped");
+        assert_eq!(
+            self.scopes.len(),
+            depth,
+            "a scoped block leaves its caller's scopes"
+        );
         let (statements, returned) = checked?;
         out.extend(statements);
         Ok(returned)
