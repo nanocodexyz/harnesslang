@@ -1389,3 +1389,42 @@ Measured, headers only (`out/rows-headers-only`, kv-store-grpc x2): $0.0052 per 
 Commands: `cargo build --release` in `agent/`, binary patched with patchelf to `/opt/nanoeval-agent/lib` into `~/luna-lean/root`; `cd ~/luna-lean && setsid nohup sh -c 'sh go.sh; echo EXIT=$? >> out/go.exit' &` (one row at a time on ports 19760/14760, waits for load <= 26 and >= 12 GB free, removes the task images it pulled, stops on a 401, 403 or 429).
 
 Verdict on 55 tasks, 2026-11-16: 71 attempts paired by task and attempt with the full-suite gate run. The cost-fix build passes 51 (71.8%, 60.5-81.0% Wilson) against 50 (70.4%, 59.0-79.8%) on the same attempts: 4 passes only with the fix (break-filter-js-from-html, build-pov-ray, git-multibranch, pypi-server), 3 only without (caffe-cifar-10, fix-git, largest-eigenval), sign test p = 1.0. Mean cost $0.0116 per attempt against $0.0284 on the same attempts (0.41x), 0.033x nanocode on Sonnet. The fix keeps the pass rate and cuts cost by 59%, so it becomes the default.
+
+## 2026-11-16: root-on-lean: the luna-root host fixes on top of the cost fix, screened at N=3
+
+Branch `root-on-lean` is master (the cost fix: session headers, compaction at 48K, the nohup instruction, per-family effort, `--finish-checks`) with luna-root's two code commits cherry-picked unchanged: exec sessions still running at task end are released instead of killed (cancel still kills), `view_image` returns a local image as an `input_image`, and the instructions and the finish check say nobody answers mid-task, so the model finds what is missing or assumes and states it and makes every requested file and program exist and run. Both picks applied without conflicts. The nohup instruction and the released sessions overlap and both stay: the instruction keeps services out of sessions, the release keeps a session the model started anyway alive. For gpt-6-luna the default effort and finish-check count are the same as the cost-fix build, so the new code is the only difference.
+
+Checks: `cargo build --release` (crate and `agent/`), `hl check examples/codex_agent.hl` ok and proved on all five targets, `scripts/docs-check.sh` ok with no requotes needed on this base, `rustfmt --edition 2024 --check` clean on every changed file, `scripts/check.sh` exit 0.
+
+Screen: the agent binary with its interpreter and rpath pointed at `/opt/nanoeval-agent/lib`, `evals/run.py` from the cost-fix screen, `--model gpt-6-luna --openai-route chatgpt --limits none --parallel 1`, one row at a time, each started only with fewer than 5 eval containers running, load at most 26 and at least 12 GB free on the dev host's root disk. Twenty tasks x 3 attempts: luna-root's ten (pypi-server, kv-store-grpc, gpt2-codegolf, nginx-request-logging, gcode-to-text, configure-git-webserver, feal-differential-cryptanalysis, hf-model-inference, git-multibranch, chess-best-move) and ten controls chosen by a fixed rule: the terminal-bench tasks outside those ten that the cost-fix build passed on every attempt (33 tasks), the 10 with the smallest sha256 of their name (build-pmars, regex-log, sqlite-db-truncate, vulnerable-secret, headless-terminal, pytorch-model-recovery, feal-linear-cryptanalysis, code-from-image, adaptive-rejection-sampler, pytorch-model-cli). $/attempt is list price from the meter's tokens (input 1e-7, cached 1e-8, output 5e-7 per token), the same formula as the cost-fix comparison.
+
+The first 46 of 60 rows (the run then waited on disk, which other work held at 11 GB):
+
+| task | root-on-lean | cost fix | luna-full | $/att root-on-lean | $/att cost fix |
+| --- | --- | --- | --- | ---: | ---: |
+| pypi-server | ppp | p | fff | 0.0050 | 0.0055 |
+| kv-store-grpc | ppf | pp | ppp | 0.0069 | 0.0062 |
+| gpt2-codegolf | fff | f | fff | 0.0097 | 0.0049 |
+| nginx-request-logging | ppp | pp | ppp | 0.0085 | 0.0065 |
+| gcode-to-text | fff | ff | fff | 0.0115 | 0.0190 |
+| configure-git-webserver | ppp | pp | ppp | 0.0150 | 0.0169 |
+| feal-differential-cryptanalysis | fff | f | fff | 0.0042 | 0.0037 |
+| hf-model-inference | ppp | p | ppp | 0.0061 | 0.0070 |
+| git-multibranch | ppp | pp | fpp | 0.0126 | 0.0122 |
+| chess-best-move | pff | f | fff | 0.0063 | 0.0135 |
+| build-pmars | ppp | p | ppp | 0.0091 | 0.0150 |
+| regex-log | ppp | pp | ppp | 0.0055 | 0.0049 |
+| sqlite-db-truncate | ppp | p | ppp | 0.0061 | 0.0051 |
+| vulnerable-secret | ppp | p | ppp | 0.0042 | 0.0036 |
+| headless-terminal | ppp | p | ppp | 0.0054 | 0.0056 |
+| pytorch-model-recovery | p | p | ppp | 0.0048 | 0.0062 |
+
+- All 46 rows: 34/46 = 73.9% (Wilson 95% 59.7 to 84.4), $0.0077 per attempt. Same tasks on luna-full: 30/46 = 65.2% (50.8 to 77.3), $0.0142.
+- Target ten: 18/30 = 60.0% (42.3 to 75.4), $0.0086; luna-full 14/30 = 46.7%; cost fix 10/15 = 66.7% on its 1 to 2 attempts.
+- Controls so far: 16/16 (80.6 to 100), $0.0060; no control regressed.
+- Matched by attempt number against the cost fix: 18 pairs, 1 pass only here (chess-best-move attempt 1), 0 only there, sign test p = 1.0. Against luna-full: 46 pairs, 5 only here, 1 only there, p = 0.22.
+- Every row's meter shows only HTTP 200. gcode-to-text calls `view_image` in all three rows (2 to 10 `input_image` messages each) without a 400, and still fails; chess-best-move's one pass also looked at its board image.
+
+Reading: the cost fix already got most of what luna-root measured against the old baseline. Its nohup instruction alone turned pypi-server (cost fix 1/1) and git-multibranch (2/2) into passes, so the released sessions add nothing measurable on top. `view_image` works end to end and brought chess-best-move 1/3, but gcode-to-text stays 0/3: the model sees the rendered toolpath and still misreads the text. The no-user wording did not move gpt2-codegolf or feal-differential-cryptanalysis (0/3 each). Per attempt the change costs no more than the cost fix (on the shared tasks $0.0077 against $0.0092), well under the $0.017 budget. Measured against the cost fix the expected gain is about one chess-best-move pass in three, about +0.6 points on the 60-task suite. That keeps the suite near 72%, far from 85%, and the interval spans zero. Fold it in for `view_image` (cheap and correct), not for the pass rate. The remaining points are in task classes these fixes don't reach.
+
+Resume: `~/root-on-lean/go.sh` on the dev host skips rows that already have a `result.json` and waits on the same gates; `python3 compare.py "<tasks>"` there prints the table and statistics.

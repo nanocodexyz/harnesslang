@@ -145,12 +145,18 @@ impl Exec {
         }
     }
 
-    pub fn stop_all(&mut self) {
-        for (_, mut session) in std::mem::take(&mut self.sessions) {
-            let _ = tools::kill_group(&mut session.child);
-            let _ = session.child.wait();
-            let _ = std::fs::remove_file(&session.output);
+    pub fn leave_running(&mut self) -> Vec<(u64, u32)> {
+        let mut left = Vec::new();
+        for (id, mut session) in std::mem::take(&mut self.sessions) {
+            drop(session.stdin.take());
+            match session.child.try_wait() {
+                Ok(Some(_)) => {
+                    let _ = std::fs::remove_file(&session.output);
+                }
+                _ => left.push((id, session.child.id())),
+            }
         }
+        left
     }
 
     fn workdir(&self, workdir: &str) -> PathBuf {
@@ -369,6 +375,30 @@ impl Exec {
             Err(error) => Ran::Failed(format!("Unified exec process failed: {error}")),
         }
     }
+}
+
+pub fn view_image(root: &Path, input: &Value) -> Ran {
+    let path = text_field(input, "path");
+    if path.is_empty() {
+        return Ran::Failed("view_image needs the path of an image file".to_owned());
+    }
+    let bytes = match std::fs::read(resolved(root, path)) {
+        Ok(bytes) => bytes,
+        Err(error) => return Ran::Failed(format!("unable to read image at {path}: {error}")),
+    };
+    if tools::media_type(&bytes).is_none() {
+        return Ran::Failed(format!(
+            "{path} is not a PNG, JPEG, GIF or WebP image; convert or render it to PNG first"
+        ));
+    }
+    if bytes.len() as u64 > crate::codex_harness::program::IMAGE_BYTES_MAX {
+        return Ran::Failed(format!(
+            "{path} is {} bytes, more than the {} an image may have; scale it down or crop it first",
+            bytes.len(),
+            crate::codex_harness::program::IMAGE_BYTES_MAX
+        ));
+    }
+    Ran::Image(bytes)
 }
 
 pub fn update_plan(input: &Value) -> Ran {

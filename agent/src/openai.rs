@@ -160,6 +160,27 @@ fn tagged(value: &Value) -> Result<(&str, Option<&Value>), String> {
     }
 }
 
+pub type Attached<'a> = dyn Fn(&str) -> Option<(String, String)> + 'a;
+
+const IMAGE_ATTACHED: &str = "The image is attached in the next message.";
+
+fn image_message(media_type: &str, data: &str) -> Value {
+    Value::object([
+        ("type", Value::text("message")),
+        ("role", Value::text("user")),
+        (
+            "content",
+            Value::Array(vec![Value::object([
+                ("type", Value::text("input_image")),
+                (
+                    "image_url",
+                    Value::text(&format!("data:{media_type};base64,{data}")),
+                ),
+            ])]),
+        ),
+    ])
+}
+
 pub fn user_message(text: &str) -> Value {
     Value::object([
         ("type", Value::text("message")),
@@ -285,7 +306,7 @@ impl Client {
         Ok(())
     }
 
-    pub fn input(&self, context: &Value) -> Result<Vec<Value>, String> {
+    pub fn input(&self, context: &Value, attached: &Attached<'_>) -> Result<Vec<Value>, String> {
         let mut items = self.preamble.clone();
         for entry in context.as_array().ok_or("the context is not a list")? {
             let (name, payload) = tagged(entry)?;
@@ -311,6 +332,21 @@ impl Client {
                     let (call, text) = pair()?;
                     items.push(self.output(call, text)?);
                 }
+                "attached" => {
+                    let (call, blob) = match payload {
+                        Some(Value::Array(fields)) if fields.len() == 2 => (&fields[0], &fields[1]),
+                        _ => return Err("context entry attached lacks its 2 fields".to_owned()),
+                    };
+                    let digest = blob
+                        .get("blob")
+                        .and_then(Value::as_str)
+                        .ok_or("an attached entry has no blob digest")?;
+                    let (media_type, data) = attached(digest).ok_or_else(|| {
+                        format!("context holds blob {digest}, which the session does not hold")
+                    })?;
+                    items.push(self.output(call, IMAGE_ATTACHED)?);
+                    items.push(image_message(&media_type, &data));
+                }
                 "unknown" => items.push(self.output(
                     payload.ok_or("an unknown entry has no call")?,
                     tools::unknown_outcome(),
@@ -325,12 +361,17 @@ impl Client {
         Ok(items)
     }
 
-    pub fn body(&self, context: &Value, effort: Option<&str>) -> Result<Value, String> {
+    pub fn body(
+        &self,
+        context: &Value,
+        effort: Option<&str>,
+        attached: &Attached<'_>,
+    ) -> Result<Value, String> {
         let reasoning = Value::object([("effort", Value::text(effort.unwrap_or(EFFORT_DEFAULT)))]);
         let mut body = Value::object([
             ("model", Value::text(&self.model)),
             ("instructions", Value::text(&self.instructions)),
-            ("input", Value::Array(self.input(context)?)),
+            ("input", Value::Array(self.input(context, attached)?)),
             ("tools", self.tools.clone()),
             ("tool_choice", Value::text("auto")),
             ("parallel_tool_calls", Value::Bool(true)),

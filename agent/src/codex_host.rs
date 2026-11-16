@@ -22,7 +22,7 @@ const PREAMBLE_FILE: &str = "preamble.json";
 const LABEL: &str = "hl-agent";
 const FINISH_CHECKS_MAX: u64 = 2;
 const REVIEWED: &str = "A reviewer read the task and the end of your transcript and found that the task is not done yet. Fix each point below, check each one by running commands, and end your turn only with a short report of the checks you ran and their results.";
-const FINISH_CHECK: &str = "Before this task is done, check it by running commands, not by reading your own code. Go through each behaviour the task states, one by one: each file exists at the exact path it names with the content or format it asks for, each program runs with the exact command and interpreter it names, each service responds through the protocol, port and account the task names, and each output matches the stated format. Run every check now. If any check fails or a stated behaviour is not yet verified, fix it and continue working. End your turn again only after the work passes, with a short report listing each check you ran and its result.";
+const FINISH_CHECK: &str = "Before this task is done, check it by running commands, not by reading your own code. Go through each behaviour the task states, one by one: each file exists at the exact path it names with the content or format it asks for, each program runs with the exact command and interpreter it names, each service responds through the protocol, port and account the task names, and each output matches the stated format. Run every check now. If any check fails or a stated behaviour is not yet verified, fix it and continue working. Nobody will answer a question or supply anything: if something seems missing, find it in the environment or take the most reasonable assumption, and make every requested file and program exist and run. End your turn again only after the work passes, with a short report listing each check you ran and its result.";
 
 pub struct CodexAgent {
     client: openai::Client,
@@ -133,9 +133,10 @@ impl CodexAgent {
         effort: Option<&str>,
         context: &Value,
         cancellable: bool,
+        attached: &openai::Attached<'_>,
     ) -> Value {
         let call = codex_harness::call_id(turn, seq);
-        let body = match self.client.body(context, effort) {
+        let body = match self.client.body(context, effort, attached) {
             Ok(body) => body,
             Err(error) => {
                 return openai::transient(&format!("context does not render: {error}"), 0);
@@ -221,6 +222,7 @@ impl CodexAgent {
             "write_stdin" => self.exec.write_stdin(input, &stop),
             "apply_patch" => codex::apply_patch(&self.workspace.root, input),
             "update_plan" => codex::update_plan(input),
+            "view_image" => codex::view_image(&self.workspace.root, input),
             other => tools::Ran::Failed(format!("unsupported call: {other}")),
         };
         if receipted {
@@ -260,8 +262,8 @@ fn output_of(ran: tools::Ran) -> codex_harness::Output {
         tools::Ran::Ok(text) | tools::Ran::Job(text) => {
             codex_harness::Output::Ok(Json::String(text))
         }
-        tools::Ran::Image(_) => {
-            codex_harness::Output::Failed("this host returns no images".to_owned())
+        tools::Ran::Image(bytes) => {
+            codex_harness::Output::Ok(codex_harness::host_blob_bytes(&bytes))
         }
         tools::Ran::Failed(text) => codex_harness::Output::Failed(text),
         tools::Ran::Units(units) => codex_harness::Output::Ok(Json::Number(units)),
@@ -343,12 +345,21 @@ impl codex_harness::Host for CodexAgent {
             .settings
             .and_then(|settings| settings.get(openai::EFFORT_SETTING))
             .and_then(|effort| effort.as_str());
+        let attached = |digest: &str| {
+            request.blobs.get(digest).map(|bytes| {
+                (
+                    tools::media_type(bytes).unwrap_or_default().to_owned(),
+                    codex_harness::base64_encode(bytes),
+                )
+            })
+        };
         let reply = self.run_model(
             request.turn,
             request.seq,
             effort,
             &context,
             request.interrupts.cancel,
+            &attached,
         );
         Json::decode(&reply.encode()).expect("a reply the host built decodes as harness JSON")
     }
@@ -588,7 +599,9 @@ pub fn main(options: &Options) -> ! {
         ran = codex_harness::run_jsonl(&mut agent, &mut disk, &request);
     }
     assert!(reviews <= reviewer::REVIEWS_MAX);
-    agent.exec.stop_all();
+    for (session, pid) in agent.exec.leave_running() {
+        eprintln!("{LABEL}: exec session {session} (pid {pid}) left running after the task");
+    }
     agent.ledger.append(Value::object([
         ("kind", Value::text("end")),
         ("at_ms", Value::number(now_ms())),

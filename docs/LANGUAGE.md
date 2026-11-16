@@ -914,9 +914,9 @@ rerun sends it again:
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
 FAIL invariant=tool_admitted seed=30 target=native-jsonl profile=clean mutation=listing_unchecked: listed call 3/19 (mcp__theta) ran as Some("theta-v9") while listing mcp admitted None in turn 3: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=6 target=native-jsonl profile=clean mutation=input_unchecked: call 2/4 (write_stdin) ran with input "gamma-0", which does not fit its declared input: not a JSON object
+FAIL invariant=tool_admitted seed=0 target=native-jsonl profile=errors mutation=input_unchecked: call 1/4 (view_image) ran with input "{\"epsilon-35\":true,\"path\":\"gamma-41\"}", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
-FAIL invariant=external_once seed=1 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 2/9 (mcp__delta) was dispatched 3 times
+FAIL invariant=external_once seed=0 target=native-jsonl profile=errors mutation=listed_class_dropped: external call 2/13 (mcp__zeta) was dispatched 3 times
 ```
 
 The checker's listing errors:

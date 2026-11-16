@@ -128,5 +128,24 @@
       ],
       "additionalProperties": false
     }
+  },
+  {
+    "type": "function",
+    "name": "view_image",
+    "description": "View a local image file (PNG, JPEG, GIF or WebP) so you can see it: a picture the task provides, or one you rendered to check output that is visual (a plot, a drawing, a toolpath, a page, text drawn as shapes). Render other formats to PNG first.",
+    "strict": false,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path, or path relative to the working directory, of the image file."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    }
   }
 ]

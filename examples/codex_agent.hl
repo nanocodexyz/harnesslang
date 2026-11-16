@@ -17,6 +17,8 @@ const output_tokens_default: u64 = 10000
 const result_tokens_max: u64 = 10000
 const result_units_max: u64 = 40039
 const mcp_tools_max: u64 = 64
+const image_bytes_max: u64 = 1048576
+const images_kept: u64 = 100
 
 type outcome = completed(text) | failed(text) | cancelled_turn | exhausted
 type codex_reply = message(text, text, bool) | calls(list<call, calls_per_round_max>, text, text)
@@ -26,6 +28,7 @@ tool exec_command(cmd: text, workdir: text = "", yield_time_ms: u64 = exec_yield
 tool write_stdin(session_id: u64, chars: text = "", yield_time_ms: u64 = stdin_yield_ms, max_output_tokens: u64 = output_tokens_default) -> text effect external interruptible by cancel
 tool apply_patch(input: text) -> text effect external recoverable
 tool update_plan(plan: text, explanation: text = "") -> text effect none
+tool view_image(path: text) -> text or blob<image_bytes_max> effect none
 tools from listing(mcp, mcp_tools_max) (arguments: text) effect external
 
 model responses calls calls_per_round_max reply codex_reply window context_window_tokens settings(effort: effort_level = "medium") interruptible by cancel
@@ -103,6 +106,7 @@ fn summarized(words: text) {
     assistant(_) => drop
     result(_, _) => drop
     error(_, _) => drop
+    attached(_, _) => drop
     unknown(_) => drop
   }
   push context user("Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n" ++ words)
@@ -125,6 +129,7 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
         pending_units = pending_units + len(cut)
         push context error(call, cut)
       }
+      blob(image) => { push context attached(call, image) }
       unknown => { push context unknown(call) }
     }
   }
@@ -174,6 +179,7 @@ on prompt(input: text, rounds: u64) -> outcome
   context_recovered = false
   loop round below rounds_max {
     if round >= rounds { return exhausted }
+    keep context blobs last images_kept
     if len(context) + 3 + calls_per_round_max + steers_per_turn_max > context_entries_max {
       compact_pending = true
     }
