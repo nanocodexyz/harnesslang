@@ -1460,3 +1460,5 @@ Event intake records (`"record":{"event":…}`, a steer or other event taken int
 ## 2026-11-16: gate.sh without agent/
 
 `scripts/gate.sh` counts hl-agent's emitted-source programs only while `agent/build.rs` exists, so the gate keeps working once agent/ is removed (its lines and programs then count 0, and the change lowers gate.txt).
+
+A target whose `hl emit --format source` answers that the harness has no source form there (the JS backend deleted, wasm only) counts 0 emitted source lines.
