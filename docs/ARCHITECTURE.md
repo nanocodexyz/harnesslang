@@ -26,8 +26,10 @@ These come from tempoxyz/tempolang and nanocodexyz/nanocode.
    a `match` that leaves out `unknown` is a compile error. "Never silently
    replay dispatched work" is a type rule, not a review comment.
 2. **The spec is the code.** One source gives an interpreter (the executable
-   spec and the oracle) and generated code for each target. Generated code is
-   checked against the interpreter by differential simulation, seed by seed.
+   spec and the oracle) and one WebAssembly module per target, whose bytes the
+   compiler writes itself; each platform runs it on one small fixed host. The
+   module is checked against the interpreter by differential simulation, seed
+   by seed, on every host.
 3. **Deterministic by construction.** Time, randomness, model calls and tools
    go only through effects the runtime journals, so a handler
    re-executed over its journal takes the same path. Recovery is replay.
@@ -652,7 +654,7 @@ not the prover; the runner reruns only unfinished turns, and a fenced owner's
 writes are refused; tools and the model return values of their declared types,
 or the turn exits as corrupt without finishing.
 
-What is not proved: the generated Rust and JavaScript themselves; properties
+What is not proved: the compiled WebAssembly and the fixed hosts themselves; properties
 across turns other than the invariants' induction; recovery from a torn
 checkpoint; Cloudflare's alarm; memory, wall time beyond the waits a program
 states, and text sizes; conditions
@@ -709,7 +711,7 @@ Invariants, named as nanocode-sim names them:
 | `seq_unique` | journal sequence numbers are unique and increasing |
 | `liveness` | every turn finishes within its bound of restarts |
 | `replay_equal` | the same seed gives the same journal bytes twice (`--twice`) |
-| `backend_equal` | generated code and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/rust-diff.sh` and `scripts/js-sim.mjs`) |
+| `backend_equal` | the compiled module and the interpreter give the same journal and dispatch trace for a seed (the differential runs, `scripts/wasm-diff.sh` on the simulated, native and fixed platform hosts) |
 | `panic` | no assertion of ours fails; a panic is caught at the seed and reported with it |
 | `event_before_read` | a read sees only events recorded before its place in the turn (`event_read_unstamped` ignores the place) |
 | `event_replay_equal` | a read the run replays sees exactly the events its journal holds there, and no event is recorded at an earlier place than one before it (`event_drain_on_replay` takes events at replayed effects, `batch_drains_replayed` in a parallel for whose last call is replayed) |
@@ -735,14 +737,13 @@ planted program in `scripts/strict.sh`. Under `--strict`, a run that went past
 its handler's worst case is reported as `worst_case` before the journal is
 checked, since the overrun is the cause of whatever the journal shows later.
 
-The differential runs have planted bugs of their own: `RUST_DIFF_PLANT` and
-`JS_DIFF_PLANT` edit the emitted code with sed (a flush skipped, a decode
-message changed, a second fsync, a batch's sequence numbers off by one, the
-recovery skipped, the enum check removed), and `scripts/mutations.sh --diff`
-requires each to fail on every target it changes with the invariant its plan
-names. A plant that leaves a target's code unchanged needs no plan there; one
+The differential runs have planted bugs of their own: `WASM_DIFF_PLANT`
+(`hl emit --plant`) compiles the module with one lowering changed (a flush
+skipped, an event acknowledged early, the recovery skipped, a fold's arms
+flipped), and `scripts/mutations.sh --diff` requires each to fail on every
+target it changes with the invariant its plan names. A plant that leaves a target's code unchanged needs no plan there; one
 that changes it without failing needs an exemption with its reason.
-`scripts/check.sh` runs every example through both differential runs, and its
+`scripts/check.sh` runs every example through the differential runs on every host, and its
 census fails when an example was not swept by `hl sim` or by a differential
 run on any target. It runs its independent steps in a pool of `CHECK_JOBS`
 jobs (`nproc` by default), each in its own process group, stops the rest at
@@ -793,8 +794,8 @@ path and operation ID in a pinned spec (Cloudflare api-schemas 8b1a451, the
   `--var` values become plain environment variables and secrets encrypted ones;
   rollback is Vercel's instant rollback; logs read build events, and
   `--follow` streams runtime logs.
-- **native-jsonl, native-sqlite, server-postgres**: versioned copies of the
-  emitted Rust under the output directory, a `current` pointer replaced
+- **native-jsonl, native-sqlite, server-postgres**: versioned copies of
+  `program.wasm` under the output directory, a `current` pointer replaced
   atomically, secrets in a mode 600 file, and a history of installs.
 
 Every deploy writes a fingerprint of what it ships into the deployment (the

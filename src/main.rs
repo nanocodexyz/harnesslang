@@ -18,7 +18,7 @@ use harnesslang::load::{load, load_within};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format wasm|mjs|wat|source] [--plant NAME] FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format wasm|mjs|wat] [--plant NAME] FILE
        hl wasm-sim --target {targets} --module FILE.wasm --trace TRACE.jsonl [--records-max HANDLER=N]... [--requests-max HANDLER=N]...
        hl bundle --target {targets} --out DIR [--plant NAME] FILE
        {deploy}
@@ -777,10 +777,6 @@ fn emit_command(args: &[String]) -> ExitCode {
         }),
         "wat" => emit::wasm::emit_text_planted(&program, target, plant).map(|text| {
             print!("{text}");
-            ExitCode::SUCCESS
-        }),
-        "source" if plant == "none" => emit::emit(&program, target).map(|code| {
-            print!("{code}");
             ExitCode::SUCCESS
         }),
         _ => return usage(),

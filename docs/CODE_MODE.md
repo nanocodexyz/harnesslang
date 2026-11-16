@@ -264,7 +264,7 @@ Durable Object RPC as subrequests to internal services, under the same
 per-invocation limit as outbound requests, so the model counts a cell's
 nested calls as `calls` internal subrequests of the loaded Worker's
 invocation and each nested call's outbound request against the RPC event
-that makes it, not none as first assumed. On Vercel the generated code runs
+that makes it, not none as first assumed. On Vercel the fixed host runs
 the engine inside a step, which the vendor documents as having the full
 Node.js runtime (so `node:vm` is there), and replays the cell from the run's
 journal in each step; a timer is a durable `sleep()`. Unverified for Vercel:
@@ -306,7 +306,7 @@ Invariants, beside the existing ones (each counts per nested call id):
 | `cell_replay_equal` | a replay without the divergence fault matches its journal step for step; under the fault the cell finishes `unknown` and nothing after the divergence is dispatched |
 | `header_before_wait` | whenever a cell waits on a timer, its header is durable |
 | `cell_bounded` | nested calls, running calls, timers and journal bytes stay within the declaration's bounds; reaching one is the typed refusal the script sees, never a dropped call |
-| `nested_enum_valid` | every nested result a cell journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not; the script sees the same failure, in the interpreter, the generated Rust and the generated JavaScript alike |
+| `nested_enum_valid` | every nested result a cell journal records for a tool returning a text enum is what the tool returned when that was one of its values, and the call's failure when it was not; the script sees the same failure, in the interpreter and the compiled module on every host alike |
 
 `seq_unique` extends to nested ids, and `external_once`,
 `unknown_reported`, `idempotent_known` and `enum_valid` keep counting
