@@ -169,6 +169,7 @@ pub struct ModelRequest<'a> {
     pub settings: Option<&'a Json>,
     pub context: &'a Value,
     pub blobs: &'a Blobs,
+    pub http: Option<&'a Json>,
 }
 
 pub trait World {
@@ -2542,13 +2543,18 @@ impl<'a> Engine<'a> {
         let sent_settings = settings
             .as_ref()
             .filter(|_| self.mutation != Mutation::SettingsDropped);
+        let wire = self.program.model.as_ref().and_then(|model| model.wire);
+        let http = wire.map(|wire| self.wire_request(wire, seq, sent, sent_settings, &args[0]));
         let response = if preempted {
             interrupted_response()
+        } else if let Some(Err(error)) = &http {
+            crate::wire::transient(error, 0)
         } else {
             let Mode::Live { world, .. } = &mut self.mode else {
                 unreachable!("replay never runs an effect");
             };
-            world.model(&ModelRequest {
+            let request = http.as_ref().and_then(|http| http.as_ref().ok());
+            let answer = world.model(&ModelRequest {
                 turn: self.turn,
                 seq,
                 calls_max,
@@ -2556,7 +2562,12 @@ impl<'a> Engine<'a> {
                 settings: sent_settings,
                 context: &args[0],
                 blobs: &self.blobs,
-            })
+                http: request,
+            });
+            match wire {
+                Some(wire) => crate::wire::decode(wire, &answer, interrupts.any()),
+                None => answer,
+            }
         };
         self.hook(Point::AfterRun(site.kind, call.effect))?;
         let interrupted = self.drain_interrupting(interrupts)?
@@ -2888,6 +2899,43 @@ impl<'a> Engine<'a> {
         }
         value::from_json(self.program, &Type::Sum(ir::REPLY), response)
             .map_err(|error| Halt::Trap(format!("model reply: {error}")))
+    }
+
+    fn wire_request(
+        &self,
+        wire: ir::Wire,
+        seq: u64,
+        mode: Option<&str>,
+        settings: Option<&Json>,
+        context: &Value,
+    ) -> Result<Json, String> {
+        let context = Json::Array(
+            context
+                .as_list()
+                .iter()
+                .map(|entry| value::to_json(self.program, &Type::Sum(ir::ENTRY), entry))
+                .collect(),
+        );
+        let attached = |digest: &str| {
+            let bytes = self.blobs.get(digest)?;
+            let media_type =
+                crate::wire::media_type(bytes).unwrap_or(crate::wire::MEDIA_TYPE_DEFAULT);
+            Some((
+                media_type.to_owned(),
+                crate::run::blob::base64_encode(bytes),
+            ))
+        };
+        crate::wire::request(
+            &crate::wire::Request {
+                wire,
+                turn: self.turn,
+                seq,
+                mode,
+                settings,
+                context: &context,
+            },
+            &attached,
+        )
     }
 
     fn reply_unrecorded(&self, response: &Json) -> bool {
