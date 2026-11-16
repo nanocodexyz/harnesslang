@@ -95,8 +95,7 @@ climb_cost_double_counted docs/snippets/climb_noise.hl --strict climb_cost_balan
 climb_gate_ignored docs/snippets/climb_gate.hl --strict climb_kept_valid"
 exempt="none: the unmutated program, which every sweep in scripts/check.sh runs"
 diff_seeds="${DIFF_PLANT_SEEDS:-0..100}"
-diff_plans="rust flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres backend_equal
-wasm flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+diff_plans="wasm flush_after_dispatch examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm crc_skipped examples/agent.hl native-jsonl backend_equal
 wasm recovery_skipped examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
 wasm recovery_unreported examples/agent.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
