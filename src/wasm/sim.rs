@@ -878,6 +878,15 @@ impl<'e> World<'_, 'e, '_> {
             .seed
             .next(self.context, "model", &detail)
             .map_err(Error::Stop)?;
+        if !matches!(request.get("http"), Json::Undefined) {
+            let checked = (|| {
+                same("model call turn", event.get("turn"), request.get("turn"))?;
+                same("model call seq", event.get("seq"), request.get("seq"))?;
+                same("model http request", event.get("http"), request.get("http"))
+            })();
+            checked.map_err(Error::Stop)?;
+            return self.give_json(instance, event.get("answer"));
+        }
         let checked = (|| {
             same("model call turn", event.get("turn"), request.get("turn"))?;
             same("model call seq", event.get("seq"), request.get("seq"))?;
