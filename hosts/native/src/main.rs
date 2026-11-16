@@ -90,6 +90,7 @@ struct Flags {
     effort: Option<String>,
     reviewer: Option<String>,
     finish_checks: Option<String>,
+    escalate_model: Option<String>,
     keep_warm: u64,
     text: Option<String>,
     request: Option<PathBuf>,
@@ -136,6 +137,7 @@ fn flags(args: &[String]) -> Flags {
             "--effort" => flags.effort = Some(value),
             "--reviewer-relay" => flags.reviewer = Some(value),
             "--finish-checks" => flags.finish_checks = Some(value),
+            "--escalate-model" => flags.escalate_model = Some(value),
             "--keep-warm" => flags.keep_warm = number_flag(flag, &value),
             "--text" => flags.text = Some(value),
             "--request" => flags.request = Some(PathBuf::from(value)),
@@ -404,8 +406,13 @@ fn front(flags: Flags) {
         .unwrap_or_else(|| EFFORT_DEFAULT.to_owned());
     let (program, configure, spawns) = match harness.as_str() {
         HARNESS_CLAUDE => {
-            if flags.reviewer.is_some() || flags.finish_checks.is_some() {
-                fail_usage("--reviewer-relay and --finish-checks are for the Codex harness");
+            if flags.reviewer.is_some()
+                || flags.finish_checks.is_some()
+                || flags.escalate_model.is_some()
+            {
+                fail_usage(
+                    "--reviewer-relay, --finish-checks and --escalate-model are for the Codex harness",
+                );
             }
             let configure = host::object(vec![
                 ("cwd", Json::text(&cwd_text)),
@@ -439,6 +446,10 @@ fn front(flags: Flags) {
                 (
                     "reviewer",
                     Json::text(flags.reviewer.as_deref().unwrap_or_default()),
+                ),
+                (
+                    "escalate_model",
+                    Json::text(flags.escalate_model.as_deref().unwrap_or_default()),
                 ),
             ]);
             (PROGRAM_CODEX, configure, Vec::new())
