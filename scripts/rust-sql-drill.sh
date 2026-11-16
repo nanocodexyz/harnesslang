@@ -6,7 +6,7 @@ targets="${SQL_DRILL_TARGETS:-native-sqlite server-postgres}"
 mode="${SQL_DRILL_MODE:-all}"
 sessions="${SQL_DRILL_SESSIONS:-8}"
 turns="${SQL_DRILL_TURNS:-6}"
-delay_ms_max="${SQL_DRILL_DELAY_MS_MAX:-30}"
+delay_ms_max="${SQL_DRILL_DELAY_MS_MAX:-60}"
 kills_per_session_max="${SQL_DRILL_KILLS_MAX:-400}"
 takeover_externals="${SQL_DRILL_TAKEOVER_EXTERNALS:-1 2 3 4 5 6}"
 takeover_turns="${SQL_DRILL_TAKEOVER_TURNS:-12}"
@@ -31,11 +31,6 @@ killed_status=137
 held_status=3
 fenced_status=4
 store_lost_status=5
-flush_before_external='if site.durability.flushes(call.effect) {'
-postgres_fence='hl_sessions.epoch = $2::bigint AND '
-sqlite_insert_fence=' s.epoch = ?2 AND'
-sqlite_advance_fence='hl_sessions.epoch = ?2 AND '
-
 case "$mutation" in
   none) ;;
   flush_after_dispatch | no_fence) out="$out-$mutation" ;;
@@ -102,48 +97,31 @@ start_postgres() {
   killer_pid=$KILLER_PID
 }
 
-mutate() {
-  local target=$1 harness=$2
-  case "$mutation" in
-    none) ;;
-    flush_after_dispatch)
-      [ "$(grep -cF "$flush_before_external" "$harness")" -eq 1 ] ||
-        fail "the generated code no longer has one flush before an external effect to mutate"
-      sed -i "s/$flush_before_external/if false \&\& site.durability.flushes(call.effect) {/" "$harness"
-      ;;
-    no_fence)
-      local fence
-      if [ "$target" = server-postgres ]; then fence=("$postgres_fence"); else fence=("$sqlite_insert_fence" "$sqlite_advance_fence"); fi
-      for text in "${fence[@]}"; do
-        [ "$(grep -oF "$text" "$harness" | wc -l)" -eq 1 ] || fail "the generated $target code no longer has one '$text' to remove"
-        local pattern
-        pattern=$(printf '%s' "$text" | sed 's/[$.*[\^/]/\\&/g')
-        sed -i "s/$pattern//" "$harness"
-        [ "$(grep -oF "$text" "$harness" | wc -l)" -eq 0 ] || fail "sed left '$text' in the generated $target code"
-      done
-      ;;
-  esac
-}
-
 build() {
-  local target=$1 dir=$out/$1/build
+  local target=$1 dir=$out/$1/build plant=none
   mkdir -p "$dir"
-  "$hl" emit --format source --target "$target" "$file" > "$dir/harness.rs.new"
-  mutate "$target" "$dir/harness.rs.new"
-  mv "$dir/harness.rs.new" "$dir/harness.rs"
-  for source in sql_drill_host sql_drill_checks sqlite_store postgres_store; do
+  [ "$mutation" = flush_after_dispatch ] && plant=flush_after_dispatch
+  "$hl" emit --target "$target" --plant "$plant" "$file" > "$dir/program.wasm"
+  for source in module_sql_drill_host sql_drill_checks sqlite_store postgres_store; do
     cp "scripts/rust/$source.rs" "$dir/$source.rs"
   done
   local key
-  key=$(cat "$dir"/*.rs | cksum | cut -d' ' -f1)
-  if [ ! -x "$dir/sql_drill_host" ] || [ "$(cat "$dir/key" 2> /dev/null)" != "$key" ]; then
-    nice rustc --edition 2024 -O -o "$dir/sql_drill_host" "$dir/sql_drill_host.rs"
+  key=$(cat "$dir"/*.rs target/release/libharnesslang.rlib | cksum | cut -d' ' -f1)
+  if [ ! -x "$dir/host" ] || [ "$(cat "$dir/key" 2> /dev/null)" != "$key" ]; then
+    nice rustc --edition 2024 -O -o "$dir/host" "$dir/module_sql_drill_host.rs" \
+      --extern harnesslang=target/release/libharnesslang.rlib -L target/release/deps
     echo "$key" > "$dir/key"
   fi
 }
 
 host() {
-  exec "$out/$1/build/sql_drill_host" "${@:2}"
+  local target=$1 command=$2 dir=$out/$1/build
+  local fence=none
+  [ "$mutation" = no_fence ] && fence=no_fence
+  case "$command" in
+    run) exec "$dir/host" run "target=$target" "module=$dir/program.wasm" "mutation=$fence" "${@:3}" ;;
+    *) exec "$dir/host" "$command" "target=$target" "${@:3}" ;;
+  esac
 }
 
 store_for() {
@@ -315,7 +293,7 @@ takeover() {
   [ "$verdict" = ok ] || fail "$target takeover external $external: verification failed"
 }
 
-[ -x "$hl" ] || cargo build --release --locked -j1 --quiet
+[ -x "$hl" ] && [ -f target/release/libharnesslang.rlib ] || cargo build --release --locked -j1 --quiet
 if uses_postgres; then
   start_postgres
   pg_admin -c "DROP DATABASE IF EXISTS hl_rust_sql_drill WITH (FORCE)" -c "CREATE DATABASE hl_rust_sql_drill"
