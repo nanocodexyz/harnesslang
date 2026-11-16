@@ -20,7 +20,8 @@ use host::{Ran, Session, Setup, Spawn};
 
 pub const EXIT_HARNESS_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
-const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
+const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host wire --request <file.json> --scratch <dir>
+       hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
 const LABEL: &str = "hl-host";
 const HARNESS_CLAUDE: &str = "claude";
 const HARNESS_CODEX: &str = "codex";
@@ -90,6 +91,8 @@ struct Flags {
     finish_checks: Option<u64>,
     keep_warm: u64,
     text: Option<String>,
+    request: Option<PathBuf>,
+    scratch: Option<PathBuf>,
 }
 
 fn spawn_flag(value: &str) -> Spawn {
@@ -134,6 +137,8 @@ fn flags(args: &[String]) -> Flags {
             "--finish-checks" => flags.finish_checks = Some(number_flag(flag, &value)),
             "--keep-warm" => flags.keep_warm = number_flag(flag, &value),
             "--text" => flags.text = Some(value),
+            "--request" => flags.request = Some(PathBuf::from(value)),
+            "--scratch" => flags.scratch = Some(PathBuf::from(value)),
             other => fail_usage(&format!("unknown flag {other}")),
         }
     }
@@ -154,9 +159,10 @@ fn main() {
     let flags = flags(args.get(1..).unwrap_or_default());
     match command {
         "steer" | "cancel" => send_event(command, &flags),
+        "wire" => wire_once(&flags),
         "run" if flags.instruction.is_some() => front(flags),
         "run" => generic(flags),
-        _ => fail_usage("the commands are run, steer and cancel"),
+        _ => fail_usage("the commands are run, wire, steer and cancel"),
     }
 }
 
@@ -181,6 +187,25 @@ fn send_event(command: &str, flags: &Flags) -> ! {
         }
         Err(error) => fail(&error),
     }
+}
+
+fn wire_once(flags: &Flags) -> ! {
+    let path = flags
+        .request
+        .as_ref()
+        .unwrap_or_else(|| fail_usage("wire needs --request"));
+    let scratch = flags
+        .scratch
+        .as_ref()
+        .unwrap_or_else(|| fail_usage("wire needs --scratch"));
+    std::fs::create_dir_all(scratch)
+        .unwrap_or_else(|error| fail(&format!("{}: {error}", scratch.display())));
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| fail_usage(&format!("{}: {error}", path.display())));
+    let http =
+        parse(&text).unwrap_or_else(|error| fail_usage(&format!("{}: {error}", path.display())));
+    println!("{}", wire::call(&http, scratch, &|| false).encode());
+    std::process::exit(0)
 }
 
 fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (PathBuf, Session) {
@@ -381,8 +406,8 @@ fn front(flags: Flags) {
             }
             let configure = host::object(vec![
                 ("cwd", Json::text(&cwd_text)),
-                ("effort", Json::text(&effort)),
-                ("model", Json::text(&model)),
+                ("requested_effort", Json::text(&effort)),
+                ("model_name", Json::text(&model)),
             ]);
             let spawn = Spawn {
                 tool: CLAUDE_SPAWN_TOOL.to_owned(),
@@ -397,12 +422,12 @@ fn front(flags: Flags) {
             }
             let configure = host::object(vec![
                 ("cwd", Json::text(&cwd_text)),
-                ("effort", Json::text(&effort)),
+                ("requested_effort", Json::text(&effort)),
                 (
                     "finish_checks",
                     Json::int(flags.finish_checks.unwrap_or(FINISH_CHECKS_DEFAULT)),
                 ),
-                ("model", Json::text(&model)),
+                ("model_name", Json::text(&model)),
                 (
                     "reviewer",
                     Json::text(flags.reviewer.as_deref().unwrap_or_default()),
