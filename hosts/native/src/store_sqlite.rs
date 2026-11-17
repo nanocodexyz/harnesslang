@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
-use crate::harness::{FENCED_ERROR, ParamType, Sql, SqlError, SqlValue, Statement};
+use crate::sql::{FENCED_ERROR, ParamType, Sql, SqlError, SqlValue, Statement};
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
@@ -24,63 +24,95 @@ struct Prepared {
     _opaque: [u8; 0],
 }
 
-#[link(name = "libsqlite3.so.0", kind = "dylib", modifiers = "+verbatim")]
+const LIBRARY: &str = "libsqlite3.so.0";
+const RTLD_NOW: c_int = 2;
+
 unsafe extern "C" {
-    fn sqlite3_libversion_number() -> c_int;
-    fn sqlite3_open_v2(
-        path: *const c_char,
-        db: *mut *mut Connection,
-        flags: c_int,
-        vfs: *const c_char,
-    ) -> c_int;
-    fn sqlite3_close(db: *mut Connection) -> c_int;
-    fn sqlite3_extended_result_codes(db: *mut Connection, on: c_int) -> c_int;
-    fn sqlite3_busy_timeout(db: *mut Connection, ms: c_int) -> c_int;
-    fn sqlite3_prepare_v2(
-        db: *mut Connection,
-        sql: *const c_char,
-        bytes: c_int,
-        statement: *mut *mut Prepared,
-        tail: *mut *const c_char,
-    ) -> c_int;
-    fn sqlite3_bind_parameter_count(statement: *mut Prepared) -> c_int;
-    fn sqlite3_bind_text(
-        statement: *mut Prepared,
-        index: c_int,
-        text: *const c_char,
-        bytes: c_int,
-        destructor: isize,
-    ) -> c_int;
-    fn sqlite3_bind_int64(statement: *mut Prepared, index: c_int, value: i64) -> c_int;
-    fn sqlite3_step(statement: *mut Prepared) -> c_int;
-    fn sqlite3_column_count(statement: *mut Prepared) -> c_int;
-    fn sqlite3_column_type(statement: *mut Prepared, column: c_int) -> c_int;
-    fn sqlite3_column_text(statement: *mut Prepared, column: c_int) -> *const u8;
-    fn sqlite3_column_bytes(statement: *mut Prepared, column: c_int) -> c_int;
-    fn sqlite3_finalize(statement: *mut Prepared) -> c_int;
-    fn sqlite3_errmsg(db: *mut Connection) -> *const c_char;
-    fn sqlite3_extended_errcode(db: *mut Connection) -> c_int;
-    fn sqlite3_get_autocommit(db: *mut Connection) -> c_int;
-    fn sqlite3_exec(
-        db: *mut Connection,
-        sql: *const c_char,
-        callback: *const c_void,
-        argument: *mut c_void,
-        error: *mut *mut c_char,
-    ) -> c_int;
+    fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+macro_rules! sqlite_api {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        struct Api {
+            $($name: unsafe extern "C" fn($($ty),*) -> $ret,)*
+        }
+
+        fn load_api() -> Result<Api, String> {
+            let file = CString::new(LIBRARY).expect("the library name holds no NUL byte");
+            let library = unsafe { dlopen(file.as_ptr(), RTLD_NOW) };
+            if library.is_null() {
+                return Err(format!("cannot load {LIBRARY}, which the SQLite journal needs"));
+            }
+            Ok(Api {
+                $($name: {
+                    let symbol_name =
+                        CString::new(stringify!($name)).expect("a symbol name holds no NUL byte");
+                    let symbol = unsafe { dlsym(library, symbol_name.as_ptr()) };
+                    if symbol.is_null() {
+                        return Err(format!("{LIBRARY} has no {}", stringify!($name)));
+                    }
+                    unsafe {
+                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn($($ty),*) -> $ret>(
+                            symbol,
+                        )
+                    }
+                },)*
+            })
+        }
+
+        $(
+            unsafe fn $name($($arg: $ty),*) -> $ret {
+                unsafe { (api().$name)($($arg),*) }
+            }
+        )*
+    };
+}
+
+sqlite_api! {
+    sqlite3_libversion_number() -> c_int;
+    sqlite3_open_v2(path: *const c_char, db: *mut *mut Connection, flags: c_int, vfs: *const c_char) -> c_int;
+    sqlite3_close(db: *mut Connection) -> c_int;
+    sqlite3_extended_result_codes(db: *mut Connection, on: c_int) -> c_int;
+    sqlite3_busy_timeout(db: *mut Connection, ms: c_int) -> c_int;
+    sqlite3_prepare_v2(db: *mut Connection, sql: *const c_char, bytes: c_int, statement: *mut *mut Prepared, tail: *mut *const c_char) -> c_int;
+    sqlite3_bind_parameter_count(statement: *mut Prepared) -> c_int;
+    sqlite3_bind_text(statement: *mut Prepared, index: c_int, text: *const c_char, bytes: c_int, destructor: isize) -> c_int;
+    sqlite3_bind_int64(statement: *mut Prepared, index: c_int, value: i64) -> c_int;
+    sqlite3_step(statement: *mut Prepared) -> c_int;
+    sqlite3_column_count(statement: *mut Prepared) -> c_int;
+    sqlite3_column_type(statement: *mut Prepared, column: c_int) -> c_int;
+    sqlite3_column_text(statement: *mut Prepared, column: c_int) -> *const u8;
+    sqlite3_column_bytes(statement: *mut Prepared, column: c_int) -> c_int;
+    sqlite3_finalize(statement: *mut Prepared) -> c_int;
+    sqlite3_errmsg(db: *mut Connection) -> *const c_char;
+    sqlite3_extended_errcode(db: *mut Connection) -> c_int;
+    sqlite3_get_autocommit(db: *mut Connection) -> c_int;
+    sqlite3_exec(db: *mut Connection, sql: *const c_char, callback: *const c_void, argument: *mut c_void, error: *mut *mut c_char) -> c_int;
+}
+
+static API: std::sync::OnceLock<Result<Api, String>> = std::sync::OnceLock::new();
+
+fn loaded() -> Result<&'static Api, String> {
+    API.get_or_init(load_api).as_ref().map_err(Clone::clone)
+}
+
+fn api() -> &'static Api {
+    loaded().expect("a connection opens only once libsqlite3 loaded")
 }
 
 pub struct SqliteStore {
     db: *mut Connection,
 }
 
-pub fn version() -> c_int {
-    unsafe { sqlite3_libversion_number() }
+pub fn version() -> Result<c_int, String> {
+    loaded()?;
+    Ok(unsafe { sqlite3_libversion_number() })
 }
 
 impl SqliteStore {
     pub fn open(path: &str, busy_timeout_ms: c_int) -> Result<Self, String> {
-        let version = version();
+        let version = version()?;
         if version < JSON_EACH_AND_RETURNING_VERSION_MIN {
             return Err(format!(
                 "libsqlite3 {version} is older than {JSON_EACH_AND_RETURNING_VERSION_MIN}, which json_each and RETURNING need"

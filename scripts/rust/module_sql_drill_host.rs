@@ -1,9 +1,11 @@
 #[path = "sql_drill_checks.rs"]
 mod checks;
-#[path = "postgres_store.rs"]
-mod postgres_store;
-#[path = "sqlite_store.rs"]
-mod sqlite_store;
+#[path = "../../hosts/native/src/sql.rs"]
+mod sql;
+#[path = "../../hosts/native/src/store_postgres.rs"]
+mod store_postgres;
+#[path = "../../hosts/native/src/store_sqlite.rs"]
+mod store_sqlite;
 
 mod harness {
     pub use harnesslang::effect::EffectClass;
@@ -16,63 +18,16 @@ mod harness {
             None
         }
     }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum ParamType {
-        Text,
-        Integer,
-        Json,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Param {
-        pub name: &'static str,
-        pub ty: ParamType,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Statement {
-        pub name: &'static str,
-        pub sql: &'static str,
-        pub params: &'static [Param],
-        pub returns: &'static [&'static str],
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum SqlValue {
-        Text(String),
-        Integer(u64),
-        Json(String),
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum SqlError {
-        Fenced,
-        Other(String),
-    }
-
-    pub trait Sql {
-        fn query(
-            &mut self,
-            statement: &Statement,
-            values: &[SqlValue],
-        ) -> Result<Vec<Vec<Option<String>>>, SqlError>;
-        fn rollback(&mut self);
-    }
-
-    pub const FENCED_ERROR: &str =
-        "SQLITE_CONSTRAINT_NOTNULL: NOT NULL constraint failed: hl_journal.epoch";
 }
 
 use std::collections::BTreeMap;
 
-use harness::{EffectClass, Param, ParamType, Sql, SqlError, SqlValue, Statement};
+use harness::EffectClass;
 use harnesslang::emit::sql as catalogue;
 use harnesslang::target::Target;
 use harnesslang::wasm::js::Json;
-use harnesslang::wasm::native::{self, Store, World};
-use postgres_store::PostgresStore;
-use sqlite_store::SqliteStore;
+use harnesslang::wasm::native::{self, World};
+use sql::{Database, Failure, Lease, Opened, Sql, Statement};
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const SPLITMIX_MIX_FIRST: u64 = 0xbf58_476d_1ce4_e5b9;
@@ -88,11 +43,8 @@ const EXIT_FENCED: i32 = 4;
 const EXIT_STORE_LOST: i32 = 5;
 const EXIT_PAUSE_BOUND: i32 = 6;
 const EXIT_USAGE: i32 = 2;
-const BUSY_TIMEOUT_MS: i32 = 10_000;
 const PAUSE_POLL_MS: u64 = 2;
 const PAUSE_POLLS_MAX: u64 = 30_000;
-const POSTGRES_USER: &str = "postgres";
-const POSTGRES_FENCED_ERROR: &str = "SQLSTATE 23502 not_null_violation on hl_journal.epoch";
 const INTEGRITY_OK: &str = "ok";
 const INTEGRITY_CHECK: Statement = Statement {
     name: "integrity_check",
@@ -100,7 +52,6 @@ const INTEGRITY_CHECK: Statement = Statement {
     params: &[],
     returns: &["integrity_check"],
 };
-const LINE_END: char = '\n';
 
 struct Rng(u64);
 
@@ -272,223 +223,6 @@ impl World for Drill<'_> {
     }
 }
 
-fn leak(statement: &catalogue::Statement) -> Statement {
-    let params: Vec<Param> = statement
-        .params
-        .iter()
-        .map(|param| Param {
-            name: param.name,
-            ty: match param.ty {
-                catalogue::ParamType::Text => ParamType::Text,
-                catalogue::ParamType::Integer => ParamType::Integer,
-                catalogue::ParamType::Json => ParamType::Json,
-            },
-        })
-        .collect();
-    Statement {
-        name: statement.name,
-        sql: Box::leak(statement.sql().into_boxed_str()),
-        params: Box::leak(params.into_boxed_slice()),
-        returns: Box::leak(statement.returns.clone().into_boxed_slice()),
-    }
-}
-
-struct Statements {
-    setup: Vec<Statement>,
-    acquire: Statement,
-    load: Statement,
-    commit: Vec<Statement>,
-}
-
-fn statements(target: Target, mutation: catalogue::Mutation) -> Statements {
-    let catalogue = catalogue::catalogue(target, mutation).unwrap_or_else(|error| usage(&error));
-    Statements {
-        setup: catalogue
-            .connect
-            .iter()
-            .chain(&catalogue.schema)
-            .map(leak)
-            .collect(),
-        acquire: leak(&catalogue.acquire),
-        load: leak(&catalogue.load),
-        commit: catalogue.commit.iter().map(leak).collect(),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Failure {
-    Fenced,
-    Lost,
-}
-
-struct Session {
-    session: String,
-    owner: String,
-    lease_ms: u64,
-}
-
-impl Session {
-    fn value(&self, param: &Param, epoch: u64, head: u64, batch: &str) -> SqlValue {
-        match param.name {
-            "session" => SqlValue::Text(self.session.clone()),
-            "owner" => SqlValue::Text(self.owner.clone()),
-            "lease_ms" => SqlValue::Integer(self.lease_ms),
-            "epoch" => SqlValue::Integer(epoch),
-            "head" => SqlValue::Integer(head),
-            "batch" => SqlValue::Json(batch.to_owned()),
-            other => panic!("the catalogue names only journal parameters, found {other}"),
-        }
-    }
-
-    fn values(&self, statement: &Statement, epoch: u64, head: u64, batch: &str) -> Vec<SqlValue> {
-        statement
-            .params
-            .iter()
-            .map(|param| self.value(param, epoch, head, batch))
-            .collect()
-    }
-}
-
-fn column(row: &[Option<String>], statement: &Statement, name: &str) -> Result<String, String> {
-    let index = statement
-        .returns
-        .iter()
-        .position(|returned| *returned == name)
-        .expect("the statement returns the column");
-    row.get(index)
-        .and_then(|value| value.clone())
-        .ok_or_else(|| format!("{} returned no {name}", statement.name))
-}
-
-fn load_lines(sql: &mut dyn Sql, load: &Statement, session: &Session) -> Result<String, SqlError> {
-    let rows = sql.query(load, &session.values(load, 0, 0, ""))?;
-    let mut text = String::new();
-    for (index, row) in rows.iter().enumerate() {
-        let seq = column(row, load, "seq").map_err(SqlError::Other)?;
-        assert_eq!(
-            seq,
-            (index + 1).to_string(),
-            "rows load in seq order without gaps"
-        );
-        let record = column(row, load, "record").map_err(SqlError::Other)?;
-        assert!(!record.contains(LINE_END), "a row holds one journal line");
-        text.push_str(&record);
-        text.push(LINE_END);
-    }
-    Ok(text)
-}
-
-struct SqlStore<'s, 'p> {
-    sql: &'s mut dyn Sql,
-    statements: &'s Statements,
-    session: Session,
-    epoch: u64,
-    head: u64,
-    read: u64,
-    failure: Option<Failure>,
-    pauser: &'p std::cell::RefCell<Pauser>,
-}
-
-impl SqlStore<'_, '_> {
-    fn batch(&self, bytes: &[u8]) -> Result<(String, u64), String> {
-        let text = std::str::from_utf8(bytes).map_err(|_| "a flush is UTF-8".to_owned())?;
-        let lines: Vec<&str> = text.split_terminator(LINE_END).collect();
-        assert!(
-            !lines.is_empty() && text.ends_with(LINE_END),
-            "a flush appends whole lines"
-        );
-        let mut rows = Vec::with_capacity(lines.len());
-        for (index, line) in lines.iter().enumerate() {
-            let record = harnesslang::run::journal::decode_line(line, false)
-                .map_err(|error| format!("a flushed line does not decode: {error}"))?;
-            rows.push(object(vec![
-                ("kind", Json::text(catalogue::record_kind(&record))),
-                ("record", Json::text(line)),
-                ("seq", Json::int(self.head + 1 + index as u64)),
-                ("turn", Json::int(catalogue::record_turn(&record))),
-            ]));
-        }
-        Ok((Json::Array(rows).encode(), lines.len() as u64))
-    }
-}
-
-impl Store for SqlStore<'_, '_> {
-    fn read(&mut self) -> Result<Vec<u8>, String> {
-        let text = load_lines(self.sql, &self.statements.load, &self.session).map_err(|error| {
-            self.failure = Some(Failure::Lost);
-            format!("load: {error:?}")
-        })?;
-        let rows = text.matches(LINE_END).count() as u64;
-        if rows != self.head {
-            return Err(format!(
-                "the session's head is {} but {rows} rows load",
-                self.head
-            ));
-        }
-        self.read = text.len() as u64;
-        Ok(text.into_bytes())
-    }
-
-    fn append(&mut self, epoch: i64, bytes: &[u8]) -> Result<(), String> {
-        {
-            let mut pauser = self.pauser.borrow_mut();
-            if pauser.waiting == Pause::FirstFlush {
-                pauser.pause_here();
-            }
-        }
-        let epoch =
-            u64::try_from(epoch).map_err(|_| "a flush names a negative epoch".to_owned())?;
-        let (batch, rows) = self.batch(bytes)?;
-        for statement in &self.statements.commit {
-            let values = self.session.values(statement, epoch, self.head, &batch);
-            match self.sql.query(statement, &values) {
-                Ok(_) => {}
-                Err(SqlError::Fenced) => {
-                    self.sql.rollback();
-                    self.failure = Some(Failure::Fenced);
-                    return Err(format!("fenced: epoch {epoch} no longer owns the session"));
-                }
-                Err(SqlError::Other(error)) => {
-                    self.sql.rollback();
-                    self.failure = Some(Failure::Lost);
-                    return Err(format!("store lost during a flush: {error}"));
-                }
-            }
-        }
-        self.head += rows;
-        self.read += bytes.len() as u64;
-        Ok(())
-    }
-
-    fn keep(&mut self, length: u64) -> Result<(), String> {
-        if length == self.read {
-            return Ok(());
-        }
-        Err(format!(
-            "an SQL journal commits whole batches, so it has no torn tail to drop ({length} of {} bytes kept)",
-            self.read
-        ))
-    }
-
-    fn epoch(&self) -> i64 {
-        self.epoch as i64
-    }
-}
-
-enum Database {
-    Sqlite(SqliteStore),
-    Postgres(PostgresStore),
-}
-
-impl Database {
-    fn sql(&mut self) -> &mut dyn Sql {
-        match self {
-            Self::Sqlite(store) => store,
-            Self::Postgres(store) => store,
-        }
-    }
-}
-
 fn target_of(options: &Options) -> Target {
     let name = options.text("target");
     match Target::parse(name) {
@@ -497,33 +231,6 @@ fn target_of(options: &Options) -> Target {
             "target={name} is not native-sqlite or server-postgres"
         )),
     }
-}
-
-fn open_database(
-    target: Target,
-    location: &str,
-    application: &str,
-    pid_file: Option<&str>,
-) -> Result<Database, String> {
-    if target == Target::NativeSqlite {
-        return SqliteStore::open(location, BUSY_TIMEOUT_MS).map(Database::Sqlite);
-    }
-    assert_eq!(
-        catalogue::Dialect::Postgres.fenced_error(),
-        POSTGRES_FENCED_ERROR,
-        "the adapter maps the fence the catalogue names"
-    );
-    let (address, database) = location
-        .split_once('/')
-        .ok_or_else(|| format!("{location} is not host:port/database"))?;
-    let store = PostgresStore::connect(address, POSTGRES_USER, database, application)?;
-    if let Some(path) = pid_file {
-        let partial = format!("{path}.partial");
-        std::fs::write(&partial, store.backend_pid.to_string())
-            .map_err(|error| format!("{partial}: {error}"))?;
-        std::fs::rename(&partial, path).map_err(|error| format!("{path}: {error}"))?;
-    }
-    Ok(Database::Postgres(store))
 }
 
 struct Options(BTreeMap<String, String>);
@@ -643,56 +350,37 @@ fn run(options: &Options) -> i32 {
         pauser: &pauser,
     };
     checks::append_synced(&mut drill.ledger, &checks::run_line(&tag));
-    let mut database = match open_database(
-        target,
-        options.text("store"),
-        &tag,
-        options.0.get("pid_file").map(String::as_str),
-    ) {
-        Ok(database) => database,
-        Err(error) => return store_lost(&error),
-    };
-    let statements = statements(target, options.mutation());
-    let sql = database.sql();
-    for statement in &statements.setup {
-        if let Err(error) = sql.query(statement, &[]) {
-            return store_lost(&format!("{}: {error:?}", statement.name));
-        }
-    }
-    let session = Session {
+    let lease = Lease {
         session: options.text("session").to_owned(),
         owner: options.text("owner").to_owned(),
         lease_ms: options.number("lease_ms"),
     };
-    let rows = match sql.query(
-        &statements.acquire,
-        &session.values(&statements.acquire, 0, 0, ""),
-    ) {
-        Ok(rows) => rows,
-        Err(error) => return store_lost(&format!("acquire: {error:?}")),
+    let opened = sql::open_journal(
+        target,
+        options.text("store"),
+        &tag,
+        lease,
+        options.mutation(),
+    );
+    let mut store = match opened {
+        Ok(Opened::Owned(store)) => store,
+        Ok(Opened::Held) => return EXIT_HELD,
+        Err(error) => return store_lost(&error),
     };
-    let [row] = rows.as_slice() else {
-        assert!(rows.is_empty(), "acquire returns at most one row");
-        return EXIT_HELD;
+    if let (Some(path), Database::Postgres(postgres)) = (options.0.get("pid_file"), &store.db) {
+        let partial = format!("{path}.partial");
+        std::fs::write(&partial, postgres.backend_pid.to_string())
+            .unwrap_or_else(|error| panic!("{partial}: {error}"));
+        std::fs::rename(&partial, path).unwrap_or_else(|error| panic!("{path}: {error}"));
+    }
+    let pause_hook = || {
+        let mut pauser = pauser.borrow_mut();
+        if pauser.waiting == Pause::FirstFlush {
+            pauser.pause_here();
+        }
     };
-    let read = |name: &str| -> u64 {
-        column(row, &statements.acquire, name)
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .unwrap_or_else(|| panic!("acquire returned no number for {name}"))
-    };
-    let (epoch, head) = (read("epoch"), read("head"));
-    checks::append_synced(&mut drill.ledger, &checks::acquired_line(&tag, epoch));
-    let mut store = SqlStore {
-        sql,
-        statements: &statements,
-        session,
-        epoch,
-        head,
-        read: 0,
-        failure: None,
-        pauser: &pauser,
-    };
+    store.before_append = Some(&pause_hook);
+    checks::append_synced(&mut drill.ledger, &checks::acquired_line(&tag, store.epoch));
     let seed = options.number("seed");
     let first = acknowledged_last(options.text("acks")) + 1;
     for turn in first..=options.number("turns") {
@@ -742,20 +430,14 @@ fn integrity(database: &mut Database) -> &'static str {
 
 fn verify(options: &Options) -> i32 {
     let target = target_of(options);
-    let mut database = match open_database(target, options.text("store"), "verify", None) {
+    let mut database = match sql::connect(target, options.text("store"), "verify") {
         Ok(database) => database,
         Err(error) => return store_lost(&error),
     };
     let integrity = integrity(&mut database);
-    let statements = statements(target, catalogue::Mutation::None);
-    let session = Session {
-        session: options.text("session").to_owned(),
-        owner: String::new(),
-        lease_ms: 0,
-    };
-    let text = match load_lines(database.sql(), &statements.load, &session) {
+    let text = match sql::read_lines(target, options.text("store"), options.text("session")) {
         Ok(text) => text,
-        Err(error) => return store_lost(&format!("load: {error:?}")),
+        Err(error) => return store_lost(&error),
     };
     let decoded = harnesslang::run::journal::decode_lines(text.as_bytes(), false)
         .unwrap_or_else(|error| panic!("the journal decodes: {error}"));
@@ -798,7 +480,7 @@ fn main() {
             println!(
                 "target={} sqlite={}",
                 target_of(&options).name(),
-                sqlite_store::version()
+                store_sqlite::version().unwrap_or_else(|error| panic!("{error}"))
             );
             0
         }
