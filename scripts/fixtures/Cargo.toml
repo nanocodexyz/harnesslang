@@ -23,3 +23,17 @@ path = "src/bin/mock_responses.rs"
 test = false
 doctest = false
 bench = false
+
+[[bin]]
+name = "mpp-gate"
+path = "src/bin/mpp_gate.rs"
+test = false
+doctest = false
+bench = false
+
+[[bin]]
+name = "mpp-pay"
+path = "src/bin/mpp_pay.rs"
+test = false
+doctest = false
+bench = false

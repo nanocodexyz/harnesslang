@@ -14,6 +14,10 @@ pub const STOPPED: &str = "the request was stopped";
 pub const MALFORMED: &str = "the host's answer to a wire model call is malformed";
 pub const MILLISECONDS_PER_SECOND: u64 = 1_000;
 pub const MEDIA_TYPE_DEFAULT: &str = "application/octet-stream";
+const HTTP_PAYMENT_REQUIRED: u64 = 402;
+const PAYMENT_SCHEME: &str = "Payment ";
+const CHALLENGE_OPEN: &str = "@@hl-challenge@@";
+const CHALLENGE_CLOSE: &str = "@@hl-end@@";
 const PNG_SIGNATURE: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff];
 const GIF_SIGNATURES: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];
@@ -180,7 +184,7 @@ pub fn transient(error: &str, retry_after_ms: u64) -> Json {
 }
 
 pub fn rejected(error: &str) -> Json {
-    tagged_json("rejected", vec![Json::text(error)])
+    Json::object([("rejected", Json::text(error))])
 }
 
 pub fn interrupted() -> Json {
@@ -211,6 +215,17 @@ fn whole(text: &str) -> Option<u64> {
             .saturating_mul(10)
             .saturating_add(u64::from(digit - b'0'))
     }))
+}
+
+pub fn with_challenge(status: u64, headers: &[(String, String)], text: &str) -> String {
+    match header(headers, "www-authenticate") {
+        Some(challenge)
+            if status == HTTP_PAYMENT_REQUIRED && challenge.starts_with(PAYMENT_SCHEME) =>
+        {
+            format!("{text} {CHALLENGE_OPEN}{challenge}{CHALLENGE_CLOSE}")
+        }
+        _ => text.to_owned(),
+    }
 }
 
 pub fn retry_after_ms(headers: &[(String, String)]) -> u64 {

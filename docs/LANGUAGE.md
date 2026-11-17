@@ -1329,7 +1329,11 @@ field `a.b` of that file's JSON (either takes a `:-default`), sends the
 request and hands back the status, headers and body. The value never enters
 the journal, so a program can name a login file (`codex_agent.hl` names
 Codex's `auth.json`, `claude_code.hl` Claude Code's `.credentials.json`)
-and the host reads its current token at each request. A wire model's reply type must
+and the host reads its current token at each request. A wire answer that is
+not a success becomes `rejected(text)` (or `throttled` or `transient`); a
+402 whose `WWW-Authenticate` is an MPP `Payment` challenge keeps that challenge
+in the text between `@@hl-challenge@@` and `@@hl-end@@`, so a program can pay it
+and retry (the agents below do). A wire model's reply type must
 have the shape its wire decodes, and its settings must name those four
 fields. The interpreter, the simulator and the compiled targets share one
 codec (`src/wire`, mirrored in the WebAssembly runtime), so the request a

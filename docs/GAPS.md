@@ -114,6 +114,15 @@ of nanocode d83b08f's `crates/integrations/mpp` and nanocode-ts d5b21f1's
 
 ## 1. Paid model calls
 
+The agents now pay a model endpoint's 402 by hand rather than through `paid by`:
+with `HL_MPP_BASE_URL` and `HL_MPP_PAYER` set and no API key, `codex_agent.hl` and the
+Claude programs read the challenge from `rejected(text)`, run the payer once as an
+external recoverable step (an unknown outcome after a crash fails the turn and is never
+paid again), present the credential on the retry, and prove `mpp_payments <=
+mpp_payments_max`. The per-charge cap is handed to the payer, which refuses a larger
+charge; it is not a proved invariant, since the language has no text-to-number builtin
+to read the challenge's amount. What follows is still the gap for `paid by` itself.
+
 nanocode pays the Tempo gateway's 402 on Messages and Responses requests through the
 same flow, keeps the gateway's `payment-failed` and `verification-failed` 402s in
 Claude Code's backoff (claude client lib.rs) and fails the turn after the last attempt.

@@ -515,10 +515,12 @@ pub fn decode(http: &wire::Http) -> Json {
         },
         (wire::Payload::Events(_), status) => {
             let (kind, text) = error_text(status, "");
+            let text = wire::with_challenge(status, &http.headers, &text);
             error_attempt(Some(status), &kind, &text, retry_after_ms)
         }
         (wire::Payload::Body(body), status) => {
             let (kind, text) = error_text(status, body);
+            let text = wire::with_challenge(status, &http.headers, &text);
             error_attempt(Some(status), &kind, &text, retry_after_ms)
         }
     }

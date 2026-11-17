@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+if [ $# -lt 1 ] || [ $(($# % 2)) -ne 1 ]; then
+  echo 'usage: hl [--model M] [--effort E] [--cwd DIR] [--<flag> <value>]... "task"' >&2
+  exit 2
+fi
+task=${!#}
+set -- "${@:1:$#-1}"
+given=" $* "
+state=${HL_STATE:-$HOME/.hl/sessions}/$(date +%Y%m%dT%H%M%S)-$$
+mkdir -p "$state"
+printf '%s\n' "$task" > "$state/instruction.md"
+args=(run --instruction "$state/instruction.md" --journal "$state/journal")
+case $given in *" --model "*) ;; *) args+=(--model "${HL_MODEL:-gpt-6-luna}") ;; esac
+case $given in *" --effort "*) ;; *) args+=(--effort "${HL_EFFORT:-medium}") ;; esac
+case $given in *" --cwd "*) ;; *) args+=(--cwd "$PWD") ;; esac
+echo "hl: journal $state/journal" >&2
+exec "$here/hl-host" "${args[@]}" "$@"

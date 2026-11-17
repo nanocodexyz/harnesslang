@@ -85,6 +85,7 @@ CLAUDE_MESSAGES_URL = "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}/v1/messa
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_KEYCHAIN = "Claude Code-credentials"
 REFRESH_CURL_SECONDS = 20
+MPP_CHARGE_MAX_UNITS = "50000"
 
 
 def yes_no(name, test):
@@ -94,6 +95,7 @@ def yes_no(name, test):
 CODEX_LOGIN_PROBE = [
     r'''printf '@@hl-login@@'; h=${CODEX_HOME:-$HOME/.codex}/auth.json; if [ -r "$h" ] && grep -q '"auth_mode": *"chatgpt"' "$h" && grep -q '"account_id": *"[^"]' "$h"; then printf chatgpt; printf '@@hl-loginfile@@'; printf '%s' "$h" | e; printf '@@hl-stale@@'; x=$(sed -n 's/.*"access_token": *"[^".]*\.\([^".]*\)\..*/\1/p' "$h" | head -n 1 | tr '_-' '/+'); while [ $((${#x} % 4)) -ne 0 ]; do x="$x="; done; t=$(printf '%s' "$x" | base64 -d 2>/dev/null | tr -d ' \n' | sed -n 's/.*"exp":\([0-9]*\).*/\1/p'); if [ -n "$t" ] && [ "$t" -le "$(date +%s)" ]; then printf yes; else printf no; fi; else printf none; fi''',
     yes_no("haskey", '[ -n "${OPENAI_API_KEY:-}" ]'),
+    yes_no("mpp", '[ -n "${HL_MPP_BASE_URL:-}" ] && [ -n "${HL_MPP_PAYER:-}" ]'),
 ]
 
 CLAUDE_OAUTH_SED = r'''sed -n 's/.*"claudeAiOauth": *{\([^}]*\)}.*/\1/p' '''
@@ -103,11 +105,12 @@ CLAUDE_LOGIN_PROBE = [
     yes_no("haskey", '[ -n "${ANTHROPIC_API_KEY:-}" ]'),
     yes_no("hasbase", '[ -n "${ANTHROPIC_BASE_URL:-}" ]'),
     yes_no("hasoauth", '[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]'),
+    yes_no("mpp", '[ -n "${HL_MPP_BASE_URL:-}" ] && [ -n "${HL_MPP_PAYER:-}" ]'),
 ]
 
 LOGIN_FACTS = {
-    True: ["login", "loginfile", "stale", "haskey"],
-    False: ["login", "loginfile", "stale", "haskey", "hasbase", "hasoauth"],
+    True: ["login", "loginfile", "stale", "haskey", "mpp"],
+    False: ["login", "loginfile", "stale", "haskey", "hasbase", "hasoauth", "mpp"],
 }
 
 REWRITE_AWK = r'''{ s = $0; h = ""; if (!on) { p = index(s, "\"" ENVIRON["HL_SCOPE"] "\""); if (p == 0) { print s; next } on = 1; h = substr(s, 1, p - 1); s = substr(s, p) } n = split(ENVIRON["HL_TEXTS"], t, " "); for (j = 1; j <= n; j++) if (!d[t[j]] && match(s, "\"" t[j] "\": *\"[^\"]*\"")) { s = substr(s, 1, RSTART - 1) "\"" t[j] "\": \"" ENVIRON["HL_" t[j]] "\"" substr(s, RSTART + RLENGTH); d[t[j]] = 1 } n = split(ENVIRON["HL_NUMBERS"], t, " "); for (j = 1; j <= n; j++) if (!d[t[j]] && match(s, "\"" t[j] "\": *[0-9]+")) { s = substr(s, 1, RSTART - 1) "\"" t[j] "\": " ENVIRON["HL_" t[j]] substr(s, RSTART + RLENGTH); d[t[j]] = 1 } print h s } END { n = split(ENVIRON["HL_TEXTS"] " " ENVIRON["HL_NUMBERS"], t, " "); for (j = 1; j <= n; j++) if (!d[t[j]]) exit 1 }'''
@@ -163,6 +166,66 @@ LOGIN_WORDS = {
 }
 
 
+MPP_PAY = r"""p=${HL_MPP_PAYER:-}; [ -n "$p" ] || { printf '@@hl-refused@@HL_MPP_PAYER is not set@@hl-end@@'; exit 0; }
+printf '%s' "$c" | "$p" "$x" 2>&1 | tail -c 4000"""
+
+
+def mpp_fns(call_of, codex):
+    if codex:
+        rest = J([['content-type', 'application/json'], ['accept', 'text/event-stream']])[1:-1] + ',[' + J('session-id') + ',' + Q
+        headers = f"{L('[')} ++ mpp_auth ++ {L(rest)} ++ cache_key ++ {L(Q + '],[' + J('thread-id') + ',' + Q)} ++ cache_key ++ {L(Q + ']]')}"
+    else:
+        headers = f"{L('[')} ++ mpp_auth ++ {L(J([['anthropic-version', '2023-06-01'], ['content-type', 'application/json']])[1:])}"
+    command = f"{L('c=' + chr(39))} ++ challenge ++ {L(chr(39) + '; x=' + MPP_CHARGE_MAX_UNITS + NL + MPP_PAY)}"
+    return [
+        "fn mpp_headers() {",
+        f"  headers = {headers}",
+        "}",
+        "",
+        "fn mpp_pay(error: text) {",
+        "  if mpp_paying {",
+        f"    return failed({L('the model endpoint asked for a payment again right after one: ')} ++ error)",
+        "  }",
+        "  if mpp_payments >= mpp_payments_max {",
+        f"    return failed({L('the MPP budget is spent: no more payments this session')})",
+        "  }",
+        f"  let challenge = before(after(error, {L('@@hl-challenge@@')}), {L('@@hl-end@@')})",
+        f"  if challenge == {L('')} or contains(challenge, {L(chr(39))}) or contains(challenge, {L(BS)}) {{",
+        f"    return failed({L('the MPP challenge is empty or holds a quote or a backslash')})",
+        "  }",
+        "  mpp_paying = true",
+        "  mpp_payments = mpp_payments + 1",
+        f"  match {call_of(command)} {{",
+        "    ok(out) => { mpp_paid(out) }",
+        f"    failed(why) => {{ return failed({L('the MPP payment failed: ')} ++ why) }}",
+        f"    unknown => {{ return failed({L('the MPP payment was cut by a restart and its outcome is unknown; it is not paid again')}) }}",
+        "  }",
+        "}",
+        "",
+        "fn mpp_paid(out: text) {",
+        f"  if not contains(out, {L('@@hl-credential@@')}) {{",
+        f"    return failed({L('the MPP payer did not pay: ')} ++ before(after(out, {L('@@hl-refused@@')}), {L('@@hl-end@@')}))",
+        "  }",
+        f"  let credential = before(after(out, {L('@@hl-credential@@')}), {L('@@hl-end@@')})",
+        f"  if credential == {L('')} or contains(credential, {L(Q)}) or contains(credential, {L(BS)}) or contains(credential, {L('$')}) {{",
+        f"    return failed({L('the MPP payer answered an unusable credential')})",
+        "  }",
+        f"  mpp_auth = {L('[' + J('authorization') + ',' + Q + 'Payment ')} ++ credential ++ {L(Q + '],')}",
+        "  mpp_headers()",
+        "}",
+        "",
+        "fn login_answered() {",
+        "  login_refreshed = false",
+        "  if mpp_paying {",
+        "    mpp_paying = false",
+        f"    mpp_auth = {L('')}",
+        "    mpp_headers()",
+        "  }",
+        "}",
+        "",
+    ]
+
+
 def login_fns(call_of, codex, otherwise):
     words = LOGIN_WORDS[codex]
     script = NL.join(CODEX_REFRESH if codex else CLAUDE_REFRESH)
@@ -193,6 +256,8 @@ def login_fns(call_of, codex, otherwise):
     if not codex:
         out += ['  } else if env_hasoauth == "yes" {', '    login_route = "token"']
     out += [
+        '  } else if env_haskey == "no" and env_mpp == "yes" {',
+        '    login_route = "mpp"',
         '  } else if env_haskey == "no" {',
         f"    return failed({L(words['none'])})",
         "  }",
@@ -215,7 +280,9 @@ def login_fns(call_of, codex, otherwise):
         "}",
         "",
         "fn login_rejected(error: text) {",
-        '  if login_route == "subscription" and not login_refreshed and contains(error, "HTTP 401") {',
+        '  if login_route == "mpp" and contains(error, "HTTP 402") and contains(error, "@@hl-challenge@@") {',
+        "    mpp_pay(error)",
+        '  } else if login_route == "subscription" and not login_refreshed and contains(error, "HTTP 401") {',
         "    refresh_login()",
         "  } else {",
         f"    {otherwise}",
@@ -223,7 +290,7 @@ def login_fns(call_of, codex, otherwise):
         "}",
         "",
     ]
-    return out
+    return out + mpp_fns(call_of, codex)
 
 
 def probe_fns(call_of, recoverable, codex):
@@ -343,6 +410,9 @@ def claude_generated(side, levels):
         '  if login_route == "subscription" {',
         f"    url = {L(CLAUDE_MESSAGES_URL)}",
         f"    headers = {L(J([['authorization', 'Bearer ${@']])[:-3])} ++ env_loginfile ++ {L('#claudeAiOauth.accessToken}' + Q + '],' + J(['anthropic-beta', CLAUDE_OAUTH_BETA]) + ',' + J(['anthropic-version', '2023-06-01']) + ',' + J(['content-type', 'application/json']) + ']')}",
+        '  } else if login_route == "mpp" {',
+        f"    url = {L('${HL_MPP_BASE_URL}/v1/messages')}",
+        "    mpp_headers()",
         '  } else if login_route == "token" {',
         f"    url = {L(CLAUDE_MESSAGES_URL)}",
         f"    headers = {L(J([['authorization', 'Bearer ${CLAUDE_CODE_OAUTH_TOKEN}'], ['anthropic-beta', CLAUDE_OAUTH_BETA], ['anthropic-version', '2023-06-01'], ['content-type', 'application/json']]))}",
@@ -414,6 +484,8 @@ def codex_generated(levels):
         "fn compose() {",
         '  if login_route == "subscription" {',
         f"    url = {L(CHATGPT_RESPONSES_URL)}",
+        '  } else if login_route == "mpp" {',
+        f"    url = {L('${HL_MPP_BASE_URL}/v1/responses')}",
         '  } else if env_base == "slash" {',
         f"    url = {L('${OPENAI_BASE_URL}v1/responses')}",
         '  } else if env_base == "v1" {',
@@ -432,6 +504,8 @@ def codex_generated(levels):
         "  }",
         '  if login_route == "subscription" {',
         f"    headers = {L(J([['authorization', 'Bearer ${@']])[:-3])} ++ env_loginfile ++ {L('#tokens.access_token}' + Q + '],' + J(['chatgpt-account-id', '${@'])[:-2])} ++ env_loginfile ++ {L('#tokens.account_id}' + Q + '],' + J([['content-type', 'application/json'], ['accept', 'text/event-stream']])[1:-1] + ',[' + J('session-id') + ',' + Q)} ++ cache_key ++ {L(Q + '],[' + J('thread-id') + ',' + Q)} ++ cache_key ++ {L(Q + ']]')}",
+        '  } else if login_route == "mpp" {',
+        "    mpp_headers()",
         "  } else {",
         f"    headers = {L(J([['authorization', 'Bearer ${OPENAI_API_KEY}'], ['content-type', 'application/json'], ['accept', 'text/event-stream']])[:-1] + ',[' + J('session-id') + ',' + Q)} ++ cache_key ++ {L(Q + '],[' + J('thread-id') + ',' + Q)} ++ cache_key ++ {L(Q + ']]')}",
         "  }",

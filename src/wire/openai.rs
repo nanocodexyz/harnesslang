@@ -533,7 +533,7 @@ pub fn decode(http: &wire::Http) -> Json {
             classify(
                 Some(status),
                 &code,
-                &message,
+                &wire::with_challenge(status, &http.headers, &message),
                 wire::retry_after_ms(&http.headers),
             )
         }
