@@ -565,3 +565,12 @@ Losses, read from each row's verifier log and meter records:
 
 - docs/SELFHOST.md is the plan: stage0 (today's Rust compiler, frozen), stage1 (`compiler/*.hl` compiled by stage0) and stage2 (compiled by stage1, byte-identical to stage1); the porting order (encode, assemble, shake, lower, data, IR, checker, parser, then the prover); what each step needs from the language; and what Rust remains: the wasm engine, the fixed hosts, the host side of wire and deploy, and the interpreter and simulator as the independent oracle, about 19,000 lines outside the oracle (est.).
 - `scripts/gate.sh` counts `rust_compiler_lines`, the tracked Rust under `src/syntax`, `src/check`, `src/ir`, `src/emit` and `src/prove`: 26,125 at 4d107f9, recorded at 27,814 after phase 1's language features. It may only go down, except when a change lands a language feature the port needs, which records the new value and says why.
+
+## 2026-11-17: SSE splitting moves into the wasm wire codec; the hosts return the raw response body
+
+- The three fixed hosts (hl-host, cloudflare.mjs, vercel.mjs) each split a streamed model response into `[event, data]` pairs before handing it to the program: three copies of one parser. Each host now answers a wire call with `{status, headers, body}` only, the raw bytes it read.
+- `wire.wat` splits the body itself when the status is 2xx and `content-type` contains `text/event-stream` (`$w_streamed`, `$w_sse_scan`, `$w_sse_events`), with the rules the hosts had: CRLF counts as LF, `:` lines are comments, a field without a colon has an empty value, one space after the colon is dropped, `data` lines join with LF, an event without `event:` is `message`. An answer that already carries `events` still decodes as before, so replayed journals and older hosts keep working.
+- `src/wire` keeps the Rust reference in step (`streamed`, `sse_events`, `sse_body`), and `hl wire-diff` now also draws a streamed answer as a raw SSE body, so the wasm split is checked against the Rust one on every seed.
+- `scripts/fixtures/wire-probe.sh` splits the raw body in Python to check the stream it got.
+- `scripts/gate.sh` counts `host_lines_total`, every tracked line under `hosts/`: 7,787 at 061d508 (native 6,087, cloudflare 883, vercel 817), 7,673 after this change (6,027, 856, 790). It may only go down.
+- Checked: agent-drill and codex-drill journals with kills off match 061d508's result for result and response for response (paths, times and ids masked); `hl wire-diff --seeds 0..3000` on both wires.

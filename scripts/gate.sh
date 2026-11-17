@@ -8,7 +8,7 @@ scratch=output/gate
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 programs=$(echo examples/*.hl examples/inlined/*.hl examples/sound/*.hl)
 per_program_hosts="agent"
-counts="emitted_source_lines host_lines_beyond_fixed programs_not_on_wasm host_policy_lines rust_compiler_lines"
+counts="emitted_source_lines host_lines_beyond_fixed programs_not_on_wasm host_policy_lines rust_compiler_lines host_lines_total"
 prose='"([^"\\]|\\.)*[A-Za-z]+ [A-Za-z]+ [A-Za-z]+ [A-Za-z]+([^"\\]|\\.)*"'
 
 fail() {
@@ -58,6 +58,10 @@ host_policy_lines() {
   files=$(git ls-files -- 'hosts/native/*.rs')
   [ -n "$files" ] || { echo 0; return; }
   cat $files | grep -cE "$prose" || true
+}
+
+host_lines_total() {
+  git ls-files -- hosts | xargs cat | wc -l
 }
 
 fixed_host() {

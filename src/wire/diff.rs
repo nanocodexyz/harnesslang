@@ -626,7 +626,7 @@ impl Gen {
                     ("body", body),
                 ])
             }
-            6 | 7 => {
+            6 => {
                 let Json::Object(mut map) = encoded else {
                     return encoded;
                 };
@@ -635,9 +635,36 @@ impl Gen {
                 }
                 Json::Object(map)
             }
+            7 => streamed_body(encoded),
             _ => encoded,
         }
     }
+}
+
+fn streamed_body(encoded: Json) -> Json {
+    let Some(crate::wire::Answer::Http(http)) = crate::wire::Answer::of_json(&encoded) else {
+        return encoded;
+    };
+    let crate::wire::Payload::Events(_) = &http.payload else {
+        return encoded;
+    };
+    let Json::Object(map) = encoded else {
+        return encoded;
+    };
+    let Some(events) = map.get("events").and_then(crate::wire::pairs) else {
+        return Json::Object(map);
+    };
+    Json::object([
+        ("status", Json::Number(http.status)),
+        (
+            "headers",
+            Json::Array(vec![Json::Array(vec![
+                Json::text("content-type"),
+                Json::text("text/event-stream; charset=utf-8"),
+            ])]),
+        ),
+        ("body", Json::text(&crate::wire::sse_body(&events))),
+    ])
 }
 
 fn object_of(fields: Vec<(&str, Json)>) -> Json {

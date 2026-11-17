@@ -65,13 +65,24 @@ import json, sys
 out = sys.argv[1]
 def answer(name):
     return json.load(open(f"{out}/{name}.out"))
+def events(answered):
+    if "events" in answered or not isinstance(answered.get("body"), str):
+        return []
+    found = []
+    for block in answered["body"].replace("\r\n", "\n").split("\n\n"):
+        lines = [line for line in block.split("\n") if line and not line.startswith(":")]
+        named = [line[len("event:"):].strip() for line in lines if line.startswith("event:")]
+        data = [line[len("data:"):].removeprefix(" ") for line in lines if line.startswith("data:")]
+        if data:
+            found.append((named[-1] if named else "message", "\n".join(data)))
+    return found
 streamed = answer("messages-stream")
-if streamed.get("status") != 200 or not streamed.get("events"):
+if streamed.get("status") != 200 or not events(streamed):
     sys.exit(f"wire-probe: the Messages stream answered {streamed}")
-names = [name for name, _ in streamed["events"]]
+names = [name for name, _ in events(streamed)]
 if names[0] != "message_start" or names[-1] != "message_stop":
     sys.exit(f"wire-probe: the Messages stream events are {names}")
-for _, data in streamed["events"]:
+for _, data in events(streamed):
     json.loads(data)
 if not any(name == "content-type" and "text/event-stream" in value for name, value in streamed["headers"]):
     sys.exit(f"wire-probe: the Messages headers are {streamed['headers']}")
@@ -82,7 +93,7 @@ missing = answer("messages-missing")
 if "WIRE_PROBE_UNSET" not in missing.get("transport", ""):
     sys.exit(f"wire-probe: an unset name answered {missing}")
 responses = answer("responses-stream")
-kinds = [name for name, _ in responses.get("events", [])]
+kinds = [name for name, _ in events(responses)]
 if responses.get("status") != 200 or "response.completed" not in kinds:
     sys.exit(f"wire-probe: the Responses stream answered {responses}")
 refused = answer("refused")

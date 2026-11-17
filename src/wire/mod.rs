@@ -15,6 +15,11 @@ pub const MALFORMED: &str = "the host's answer to a wire model call is malformed
 pub const MILLISECONDS_PER_SECOND: u64 = 1_000;
 pub const MEDIA_TYPE_DEFAULT: &str = "application/octet-stream";
 const HTTP_PAYMENT_REQUIRED: u64 = 402;
+const HTTP_SUCCESS_FIRST: u64 = 200;
+const HTTP_SUCCESS_LAST: u64 = 299;
+const CONTENT_TYPE: &str = "content-type";
+const EVENT_STREAM: &str = "text/event-stream";
+const EVENT_DEFAULT: &str = "message";
 const PAYMENT_SCHEME: &str = "Payment ";
 const CHALLENGE_OPEN: &str = "@@hl-challenge@@";
 const CHALLENGE_CLOSE: &str = "@@hl-end@@";
@@ -55,7 +60,7 @@ pub enum Answer {
     Stopped,
 }
 
-fn pairs(json: &Json) -> Option<Vec<(String, String)>> {
+pub fn pairs(json: &Json) -> Option<Vec<(String, String)>> {
     let Json::Array(items) = json else {
         return None;
     };
@@ -77,6 +82,72 @@ fn pairs_json(pairs: &[(String, String)]) -> Json {
             .map(|(name, value)| Json::Array(vec![Json::text(name), Json::text(value)]))
             .collect(),
     )
+}
+
+pub fn streamed(status: u64, headers: &[(String, String)]) -> bool {
+    (HTTP_SUCCESS_FIRST..=HTTP_SUCCESS_LAST).contains(&status)
+        && headers.iter().any(|(name, value)| {
+            name == CONTENT_TYPE && value.to_ascii_lowercase().contains(EVENT_STREAM)
+        })
+}
+
+fn sse_flush(found: &mut Vec<(String, String)>, event: &mut String, data: &mut Option<String>) {
+    if let Some(data) = data.take() {
+        let name = if event.is_empty() {
+            EVENT_DEFAULT.to_owned()
+        } else {
+            event.clone()
+        };
+        found.push((name, data));
+    }
+    event.clear();
+}
+
+pub fn sse_events(body: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut event = String::new();
+    let mut data: Option<String> = None;
+    let normalized = body.replace("\r\n", "\n");
+    for line in normalized.split('\n') {
+        if line.is_empty() {
+            sse_flush(&mut found, &mut event, &mut data);
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event = value.to_owned(),
+            "data" => match data.as_mut() {
+                Some(held) => {
+                    held.push('\n');
+                    held.push_str(value);
+                }
+                None => data = Some(value.to_owned()),
+            },
+            _ => {}
+        }
+    }
+    sse_flush(&mut found, &mut event, &mut data);
+    found
+}
+
+pub fn sse_body(events: &[(String, String)]) -> String {
+    let mut body = String::new();
+    for (event, data) in events {
+        body.push_str("event: ");
+        body.push_str(event);
+        body.push('\n');
+        for line in data.split('\n') {
+            body.push_str("data: ");
+            body.push_str(line);
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body
 }
 
 impl Answer {
@@ -102,6 +173,12 @@ impl Answer {
             (Some(events), None) => {
                 Payload::Events(pairs(events)?.into_iter().map(|(_, data)| data).collect())
             }
+            (None, Some(body)) if streamed(status, &headers) => Payload::Events(
+                sse_events(body.as_str()?)
+                    .into_iter()
+                    .map(|(_, data)| data)
+                    .collect(),
+            ),
             (None, Some(body)) => Payload::Body(body.as_str()?.to_owned()),
             _ => return None,
         };

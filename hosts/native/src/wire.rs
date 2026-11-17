@@ -4,10 +4,6 @@ use harnesslang::wasm::js::{Json, parse};
 
 use crate::transport::{self, Post, Sent};
 
-const EVENT_STREAM: &str = "text/event-stream";
-const EVENT_DEFAULT: &str = "message";
-const SUCCESS_FIRST: u16 = 200;
-const SUCCESS_LAST: u16 = 299;
 const PARTIAL_FILE: &str = "wire-partial";
 const OPEN: &str = "${";
 const DEFAULT_MARK: &str = ":-";
@@ -69,49 +65,6 @@ pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Str
     Ok(out)
 }
 
-fn flush(found: &mut Vec<(String, String)>, event: &mut String, data: &mut Option<String>) {
-    if let Some(data) = data.take() {
-        let name = if event.is_empty() {
-            EVENT_DEFAULT.to_owned()
-        } else {
-            event.clone()
-        };
-        found.push((name, data));
-    }
-    event.clear();
-}
-
-pub fn events(body: &str) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    let mut event = String::new();
-    let mut data: Option<String> = None;
-    let normalized = body.replace("\r\n", "\n");
-    for line in normalized.split('\n') {
-        if line.is_empty() {
-            flush(&mut found, &mut event, &mut data);
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        let (field, value) = line.split_once(':').unwrap_or((line, ""));
-        let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "event" => event = value.to_owned(),
-            "data" => match data.as_mut() {
-                Some(held) => {
-                    held.push('\n');
-                    held.push_str(value);
-                }
-                None => data = Some(value.to_owned()),
-            },
-            _ => {}
-        }
-    }
-    flush(&mut found, &mut event, &mut data);
-    found
-}
-
 fn pairs(pairs: &[(String, String)]) -> Json {
     Json::Array(
         pairs
@@ -131,23 +84,10 @@ fn object(fields: Vec<(&str, Json)>) -> Json {
 }
 
 pub fn answer(response: &transport::Response) -> Json {
-    let streamed = response.headers.iter().any(|(name, value)| {
-        name == "content-type" && value.to_ascii_lowercase().contains(EVENT_STREAM)
-    });
-    let success = (SUCCESS_FIRST..=SUCCESS_LAST).contains(&response.status);
-    let headers = pairs(&response.headers);
-    let status = Json::int(response.status);
-    if success && streamed {
-        return object(vec![
-            ("events", pairs(&events(&response.body))),
-            ("headers", headers),
-            ("status", status),
-        ]);
-    }
     object(vec![
         ("body", Json::text(&response.body)),
-        ("headers", headers),
-        ("status", status),
+        ("headers", pairs(&response.headers)),
+        ("status", Json::int(response.status)),
     ])
 }
 

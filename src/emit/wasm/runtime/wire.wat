@@ -3,6 +3,8 @@
 (global $WIRE_RAW_NUMBER i32 (i32.const 8))
 (global $WIRE_DEPTH_MAX i32 (i32.const 128))
 (global $WIRE_HTTP_OK i64 (i64.const 200))
+(global $WIRE_HTTP_SUCCESS_LAST i64 (i64.const 299))
+(global $ASCII_COLON i32 (i32.const 0x3a))
 (global $WIRE_HTTP_REQUEST_TIMEOUT i64 (i64.const 408))
 (global $WIRE_HTTP_CONFLICT i64 (i64.const 409))
 (global $WIRE_HTTP_TOO_LARGE i64 (i64.const 413))
@@ -105,6 +107,10 @@
 (text $wt_base64 "base64")
 (text $wt_media_type "media_type")
 (text $wt_data "data")
+(text $wt_event "event")
+(text $wt_newline "\n")
+(text $wt_content_type "content-type")
+(text $wt_event_stream "text/event-stream")
 (text $wt_image "image")
 (text $wt_source "source")
 (text $wt_ephemeral "ephemeral")
@@ -814,6 +820,90 @@
   (local.set $buffer (call $buf_new))
   (call $raw_write (local.get $buffer) (local.get $out))
   (local.get $buffer))
+(func $w_streamed (param $status i64) (param $headers i32) (result i32) (local $index i32) (local $pair i32)
+  (if (i32.or (i64.lt_u (local.get $status) (global.get $WIRE_HTTP_OK)) (i64.gt_u (local.get $status) (global.get $WIRE_HTTP_SUCCESS_LAST))) (then (return (i32.const 0))))
+  block $absent
+    loop $next
+      (br_if $absent (i32.ge_u (local.get $index) (call $json_count (local.get $headers))))
+      (local.set $pair (call $json_item (local.get $headers) (local.get $index)))
+      (if (call $text_eq (call $json_text (call $json_item (local.get $pair) (i32.const 0))) (i32.const $wt_content_type))
+        (then
+          (if (i32.ge_s (call $text_find (call $w_lower (call $json_text (call $json_item (local.get $pair) (i32.const 1)))) (i32.const $wt_event_stream)) (i32.const 0))
+            (then (return (i32.const 1))))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (i32.const 0))
+(func $w_sse_flush (param $out i32) (param $count i32) (param $event i32) (param $data i32) (result i32)
+  (if (i32.eqz (local.get $data)) (then (return (local.get $count))))
+  (if (local.get $out)
+    (then
+      (if (i32.eqz (call $text_len (local.get $event))) (then (local.set $event (i32.const $wt_message))))
+      (call $json_array_set (local.get $out) (local.get $count) (call $w_arr2 (call $w_string (local.get $event)) (call $w_string (local.get $data))))))
+  (i32.add (local.get $count) (i32.const 1)))
+(func $w_sse_scan (param $body i32) (param $out i32) (result i32) (local $count i32) (local $start i32) (local $end i32) (local $stop i32) (local $colon i32) (local $value i32) (local $field i32) (local $event i32) (local $data i32) (local $length i32)
+  (local.set $length (call $text_len (local.get $body)))
+  (local.set $event (i32.const $s_empty))
+  block $done
+    loop $next
+      (br_if $done (i32.gt_u (local.get $start) (local.get $length)))
+      (local.set $stop (local.get $start))
+      block $found
+        loop $seek
+          (br_if $found (i32.ge_u (local.get $stop) (local.get $length)))
+          (br_if $found (i32.eq (call $text_byte (local.get $body) (local.get $stop)) (global.get $ASCII_NEWLINE)))
+          (local.set $stop (i32.add (local.get $stop) (i32.const 1)))
+          br $seek
+        end
+      end
+      (local.set $end (local.get $stop))
+      (if (i32.and (i32.lt_u (local.get $stop) (local.get $length)) (i32.gt_u (local.get $stop) (local.get $start)))
+        (then
+          (if (i32.eq (call $text_byte (local.get $body) (i32.sub (local.get $stop) (i32.const 1))) (global.get $ASCII_RETURN))
+            (then (local.set $end (i32.sub (local.get $stop) (i32.const 1)))))))
+      (if (i32.eq (local.get $end) (local.get $start))
+        (then
+          (local.set $count (call $w_sse_flush (local.get $out) (local.get $count) (local.get $event) (local.get $data)))
+          (local.set $event (i32.const $s_empty))
+          (local.set $data (i32.const 0)))
+        (else
+          (if (i32.ne (call $text_byte (local.get $body) (local.get $start)) (global.get $ASCII_COLON))
+            (then
+              (local.set $colon (local.get $start))
+              block $split
+                loop $scan
+                  (br_if $split (i32.ge_u (local.get $colon) (local.get $end)))
+                  (br_if $split (i32.eq (call $text_byte (local.get $body) (local.get $colon)) (global.get $ASCII_COLON)))
+                  (local.set $colon (i32.add (local.get $colon) (i32.const 1)))
+                  br $scan
+                end
+              end
+              (local.set $field (call $text_slice (local.get $body) (local.get $start) (local.get $colon)))
+              (local.set $value (local.get $end))
+              (if (i32.lt_u (local.get $colon) (local.get $end))
+                (then
+                  (local.set $value (i32.add (local.get $colon) (i32.const 1)))
+                  (if (i32.lt_u (local.get $value) (local.get $end))
+                    (then
+                      (if (i32.eq (call $text_byte (local.get $body) (local.get $value)) (global.get $ASCII_SPACE))
+                        (then (local.set $value (i32.add (local.get $value) (i32.const 1)))))))))
+              (local.set $value (call $text_slice (local.get $body) (local.get $value) (local.get $end)))
+              (if (call $text_eq (local.get $field) (i32.const $wt_event)) (then (local.set $event (local.get $value))))
+              (if (call $text_eq (local.get $field) (i32.const $wt_data))
+                (then
+                  (if (local.get $data)
+                    (then (local.set $data (call $w_cat3 (local.get $data) (i32.const $wt_newline) (local.get $value))))
+                    (else (local.set $data (local.get $value))))))))))
+      (local.set $start (i32.add (local.get $stop) (i32.const 1)))
+      br $next
+    end
+  end
+  (call $w_sse_flush (local.get $out) (local.get $count) (local.get $event) (local.get $data)))
+(func $w_sse_events (param $body i32) (result i32) (local $out i32)
+  (local.set $out (call $json_array (call $w_sse_scan (local.get $body) (i32.const 0))))
+  (drop (call $w_sse_scan (local.get $body) (local.get $out)))
+  (local.get $out))
 (func $w_answer (param $answer i32) (result i32) (local $value i32) (local $events i32) (local $body i32)
   (if (i32.eqz (call $w_is (local.get $answer) (global.get $JSON_OBJECT))) (then (return (global.get $WIRE_ANSWER_MALFORMED))))
   (if (i32.eq (call $json_count (local.get $answer)) (i32.const 1))
@@ -846,6 +936,10 @@
     (then
       (global.set $wa_body (call $w_as_text (local.get $body)))
       (if (i32.eqz (global.get $wa_body)) (then (return (global.get $WIRE_ANSWER_MALFORMED))))
+      (if (call $w_streamed (global.get $wa_status) (global.get $wa_headers))
+        (then
+          (global.set $wa_events (call $w_sse_events (global.get $wa_body)))
+          (global.set $wa_body (i32.const 0))))
       (return (global.get $WIRE_ANSWER_HTTP))))
   (global.get $WIRE_ANSWER_MALFORMED))
 (func $wire_decode (param $wire i32) (param $answer i32) (param $interruptible i32) (result i32) (local $kind i32)

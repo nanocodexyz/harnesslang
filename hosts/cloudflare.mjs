@@ -32,8 +32,6 @@ const FINISHED_EXITS = ["finished", "already_finished"];
 const NO_SIMULATION = { mutation: "none", hook() {}, gate() {}, tools: undefined };
 const WIRE_OPEN = "${";
 const WIRE_DEFAULT_MARK = ":-";
-const WIRE_EVENT_STREAM = "text/event-stream";
-const WIRE_EVENT_DEFAULT = "message";
 
 class Panic extends Error {}
 class Corrupt extends Error {}
@@ -176,28 +174,6 @@ function wireExpand(text, lookup) {
   return out + rest;
 }
 
-function wireEvents(body) {
-  const found = [];
-  let event = "";
-  let data = null;
-  const flush = () => {
-    if (data !== null) found.push([event === "" ? WIRE_EVENT_DEFAULT : event, data]);
-    event = "";
-    data = null;
-  };
-  for (const line of body.replaceAll("\r\n", "\n").split("\n")) {
-    if (line === "") flush();
-    if (line === "" || line.startsWith(":")) continue;
-    const colon = line.indexOf(":");
-    const field = colon < 0 ? line : line.slice(0, colon);
-    const value = colon < 0 ? "" : line.slice(colon + (line[colon + 1] === " " ? 2 : 1));
-    if (field === "event") event = value;
-    if (field === "data") data = data === null ? value : data + "\n" + value;
-  }
-  flush();
-  return found;
-}
-
 function wireText(value, what) {
   if (typeof value !== "string") throw new HostError(what + " is not text: " + encodeJson(value ?? null));
   return value;
@@ -221,10 +197,7 @@ async function wireCall(fetcher, lookup, http) {
     if (error instanceof Panic) throw error;
     return { transport: String(error?.message ?? error) };
   }
-  const headers = [...response.headers];
-  const streamed = headers.some(([name, value]) => name === "content-type" && value.toLowerCase().includes(WIRE_EVENT_STREAM));
-  const status = BigInt(response.status);
-  return response.ok && streamed ? { events: wireEvents(body), headers, status } : { body, headers, status };
+  return { body, headers: [...response.headers], status: BigInt(response.status) };
 }
 
 function defaultHost(config) {
