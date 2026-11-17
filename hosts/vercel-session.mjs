@@ -7,6 +7,7 @@ function host() {
     toolsUrl: process.env.HL_TOOLS_URL,
     listingsUrl: process.env.HL_LISTINGS_URL,
     modelUrl: process.env.HL_MODEL_URL,
+    env: process.env,
     recoverUrl: process.env.HL_RECOVER_URL,
     jobsUrl: process.env.HL_JOBS_URL,
     cellsUrl: process.env.HL_CELLS_URL,

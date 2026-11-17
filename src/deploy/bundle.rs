@@ -137,13 +137,6 @@ pub fn emitted_planted(
     plant: Plant,
 ) -> Result<Bundle, String> {
     let module = crate::emit::wasm::emit_planted(program, target, wasm_plant)?;
-    if matches!(target, Target::Cloudflare | Target::Vercel) && !program.codes.is_empty() {
-        return Err(format!(
-            "{} runs code cells, which the fixed {} host does not run",
-            program.name,
-            target.name()
-        ));
-    }
     match target {
         Target::Cloudflare => Bundle::new(
             CLOUDFLARE_AUTH_MAIN,
@@ -154,22 +147,11 @@ pub fn emitted_planted(
             ],
             Origin::Emitted,
         ),
-        Target::Vercel => {
-            if program.events.cancel
-                || program.events.steers.is_some()
-                || program.events.jobs.is_some()
-            {
-                return Err(format!(
-                    "{} takes events, which the fixed Vercel host does not deliver inside a step",
-                    program.name
-                ));
-            }
-            Bundle::new(
-                VERCEL_ROUTE,
-                vercel_files(program, &module, plant),
-                Origin::Emitted,
-            )
-        }
+        Target::Vercel => Bundle::new(
+            VERCEL_ROUTE,
+            vercel_files(program, &module, plant),
+            Origin::Emitted,
+        ),
         _ => Bundle::new(
             NATIVE_PROGRAM,
             vec![file(NATIVE_PROGRAM, module)],
