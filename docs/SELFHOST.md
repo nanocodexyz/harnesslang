@@ -214,3 +214,124 @@ After the switch it is 0, and the gate also compares stage1 and stage2.
 | 7 | `src/check` | 9,274 | `compiler/check.hl` | all above | planned |
 | 8 | `src/syntax` | 2,591 | `compiler/parse.hl` | stack, interning | planned |
 | 9 | `src/prove` | 6,828 | `compiler/prove.hl` | all above | planned |
+## How fast compiled .hl runs
+
+`compiler/bench` times `compiler/encode.hl` compiled for hl-host against
+encode.rs, in process, on examples/claude_code.hl (145,064 flat bytes in,
+137,209 module bytes out), and checks that the bytes match. Best of 20 on a
+hosted Hand:
+
+```console
+$ cargo build --release --locked --manifest-path compiler/bench/Cargo.toml
+$ hl emit --format wasm --target native-jsonl compiler/encode.hl > encode.wasm
+$ compiler/bench/target/release/selfhost-bench examples/claude_code.hl encode.wasm
+```
+
+| | encode.hl handler | over encode.rs (0.054 ms) | hl-host wall |
+| --- | --- | --- | --- |
+| before (061d508) | 300 ms | 5,578x | 440 ms |
+| after | 13.8 ms | 251x | 47 ms |
+
+Startup is outside those: decoding and compiling the encoder's wasm takes
+1.4 ms in process, and an hl-host run of an empty handler takes 9 ms wall,
+process start and journal included.
+
+What it took, in the order the profile showed it:
+
+- Hex. Over 95% of executed wasm ops were the .hl hex loops. `bytes_of_hex`
+  and `hex_of` are now pure builtins, done by the runtime in two table loops
+  that the engine fuses into one instruction each (Inst::Unhex, Inst::Hex),
+  as it already fused byte scans and crc.
+- The engine. Scan, crc and the hex loops run over a slice when every access
+  is in bounds, and `write_string` copies runs of plain bytes at once.
+- Checks a pure fn proves away (see Pure fns in LANGUAGE.md): unchecked add,
+  multiply, divide and remainder where the operands' largest values allow, a
+  push without the byte-width check, and no halt check after an expression
+  that cannot trap.
+
+Copies on push were not a cost: a push copies only a shared buffer and grows
+in place otherwise.
+
+The 20x goal is not met, and an interpreter will not meet it: the handler
+still dispatches about 2.1 million wasm instructions, which take about 8 ms
+at the engine's speed, against 0.054 ms of native code. What remains, by
+size: the dispatch loop itself (half the time; closing the gap needs
+compiling wasm to native code, or the encoder linked as native code); the
+journal carrying the 290 KB hex input and output, which the runtime crc's,
+escapes, parses, re-encodes and compares byte for byte (about a quarter of
+the dispatched instructions are that comparison); and bytes copied into and
+out of buffers. A raw bytes argument and result for pure entries and tools,
+which the hosts must carry, removes the hex and halves the journal work.
+
+
+## Beyond the compiler: what else moves to .hl
+
+The compiler is not the only Rust that a .hl program could replace. Ordered by
+value: the first item removes code kept twice and kept in step by hand, the
+last only shortens tooling. Line counts are measured at the commit that adds
+this section; (est.) marks an estimate of what the .hl version costs.
+
+| # | What | Lines it removes | Needs |
+| --- | --- | --- | --- |
+| 1 | Code implemented twice: wire codec, JSON, journal | 8,485 | an embedding of pure .hl in the interpreter, recursion-free trees, raw bytes in and out |
+| 2 | Pure text work left in hosts | about 380 | pure entries a host calls, text builtins |
+| 3 | The compiler | 21,266 | the porting order above |
+| 4 | The prover | 6,828 | the compiler's features, plus rationals or bounded big integers |
+| 5 | The rest of the .wat runtime | 6,002 | effects and imports declared in .hl, control of memory layout |
+| 6 | Tooling as .hl programs | about 10,000 | file and process tools, a const-from-file include |
+
+1. **Code implemented twice.** Each of these exists once in Rust for the
+   interpreter and once in .wat for compiled programs, and wasm-diff is what
+   keeps the two in step:
+   - the wire codec: `src/wire` (2,936, of which `diff.rs` is 775) and
+     `runtime/wire.wat` (1,965);
+   - JSON: `src/run/json.rs` (398) and `runtime/json.wat` (520), with
+     `src/wire/json.rs` (342, counted above) a third copy;
+   - journal encode and fold: `src/run/journal.rs` (908),
+     `src/run/cell_journal.rs` (636) and `src/run/crc.rs` (34), against
+     `runtime/journal.wat` (675) and `runtime/cell_journal.wat` (413).
+
+   Together 8,485 lines (4,912 Rust and 3,573 .wat), which
+   would become one .hl implementation of about 3,000 lines (est.) that the
+   interpreter runs and the compiler compiles. It needs: the interpreter
+   calling a pure .hl fn from Rust (an embedding, the reverse of today's
+   `hl run`); JSON trees without recursion (an arena of nodes and an explicit
+   work stack, the same `bytes` arenas the compiler port needs); decimal
+   u64 text and UTF-16 escapes; the crc table as a const; and bytes in and
+   out of a pure entry without hex. `bytes_of_hex` and `hex_of` make hex
+   cheap today (see How fast compiled .hl runs above) but a raw bytes argument and
+   result, which the hosts must carry, removes the doubling.
+2. **Pure text work in hosts.** Lane 23 moved SSE splitting into the wasm
+   wire codec and Bash and codex exec rendering into .hl pure fns, which cut
+   hosts from 7,787 to 7,573 lines. What is left: the apply_patch grammar
+   (`hosts/native/src/codex.rs`, 195 lines of parsing and matching from
+   `parse_patch` to `updated`, 315 with its file writes), Read paging
+   (`first_page` in `hosts/native/src/tools.rs`), stall-line detection
+   (`prompting` in `hosts/native/src/jobs.rs`) and `${VAR}` expansion
+   (`wireExpand` in `hosts/cloudflare.mjs` and `hosts/vercel.mjs`, 20 lines
+   each). DECISIONS.md says why each of the first three stays for now: Read
+   paging rounds f64 twice per step, stall detection decides what the
+   journal admits, and apply_patch needs every touched file's contents, so
+   moving it is a new tool protocol. They need: an f64-exact integer
+   formulation or a decimal type, and a read-then-write tool shape.
+3. **The compiler.** `src/syntax` (2,591), `src/check` (9,289), `src/ir`
+   (3,072) and `src/emit` (6,314): 21,266 lines, by the porting order above.
+4. **The prover.** `src/prove` (6,828). It needs everything the compiler
+   does, and its arithmetic (bounds and sums of rationals or wide integers)
+   needs either a bounded big-integer type or rationals built from u64 pairs.
+5. **The rest of the .wat runtime.** `src/emit/wasm/runtime` holds 9,575
+   lines of hand-written .wat; less item 1's 3,573 that leaves 6,002 (value
+   and text helpers, the engine, cells, events, blobs, jobs, forks). Written
+   in .hl, the compiler would compile its own runtime and the shake would see
+   one language. It needs what pure fns lack today: declared host imports,
+   effects and globals, and control of memory layout (the value encoding
+   every host reads).
+6. **Tooling as .hl programs.** The fuzz generator `src/generate` (2,482);
+   deploy and bundle `src/deploy` (4,561, of which `http.rs`, `websocket.rs`,
+   `sha1.rs` and `multipart.rs`, 973, are the host side); CLI dispatch
+   `src/main.rs` (926); the eval driver and scorer `evals/*.py` (1,645); and
+   `scripts/program-literals.py` (636), which a const-from-file include
+   (`const prompt: text = include("prompts/x.md")`) replaces outright. About
+   10,000 lines; these are programs that read files, run processes and talk
+   HTTP, so they need the tool and file effects harness programs already
+   have, run under the native host.

@@ -1708,12 +1708,20 @@ pub enum BytesOp {
     Slice,
     OfText,
     ToText,
+    OfHex,
+    ToHex,
     Empty,
     EmptyList,
 }
 
 impl BytesOp {
-    pub const NAMED: [Self; 3] = [Self::OfText, Self::ToText, Self::Slice];
+    pub const NAMED: [Self; 5] = [
+        Self::OfText,
+        Self::ToText,
+        Self::Slice,
+        Self::OfHex,
+        Self::ToHex,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -1721,6 +1729,8 @@ impl BytesOp {
             Self::Slice => "slice",
             Self::OfText => "bytes_of",
             Self::ToText => "text_of",
+            Self::OfHex => "bytes_of_hex",
+            Self::ToHex => "hex_of",
             Self::Empty | Self::EmptyList => "[]",
         }
     }
@@ -1728,8 +1738,8 @@ impl BytesOp {
     pub const fn arity(self) -> usize {
         match self {
             Self::Empty | Self::EmptyList => 0,
-            Self::ToText => 1,
-            Self::Get | Self::OfText => 2,
+            Self::ToText | Self::ToHex => 1,
+            Self::Get | Self::OfText | Self::OfHex => 2,
             Self::Slice => 3,
         }
     }

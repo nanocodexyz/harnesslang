@@ -8,6 +8,12 @@ pub enum Inst {
     Crc {
         crc: u32,
     },
+    Unhex {
+        unhex: u32,
+    },
+    Hex {
+        hex: u32,
+    },
     Unreachable,
     Jump(u32),
     JumpIf {
@@ -1257,6 +1263,11 @@ const SCAN_EQUAL_OPS: u64 = 5;
 const SCAN_TABLE_FOUND_OPS: u64 = 4;
 const SCAN_EQUAL_FOUND_OPS: u64 = 3;
 const CRC_OPS: u64 = 10;
+const UNHEX_OPS: u64 = 15;
+const UNHEX_INVALID_OPS: u64 = 8;
+const HEX_OPS: u64 = 14;
+const HEX_NIBBLE_MAX: u32 = 15;
+const HEX_NIBBLE_BITS: u32 = 4;
 const LOOP_EXIT_OPS: u64 = 1;
 const CRC_BYTE_BITS: u32 = 8;
 const CRC_BYTE_MASK: u32 = 0xff;
@@ -1313,10 +1324,64 @@ impl Crc {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Unhex {
+    pub at: u32,
+    pub end: u32,
+    pub from: u32,
+    pub into: u32,
+    pub scratch: u32,
+    pub high: u32,
+    pub low: u32,
+    pub pair: u32,
+    pub values: u32,
+    pub done: u32,
+    pub invalid: u32,
+}
+
+impl Unhex {
+    pub const NIBBLE_MAX: u32 = HEX_NIBBLE_MAX;
+    pub const NIBBLE_BITS: u32 = HEX_NIBBLE_BITS;
+
+    pub const fn ops(pairs: u64, invalid: bool) -> u64 {
+        pairs * UNHEX_OPS
+            + if invalid {
+                UNHEX_INVALID_OPS
+            } else {
+                LOOP_EXIT_OPS
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Hex {
+    pub at: u32,
+    pub end: u32,
+    pub from: u32,
+    pub into: u32,
+    pub byte: u32,
+    pub doubled: u32,
+    pub address: u32,
+    pub nibble: u32,
+    pub digits: u32,
+    pub done: u32,
+}
+
+impl Hex {
+    pub const NIBBLE_MASK: u32 = HEX_NIBBLE_MAX;
+    pub const NIBBLE_BITS: u32 = HEX_NIBBLE_BITS;
+
+    pub const fn ops(bytes: u64) -> u64 {
+        bytes * HEX_OPS + LOOP_EXIT_OPS
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Loops {
     pub scans: Vec<Scan>,
     pub crcs: Vec<Crc>,
+    pub unhexes: Vec<Unhex>,
+    pub hexes: Vec<Hex>,
 }
 
 fn distinct(slots: &[u32]) -> bool {
@@ -1339,6 +1404,16 @@ pub fn fuse_loops(insts: &mut [Inst]) -> Loops {
                 crc: loops.crcs.len() as u32,
             };
             loops.crcs.push(crc);
+        } else if let Some(unhex) = unhex_at(insts, head) {
+            insts[head] = Inst::Unhex {
+                unhex: loops.unhexes.len() as u32,
+            };
+            loops.unhexes.push(unhex);
+        } else if let Some(hex) = hex_at(insts, head) {
+            insts[head] = Inst::Hex {
+                hex: loops.hexes.len() as u32,
+            };
+            loops.hexes.push(hex);
         }
     }
     loops
@@ -1498,6 +1573,235 @@ fn crc_at(insts: &[Inst], head: usize) -> Option<Crc> {
         index,
         word,
         table,
+        done,
+    })
+}
+
+fn unhex_at(insts: &[Inst], head: usize) -> Option<Unhex> {
+    let window = insts.get(head..head + UNHEX_OPS as usize)?;
+    let [
+        Inst::JumpGeU {
+            left: at,
+            right: end,
+            target: done,
+        },
+        Inst::LoadIndexedU8 {
+            result: scratch,
+            base: from,
+            index: first_at,
+        },
+        Inst::LoadPlusU8 {
+            result: high,
+            address: high_from,
+            plus: values,
+        },
+        Inst::I32Add {
+            result: second,
+            left: second_base,
+            right: second_at,
+        },
+        Inst::LoadU8 {
+            result: second_byte,
+            address: second_address,
+            offset: 1,
+        },
+        Inst::LoadPlusU8 {
+            result: low,
+            address: low_from,
+            plus: low_values,
+        },
+        Inst::I32Or {
+            result: pair,
+            left: pair_high,
+            right: pair_low,
+        },
+        Inst::JumpGtUImmediate {
+            left: checked,
+            right: HEX_NIBBLE_MAX,
+            target: invalid,
+        },
+        Inst::I32ShrUImmediate {
+            result: half,
+            left: half_from,
+            right: 1,
+        },
+        Inst::I32Add {
+            result: address,
+            left: into,
+            right: address_half,
+        },
+        Inst::I32ShlImmediate {
+            result: shifted,
+            left: shifted_from,
+            right: HEX_NIBBLE_BITS,
+        },
+        Inst::I32Or {
+            result: joined,
+            left: joined_high,
+            right: joined_low,
+        },
+        Inst::StoreU8 {
+            address: store_address,
+            value: stored,
+            offset: 0,
+        },
+        Inst::I32AddImmediate {
+            result: stepped,
+            left: step_from,
+            right: 2,
+        },
+        Inst::Jump(back),
+    ] = *window
+    else {
+        return None;
+    };
+    let chained = first_at == at
+        && high_from == scratch
+        && second == scratch
+        && second_base == from
+        && second_at == at
+        && second_byte == scratch
+        && second_address == scratch
+        && low_from == scratch
+        && low_values == values
+        && pair_high == high
+        && pair_low == low
+        && checked == pair
+        && half == scratch
+        && half_from == at
+        && address == pair
+        && address_half == scratch
+        && shifted == scratch
+        && shifted_from == high
+        && joined == scratch
+        && joined_high == scratch
+        && joined_low == low
+        && store_address == pair
+        && stored == scratch
+        && stepped == at
+        && step_from == at
+        && back as usize == head;
+    (chained && distinct(&[at, end, from, into, scratch, high, low, pair])).then_some(Unhex {
+        at,
+        end,
+        from,
+        into,
+        scratch,
+        high,
+        low,
+        pair,
+        values,
+        done,
+        invalid,
+    })
+}
+
+fn hex_at(insts: &[Inst], head: usize) -> Option<Hex> {
+    let window = insts.get(head..head + HEX_OPS as usize)?;
+    let [
+        Inst::JumpGeU {
+            left: at,
+            right: end,
+            target: done,
+        },
+        Inst::LoadIndexedU8 {
+            result: byte,
+            base: from,
+            index: byte_at,
+        },
+        Inst::I32ShlImmediate {
+            result: doubled,
+            left: doubled_from,
+            right: 1,
+        },
+        Inst::I32Add {
+            result: address,
+            left: into,
+            right: address_doubled,
+        },
+        Inst::I32ShrUImmediate {
+            result: nibble,
+            left: nibble_from,
+            right: HEX_NIBBLE_BITS,
+        },
+        Inst::LoadPlusU8 {
+            result: digit,
+            address: digit_from,
+            plus: digits,
+        },
+        Inst::StoreU8 {
+            address: high_address,
+            value: high_digit,
+            offset: 0,
+        },
+        Inst::I32ShlImmediate {
+            result: doubled_again,
+            left: doubled_again_from,
+            right: 1,
+        },
+        Inst::I32Add {
+            result: address_again,
+            left: into_again,
+            right: address_again_doubled,
+        },
+        Inst::I32AndImmediate {
+            result: low_nibble,
+            left: low_from,
+            right: HEX_NIBBLE_MAX,
+        },
+        Inst::LoadPlusU8 {
+            result: low_digit,
+            address: low_digit_from,
+            plus: low_digits,
+        },
+        Inst::StoreU8 {
+            address: low_address,
+            value: low_value,
+            offset: 1,
+        },
+        Inst::I32AddImmediate {
+            result: stepped,
+            left: step_from,
+            right: 1,
+        },
+        Inst::Jump(back),
+    ] = *window
+    else {
+        return None;
+    };
+    let chained = byte_at == at
+        && doubled_from == at
+        && address_doubled == doubled
+        && nibble_from == byte
+        && digit == doubled
+        && digit_from == nibble
+        && high_address == address
+        && high_digit == doubled
+        && doubled_again == doubled
+        && doubled_again_from == at
+        && address_again == address
+        && into_again == into
+        && address_again_doubled == doubled
+        && low_nibble == nibble
+        && low_from == byte
+        && low_digit == doubled
+        && low_digit_from == nibble
+        && low_digits == digits
+        && low_address == address
+        && low_value == doubled
+        && stepped == at
+        && step_from == at
+        && back as usize == head;
+    (chained && distinct(&[at, end, from, into, byte, doubled, address, nibble])).then_some(Hex {
+        at,
+        end,
+        from,
+        into,
+        byte,
+        doubled,
+        address,
+        nibble,
+        digits,
         done,
     })
 }

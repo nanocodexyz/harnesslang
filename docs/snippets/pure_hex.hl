@@ -1,0 +1,23 @@
+harness hexes
+
+const buffer_max: u64 = 32
+
+fn round(input: text) -> text {
+  let raw: bytes<buffer_max> = bytes_of(input)
+  let spelled = hex_of(raw)
+  let back: bytes<buffer_max> = bytes_of_hex(spelled)
+  var folded: bytes<buffer_max> = []
+  loop i below buffer_max while i < len(back) {
+    push folded back[i] % 26 + 'a'
+  }
+  return text_of(folded) ++ " " ++ spelled
+}
+
+fn strict(input: text) -> text {
+  let parsed: bytes<buffer_max> = bytes_of_hex(input)
+  return hex_of(parsed)
+}
+
+on hexes(input: text) -> text {
+  return round(input) ++ " " ++ strict(input)
+}

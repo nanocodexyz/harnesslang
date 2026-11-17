@@ -14,9 +14,11 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 20] = [
+pub const BUILTIN_FUNCTIONS: [&str; 22] = [
     "bytes_of",
     "text_of",
+    "bytes_of_hex",
+    "hex_of",
     "slice",
     "dispatch",
     "now",

@@ -236,22 +236,31 @@ pub fn number_text(value: f64) -> String {
 }
 
 fn write_string(out: &mut String, value: &str) {
+    out.reserve(value.len() + 2);
     out.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            control if u32::from(control) < CONTROL_LIMIT => {
-                out.push_str(&format!("\\u{:04x}", u32::from(control)))
-            }
-            other => out.push(other),
+    let bytes = value.as_bytes();
+    let mut plain = 0;
+    for (at, byte) in bytes.iter().enumerate() {
+        let escape = match *byte {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            control if u32::from(control) < CONTROL_LIMIT => "",
+            _ => continue,
+        };
+        out.push_str(&value[plain..at]);
+        if escape.is_empty() {
+            out.push_str(&format!("\\u{:04x}", byte));
+        } else {
+            out.push_str(escape);
         }
+        plain = at + 1;
     }
+    out.push_str(&value[plain..]);
     out.push('"');
 }
 

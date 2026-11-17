@@ -1,6 +1,5 @@
 harness encode
 
-const hex_bytes_max: u64 = 8388608
 const flat_bytes_max: u64 = 4194304
 const module_bytes_max: u64 = 4194304
 const leb_bytes_max: u64 = 10
@@ -9,38 +8,6 @@ const locals_max: u64 = 65536
 
 tool read_file(file_path: text) -> text effect none
 tool write_bytes(file_path: text, hex: text) -> text effect idempotent
-
-fn nibble(character: u64) -> u64 {
-  if character >= 'a' {
-    return character - 'a' + 10
-  }
-  return character - '0'
-}
-
-fn digit(value: u64) -> u64 {
-  if value < 10 {
-    return '0' + value
-  }
-  return 'a' + value - 10
-}
-
-fn unhex(input: text) -> bytes<flat_bytes_max> {
-  let digits: bytes<hex_bytes_max> = bytes_of(input)
-  var out: bytes<flat_bytes_max> = []
-  loop i below flat_bytes_max while i * 2 < len(digits) {
-    push out nibble(digits[i * 2]) * 16 + nibble(digits[i * 2 + 1])
-  }
-  return out
-}
-
-fn hex(input: bytes<module_bytes_max>) -> text {
-  var out: bytes<hex_bytes_max> = []
-  loop i below module_bytes_max while i < len(input) {
-    push out digit(input[i] / 16)
-    push out digit(input[i] % 16)
-  }
-  return text_of(out)
-}
 
 fn word(flat: bytes<flat_bytes_max>, at: u64) -> u64 {
   return flat[at] + flat[at + 1] * 256 + flat[at + 2] * 65536 + flat[at + 3] * 16777216
@@ -335,7 +302,8 @@ fn module(flat: bytes<flat_bytes_max>) -> bytes<module_bytes_max> {
 }
 
 fn encode_hex(input: text) -> text {
-  return hex(module(unhex(input)))
+  let flat: bytes<flat_bytes_max> = bytes_of_hex(input)
+  return hex_of(module(flat))
 }
 
 on encode(input: text) -> text {

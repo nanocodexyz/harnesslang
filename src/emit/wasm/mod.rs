@@ -311,6 +311,7 @@ pub const PLANTS: [(&str, &str, &str); 55] = [
 
 const BYTE_VALUES: usize = 256;
 const TABLE_WORD_BYTES: usize = 4;
+const HEX_INVALID: u8 = 0xff;
 const JSON_CONTROL_END: u8 = 0x20;
 
 fn json_special(byte: u8) -> bool {
@@ -338,6 +339,29 @@ fn base64_table() -> String {
     format!("(text $base64_table {})\n", data::wat_string(&table))
 }
 
+fn byte_words(name: &str, bytes: &[u8]) -> String {
+    let words: Vec<String> = bytes
+        .chunks(TABLE_WORD_BYTES)
+        .map(|chunk| {
+            let mut word = [0_u8; TABLE_WORD_BYTES];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u32::from_le_bytes(word).to_string()
+        })
+        .collect();
+    format!("(words {name} {})\n", words.join(" "))
+}
+
+fn hex_tables() -> String {
+    let mut values = [HEX_INVALID; BYTE_VALUES];
+    for (byte, value) in values.iter_mut().enumerate() {
+        let byte = u8::try_from(byte).expect("a table index fits a byte");
+        if let Some(nibble) = crate::run::pure::nibble(byte) {
+            *value = nibble;
+        }
+    }
+    byte_words("$hex_values", &values) + &byte_words("$hex_digits", crate::run::pure::HEX_DIGITS)
+}
+
 fn crc_table() -> String {
     let words: Vec<String> = crate::run::crc::TABLE
         .iter()
@@ -353,6 +377,7 @@ pub fn emit_text(program: &Program, target: Target) -> Result<String, String> {
 pub fn emit_text_planted(program: &Program, target: Target, plant: &str) -> Result<String, String> {
     let mut text = RUNTIME.concat();
     text.push_str(&crc_table());
+    text.push_str(&hex_tables());
     text.push_str(&base64_table());
     text.push_str(&json_special_table());
     text.push_str(&lower::program_text(program, target)?);

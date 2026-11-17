@@ -16,6 +16,8 @@ struct Function<'t, 'p> {
     body: Vec<String>,
     temps: usize,
     labels: usize,
+    facts: Vec<(usize, Option<u64>)>,
+    fixed: Vec<bool>,
 }
 
 fn not_yet<T>(what: &str) -> Result<T, String> {
@@ -44,6 +46,154 @@ impl<'p> Function<'_, 'p> {
 
     fn program(&self) -> &'p Program {
         self.tables.program
+    }
+
+    fn fact(&self, local: usize) -> Option<u64> {
+        self.facts
+            .iter()
+            .rev()
+            .find(|(known, _)| *known == local)
+            .and_then(|(_, most)| *most)
+    }
+
+    fn learn(&mut self, local: usize, most: Option<u64>) {
+        if !self.fixed.get(local).copied().unwrap_or(false) {
+            return;
+        }
+        let most = match (self.fact(local), most) {
+            (Some(known), Some(new)) => Some(known.min(new)),
+            (_, new) => new,
+        };
+        self.facts.push((local, most));
+    }
+
+    fn scoped<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let kept = self.facts.len();
+        let result = body(self);
+        self.facts.truncate(kept);
+        result
+    }
+
+    fn capacity_of(&self, expr: &Expr) -> Option<u64> {
+        let Expr::Local(local) = expr else {
+            return None;
+        };
+        match &self.handler.locals[*local].ty {
+            Type::Bytes(capacity) | Type::List { capacity, .. } => Some(capacity.value),
+            _ => None,
+        }
+    }
+
+    fn divisor(&self, expr: &Expr) -> Option<u64> {
+        match expr {
+            Expr::U64(value) => Some(*value),
+            Expr::Constant(constant) => Some(self.program().constants[*constant].value),
+            _ => None,
+        }
+        .filter(|value| *value > 0)
+    }
+
+    fn most(&self, expr: &Expr) -> Option<u64> {
+        match expr {
+            Expr::U64(value) => Some(*value),
+            Expr::Bool(_) | Expr::Not(_) => Some(1),
+            Expr::Constant(constant) => Some(self.program().constants[*constant].value),
+            Expr::Local(local) => self.fact(*local),
+            Expr::Len(operand) => self.capacity_of(operand),
+            Expr::Bytes {
+                op: ir::BytesOp::Get,
+                ..
+            } => Some(u64::from(u8::MAX)),
+            Expr::Binary {
+                op, left, right, ..
+            } => match op {
+                BinaryOp::Add => self.most(left)?.checked_add(self.most(right)?),
+                BinaryOp::Multiply => self.most(left)?.checked_mul(self.most(right)?),
+                BinaryOp::Divide => self.divisor(right).and(self.most(left)),
+                BinaryOp::Remainder => {
+                    let below = self.divisor(right)? - 1;
+                    Some(self.most(left).map_or(below, |most| most.min(below)))
+                }
+                BinaryOp::Less
+                | BinaryOp::LessEqual
+                | BinaryOp::Greater
+                | BinaryOp::GreaterEqual
+                | BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::And
+                | BinaryOp::Or => Some(1),
+                BinaryOp::Subtract | BinaryOp::Concat => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn proven(&self, op: BinaryOp, left: &Expr, right: &Expr) -> bool {
+        match op {
+            BinaryOp::Add => self
+                .most(left)
+                .zip(self.most(right))
+                .is_some_and(|(left, right)| left.checked_add(right).is_some()),
+            BinaryOp::Multiply => self
+                .most(left)
+                .zip(self.most(right))
+                .is_some_and(|(left, right)| left.checked_mul(right).is_some()),
+            BinaryOp::Divide | BinaryOp::Remainder => self.divisor(right).is_some(),
+            _ => false,
+        }
+    }
+
+    fn may_halt(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::U64(_)
+            | Expr::Bool(_)
+            | Expr::Text(_)
+            | Expr::Constant(_)
+            | Expr::Local(_)
+            | Expr::Field(_) => false,
+            Expr::Not(operand) | Expr::Len(operand) => self.may_halt(operand),
+            Expr::Binary {
+                op,
+                operand,
+                left,
+                right,
+            } => {
+                let quiet = match op {
+                    BinaryOp::Add | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Remainder => {
+                        self.proven(*op, left, right)
+                    }
+                    BinaryOp::Subtract | BinaryOp::Concat => false,
+                    BinaryOp::Equal | BinaryOp::NotEqual => {
+                        matches!(operand, Type::U64 | Type::Bool)
+                    }
+                    BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual
+                    | BinaryOp::And
+                    | BinaryOp::Or => true,
+                };
+                !quiet || self.may_halt(left) || self.may_halt(right)
+            }
+            _ => true,
+        }
+    }
+
+    fn checked(&mut self, expr: &Expr) -> Result<(), String> {
+        self.expr(expr)?;
+        if self.may_halt(expr) {
+            self.halt_check();
+        }
+        Ok(())
+    }
+
+    fn learn_index(&mut self, base: &Expr, index: &Expr) {
+        if let (Some(capacity), Expr::Local(local)) = (self.capacity_of(base), index) {
+            self.learn(*local, capacity.checked_sub(1));
+        }
     }
 
     fn expr(&mut self, expr: &Expr) -> Result<(), String> {
@@ -232,7 +382,7 @@ impl<'p> Function<'_, 'p> {
                 self.emit("i64.const 0");
                 return Ok(());
             }
-            ir::BytesOp::OfText => {
+            ir::BytesOp::OfText | ir::BytesOp::OfHex => {
                 let Expr::Constant(capacity) = &args[1] else {
                     panic!("the checker passes bytes_of its capacity constant");
                 };
@@ -240,13 +390,29 @@ impl<'p> Function<'_, 'p> {
                 self.expr(&args[0])?;
                 self.emit(format!("i64.const {}", constant.value));
                 self.trap_name(&constant.name.clone());
-                self.emit("call $bytes_of_text");
+                if op == ir::BytesOp::OfHex {
+                    self.trap_name(crate::run::pure::HEX_TRAP);
+                    self.emit("call $bytes_of_hex");
+                } else {
+                    self.emit("call $bytes_of_text");
+                }
+                return Ok(());
+            }
+            ir::BytesOp::ToHex => {
+                self.expr(&args[0])?;
+                self.emit("call $bytes_hex");
                 return Ok(());
             }
             ir::BytesOp::Get | ir::BytesOp::Slice | ir::BytesOp::ToText => {}
         }
         for arg in args {
             self.expr(arg)?;
+        }
+        if op == ir::BytesOp::Get {
+            self.trap_name("index");
+            self.emit("call $bytes_get");
+            self.learn_index(&args[0], &args[1]);
+            return Ok(());
         }
         let (trap, call) = match op {
             ir::BytesOp::Get => ("index", "call $bytes_get"),
@@ -290,6 +456,13 @@ impl<'p> Function<'_, 'p> {
         self.trap_name(&capacity.name);
         match (ty, append) {
             (Type::Bytes(_), true) => self.emit("call $bytes_append"),
+            (Type::Bytes(_), false)
+                if self
+                    .most(value)
+                    .is_some_and(|most| most <= u64::from(u8::MAX)) =>
+            {
+                self.emit("call $bytes_push_byte");
+            }
             (Type::Bytes(_), false) => {
                 self.trap_name("byte");
                 self.emit("call $bytes_push");
@@ -317,11 +490,13 @@ impl<'p> Function<'_, 'p> {
         self.emit(format!("i64.const {bound}"));
         self.emit("i64.ge_u");
         self.emit(format!("br_if $break{label}"));
-        self.expr(condition)?;
-        self.halt_check();
-        self.emit("i64.eqz");
-        self.emit(format!("br_if $break{label}"));
-        self.block(body)?;
+        self.scoped(|function| {
+            function.learn(index, bound.checked_sub(1));
+            function.checked(condition)?;
+            function.emit("i64.eqz");
+            function.emit(format!("br_if $break{label}"));
+            function.block(body)
+        })?;
         self.emit(format!("local.get $l{index}"));
         self.emit("i64.const 1");
         self.emit("i64.add");
@@ -346,6 +521,17 @@ impl<'p> Function<'_, 'p> {
         self.expr(right)?;
         let compare = |name: &str| vec![name.to_owned(), "i64.extend_i32_u".to_owned()];
         let lines = match op {
+            BinaryOp::Add | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Remainder
+                if self.proven(op, left, right) =>
+            {
+                let raw = match op {
+                    BinaryOp::Add => "i64.add",
+                    BinaryOp::Multiply => "i64.mul",
+                    BinaryOp::Divide => "i64.div_u",
+                    _ => "i64.rem_u",
+                };
+                vec![raw.to_owned()]
+            }
             BinaryOp::Add => vec!["call $u64_add".to_owned()],
             BinaryOp::Subtract => vec!["call $u64_subtract".to_owned()],
             BinaryOp::Multiply => vec!["call $u64_multiply".to_owned()],
@@ -399,9 +585,14 @@ impl<'p> Function<'_, 'p> {
 
     fn statement(&mut self, statement: &Stmt) -> Result<(), String> {
         match statement {
-            Stmt::Let { local, value } | Stmt::Set { local, value } => {
-                self.expr(value)?;
-                self.halt_check();
+            Stmt::Let { local, value } => {
+                self.checked(value)?;
+                self.emit(format!("local.set $l{local}"));
+                let most = self.most(value);
+                self.learn(*local, most);
+            }
+            Stmt::Set { local, value } => {
+                self.checked(value)?;
                 self.emit(format!("local.set $l{local}"));
             }
             Stmt::SetIndex {
@@ -432,13 +623,12 @@ impl<'p> Function<'_, 'p> {
                 then,
                 otherwise,
             } => {
-                self.expr(condition)?;
-                self.halt_check();
+                self.checked(condition)?;
                 self.emit("i32.wrap_i64");
                 self.emit("if");
-                self.block(then)?;
+                self.scoped(|function| function.block(then))?;
                 self.emit("else");
-                self.block(otherwise)?;
+                self.scoped(|function| function.block(otherwise))?;
                 self.emit("end");
             }
             Stmt::Match { subject, arms, .. } => self.matched(subject, arms)?,
@@ -448,8 +638,7 @@ impl<'p> Function<'_, 'p> {
             } => self.each(*item, list, body)?,
             Stmt::Effect { site, args, result } => self.effect(*site, args, *result)?,
             Stmt::Finish { value } => {
-                self.expr(value)?;
-                self.halt_check();
+                self.checked(value)?;
                 self.emit("local.set $result");
                 self.emit("br $exit");
             }
@@ -761,7 +950,7 @@ impl<'p> Function<'_, 'p> {
                     self.emit(format!("local.set $l{local}"));
                 }
             }
-            self.block(&arm.body)?;
+            self.scoped(|function| function.block(&arm.body))?;
             self.emit("end");
         }
         Ok(())
@@ -777,7 +966,10 @@ impl<'p> Function<'_, 'p> {
         self.emit(format!("i64.const {bound}"));
         self.emit("i64.ge_u");
         self.emit(format!("br_if $break{label}"));
-        self.block(body)?;
+        self.scoped(|function| {
+            function.learn(index, bound.checked_sub(1));
+            function.block(body)
+        })?;
         self.emit(format!("local.get $l{index}"));
         self.emit("i64.const 1");
         self.emit("i64.add");
@@ -810,7 +1002,7 @@ impl<'p> Function<'_, 'p> {
         self.emit("i32.wrap_i64");
         self.emit("call $list_get");
         self.emit(format!("local.set $l{item}"));
-        self.block(body)?;
+        self.scoped(|function| function.block(body))?;
         self.emit(format!("local.get {at}"));
         self.emit("i64.const 1");
         self.emit("i64.add");
@@ -877,6 +1069,8 @@ fn handler_function<'p>(
         body: Vec::new(),
         temps: 0,
         labels: 0,
+        facts: Vec::new(),
+        fixed: vec![false; handler.locals.len()],
     };
     for (position, local) in handler.params.iter().enumerate() {
         function.emit("local.get $arguments");
@@ -927,6 +1121,8 @@ fn pure_function<'p>(
         body: Vec::new(),
         temps: 0,
         labels: 0,
+        facts: Vec::new(),
+        fixed: fixed_locals(definition),
     };
     function.emit("block $exit");
     function.block(&definition.body)?;
@@ -951,6 +1147,40 @@ fn pure_function<'p>(
     }
     text.push_str("  local.get $result)\n");
     Ok(text)
+}
+
+fn assigned(statements: &[Stmt], fixed: &mut [bool]) {
+    for statement in statements {
+        match statement {
+            Stmt::Set { local, .. } => fixed[*local] = false,
+            Stmt::Effect { result, .. } | Stmt::Take { result, .. } => fixed[*result] = false,
+            Stmt::If {
+                then, otherwise, ..
+            } => {
+                assigned(then, fixed);
+                assigned(otherwise, fixed);
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    assigned(&arm.body, fixed);
+                }
+            }
+            Stmt::Loop { body, .. } | Stmt::For { body, .. } | Stmt::While { body, .. } => {
+                assigned(body, fixed)
+            }
+            Stmt::Let { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::Finish { .. } => {}
+            _ => fixed.fill(false),
+        }
+    }
+}
+
+fn fixed_locals(definition: &Handler) -> Vec<bool> {
+    let mut fixed = vec![true; definition.locals.len()];
+    assigned(&definition.body, &mut fixed);
+    fixed
 }
 
 fn refuse_unsupported(program: &Program) -> Result<(), String> {

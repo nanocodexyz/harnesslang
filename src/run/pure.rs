@@ -78,9 +78,55 @@ pub fn bytes(
         BytesOp::ToText => Value::Text(
             String::from_utf8(args[0].as_bytes().to_vec()).map_err(|_| "text_of".to_owned())?,
         ),
+        BytesOp::OfHex => {
+            let Expr::Constant(capacity) = &exprs[1] else {
+                panic!("the checker passes bytes_of_hex its capacity constant");
+            };
+            let capacity = &program.constants[*capacity];
+            Value::Bytes(Rc::new(unhex(args[0].as_text().as_bytes(), capacity)?))
+        }
+        BytesOp::ToHex => Value::Text(hex(args[0].as_bytes())),
         BytesOp::Empty => Value::Bytes(Rc::default()),
         BytesOp::EmptyList => Value::List(Vec::new()),
     })
+}
+
+pub const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+pub const HEX_TRAP: &str = "hex";
+pub const NIBBLE_BITS: u32 = 4;
+
+pub fn nibble(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn unhex(digits: &[u8], capacity: &ir::Constant) -> Result<Vec<u8>, String> {
+    if digits.len() % 2 != 0 {
+        return Err(HEX_TRAP.to_owned());
+    }
+    if (digits.len() / 2) as u64 > capacity.value {
+        return Err(format!("bound({})", capacity.name));
+    }
+    digits
+        .chunks_exact(2)
+        .map(|pair| match (nibble(pair[0]), nibble(pair[1])) {
+            (Some(high), Some(low)) => Ok((high << NIBBLE_BITS) | low),
+            _ => Err(HEX_TRAP.to_owned()),
+        })
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX_DIGITS[usize::from(byte >> NIBBLE_BITS)]));
+        out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 pub fn index(base: &Value, index: &Value) -> Result<Value, String> {

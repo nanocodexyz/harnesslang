@@ -4,3 +4,4 @@
 /hosts/native/target
 /scripts/fixtures/target
 __pycache__/
+/compiler/bench/target

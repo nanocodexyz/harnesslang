@@ -1,9 +1,13 @@
 use super::compile::{Binary, Code, Load, Store, Unary};
 use super::decode::{MEMORY_PAGES_MAX, Module};
-use super::specialize::{Crc, Inst, Scan, Test};
+use super::specialize::{Crc, Hex, Inst, Scan, Test, Unhex};
 use super::{Error, Host, Trap, Value};
 use crate::emit::wasm::encode::PAGE_BYTES;
 
+const BYTE_VALUES: u32 = 256;
+const CRC_WORD_BYTES: usize = 4;
+const CRC_TABLE_BYTES: u32 = BYTE_VALUES * CRC_WORD_BYTES as u32;
+const HEX_DIGIT_COUNT: u32 = 16;
 pub const NODE_STACK_BYTES: usize = 984 * 1024;
 pub const SLOT_BYTES: usize = 8;
 pub const FRAME_BYTES_MIN: usize = 4 * SLOT_BYTES;
@@ -75,6 +79,13 @@ impl Memory {
             Some(bytes) => Ok(bytes.try_into().expect("a range of n bytes is n bytes")),
             None => Err(Trap::MemoryOutOfBounds),
         }
+    }
+
+    fn span(&self, base: u32, from: u32, to: u32) -> Option<std::ops::Range<usize>> {
+        let start = u64::from(base) + u64::from(from);
+        let end = u64::from(base) + u64::from(to.max(from));
+        (end <= u64::from(u32::MAX) && end <= self.bytes.len() as u64)
+            .then_some(start as usize..end as usize)
     }
 
     fn byte(&self, address: u64) -> Result<u8, Trap> {
@@ -994,6 +1005,18 @@ impl<'a> Instance<'a> {
                     executed += ops - 1;
                     pc = target as usize;
                 }
+                Inst::Unhex { unhex } => {
+                    let unhex = code.loops.unhexes[unhex as usize];
+                    let (target, ops) = check!(self.unhex(unhex, stack, base));
+                    executed += ops - 1;
+                    pc = target as usize;
+                }
+                Inst::Hex { hex } => {
+                    let hex = code.loops.hexes[hex as usize];
+                    let (target, ops) = check!(self.hex(hex, stack, base));
+                    executed += ops - 1;
+                    pc = target as usize;
+                }
                 Inst::JumpIf { condition, target } => {
                     if slot!(condition) as u32 != 0 {
                         pc = target as usize;
@@ -1163,6 +1186,49 @@ impl<'a> Instance<'a> {
         let slot = |index: u32| base + index as usize;
         let end = stack[slot(scan.end)] as u32;
         let start = stack[slot(scan.base)] as u32;
+        let at = stack[slot(scan.at)] as u32;
+        let table = match scan.test {
+            Test::Table { table, .. } => self.memory.span(table, 0, BYTE_VALUES),
+            Test::Equal(_) => Some(0..0),
+        };
+        let (Some(bytes), Some(table)) = (self.memory.span(start, at, end), table) else {
+            return self.scan_bytewise(scan, stack, base);
+        };
+        let memory = &self.memory.bytes;
+        let bytes = &memory[bytes];
+        let table = &memory[table];
+        let hit = |byte: u8| match scan.test {
+            Test::Equal(value) => u32::from(byte) == value,
+            Test::Table { .. } => table[usize::from(byte)] != 0,
+        };
+        let position = bytes.iter().position(|byte| hit(*byte));
+        let iterations = position.unwrap_or(bytes.len());
+        let last = position.or(iterations.checked_sub(1));
+        if let Some(last) = last {
+            let byte = bytes[last];
+            stack[slot(scan.byte)] = u64::from(byte);
+            if let Test::Table { class, .. } = scan.test {
+                stack[slot(class)] = u64::from(table[usize::from(byte)]);
+            }
+        }
+        stack[slot(scan.at)] = u64::from(at.wrapping_add(iterations as u32));
+        let target = if position.is_some() {
+            scan.found
+        } else {
+            scan.done
+        };
+        Ok((target, scan.ops(iterations as u64, position.is_some())))
+    }
+
+    fn scan_bytewise(
+        &self,
+        scan: Scan,
+        stack: &mut [u64],
+        base: usize,
+    ) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(scan.end)] as u32;
+        let start = stack[slot(scan.base)] as u32;
         let mut at = stack[slot(scan.at)] as u32;
         let mut iterations: u64 = 0;
         let found = loop {
@@ -1196,6 +1262,43 @@ impl<'a> Instance<'a> {
         let slot = |index: u32| base + index as usize;
         let end = stack[slot(crc.end)] as u32;
         let start = stack[slot(crc.base)] as u32;
+        let at = stack[slot(crc.at)] as u32;
+        let table = self.memory.span(crc.table, 0, CRC_TABLE_BYTES);
+        let (Some(bytes), Some(table)) = (self.memory.span(start, at, end), table) else {
+            return self.crc_bytewise(crc, stack, base);
+        };
+        let memory = &self.memory.bytes;
+        let table = &memory[table];
+        let mut value = stack[slot(crc.crc)] as u32;
+        let mut last = None;
+        for byte in &memory[bytes.clone()] {
+            let shifted = value >> Crc::BYTE_BITS;
+            let byte = u32::from(*byte);
+            let index = ((value ^ byte) & Crc::BYTE_MASK).wrapping_shl(Crc::WORD_SHIFT);
+            let at = index as usize;
+            let word = u32::from_le_bytes(
+                table[at..at + CRC_WORD_BYTES]
+                    .try_into()
+                    .expect("a crc table word is four bytes"),
+            );
+            value = shifted ^ word;
+            last = Some((shifted, byte, index, word));
+        }
+        if let Some((shifted, byte, index, word)) = last {
+            stack[slot(crc.shifted)] = u64::from(shifted);
+            stack[slot(crc.byte)] = u64::from(byte);
+            stack[slot(crc.index)] = u64::from(index);
+            stack[slot(crc.word)] = u64::from(word);
+            stack[slot(crc.crc)] = u64::from(value);
+            stack[slot(crc.at)] = u64::from(end);
+        }
+        Ok((crc.done, Crc::ops(bytes.len() as u64)))
+    }
+
+    fn crc_bytewise(&self, crc: Crc, stack: &mut [u64], base: usize) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(crc.end)] as u32;
+        let start = stack[slot(crc.base)] as u32;
         let mut at = stack[slot(crc.at)] as u32;
         let mut value = stack[slot(crc.crc)] as u32;
         let mut iterations: u64 = 0;
@@ -1216,6 +1319,178 @@ impl<'a> Instance<'a> {
             iterations += 1;
         }
         Ok((crc.done, Crc::ops(iterations)))
+    }
+
+    fn unhex(&mut self, unhex: Unhex, stack: &mut [u64], base: usize) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(unhex.end)] as u32;
+        let from = stack[slot(unhex.from)] as u32;
+        let into = stack[slot(unhex.into)] as u32;
+        let mut at = stack[slot(unhex.at)] as u32;
+        let reads = end
+            .checked_add(1)
+            .and_then(|last| self.memory.span(from, at, last));
+        let writes = self.memory.span(into, at >> 1, end.div_ceil(2));
+        let values = self.memory.span(unhex.values, 0, BYTE_VALUES);
+        let (Some(_), Some(_), Some(values)) = (reads, writes, values) else {
+            return self.unhex_bytewise(unhex, stack, base);
+        };
+        let memory = &mut self.memory.bytes;
+        let values = values.start;
+        let mut pairs: u64 = 0;
+        let mut last = None;
+        let invalid = loop {
+            if at >= end {
+                break false;
+            }
+            let digits = (from + at) as usize;
+            let second = memory[digits + 1];
+            let high = u32::from(memory[values + usize::from(memory[digits])]);
+            let low = u32::from(memory[values + usize::from(second)]);
+            if (high | low) > Unhex::NIBBLE_MAX {
+                last = Some((u32::from(second), high, low, high | low));
+                break true;
+            }
+            let address = into + (at >> 1);
+            let joined = (high << Unhex::NIBBLE_BITS) | low;
+            memory[address as usize] = joined as u8;
+            last = Some((joined, high, low, address));
+            at += 2;
+            pairs += 1;
+        };
+        if let Some((scratch, high, low, pair)) = last {
+            stack[slot(unhex.scratch)] = u64::from(scratch);
+            stack[slot(unhex.high)] = u64::from(high);
+            stack[slot(unhex.low)] = u64::from(low);
+            stack[slot(unhex.pair)] = u64::from(pair);
+            stack[slot(unhex.at)] = u64::from(at);
+        }
+        let target = if invalid { unhex.invalid } else { unhex.done };
+        Ok((target, Unhex::ops(pairs, invalid)))
+    }
+
+    fn unhex_bytewise(
+        &mut self,
+        unhex: Unhex,
+        stack: &mut [u64],
+        base: usize,
+    ) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(unhex.end)] as u32;
+        let from = stack[slot(unhex.from)] as u32;
+        let into = stack[slot(unhex.into)] as u32;
+        let mut at = stack[slot(unhex.at)] as u32;
+        let mut pairs: u64 = 0;
+        let invalid = loop {
+            if at >= end {
+                break false;
+            }
+            let first = self.memory.byte(u64::from(from.wrapping_add(at)))?;
+            let high = u32::from(
+                self.memory
+                    .byte(u64::from(u32::from(first).wrapping_add(unhex.values)))?,
+            );
+            stack[slot(unhex.scratch)] = u64::from(first);
+            stack[slot(unhex.high)] = u64::from(high);
+            let second = self.memory.byte(u64::from(from.wrapping_add(at)) + 1)?;
+            stack[slot(unhex.scratch)] = u64::from(second);
+            let low = u32::from(
+                self.memory
+                    .byte(u64::from(u32::from(second).wrapping_add(unhex.values)))?,
+            );
+            stack[slot(unhex.low)] = u64::from(low);
+            stack[slot(unhex.pair)] = u64::from(high | low);
+            if (high | low) > Unhex::NIBBLE_MAX {
+                break true;
+            }
+            let address = into.wrapping_add(at >> 1);
+            stack[slot(unhex.pair)] = u64::from(address);
+            let joined = (high << Unhex::NIBBLE_BITS) | low;
+            stack[slot(unhex.scratch)] = u64::from(joined);
+            self.memory.store(u64::from(address), &[joined as u8])?;
+            at = at.wrapping_add(2);
+            stack[slot(unhex.at)] = u64::from(at);
+            pairs += 1;
+        };
+        let target = if invalid { unhex.invalid } else { unhex.done };
+        Ok((target, Unhex::ops(pairs, invalid)))
+    }
+
+    fn hex(&mut self, hex: Hex, stack: &mut [u64], base: usize) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(hex.end)] as u32;
+        let from = stack[slot(hex.from)] as u32;
+        let into = stack[slot(hex.into)] as u32;
+        let at = stack[slot(hex.at)] as u32;
+        let reads = self.memory.span(from, at, end);
+        let writes = end
+            .checked_mul(2)
+            .and_then(|last| self.memory.span(into, at.saturating_mul(2), last));
+        let digits = self.memory.span(hex.digits, 0, HEX_DIGIT_COUNT);
+        let (Some(reads), Some(_), Some(digits)) = (reads, writes, digits) else {
+            return self.hex_bytewise(hex, stack, base);
+        };
+        if at >= end {
+            return Ok((hex.done, Hex::ops(0)));
+        }
+        let memory = &mut self.memory.bytes;
+        let digits = digits.start;
+        let mut last = (0, 0, 0, 0);
+        for (step, read) in reads.enumerate() {
+            let byte = u32::from(memory[read]);
+            let address = into + ((at + step as u32) << 1);
+            let nibble = byte & Hex::NIBBLE_MASK;
+            memory[address as usize] = memory[digits + (byte >> Hex::NIBBLE_BITS) as usize];
+            let low = memory[digits + nibble as usize];
+            memory[address as usize + 1] = low;
+            last = (byte, u32::from(low), address, nibble);
+        }
+        let (byte, low, address, nibble) = last;
+        stack[slot(hex.byte)] = u64::from(byte);
+        stack[slot(hex.doubled)] = u64::from(low);
+        stack[slot(hex.address)] = u64::from(address);
+        stack[slot(hex.nibble)] = u64::from(nibble);
+        stack[slot(hex.at)] = u64::from(end);
+        Ok((hex.done, Hex::ops(u64::from(end - at))))
+    }
+
+    fn hex_bytewise(
+        &mut self,
+        hex: Hex,
+        stack: &mut [u64],
+        base: usize,
+    ) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(hex.end)] as u32;
+        let from = stack[slot(hex.from)] as u32;
+        let into = stack[slot(hex.into)] as u32;
+        let mut at = stack[slot(hex.at)] as u32;
+        let mut bytes: u64 = 0;
+        while at < end {
+            let byte = u32::from(self.memory.byte(u64::from(from.wrapping_add(at)))?);
+            stack[slot(hex.byte)] = u64::from(byte);
+            stack[slot(hex.doubled)] = u64::from(at << 1);
+            let address = into.wrapping_add(at << 1);
+            stack[slot(hex.address)] = u64::from(address);
+            stack[slot(hex.nibble)] = u64::from(byte >> Hex::NIBBLE_BITS);
+            let high = self.memory.byte(u64::from(
+                (byte >> Hex::NIBBLE_BITS).wrapping_add(hex.digits),
+            ))?;
+            stack[slot(hex.doubled)] = u64::from(high);
+            self.memory.store(u64::from(address), &[high])?;
+            stack[slot(hex.doubled)] = u64::from(at << 1);
+            let nibble = byte & Hex::NIBBLE_MASK;
+            stack[slot(hex.nibble)] = u64::from(nibble);
+            let low = self
+                .memory
+                .byte(u64::from(nibble.wrapping_add(hex.digits)))?;
+            stack[slot(hex.doubled)] = u64::from(low);
+            self.memory.store(u64::from(address) + 1, &[low])?;
+            at = at.wrapping_add(1);
+            stack[slot(hex.at)] = u64::from(at);
+            bytes += 1;
+        }
+        Ok((hex.done, Hex::ops(bytes)))
     }
 
     fn other(&mut self, inst: Inst, stack: &mut [u64], base: usize) -> Result<(), Trap> {

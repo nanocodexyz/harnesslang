@@ -101,7 +101,11 @@ fn fresh(value: &Expr) -> bool {
         value,
         Expr::Copy { .. }
             | Expr::Bytes {
-                op: BytesOp::Empty | BytesOp::EmptyList | BytesOp::OfText | BytesOp::Slice,
+                op: BytesOp::Empty
+                    | BytesOp::EmptyList
+                    | BytesOp::OfText
+                    | BytesOp::OfHex
+                    | BytesOp::Slice,
                 ..
             }
     )
@@ -537,7 +541,11 @@ impl Checker<'_> {
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
         self.pure_only(at, &format!("{}(...)", op.name()))?;
-        let arity = if op == BytesOp::OfText { 1 } else { op.arity() };
+        let arity = if matches!(op, BytesOp::OfText | BytesOp::OfHex) {
+            1
+        } else {
+            op.arity()
+        };
         if args.len() != arity {
             return error(
                 at,
@@ -550,11 +558,14 @@ impl Checker<'_> {
         }
         let mut values = Vec::with_capacity(arity);
         let result = match op {
-            BytesOp::OfText => {
+            BytesOp::OfText | BytesOp::OfHex => {
                 let Some(ty @ Type::Bytes(_)) = expected else {
                     return error(
                         at,
-                        "bytes_of takes its capacity from where it goes, such as let b: bytes<N> = bytes_of(t)",
+                        format!(
+                            "{name} takes its capacity from where it goes, such as let b: bytes<N> = {name}(t)",
+                            name = op.name()
+                        ),
                     );
                 };
                 let ty = ty.clone();
@@ -574,7 +585,7 @@ impl Checker<'_> {
                 values.push(Expr::Constant(constant));
                 ty
             }
-            BytesOp::ToText | BytesOp::Slice => {
+            BytesOp::ToText | BytesOp::ToHex | BytesOp::Slice => {
                 let arg_at = args[0].at();
                 let (value, found) = self.borrowed(&args[0], out)?;
                 if !matches!(found, Type::Bytes(_)) {
@@ -594,14 +605,16 @@ impl Checker<'_> {
                     self.expect(arg_at, &Type::U64, &ty)?;
                     values.push(value);
                 }
-                if op == BytesOp::ToText {
+                if matches!(op, BytesOp::ToText | BytesOp::ToHex) {
                     Type::Text
                 } else {
                     found
                 }
             }
             BytesOp::Get | BytesOp::Empty | BytesOp::EmptyList => {
-                unreachable!("only bytes_of, text_of and slice are called by name")
+                unreachable!(
+                    "only bytes_of, text_of, bytes_of_hex, hex_of and slice are called by name"
+                )
             }
         };
         Ok((Expr::Bytes { op, args: values }, result))

@@ -500,7 +500,7 @@ Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `allow` `before` `bytes_of` `contains` `deny` `dispatch` `hold` `join` `json_escape` `len` `now` `random` `respond` `slice` `suspend` `text_of` `trim` `truncate_middle` `wait`
+Builtins: `after` `allow` `before` `bytes_of` `bytes_of_hex` `contains` `deny` `dispatch` `hex_of` `hold` `join` `json_escape` `len` `now` `random` `respond` `slice` `suspend` `text_of` `trim` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -1986,11 +1986,21 @@ so a call writes nothing to the journal.
   (traps with `index` outside `b`), `bytes_of(t)` is the UTF-8 bytes of text
   `t` (traps with `bound(N)` past the capacity of where it goes), and
   `text_of(b)` is the text the bytes spell (traps with `text_of` unless they
-  are UTF-8). A byte buffer lives only inside pure fns: it goes in no state
+  are UTF-8). `hex_of(b)` is the lowercase hex of the bytes, two digits each,
+  and `bytes_of_hex(t)` is the bytes hex text spells, upper or lower case
+  (traps with `hex` on an odd length or a non-hex digit, and with `bound(N)`
+  past the capacity of where it goes). A byte buffer lives only inside pure fns: it goes in no state
   field, tool, sum, list or handler local, and a handler calls no pure fn
   that returns one.
 - Values stay values: a list or byte buffer handed to a `var`, a `let` or a
   call is a copy, so `set` changes only the `var` it names.
+- Compiled pure fns drop a runtime check they can show never fires: `+` and
+  `*` whose operands' largest values fit a u64, `/` and `%` by a nonzero
+  constant, and a `push` of a value below 256 skip their checks. Largest
+  values come from constants, loop indexes below their bound, a byte read,
+  `len` of a buffer, and a `let` no `set` changes, which an index that
+  succeeded also bounds by its buffer's capacity. Every other check stays
+  and traps as the interpreter does.
 
 Every pure fn is bounded: its loops have named bounds, its buffers have
 capacities and it never recurses, so every call ends. What the prover leaves
@@ -2066,6 +2076,35 @@ fn share(n: u64) -> text {
 
 on digest(input: text, n: u64) -> text {
   return hex(input) ++ " " ++ share(n) ++ " " ++ spread(n)
+}
+```
+
+This one turns text into bytes, spells them in hex and reads the hex back;
+`bytes_of_hex` traps with `hex` on input such as `hi`, which is no hex:
+
+```hl docs/snippets/pure_hex.hl
+harness hexes
+
+const buffer_max: u64 = 32
+
+fn round(input: text) -> text {
+  let raw: bytes<buffer_max> = bytes_of(input)
+  let spelled = hex_of(raw)
+  let back: bytes<buffer_max> = bytes_of_hex(spelled)
+  var folded: bytes<buffer_max> = []
+  loop i below buffer_max while i < len(back) {
+    push folded back[i] % 26 + 'a'
+  }
+  return text_of(folded) ++ " " ++ spelled
+}
+
+fn strict(input: text) -> text {
+  let parsed: bytes<buffer_max> = bytes_of_hex(input)
+  return hex_of(parsed)
+}
+
+on hexes(input: text) -> text {
+  return round(input) ++ " " ++ strict(input)
 }
 ```
 
