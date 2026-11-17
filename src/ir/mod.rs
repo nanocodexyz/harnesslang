@@ -71,6 +71,7 @@ pub enum Type {
     Known(Box<Type>),
     Maybe(Box<Type>),
     Blob(Bound),
+    Bytes(Bound),
 }
 
 impl Type {
@@ -86,6 +87,7 @@ impl Type {
             Self::Known(inner) => format!("known<{}>", inner.name(program)),
             Self::Maybe(inner) => format!("maybe<{}>", inner.name(program)),
             Self::Blob(bytes) => format!("blob<{}>", bytes.name),
+            Self::Bytes(capacity) => format!("bytes<{}>", capacity.name),
         }
     }
 
@@ -99,7 +101,21 @@ impl Type {
                 .iter()
                 .flat_map(|variant| &variant.fields)
                 .any(|field| matches!(field, Self::Blob(_))),
-            Self::U64 | Self::Bool | Self::Text => false,
+            Self::U64 | Self::Bool | Self::Text | Self::Bytes(_) => false,
+        }
+    }
+
+    pub fn holds_bytes(&self, program: &Program) -> bool {
+        match self {
+            Self::Bytes(_) => true,
+            Self::List { element, .. } => element.holds_bytes(program),
+            Self::Known(inner) | Self::Maybe(inner) => inner.holds_bytes(program),
+            Self::Sum(sum) => program.sums[*sum]
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .any(|field| field.holds_bytes(program)),
+            Self::U64 | Self::Bool | Self::Text | Self::Blob(_) => false,
         }
     }
 
@@ -119,7 +135,12 @@ impl Type {
             Self::Sum(sum) => Some(program.sums[*sum].variants.clone()),
             Self::Known(inner) => Some(outcome_variants(inner, false)),
             Self::Maybe(inner) => Some(outcome_variants(inner, true)),
-            Self::U64 | Self::Bool | Self::Text | Self::List { .. } | Self::Blob(_) => None,
+            Self::U64
+            | Self::Bool
+            | Self::Text
+            | Self::List { .. }
+            | Self::Blob(_)
+            | Self::Bytes(_) => None,
         }
     }
 }
@@ -176,6 +197,7 @@ pub struct Program {
     pub invariants: Vec<Invariant>,
     pub handlers: Vec<Handler>,
     pub sides: Vec<Handler>,
+    pub functions: Vec<Handler>,
     pub events: Events,
     pub cuts: Vec<u64>,
     pub notice: Option<VariantId>,
@@ -1136,6 +1158,26 @@ pub enum Stmt {
     Finish {
         value: Expr,
     },
+    Set {
+        local: LocalId,
+        value: Expr,
+    },
+    SetIndex {
+        local: LocalId,
+        index: Expr,
+        value: Expr,
+    },
+    PushLocal {
+        local: LocalId,
+        value: Expr,
+        append: bool,
+    },
+    While {
+        index: LocalId,
+        bound: Bound,
+        condition: Expr,
+        body: Vec<Stmt>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1253,7 +1295,103 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
         | Stmt::Rewrite { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
-        | Stmt::Finish { .. } => statement.clone(),
+        | Stmt::Finish { .. }
+        | Stmt::Set { .. }
+        | Stmt::SetIndex { .. }
+        | Stmt::PushLocal { .. }
+        | Stmt::While { .. } => statement.clone(),
+    }
+}
+
+pub fn visit_exprs(statements: &[Stmt], visit: &mut dyn FnMut(&Expr)) {
+    for statement in statements {
+        match statement {
+            Stmt::Let { value, .. }
+            | Stmt::Assign { value, .. }
+            | Stmt::Push { value, .. }
+            | Stmt::Set { value, .. }
+            | Stmt::PushLocal { value, .. }
+            | Stmt::Finish { value } => visit_expr(value, visit),
+            Stmt::SetIndex { index, value, .. } => {
+                visit_expr(index, visit);
+                visit_expr(value, visit);
+            }
+            Stmt::If {
+                condition,
+                then,
+                otherwise,
+            } => {
+                visit_expr(condition, visit);
+                visit_exprs(then, visit);
+                visit_exprs(otherwise, visit);
+            }
+            Stmt::Match { subject, arms, .. } => {
+                visit_expr(subject, visit);
+                arms.iter().for_each(|arm| visit_exprs(&arm.body, visit));
+            }
+            Stmt::Loop { body, .. } => visit_exprs(body, visit),
+            Stmt::While {
+                condition, body, ..
+            } => {
+                visit_expr(condition, visit);
+                visit_exprs(body, visit);
+            }
+            Stmt::For { list, body, .. } => {
+                visit_expr(list, visit);
+                visit_exprs(body, visit);
+            }
+            Stmt::Effect { args, .. } => args.iter().for_each(|arg| visit_expr(arg, visit)),
+            Stmt::Shrink { .. }
+            | Stmt::KeepBlobs { .. }
+            | Stmt::Rewrite { .. }
+            | Stmt::Parallel(_)
+            | Stmt::Take { .. } => {}
+        }
+    }
+}
+
+pub fn visit_expr(value: &Expr, visit: &mut dyn FnMut(&Expr)) {
+    visit(value);
+    match value {
+        Expr::Member { base: operand, .. }
+        | Expr::Not(operand)
+        | Expr::Len(operand)
+        | Expr::TextLen(operand)
+        | Expr::Truncate { text: operand, .. }
+        | Expr::Copy { value: operand, .. } => visit_expr(operand, visit),
+        Expr::Construct { fields: args, .. }
+        | Expr::TextBuiltin { args, .. }
+        | Expr::Call { args, .. }
+        | Expr::Bytes { args, .. } => args.iter().for_each(|arg| visit_expr(arg, visit)),
+        Expr::Binary { left, right, .. }
+        | Expr::With {
+            list: left,
+            entry: right,
+        }
+        | Expr::Index {
+            base: left,
+            index: right,
+        } => {
+            visit_expr(left, visit);
+            visit_expr(right, visit);
+        }
+        Expr::Outcome {
+            tag,
+            value,
+            reason,
+            original,
+            ..
+        } => [tag, value, reason, original]
+            .into_iter()
+            .for_each(|part| visit_expr(part, visit)),
+        Expr::U64(_)
+        | Expr::Bool(_)
+        | Expr::Text(_)
+        | Expr::Constant(_)
+        | Expr::Local(_)
+        | Expr::Field(_)
+        | Expr::ListingNotice(_)
+        | Expr::Cancelled => {}
     }
 }
 
@@ -1297,7 +1435,11 @@ pub fn has_parallel(statements: &[Stmt]) -> bool {
         | Stmt::Rewrite { .. }
         | Stmt::Effect { .. }
         | Stmt::Take { .. }
-        | Stmt::Finish { .. } => false,
+        | Stmt::Finish { .. }
+        | Stmt::Set { .. }
+        | Stmt::SetIndex { .. }
+        | Stmt::PushLocal { .. }
+        | Stmt::While { .. } => false,
     })
 }
 
@@ -1311,9 +1453,13 @@ fn expr_cuts(value: &Expr, constants: &[Constant], out: &mut Vec<u64>) {
         | Expr::Not(operand)
         | Expr::Len(operand)
         | Expr::TextLen(operand) => expr_cuts(operand, constants, out),
-        Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => fields
+        Expr::Construct { fields, .. }
+        | Expr::TextBuiltin { args: fields, .. }
+        | Expr::Call { args: fields, .. }
+        | Expr::Bytes { args: fields, .. } => fields
             .iter()
             .for_each(|field| expr_cuts(field, constants, out)),
+        Expr::Copy { value, .. } => expr_cuts(value, constants, out),
         Expr::Outcome {
             tag,
             value,
@@ -1327,6 +1473,10 @@ fn expr_cuts(value: &Expr, constants: &[Constant], out: &mut Vec<u64>) {
         | Expr::With {
             list: left,
             entry: right,
+        }
+        | Expr::Index {
+            base: left,
+            index: right,
         } => {
             expr_cuts(left, constants, out);
             expr_cuts(right, constants, out);
@@ -1348,7 +1498,19 @@ fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
             Stmt::Let { value, .. }
             | Stmt::Assign { value, .. }
             | Stmt::Push { value, .. }
+            | Stmt::Set { value, .. }
+            | Stmt::PushLocal { value, .. }
             | Stmt::Finish { value } => expr_cuts(value, constants, out),
+            Stmt::SetIndex { index, value, .. } => {
+                expr_cuts(index, constants, out);
+                expr_cuts(value, constants, out);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                expr_cuts(condition, constants, out);
+                block_cuts(body, constants, out);
+            }
             Stmt::Shrink { kept, .. } => match kept {
                 Kept::Nothing => {}
                 Kept::Last(count) => expr_cuts(count, constants, out),
@@ -1412,7 +1574,13 @@ impl Program {
 
     pub fn find_cuts(&self) -> Vec<u64> {
         let mut cuts = Vec::new();
-        for handler in self.handlers.iter().chain(&self.sides).chain(&self.forked) {
+        for handler in self
+            .handlers
+            .iter()
+            .chain(&self.sides)
+            .chain(&self.forked)
+            .chain(&self.functions)
+        {
             block_cuts(&handler.body, &self.constants, &mut cuts);
         }
         cuts.sort_unstable();
@@ -1514,6 +1682,61 @@ pub enum Expr {
         reason: Box<Expr>,
         original: Box<Expr>,
     },
+    Call {
+        function: FunctionId,
+        args: Vec<Expr>,
+    },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    Bytes {
+        op: BytesOp,
+        args: Vec<Expr>,
+    },
+    Copy {
+        value: Box<Expr>,
+        bytes: bool,
+    },
+}
+
+pub type FunctionId = usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BytesOp {
+    Get,
+    Slice,
+    OfText,
+    ToText,
+    Empty,
+    EmptyList,
+}
+
+impl BytesOp {
+    pub const NAMED: [Self; 3] = [Self::OfText, Self::ToText, Self::Slice];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Slice => "slice",
+            Self::OfText => "bytes_of",
+            Self::ToText => "text_of",
+            Self::Empty | Self::EmptyList => "[]",
+        }
+    }
+
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Empty | Self::EmptyList => 0,
+            Self::ToText => 1,
+            Self::Get | Self::OfText => 2,
+            Self::Slice => 3,
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::NAMED.into_iter().find(|op| op.name() == name)
+    }
 }
 
 pub const UTF16_UNITS_PER_TOKEN: u64 = 4;

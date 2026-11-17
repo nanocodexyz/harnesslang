@@ -429,7 +429,7 @@ pub fn collect(value: &Value, out: &mut Vec<String>) {
         Value::Blob(digest) => out.push(digest.clone()),
         Value::List(items) => items.iter().for_each(|item| collect(item, out)),
         Value::Variant(_, fields) => fields.iter().for_each(|field| collect(field, out)),
-        Value::U64(_) | Value::Bool(_) | Value::Text(_) => {}
+        Value::U64(_) | Value::Bool(_) | Value::Text(_) | Value::Bytes(_) => {}
     }
 }
 

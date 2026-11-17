@@ -143,6 +143,14 @@ fn capacity(ty: &Type) -> Option<i128> {
 fn modified(statements: &[Stmt], program: &Program, out: &mut BTreeSet<Quantity>) {
     for statement in statements {
         match statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Assign { field, .. } => match program.state[*field].ty {
                 Type::U64 => {
                     out.insert(Quantity::Field(*field));

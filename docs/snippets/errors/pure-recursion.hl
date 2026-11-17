@@ -1,0 +1,9 @@
+harness counting
+
+fn down(n: u64) -> u64 {
+  return down(n)
+}
+
+on go(n: u64) -> u64 {
+  return down(n)
+}

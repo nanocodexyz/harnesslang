@@ -744,11 +744,13 @@ fn fill(statements: Vec<Stmt>, slots: &mut Slots) -> Vec<Stmt> {
                 at,
                 name,
                 bound,
+                guard,
                 body,
             } => out.push(Stmt::Loop {
                 at,
                 name,
                 bound,
+                guard,
                 body: fill_block(body, slots),
             }),
             Stmt::For {
@@ -846,11 +848,13 @@ impl Yields<'_> {
                 at,
                 name,
                 bound,
+                guard,
                 body,
             } => Stmt::Loop {
                 at: *at,
                 name: name.clone(),
                 bound: bound.clone(),
+                guard: guard.clone(),
                 body: self.block(body)?,
             },
             Stmt::For {
@@ -984,7 +988,10 @@ fn pure(expr: &Expr, what: &str) -> Checked<()> {
             }
             Expr::Not { operand, .. } => pending.push(operand),
             Expr::Member { base, .. } => pending.push(base),
-            Expr::Take { at, .. } | Expr::With { at, .. } => {
+            Expr::Take { at, .. }
+            | Expr::With { at, .. }
+            | Expr::Index { at, .. }
+            | Expr::Empty(at) => {
                 return error(*at, format!("{what} is a pure predicate over the metrics"));
             }
             Expr::Number(..) | Expr::Text(..) | Expr::Bool(..) | Expr::Name(_) => {}
@@ -1027,6 +1034,10 @@ fn render(expr: &Expr, depth: u32) -> String {
             render(list, depth + 1),
             render(entry, depth + 1)
         ),
+        Expr::Index { base, index, .. } => {
+            format!("{}[{}]", render(base, depth + 1), render(index, depth + 1))
+        }
+        Expr::Empty(_) => "[]".to_owned(),
     }
 }
 
@@ -1422,11 +1433,13 @@ impl Lowering<'_> {
                 at,
                 name,
                 bound,
+                guard,
                 body,
             } => Stmt::Loop {
                 at: *at,
                 name: name.clone(),
                 bound: bound.clone(),
+                guard: guard.clone(),
                 body: self.block(body)?,
             },
             Stmt::For {

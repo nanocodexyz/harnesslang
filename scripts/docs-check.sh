@@ -252,7 +252,7 @@ if [ "${DOCS_CHECK_SELF:-1}" = 1 ]; then
   mutant snippet_body "but the block differs from the file" 's/(```hl docs\/snippets\/[^\n]+\n[^\n]*\n)/$1  \n/'
   mutant unnamed_block "an hl block names no file" 's/```hl docs\/snippets\//```hl\n```\n```hl docs\/snippets\//'
   mutant keyword_dropped "differs from KEYWORDS" 's/(\nKeywords: [^\n]*?) `requires`/$1/'
-  mutant terminal_added "the grammar's terminals" 's/(```ebnf\n)/$1while = "while" ;\n/'
+  mutant terminal_added "the grammar's terminals" 's/(```ebnf\n)/$1until = "until" ;\n/'
   mutant constant_value "src says" 's/(`NESTING_DEPTH_MAX` = )64/${1}65/'
   mutant prose_error "quoted outside a console block" 's/(\n## )/\nfile.hl:1:1: error: made up\n$1/'
 fi

@@ -1,0 +1,13 @@
+harness counting
+
+state {
+  total: u64
+}
+
+fn next(n: u64) -> u64 {
+  return n + total
+}
+
+on go(n: u64) -> u64 {
+  return next(n)
+}

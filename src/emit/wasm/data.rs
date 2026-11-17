@@ -126,6 +126,7 @@ impl<'p> Tables<'p> {
             Type::U64 => format!("{TYPE_U64} 0 0 0"),
             Type::Bool => format!("{TYPE_BOOL} 0 0 0"),
             Type::Text => format!("{TYPE_TEXT} 0 0 0"),
+            Type::Bytes(_) => return Err("emit: bytes live only inside pure fns".to_owned()),
             Type::List { element, capacity } => {
                 let element = self.ty(element)?;
                 let bound = self.text(&capacity.name);

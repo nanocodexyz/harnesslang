@@ -232,6 +232,7 @@ pub struct Param {
 pub struct Function {
     pub name: Name,
     pub params: Vec<Param>,
+    pub returns: Option<TypeExpr>,
     pub body: Block,
 }
 
@@ -273,6 +274,10 @@ pub enum TypeExpr {
         at: Position,
         bytes: Name,
     },
+    Bytes {
+        at: Position,
+        capacity: Name,
+    },
 }
 
 impl TypeExpr {
@@ -282,7 +287,8 @@ impl TypeExpr {
             Self::List { at, .. }
             | Self::Known { at, .. }
             | Self::Maybe { at, .. }
-            | Self::Blob { at, .. } => *at,
+            | Self::Blob { at, .. }
+            | Self::Bytes { at, .. } => *at,
         }
     }
 }
@@ -302,6 +308,17 @@ pub enum Stmt {
     },
     Assign {
         name: Name,
+        value: Expr,
+    },
+    Var {
+        name: Name,
+        ty: Option<TypeExpr>,
+        value: Expr,
+    },
+    SetIndex {
+        at: Position,
+        list: Name,
+        index: Expr,
         value: Expr,
     },
     Push {
@@ -344,6 +361,7 @@ pub enum Stmt {
         at: Position,
         name: Name,
         bound: Name,
+        guard: Option<Expr>,
         body: Block,
     },
     For {
@@ -463,6 +481,8 @@ pub enum BinaryOp {
     Add,
     Subtract,
     Multiply,
+    Divide,
+    Remainder,
     Concat,
     Equal,
     NotEqual,
@@ -480,6 +500,8 @@ impl BinaryOp {
             Self::Add => "+",
             Self::Subtract => "-",
             Self::Multiply => "*",
+            Self::Divide => "/",
+            Self::Remainder => "%",
             Self::Concat => "++",
             Self::Equal => "==",
             Self::NotEqual => "!=",
@@ -528,19 +550,26 @@ pub enum Expr {
         list: Box<Expr>,
         entry: Box<Expr>,
     },
+    Index {
+        at: Position,
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    Empty(Position),
 }
 
 impl Expr {
     pub fn at(&self) -> Position {
         match self {
-            Self::Number(_, at) | Self::Text(_, at) | Self::Bool(_, at) => *at,
+            Self::Number(_, at) | Self::Text(_, at) | Self::Bool(_, at) | Self::Empty(at) => *at,
             Self::Name(name) => name.at,
             Self::Member { base, .. } => base.at(),
             Self::Call { callee, .. } => callee.at,
             Self::Binary { at, .. }
             | Self::Not { at, .. }
             | Self::Take { at, .. }
-            | Self::With { at, .. } => *at,
+            | Self::With { at, .. }
+            | Self::Index { at, .. } => *at,
         }
     }
 }

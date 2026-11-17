@@ -171,6 +171,14 @@ fn repeat_assignments(statements: &mut Vec<Stmt>) {
     let mut out = Vec::with_capacity(statements.len());
     for mut statement in statements.drain(..) {
         match &mut statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Assign { .. } => out.push(statement.clone()),
             Stmt::If {
                 then, otherwise, ..

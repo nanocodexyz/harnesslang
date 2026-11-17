@@ -1,0 +1,13 @@
+harness counting
+
+const items_max: u64 = 8
+
+fn first(xs: list<u64, items_max>) -> u64 {
+  let ys = xs
+  set ys[0] = 1
+  return ys[0]
+}
+
+on go(n: u64) -> u64 {
+  return n
+}

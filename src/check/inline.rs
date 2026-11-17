@@ -166,7 +166,7 @@ pub fn expand(
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Function(function) => Some(function),
+            Item::Function(function) if function.returns.is_none() => Some(function),
             _ => None,
         })
         .collect();
@@ -220,6 +220,7 @@ fn declared(
     names.extend(globals.tools.keys().cloned());
     names.extend(globals.listings.keys().cloned());
     names.extend(globals.model.iter().cloned());
+    names.extend(globals.functions.keys().cloned());
     names.extend(BUILTIN_FUNCTIONS.iter().map(|name| (*name).to_owned()));
     names
 }
@@ -401,9 +402,17 @@ impl<'a> Inliner<'a> {
     fn statement(&mut self, walk: &mut Walk<'a>, statement: &'a Stmt) -> Checked<Stmt> {
         walk.count(super::handler::statement_at(statement), 1)?;
         match statement {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let { name, value, .. } | Stmt::Var { name, value, .. } => {
                 self.expr(walk, value)?;
                 walk.bind(name)?;
+                Ok(statement.clone())
+            }
+            Stmt::SetIndex {
+                list, index, value, ..
+            } => {
+                walk.reference(&self.declared, list)?;
+                self.expr(walk, index)?;
+                self.expr(walk, value)?;
                 Ok(statement.clone())
             }
             Stmt::Assign { name, value }
@@ -551,14 +560,20 @@ impl<'a> Inliner<'a> {
                 at,
                 name,
                 bound,
+                guard,
                 body,
             } => {
-                let body =
-                    walk.scoped(std::slice::from_ref(name), |walk| self.block(walk, body))?;
+                let body = walk.scoped(std::slice::from_ref(name), |walk| {
+                    if let Some(guard) = guard {
+                        self.expr(walk, guard)?;
+                    }
+                    self.block(walk, body)
+                })?;
                 Ok(Stmt::Loop {
                     at: *at,
                     name: name.clone(),
                     bound: bound.clone(),
+                    guard: guard.clone(),
                     body,
                 })
             }
@@ -674,7 +689,11 @@ impl<'a> Inliner<'a> {
                     pending.push(left);
                 }
                 Expr::Not { operand, .. } => pending.push(operand),
-                Expr::Take { .. } => {}
+                Expr::Index { base, index, .. } => {
+                    pending.push(index);
+                    pending.push(base);
+                }
+                Expr::Take { .. } | Expr::Empty(_) => {}
             }
         }
         Ok(())

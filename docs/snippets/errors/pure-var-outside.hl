@@ -1,0 +1,6 @@
+harness counting
+
+on go(n: u64) -> u64 {
+  var count = n
+  return count
+}

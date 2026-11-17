@@ -1,0 +1,8 @@
+harness buffers
+
+const buffer_max: u64 = 64
+
+on go(input: text) -> u64 {
+  let buffer: bytes<buffer_max> = bytes_of(input)
+  return len(buffer)
+}

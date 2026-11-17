@@ -533,8 +533,19 @@ impl<'a> Parser<'a> {
         self.word("fn")?;
         let name = self.name("a fn name")?;
         let params = self.params()?;
+        let returns = if self.is_symbol(Symbol::Arrow) {
+            self.advance();
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
         let body = self.block()?;
-        Ok(Function { name, params, body })
+        Ok(Function {
+            name,
+            params,
+            returns,
+            body,
+        })
     }
 
     fn spawn(&mut self) -> Parsed<Spawn> {
@@ -853,6 +864,12 @@ impl<'a> Parser<'a> {
             let bytes = self.bound("the bytes a blob may hold")?;
             self.symbol(Symbol::Greater)?;
             TypeExpr::Blob { at, bytes }
+        } else if self.is_word("bytes") && self.peek_second() == &Token::Symbol(Symbol::Less) {
+            self.advance();
+            self.symbol(Symbol::Less)?;
+            let capacity = self.bound("the bytes a byte buffer may hold")?;
+            self.symbol(Symbol::Greater)?;
+            TypeExpr::Bytes { at, capacity }
         } else {
             TypeExpr::Named(self.name("a type")?)
         };
@@ -896,6 +913,34 @@ impl<'a> Parser<'a> {
                 self.symbol(Symbol::Assign)?;
                 let value = self.expr()?;
                 Ok(Stmt::Let { name, ty, value })
+            }
+            "var" if matches!(self.peek_second(), Token::Name(_)) => {
+                self.word("var")?;
+                let name = self.name("a var name")?;
+                let ty = if self.is_symbol(Symbol::Colon) {
+                    self.advance();
+                    Some(self.type_expr()?)
+                } else {
+                    None
+                };
+                self.symbol(Symbol::Assign)?;
+                let value = self.expr()?;
+                Ok(Stmt::Var { name, ty, value })
+            }
+            "set" if matches!(self.peek_second(), Token::Name(_)) => {
+                self.word("set")?;
+                let list = self.name("a list or bytes var to set an entry of")?;
+                self.symbol(Symbol::LeftBracket)?;
+                let index = self.expr()?;
+                self.symbol(Symbol::RightBracket)?;
+                self.symbol(Symbol::Assign)?;
+                let value = self.expr()?;
+                Ok(Stmt::SetIndex {
+                    at,
+                    list,
+                    index,
+                    value,
+                })
             }
             "push" => {
                 self.advance();
@@ -942,11 +987,18 @@ impl<'a> Parser<'a> {
                 let name = self.name("a loop name")?;
                 self.word("below")?;
                 let bound = self.bound(&format!("the bound of loop '{}'", name.text))?;
+                let guard = if self.is_word("while") {
+                    self.advance();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
                 let body = self.block()?;
                 Ok(Stmt::Loop {
                     at,
                     name,
                     bound,
+                    guard,
                     body,
                 })
             }
@@ -1406,17 +1458,31 @@ impl<'a> Parser<'a> {
     }
 
     fn product(&mut self) -> Parsed<Expr> {
-        self.binary_chain(Self::postfix, |parser| {
-            (parser.peek().token == Token::Symbol(Symbol::Star)).then_some(BinaryOp::Multiply)
+        self.binary_chain(Self::postfix, |parser| match parser.peek().token {
+            Token::Symbol(Symbol::Star) => Some(BinaryOp::Multiply),
+            Token::Symbol(Symbol::Slash) => Some(BinaryOp::Divide),
+            Token::Symbol(Symbol::Percent) => Some(BinaryOp::Remainder),
+            _ => None,
         })
     }
 
     fn postfix(&mut self) -> Parsed<Expr> {
         let mut expr = self.primary()?;
         let mut entered = 0;
-        while self.is_symbol(Symbol::Dot) {
+        while self.is_symbol(Symbol::Dot) || self.is_symbol(Symbol::LeftBracket) {
             self.enter()?;
             entered += 1;
+            if self.is_symbol(Symbol::LeftBracket) {
+                let at = self.advance().at;
+                let index = self.expr()?;
+                self.symbol(Symbol::RightBracket)?;
+                expr = Expr::Index {
+                    at,
+                    base: Box::new(expr),
+                    index: Box::new(index),
+                };
+                continue;
+            }
             self.advance();
             let at = self.at();
             let Token::Name(text) = self.peek().token.clone() else {
@@ -1460,6 +1526,11 @@ impl<'a> Parser<'a> {
                 let inner = self.expr()?;
                 self.symbol(Symbol::RightParen)?;
                 Ok(inner)
+            }
+            Token::Symbol(Symbol::LeftBracket) => {
+                self.advance();
+                self.symbol(Symbol::RightBracket)?;
+                Ok(Expr::Empty(at))
             }
             Token::Name(_) => {
                 let callee = self.name("an expression")?;

@@ -42,6 +42,25 @@ pub fn program(program: &Program) {
         assert!(forked.sites.is_empty(), "on forked runs no effect");
         assert!(forked.requires.is_none(), "on forked has no requires");
     }
+    for (id, function) in program.functions.iter().enumerate() {
+        self::handler(program, function);
+        assert!(function.sites.is_empty(), "a pure fn runs no effect");
+        assert!(!writes_state(&function.body), "a pure fn changes no state");
+        assert!(
+            calls_below(&function.body, id),
+            "a pure fn calls only the fns declared above it"
+        );
+    }
+}
+
+fn calls_below(statements: &[Stmt], id: usize) -> bool {
+    let mut below = true;
+    ir::visit_exprs(statements, &mut |value| {
+        if let Expr::Call { function, .. } = value {
+            below &= *function < id;
+        }
+    });
+    below
 }
 
 fn side_reads_only(side: &ir::Handler) {
@@ -75,8 +94,15 @@ fn writes_state(statements: &[ir::Stmt]) -> bool {
             then, otherwise, ..
         } => writes_state(then) || writes_state(otherwise),
         ir::Stmt::Match { arms, .. } => arms.iter().any(|arm| writes_state(&arm.body)),
-        ir::Stmt::Loop { body, .. } | ir::Stmt::For { body, .. } => writes_state(body),
-        ir::Stmt::Let { .. } | ir::Stmt::Effect { .. } | ir::Stmt::Finish { .. } => false,
+        ir::Stmt::Loop { body, .. } | ir::Stmt::For { body, .. } | ir::Stmt::While { body, .. } => {
+            writes_state(body)
+        }
+        ir::Stmt::Let { .. }
+        | ir::Stmt::Effect { .. }
+        | ir::Stmt::Finish { .. }
+        | ir::Stmt::Set { .. }
+        | ir::Stmt::SetIndex { .. }
+        | ir::Stmt::PushLocal { .. } => false,
     })
 }
 
@@ -175,7 +201,13 @@ fn reads_local(value: &Expr) -> bool {
         | Expr::With {
             list: left,
             entry: right,
+        }
+        | Expr::Index {
+            base: left,
+            index: right,
         } => reads_local(left) || reads_local(right),
+        Expr::Copy { value, .. } => reads_local(value),
+        Expr::Call { args, .. } | Expr::Bytes { args, .. } => args.iter().any(reads_local),
         Expr::Not(operand)
         | Expr::Len(operand)
         | Expr::TextLen(operand)
@@ -210,7 +242,13 @@ fn reads_events(value: &Expr) -> bool {
         | Expr::With {
             list: left,
             entry: right,
+        }
+        | Expr::Index {
+            base: left,
+            index: right,
         } => reads_events(left) || reads_events(right),
+        Expr::Copy { value, .. } => reads_events(value),
+        Expr::Call { args, .. } | Expr::Bytes { args, .. } => args.iter().any(reads_events),
         Expr::Not(operand)
         | Expr::Len(operand)
         | Expr::TextLen(operand)
@@ -423,7 +461,12 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     block(program, handler, &arm.body, used);
                 }
             }
-            Stmt::Loop { body, bound, .. } | Stmt::For { body, bound, .. } => {
+            Stmt::Loop { body, bound, .. }
+            | Stmt::For { body, bound, .. }
+            | Stmt::While { body, bound, .. } => {
+                if let Stmt::While { condition, .. } = statement {
+                    expr(program, handler, condition);
+                }
                 assert!(!bound.name.is_empty(), "every loop has a named bound");
                 block(program, handler, body, used);
             }
@@ -495,6 +538,35 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                 );
             }
             Stmt::Finish { value } => expr(program, handler, value),
+            Stmt::Set { local, value } => {
+                assert!(*local < handler.locals.len(), "a set targets a local");
+                expr(program, handler, value);
+            }
+            Stmt::SetIndex {
+                local,
+                index,
+                value,
+            } => {
+                assert!(
+                    matches!(
+                        handler.locals[*local].ty,
+                        Type::List { .. } | Type::Bytes(_)
+                    ),
+                    "an indexed set targets a list or bytes local"
+                );
+                expr(program, handler, index);
+                expr(program, handler, value);
+            }
+            Stmt::PushLocal { local, value, .. } => {
+                assert!(
+                    matches!(
+                        handler.locals[*local].ty,
+                        Type::List { .. } | Type::Bytes(_)
+                    ),
+                    "a local push targets a list or bytes local"
+                );
+                expr(program, handler, value);
+            }
         }
     }
 }
@@ -553,9 +625,27 @@ fn expr(program: &Program, handler: &Handler, value: &Expr) {
         | Expr::With {
             list: left,
             entry: right,
+        }
+        | Expr::Index {
+            base: left,
+            index: right,
         } => {
             expr(program, handler, left);
             expr(program, handler, right);
+        }
+        Expr::Copy { value, .. } => expr(program, handler, value),
+        Expr::Call { function, args } => {
+            let callee = &program.functions[*function];
+            assert_eq!(
+                args.len(),
+                callee.params.len(),
+                "a call passes one argument per param"
+            );
+            args.iter().for_each(|arg| expr(program, handler, arg));
+        }
+        Expr::Bytes { op, args } => {
+            assert_eq!(args.len(), op.arity(), "a bytes builtin takes its arity");
+            args.iter().for_each(|arg| expr(program, handler, arg));
         }
         Expr::Truncate { text, tokens } => {
             assert!(

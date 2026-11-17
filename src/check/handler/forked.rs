@@ -22,6 +22,10 @@ pub fn forked(program: &ir::Program, globals: &Globals, hook: &ast::Hook) -> Che
         forked: true,
         used: std::collections::BTreeSet::new(),
         paid_sites: std::collections::BTreeSet::new(),
+        pure: None,
+        vars: std::collections::BTreeSet::new(),
+        owned: std::collections::BTreeSet::new(),
+        set_names: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::with_capacity(hook.params.len());
     for param in &hook.params {

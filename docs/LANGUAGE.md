@@ -478,13 +478,16 @@ separates tokens and is otherwise ignored. There are no comments.
   starting with `_` are reserved for the compiler; a lone `_` in a pattern
   ignores a field.
 - **Numbers**: decimal digits, with `_` allowed between them (`1_000_000`).
-  A number must fit in `u64` and may not be followed by a letter. There are
-  no negative, fractional or hexadecimal literals.
+  A number must fit in `u64` and may not be followed by a letter. `0x`
+  starts a hexadecimal number (`0xff`). There are no negative or fractional
+  literals.
+- **Bytes**: one ascii character between single quotes (`'a'`) is the `u64`
+  value of that byte. The escapes are `\'`, `\\` and `\n`.
 - **Text**: between double quotes, on one line. The escapes are `\"`, `\\`
   and `\n`; any other backslash is an error.
 - **Symbols**, longest match first:
 
-Symbols: `{` `}` `(` `)` `<` `<=` `>` `>=` `,` `:` `=` `==` `!=` `->` `=>` `+` `++` `-` `*` `.` `|`
+Symbols: `{` `}` `(` `)` `<` `<=` `>` `>=` `,` `:` `=` `==` `!=` `->` `=>` `+` `++` `-` `*` `/` `%` `[` `]` `.` `|`
 
 Keywords, which cannot be used as names:
 
@@ -493,11 +496,11 @@ Keywords: `harness` `code` `const` `type` `tool` `model` `state` `on` `let` `pus
 Words that are keywords only where the grammar expects them, and names
 elsewhere:
 
-Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `wall` `wallet` `when` `window` `wire` `with` `within` `yield`
+Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `bound` `by` `bytes` `calls` `candidate` `candidates` `charge` `climb` `compact` `cost` `cycles` `drop` `end` `failures` `finds` `fn` `fork` `forked` `from` `gate` `higher` `idle` `in` `interruptible` `jobs` `known` `last` `least` `ledger` `listing` `lower` `maybe` `mean` `measure` `metric` `mode` `modes` `most` `over` `paid` `parallel` `payments` `post` `pre` `prompt` `propose` `recoverable` `reply` `rewrite` `runs` `score` `set` `session` `sessions` `settings` `side` `sign` `spawn` `spend` `start` `stop` `subagent` `submit` `take` `tools` `trial` `trials` `var` `wall` `wallet` `when` `while` `window` `wire` `with` `within` `yield`
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `hold` `join` `json_escape` `len` `now` `random` `respond` `suspend` `trim` `truncate_middle` `wait`
+Builtins: `after` `allow` `before` `bytes_of` `contains` `deny` `dispatch` `hold` `join` `json_escape` `len` `now` `random` `respond` `slice` `suspend` `text_of` `trim` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -556,7 +559,7 @@ code       = "code" name "{" { name ( bound | name { "," name } ) } "}" ;
 model      = "model" name "calls" bound [ "reply" name ] [ "window" bound ] [ "modes" name { "," name } ] [ "settings" tool_params ] [ interrupts ] [ "wire" name ] ;
 state      = "state" "{" { name ":" type_expr } "}" ;
 invariant  = "invariant" name ":" expr ;
-function   = "fn" name params block ;
+function   = "fn" name params [ "->" type_expr ] block ;
 spawn      = "spawn" name "runs" name "from" text [ "sessions" "at" "most" name ] ;
 fork       = "fork" name "at" name ;
 hook       = ( "before" | "after" ) "tool" params block ;
@@ -574,9 +577,12 @@ type_expr  = "list" "<" type_expr "," bound ">"
            | "known" "<" type_expr ">"
            | "maybe" "<" type_expr ">"
            | "blob" "<" bound ">"
+           | "bytes" "<" bound ">"
            | name ;
 block      = "{" { statement } "}" ;
 statement  = "let" name [ ":" type_expr ] "=" expr
+           | "var" name [ ":" type_expr ] "=" expr
+           | "set" name "[" expr "]" "=" expr
            | "push" name expr
            | "clear" name
            | "keep" name "last" expr [ "after" expr ]
@@ -584,7 +590,7 @@ statement  = "let" name [ ":" type_expr ] "=" expr
            | "rewrite" name "{" { name [ "(" name { "," name } ")" ] "=>" ( expr | "drop" ) [ "," ] } "}"
            | if
            | "match" expr "{" { arm [ "," ] } "}"
-           | "loop" name "below" bound block
+           | "loop" name "below" bound [ "while" expr ] block
            | "for" name "in" expr [ "parallel" ] block
            | "return" expr
            | climb
@@ -607,9 +613,9 @@ and        = not { "and" not } ;
 not        = "not" not | comparison ;
 comparison = sum [ ( "==" | "!=" | "<" | "<=" | ">" | ">=" ) sum ] ;
 sum        = product { ( "+" | "-" | "++" ) product } ;
-product    = postfix { "*" postfix } ;
-postfix    = primary { "." name } ;
-primary    = number | text | "true" | "false" | "(" expr ")"
+product    = postfix { ( "*" | "/" | "%" ) postfix } ;
+postfix    = primary { "." name | "[" expr "]" } ;
+primary    = number | text | "true" | "false" | "(" expr ")" | "[" "]"
            | "take" name
            | name [ "(" [ expr { "," expr } ] ")" [ "at" "most" bound ] [ "mode" name ] [ "with" "{" name ":" expr { "," name ":" expr } "}" ] ] ;
 ```
@@ -620,9 +626,9 @@ Notes the grammar leaves out:
   harness has at most one `model` and one `state` block and at least one
   handler.
 - Operators bind, loosest first: `or`, `and`, `not`, comparisons, `+ - ++`,
-  `*`, `.`. Binary operators are left associative; a comparison does not chain
+  `* / %`, `.` and `[ ]`. Binary operators are left associative; a comparison does not chain
   (`a < b < c` is a parse error).
-- `known`, `maybe` and `blob` start a type only when `<` follows. A field name after
+- `known`, `maybe`, `blob` and `bytes` start a type only when `<` follows. A field name after
   `.` may be any name.
 - A `bound` is a name: a number there is an error that names the number.
 - Nesting of blocks, types and expressions is bounded by
@@ -1943,6 +1949,235 @@ fn reset() {
 }
 
 on ping() -> u64 { return count }
+```
+
+### Pure fns
+
+`fn name(param: type, ...) -> type { ... }` is a pure fn: a function with a
+result that computes without effects. A call is an expression, `name(argument,
+...)`, and runs the body out of line: the checker checks the body once and
+every target compiles it to one function. A pure fn exists so a harness can
+compute (parse, encode, sort, format) without spending journal records: it
+calls no tool, model or effect, reads no clock, no state field and no event,
+so a call writes nothing to the journal.
+
+- A pure fn sees its parameters, its own bindings, the constants, the types
+  and their variants, the builtins that compute, and the pure fns declared
+  above it. A call to a pure fn declared below, or to itself, is an error, so
+  a pure fn never recurses.
+- Its body ends in `return`, and only its last statement returns: every path
+  through the body reaches a `return`.
+- `var name: type = value` binds a local that `name = value` may change; a
+  `let` and a parameter never change. `var`, `set`, `while`, `/`, `%`,
+  `xs[i]`, `[]` and `bytes<N>` live only inside pure fns.
+- `loop i below N while condition { ... }` runs at most `N` times and stops
+  early once `condition` is false, checked before each pass.
+- `a / b` and `a % b` divide `u64`s; a zero divisor traps with
+  `u64 division by zero in '/'`.
+- `xs[i]` reads entry `i` of a list or a byte buffer, and `set xs[i] = v`
+  changes it in a `var`; an index at or past `len(xs)` traps with `index`.
+  `push xs v` appends to a `var` list or byte buffer, and traps with
+  `bound(N)` past its capacity. `[]` is an empty list or byte buffer, typed by
+  where it goes.
+- `bytes<N>` is a byte buffer of at most `N` bytes. Its entries are `u64`s
+  below 256, so a byte literal such as `'a'` is one. `len(b)` is its length,
+  `push b x` appends a byte or another buffer (a byte at 256 or more traps
+  with `byte`), `slice(b, from, to)` copies the bytes from `from` up to `to`
+  (traps with `index` outside `b`), `bytes_of(t)` is the UTF-8 bytes of text
+  `t` (traps with `bound(N)` past the capacity of where it goes), and
+  `text_of(b)` is the text the bytes spell (traps with `text_of` unless they
+  are UTF-8). A byte buffer lives only inside pure fns: it goes in no state
+  field, tool, sum, list or handler local, and a handler calls no pure fn
+  that returns one.
+- Values stay values: a list or byte buffer handed to a `var`, a `let` or a
+  call is a copy, so `set` changes only the `var` it names.
+
+Every pure fn is bounded: its loops have named bounds, its buffers have
+capacities and it never recurses, so every call ends. What the prover leaves
+to run time inside a pure fn is arithmetic, indexing and capacity: an
+overflow, a zero divisor, an index past the end or a push past the capacity
+traps with its name, and the interpreter and every target trap alike. A
+handler's own arithmetic stays proved, and the prover reads a call's result
+as any value of its type.
+
+This program formats numbers and text with pure fns, and its handler spends
+the same three journal records as one that returns a constant:
+
+```hl docs/snippets/pure.hl
+harness digest
+
+const buffer_max: u64 = 64
+const digits_max: u64 = 20
+const items_max: u64 = 8
+
+fn hex(input: text) -> text {
+  let source: bytes<buffer_max> = bytes_of(input)
+  let table: bytes<buffer_max> = bytes_of("0123456789abcdef")
+  var out: bytes<buffer_max> = []
+  loop i below buffer_max while i < len(source) {
+    push out table[source[i] / 16]
+    push out table[source[i] % 0x10]
+  }
+  return text_of(out)
+}
+
+fn decimal(n: u64) -> text {
+  var reversed: bytes<digits_max> = []
+  var rest = n
+  push reversed '0' + rest % 10
+  rest = rest / 10
+  loop step below digits_max while rest > 0 {
+    push reversed '0' + rest % 10
+    rest = rest / 10
+  }
+  var out: bytes<digits_max> = []
+  loop i below digits_max while i < len(reversed) {
+    push out reversed[len(reversed) - 1 - i]
+  }
+  return text_of(out)
+}
+
+fn sorted(input: list<u64, items_max>) -> list<u64, items_max> {
+  var xs = input
+  loop i below items_max while i < len(xs) {
+    loop j below items_max while j + 1 + i < len(xs) {
+      if xs[j] > xs[j + 1] {
+        let held = xs[j]
+        set xs[j] = xs[j + 1]
+        set xs[j + 1] = held
+      }
+    }
+  }
+  return xs
+}
+
+fn spread(n: u64) -> text {
+  var xs: list<u64, items_max> = []
+  push xs n % 7
+  push xs n % 5
+  push xs n % 3
+  let ordered = sorted(xs)
+  return decimal(ordered[0]) ++ " " ++ decimal(ordered[1]) ++ " " ++ decimal(ordered[2])
+}
+
+fn share(n: u64) -> text {
+  return decimal(1000 / (n % 4))
+}
+
+on digest(input: text, n: u64) -> text {
+  return hex(input) ++ " " ++ share(n) ++ " " ++ spread(n)
+}
+```
+
+The checker refuses what would break those rules:
+
+```console
+$ hl check docs/snippets/errors/pure-recursion.hl
+docs/snippets/errors/pure-recursion.hl:4:10: error: fn 'down' calls itself: a pure fn calls only the pure fns above it, so it never recurses
+$ hl check docs/snippets/errors/pure-tool.hl
+docs/snippets/errors/pure-tool.hl:6:10: error: fn 'peek' is pure: it cannot call 'read', since it calls no tool, model or effect and reads no clock
+$ hl check docs/snippets/errors/pure-state.hl
+docs/snippets/errors/pure-state.hl:8:14: error: fn 'next' is pure: it cannot read 'total', since it reads no state or events
+$ hl check docs/snippets/errors/pure-var-outside.hl
+docs/snippets/errors/pure-var-outside.hl:4:7: error: a var lives only in a pure fn (fn f(...) -> T), which computes without effects
+$ hl check docs/snippets/errors/pure-set-let.hl
+docs/snippets/errors/pure-set-let.hl:7:7: error: cannot set an entry of 'ys': it is a let or a parameter, and only a var changes
+$ hl check docs/snippets/errors/pure-no-return.hl
+docs/snippets/errors/pure-no-return.hl:3:24: error: fn 'half' can reach its end without returning
+$ hl check docs/snippets/errors/pure-bytes-handler.hl
+docs/snippets/errors/pure-bytes-handler.hl:6:35: error: bytes_of(...) lives only in a pure fn (fn f(...) -> T), which computes without effects
+```
+
+```hl docs/snippets/errors/pure-recursion.hl
+harness counting
+
+fn down(n: u64) -> u64 {
+  return down(n)
+}
+
+on go(n: u64) -> u64 {
+  return down(n)
+}
+```
+
+```hl docs/snippets/errors/pure-tool.hl
+harness reading
+
+tool read(path: text) -> text effect none
+
+fn peek(path: text) -> text {
+  return read(path)
+}
+
+on go(path: text) -> text {
+  return peek(path)
+}
+```
+
+```hl docs/snippets/errors/pure-state.hl
+harness counting
+
+state {
+  total: u64
+}
+
+fn next(n: u64) -> u64 {
+  return n + total
+}
+
+on go(n: u64) -> u64 {
+  return next(n)
+}
+```
+
+```hl docs/snippets/errors/pure-var-outside.hl
+harness counting
+
+on go(n: u64) -> u64 {
+  var count = n
+  return count
+}
+```
+
+```hl docs/snippets/errors/pure-set-let.hl
+harness counting
+
+const items_max: u64 = 8
+
+fn first(xs: list<u64, items_max>) -> u64 {
+  let ys = xs
+  set ys[0] = 1
+  return ys[0]
+}
+
+on go(n: u64) -> u64 {
+  return n
+}
+```
+
+```hl docs/snippets/errors/pure-no-return.hl
+harness counting
+
+fn half(n: u64) -> u64 {
+  if n > 1 {
+    return n / 2
+  }
+}
+
+on go(n: u64) -> u64 {
+  return n
+}
+```
+
+```hl docs/snippets/errors/pure-bytes-handler.hl
+harness buffers
+
+const buffer_max: u64 = 64
+
+on go(input: text) -> u64 {
+  let buffer: bytes<buffer_max> = bytes_of(input)
+  return len(buffer)
+}
 ```
 
 ### Hooks

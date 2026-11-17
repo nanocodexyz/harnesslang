@@ -79,6 +79,14 @@ impl Walk<'_> {
 
     fn statement(&mut self, statement: &Stmt) -> bool {
         match statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Finish { .. } => {
                 self.finishes += 1;
                 false

@@ -58,7 +58,14 @@ fn pure(program: &Program, state: &[Value], expr: &Expr) -> Option<Value> {
             pure(program, state, text)?.as_text(),
             program.constants[*tokens].value,
         )),
-        Expr::Local(_) | Expr::Member { .. } | Expr::Construct { .. } | Expr::With { .. } => {
+        Expr::Local(_)
+        | Expr::Member { .. }
+        | Expr::Construct { .. }
+        | Expr::With { .. }
+        | Expr::Call { .. }
+        | Expr::Index { .. }
+        | Expr::Bytes { .. }
+        | Expr::Copy { .. } => {
             return None;
         }
     })
@@ -70,6 +77,8 @@ fn binary(op: BinaryOp, left: &Value, right: &Value) -> Option<Value> {
         BinaryOp::Add => number(left.as_u64().checked_add(right.as_u64()))?,
         BinaryOp::Subtract => number(left.as_u64().checked_sub(right.as_u64()))?,
         BinaryOp::Multiply => number(left.as_u64().checked_mul(right.as_u64()))?,
+        BinaryOp::Divide => number(left.as_u64().checked_div(right.as_u64()))?,
+        BinaryOp::Remainder => number(left.as_u64().checked_rem(right.as_u64()))?,
         BinaryOp::Concat => Value::Text(format!("{}{}", left.as_text(), right.as_text())),
         BinaryOp::Equal => Value::Bool(left == right),
         BinaryOp::NotEqual => Value::Bool(left != right),

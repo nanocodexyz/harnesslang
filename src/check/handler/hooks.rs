@@ -871,6 +871,8 @@ fn decides(statement: &ast::Stmt) -> Checked<bool> {
             panic!("climbs are expanded before hooks are read")
         }
         ast::Stmt::Let { .. }
+        | ast::Stmt::Var { .. }
+        | ast::Stmt::SetIndex { .. }
         | ast::Stmt::Assign { .. }
         | ast::Stmt::Push { .. }
         | ast::Stmt::Clear { .. }

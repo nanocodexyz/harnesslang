@@ -1,0 +1,11 @@
+harness counting
+
+fn half(n: u64) -> u64 {
+  if n > 1 {
+    return n / 2
+  }
+}
+
+on go(n: u64) -> u64 {
+  return n
+}

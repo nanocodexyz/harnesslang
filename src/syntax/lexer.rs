@@ -21,6 +21,10 @@ pub enum Symbol {
     PlusPlus,
     Minus,
     Star,
+    Slash,
+    Percent,
+    LeftBracket,
+    RightBracket,
     Dot,
     Bar,
 }
@@ -47,13 +51,17 @@ impl Symbol {
             Self::PlusPlus => "++",
             Self::Minus => "-",
             Self::Star => "*",
+            Self::Slash => "/",
+            Self::Percent => "%",
+            Self::LeftBracket => "[",
+            Self::RightBracket => "]",
             Self::Dot => ".",
             Self::Bar => "|",
         }
     }
 }
 
-const SYMBOLS: [Symbol; 21] = [
+const SYMBOLS: [Symbol; 25] = [
     Symbol::LessEqual,
     Symbol::GreaterEqual,
     Symbol::Equal,
@@ -73,6 +81,10 @@ const SYMBOLS: [Symbol; 21] = [
     Symbol::Plus,
     Symbol::Minus,
     Symbol::Star,
+    Symbol::Slash,
+    Symbol::Percent,
+    Symbol::LeftBracket,
+    Symbol::RightBracket,
     Symbol::Dot,
     Symbol::Bar,
 ];
@@ -159,6 +171,8 @@ pub fn lex(source: &str) -> Result<Vec<Lexeme>, Diagnostic> {
             number(&mut cursor, at)?
         } else if byte == b'"' {
             text(&mut cursor, at)?
+        } else if byte == b'\'' {
+            byte_literal(&mut cursor, at)?
         } else {
             symbol(&mut cursor, at)?
         };
@@ -184,7 +198,78 @@ fn name(cursor: &mut Cursor<'_>) -> Token {
     Token::Name(text.to_owned())
 }
 
+fn byte_literal(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
+    cursor.bump();
+    let byte = match cursor.peek(0) {
+        Some(b'\\') => {
+            cursor.bump();
+            match cursor.peek(0) {
+                Some(b'\'') => b'\'',
+                Some(b'\\') => b'\\',
+                Some(b'n') => b'\n',
+                _ => {
+                    return Err(Diagnostic::new(
+                        at,
+                        "unknown escape in byte literal: only \\' \\\\ and \\n are escapes",
+                    ));
+                }
+            }
+        }
+        Some(byte) if byte.is_ascii() && byte != b'\'' && byte != b'\n' => byte,
+        _ => {
+            return Err(Diagnostic::new(
+                at,
+                "a byte literal holds one ascii character, such as 'a'",
+            ));
+        }
+    };
+    cursor.bump();
+    if cursor.peek(0) != Some(b'\'') {
+        return Err(Diagnostic::new(at, "byte literal is not closed with '"));
+    }
+    cursor.bump();
+    Ok(Token::Number(u64::from(byte)))
+}
+
+fn hex_number(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
+    cursor.bump();
+    cursor.bump();
+    let mut value: u64 = 0;
+    let mut digits = 0;
+    while let Some(byte) = cursor.peek(0) {
+        if byte == b'_' {
+            cursor.bump();
+            continue;
+        }
+        let Some(digit) = char::from(byte).to_digit(16) else {
+            break;
+        };
+        value = value
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(u64::from(digit)))
+            .ok_or_else(|| Diagnostic::new(at, "number does not fit in u64"))?;
+        digits += 1;
+        cursor.bump();
+    }
+    if digits == 0 {
+        return Err(Diagnostic::new(at, "a hex number needs a digit after 0x"));
+    }
+    if cursor
+        .peek(0)
+        .is_some_and(|byte| byte.is_ascii_alphabetic())
+    {
+        return Err(Diagnostic::new(
+            cursor.at(),
+            "a number is followed by a letter",
+        ));
+    }
+    Ok(Token::Number(value))
+}
+
 fn number(cursor: &mut Cursor<'_>, at: Position) -> Result<Token, Diagnostic> {
+    if cursor.peek(0) == Some(b'0') && cursor.peek(1) == Some(b'x') {
+        return hex_number(cursor, at);
+    }
     let mut value: u64 = 0;
     while let Some(byte) = cursor.peek(0) {
         if byte == b'_' {

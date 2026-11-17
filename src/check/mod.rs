@@ -14,7 +14,10 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 17] = [
+pub const BUILTIN_FUNCTIONS: [&str; 20] = [
+    "bytes_of",
+    "text_of",
+    "slice",
     "dispatch",
     "now",
     "random",
@@ -57,6 +60,7 @@ pub struct Globals {
     fields: BTreeMap<String, ir::FieldId>,
     model: Option<String>,
     hooks: BTreeMap<ast::HookKind, ast::Hook>,
+    functions: BTreeMap<String, ir::FunctionId>,
 }
 
 impl Globals {
@@ -105,6 +109,7 @@ pub fn check_mutated(
         invariants: Vec::new(),
         handlers: Vec::new(),
         sides: Vec::new(),
+        functions: Vec::new(),
         events: ir::Events::default(),
         cuts: Vec::new(),
         notice: None,
@@ -123,6 +128,7 @@ pub fn check_mutated(
         fields: BTreeMap::new(),
         model: None,
         hooks: BTreeMap::new(),
+        functions: BTreeMap::new(),
     };
     let mut values: BTreeMap<String, Position> = BTreeMap::new();
     constants(source, &mut program, &mut globals, &mut values)?;
@@ -138,6 +144,7 @@ pub fn check_mutated(
     state(source, &mut program, &mut globals, &mut values)?;
     events(source, &mut program, &globals, &mut values)?;
     interrupts(source, &mut program)?;
+    functions(source, &mut program, &mut globals, &mut values)?;
     let expanded = inline::expand(source, &program, &globals, &mut values)?;
     let expanded = climb::expand(&expanded, &mut program, &globals, mutation)?.unwrap_or(expanded);
     globals.hooks = hooks(&expanded, &program, &globals)?;
@@ -149,6 +156,38 @@ pub fn check_mutated(
     program.cuts = program.find_cuts();
     ir::validate::program(&program);
     Ok(program)
+}
+
+fn functions(
+    source: &ast::Program,
+    program: &mut ir::Program,
+    globals: &mut Globals,
+    values: &mut BTreeMap<String, Position>,
+) -> Checked<()> {
+    let pure: Vec<&ast::Function> = source
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Function(function) if function.returns.is_some() => Some(function),
+            _ => None,
+        })
+        .collect();
+    let variants = variant_names(program);
+    for (id, function) in pure.iter().enumerate() {
+        claim(values, &function.name, "fn")?;
+        if variants.contains(&function.name.text) {
+            return error(
+                function.name.at,
+                format!("fn '{}' has the name of a variant", function.name.text),
+            );
+        }
+        globals.functions.insert(function.name.text.clone(), id);
+    }
+    for function in pure {
+        let checked = handler::pure_function(program, globals, function)?;
+        program.functions.push(checked);
+    }
+    Ok(())
 }
 
 fn claim(values: &mut BTreeMap<String, Position>, name: &ast::Name, what: &str) -> Checked<()> {
@@ -898,7 +937,7 @@ fn text_values(definition: &ast::TypeDef, values: &[ast::Name]) -> Checked<Vec<V
 
 fn contained(ty: &Type, out: &mut Vec<ir::SumId>) {
     match ty {
-        Type::U64 | Type::Bool | Type::Text | Type::Blob(_) => {}
+        Type::U64 | Type::Bool | Type::Text | Type::Blob(_) | Type::Bytes(_) => {}
         Type::Sum(sum) => out.push(*sum),
         Type::List { element, .. } => contained(element, out),
         Type::Known(inner) | Type::Maybe(inner) => contained(inner, out),
@@ -990,6 +1029,10 @@ pub fn resolve(program: &ir::Program, globals: &Globals, ty: &TypeExpr) -> Check
             let bytes = bound(program, globals, bytes, "the bytes a blob may hold")?;
             Ok(Type::Blob(bytes))
         }
+        TypeExpr::Bytes { at, .. } => error(
+            *at,
+            "bytes<N> is the type of a pure fn's parameter, result or local, and goes in no list, sum, state field, tool or handler",
+        ),
     }
 }
 

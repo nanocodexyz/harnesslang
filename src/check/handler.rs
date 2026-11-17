@@ -13,6 +13,9 @@ use crate::syntax::ast;
 mod forked;
 mod hooks;
 mod paid;
+mod pure;
+
+pub use pure::function as pure_function;
 
 pub use paid::value_field_name;
 
@@ -33,6 +36,10 @@ struct Checker<'a> {
     forked: bool,
     used: std::collections::BTreeSet<ast::HookKind>,
     paid_sites: std::collections::BTreeSet<usize>,
+    pure: Option<String>,
+    vars: std::collections::BTreeSet<LocalId>,
+    owned: std::collections::BTreeSet<LocalId>,
+    set_names: std::collections::BTreeSet<String>,
 }
 
 pub fn check(
@@ -56,6 +63,10 @@ pub fn check(
         forked: false,
         used: std::collections::BTreeSet::new(),
         paid_sites: std::collections::BTreeSet::new(),
+        pure: None,
+        vars: std::collections::BTreeSet::new(),
+        owned: std::collections::BTreeSet::new(),
+        set_names: std::collections::BTreeSet::new(),
     };
     let mut params = Vec::new();
     for param in &definition.params {
@@ -143,6 +154,10 @@ pub fn invariant(
         forked: false,
         used: std::collections::BTreeSet::new(),
         paid_sites: std::collections::BTreeSet::new(),
+        pure: None,
+        vars: std::collections::BTreeSet::new(),
+        owned: std::collections::BTreeSet::new(),
+        set_names: std::collections::BTreeSet::new(),
     };
     let condition = checker.condition(
         &definition.condition,
@@ -152,6 +167,31 @@ pub fn invariant(
         name: definition.name.text.clone(),
         condition,
     })
+}
+
+impl<'a> Checker<'a> {
+    fn new(program: &'a ir::Program, globals: &'a Globals, returns: Type) -> Self {
+        Self {
+            program,
+            globals,
+            locals: Vec::new(),
+            scopes: vec![Vec::new()],
+            sites: Vec::new(),
+            returns,
+            reads_events: false,
+            in_hook: false,
+            spawn_subject: false,
+            lane_answer: None,
+            side: None,
+            forked: false,
+            used: std::collections::BTreeSet::new(),
+            paid_sites: std::collections::BTreeSet::new(),
+            pure: None,
+            vars: std::collections::BTreeSet::new(),
+            owned: std::collections::BTreeSet::new(),
+            set_names: std::collections::BTreeSet::new(),
+        }
+    }
 }
 
 impl Checker<'_> {
@@ -210,6 +250,18 @@ impl Checker<'_> {
             return error(
                 name.at,
                 format!("'{}' is already a tool, listing or model", name.text),
+            );
+        }
+        if self.globals.functions.contains_key(&name.text) {
+            return error(name.at, format!("'{}' is already a fn", name.text));
+        }
+        if self.pure.is_none() && ty.holds_bytes(self.program) {
+            return error(
+                name.at,
+                format!(
+                    "'{}' would hold bytes, which live only inside pure fns",
+                    name.text
+                ),
             );
         }
         Ok(self.bind(name.text.clone(), ty))
@@ -419,10 +471,18 @@ impl Checker<'_> {
 
     fn statement(&mut self, statement: &ast::Stmt, out: &mut Vec<Stmt>) -> Checked<bool> {
         self.side_writes(statement)?;
+        self.pure_statement(statement)?;
         match statement {
+            ast::Stmt::Var { name, ty, value } => self.var_statement(name, ty.as_ref(), value, out),
+            ast::Stmt::SetIndex {
+                at,
+                list,
+                index,
+                value,
+            } => self.set_index(*at, list, index, value, out),
             ast::Stmt::Let { name, ty, value } => {
                 let wanted = match ty {
-                    Some(ty) => Some(resolve(self.program, self.globals, ty)?),
+                    Some(ty) => Some(pure::resolve_local(self.program, self.globals, ty)?),
                     None => None,
                 };
                 let at = value.at();
@@ -435,6 +495,9 @@ impl Checker<'_> {
                 Ok(false)
             }
             ast::Stmt::Assign { name, value } => {
+                if let Some(done) = self.assign_local(name, value, out)? {
+                    return Ok(done);
+                }
                 let field = self.state_field(name, "assign to")?;
                 let wanted = self.program.state[field].ty.clone();
                 let at = value.at();
@@ -444,6 +507,9 @@ impl Checker<'_> {
                 Ok(false)
             }
             ast::Stmt::Push { list, value, .. } => {
+                if let Some(done) = self.push_local(list, value, out)? {
+                    return Ok(done);
+                }
                 let (field, element) = self.list_field(list, "push onto")?;
                 let at = value.at();
                 let (value, ty) = self.expr(value, Some(&element), out)?;
@@ -518,6 +584,13 @@ impl Checker<'_> {
             ast::Stmt::Loop {
                 name,
                 bound: limit,
+                guard: Some(guard),
+                body,
+                ..
+            } => self.while_statement(name, limit, guard, body, out),
+            ast::Stmt::Loop {
+                name,
+                bound: limit,
                 body,
                 ..
             } => self.loop_statement(name, limit, body, out),
@@ -538,7 +611,9 @@ impl Checker<'_> {
                 at: return_at,
                 value,
             } => {
-                self.lifecycle(ast::HookKind::Stop, Vec::new(), *return_at, out)?;
+                if self.pure.is_none() {
+                    self.lifecycle(ast::HookKind::Stop, Vec::new(), *return_at, out)?;
+                }
                 let wanted = self.returns.clone();
                 let at = value.at();
                 let (value, ty) = self.expr(value, Some(&wanted), out)?;
@@ -1531,6 +1606,13 @@ impl Checker<'_> {
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
+        if let Some(&function) = self.globals.functions.get(&callee.text) {
+            return self.pure_call(callee, function, args, out);
+        }
+        self.refuse_impure(callee)?;
+        if let Some(op) = ir::BytesOp::parse(&callee.text) {
+            return self.bytes_builtin(callee.at, op, args, expected, out);
+        }
         self.side_call(callee)?;
         let at = callee.at;
         let is_model = self.globals.model.as_deref() == Some(callee.text.as_str());
@@ -1673,9 +1755,11 @@ impl Checker<'_> {
                     return error(at, "len takes one list or text");
                 };
                 let list_at = list.at();
-                let (value, ty) = self.expr(list, None, out)?;
+                let (value, ty) = self.borrowed(list, out)?;
                 match ty {
-                    Type::List { .. } => Ok((Expr::Len(Box::new(value)), Type::U64)),
+                    Type::List { .. } | Type::Bytes(_) => {
+                        Ok((Expr::Len(Box::new(value)), Type::U64))
+                    }
                     Type::Text => Ok((Expr::TextLen(Box::new(value)), Type::U64)),
                     _ => error(
                         list_at,
@@ -1856,6 +1940,8 @@ impl Checker<'_> {
             ast::Expr::Text(text, at) => self.text(text, *at, expected),
             ast::Expr::Bool(value, _) => Ok((Expr::Bool(*value), Type::Bool)),
             ast::Expr::Name(name) => self.name(name, expected, out),
+            ast::Expr::Index { at, base, index } => self.index(*at, base, index, out),
+            ast::Expr::Empty(at) => self.empty(*at, expected),
             ast::Expr::Member { base, field } => {
                 let (base, ty) = self.expr(base, None, out)?;
                 let index = ir::CALL_FIELDS.iter().position(|name| *name == field.text);
@@ -1933,12 +2019,24 @@ impl Checker<'_> {
         expected: Option<&Type>,
         out: &mut Vec<Stmt>,
     ) -> Checked<(Expr, Type)> {
+        if let Some(local) = self.lookup(&name.text) {
+            return Ok(self.local_read(local));
+        }
+        if let Some(function) = &self.pure
+            && (self.globals.fields.contains_key(&name.text)
+                || (self.program.events.cancel && name.text == CANCELLED_READ))
+        {
+            return error(
+                name.at,
+                format!(
+                    "fn '{function}' is pure: it cannot read '{}', since it reads no state or events",
+                    name.text
+                ),
+            );
+        }
         if self.program.events.cancel && name.text == CANCELLED_READ {
             self.events_readable(name.at, CANCELLED_READ)?;
             return Ok((Expr::Cancelled, Type::Bool));
-        }
-        if let Some(local) = self.lookup(&name.text) {
-            return Ok((Expr::Local(local), self.locals[local].ty.clone()));
         }
         if let Some(&field) = self.globals.fields.get(&name.text) {
             return Ok((Expr::Field(field), self.program.state[field].ty.clone()));
@@ -1965,6 +2063,10 @@ impl Checker<'_> {
     ) -> Checked<(Expr, Type)> {
         let (operand, result) = match op {
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => (Some(Type::U64), Type::U64),
+            BinaryOp::Divide | BinaryOp::Remainder => {
+                self.pure_only(at, &format!("'{}'", op.symbol()))?;
+                (Some(Type::U64), Type::U64)
+            }
             BinaryOp::Concat => (Some(Type::Text), Type::Text),
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
                 (Some(Type::U64), Type::Bool)
@@ -2057,7 +2159,8 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
                 "a parallel for cannot be nested in another parallel for",
             );
         }
-        ast::Stmt::Let { .. } => "a let".to_owned(),
+        ast::Stmt::Let { .. } | ast::Stmt::Var { .. } => "a let".to_owned(),
+        ast::Stmt::SetIndex { .. } => "a set".to_owned(),
         ast::Stmt::Assign { .. } => "an assignment".to_owned(),
         ast::Stmt::Push { .. } => "a push".to_owned(),
         ast::Stmt::Clear { .. } => "a clear".to_owned(),
@@ -2081,7 +2184,10 @@ fn parallel_error<T>(statement: &ast::Stmt, shape: &str) -> Checked<T> {
 
 pub(super) fn statement_at(statement: &ast::Stmt) -> Position {
     match statement {
-        ast::Stmt::Let { name, .. } | ast::Stmt::Assign { name, .. } => name.at,
+        ast::Stmt::Let { name, .. }
+        | ast::Stmt::Assign { name, .. }
+        | ast::Stmt::Var { name, .. } => name.at,
+        ast::Stmt::SetIndex { at, .. } => *at,
         ast::Stmt::Call { callee, .. } => callee.at,
         ast::Stmt::Inlined { at, .. } | ast::Stmt::Yield { at, .. } => *at,
         ast::Stmt::Climb(climb) => climb.at,

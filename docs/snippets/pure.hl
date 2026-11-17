@@ -1,0 +1,63 @@
+harness digest
+
+const buffer_max: u64 = 64
+const digits_max: u64 = 20
+const items_max: u64 = 8
+
+fn hex(input: text) -> text {
+  let source: bytes<buffer_max> = bytes_of(input)
+  let table: bytes<buffer_max> = bytes_of("0123456789abcdef")
+  var out: bytes<buffer_max> = []
+  loop i below buffer_max while i < len(source) {
+    push out table[source[i] / 16]
+    push out table[source[i] % 0x10]
+  }
+  return text_of(out)
+}
+
+fn decimal(n: u64) -> text {
+  var reversed: bytes<digits_max> = []
+  var rest = n
+  push reversed '0' + rest % 10
+  rest = rest / 10
+  loop step below digits_max while rest > 0 {
+    push reversed '0' + rest % 10
+    rest = rest / 10
+  }
+  var out: bytes<digits_max> = []
+  loop i below digits_max while i < len(reversed) {
+    push out reversed[len(reversed) - 1 - i]
+  }
+  return text_of(out)
+}
+
+fn sorted(input: list<u64, items_max>) -> list<u64, items_max> {
+  var xs = input
+  loop i below items_max while i < len(xs) {
+    loop j below items_max while j + 1 + i < len(xs) {
+      if xs[j] > xs[j + 1] {
+        let held = xs[j]
+        set xs[j] = xs[j + 1]
+        set xs[j + 1] = held
+      }
+    }
+  }
+  return xs
+}
+
+fn spread(n: u64) -> text {
+  var xs: list<u64, items_max> = []
+  push xs n % 7
+  push xs n % 5
+  push xs n % 3
+  let ordered = sorted(xs)
+  return decimal(ordered[0]) ++ " " ++ decimal(ordered[1]) ++ " " ++ decimal(ordered[2])
+}
+
+fn share(n: u64) -> text {
+  return decimal(1000 / (n % 4))
+}
+
+on digest(input: text, n: u64) -> text {
+  return hex(input) ++ " " ++ share(n) ++ " " ++ spread(n)
+}

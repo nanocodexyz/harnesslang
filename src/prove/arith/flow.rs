@@ -18,6 +18,14 @@ impl Prover<'_> {
 
     fn statement(&mut self, statement: &Stmt, mut state: State) -> Option<State> {
         match statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Let { local, value } => {
                 let linear = self.local_value(&mut state, *local, value);
                 self.bind(&mut state, *local, linear);

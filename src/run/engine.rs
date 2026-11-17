@@ -1105,6 +1105,12 @@ impl<'a> Engine<'a> {
                 self.locals[*result] = Some(events);
             }
             Stmt::Finish { value } => return Ok(Flow::Return(self.eval(value)?)),
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!("the checker keeps vars and while loops inside pure fns")
+            }
         }
         Ok(Flow::Next)
     }
@@ -3395,7 +3401,11 @@ fn reads_cancelled(expr: &Expr) -> bool {
         | Expr::Len(operand)
         | Expr::TextLen(operand)
         | Expr::Truncate { text: operand, .. } => reads_cancelled(operand),
-        Expr::TextBuiltin { args, .. } => args.iter().any(reads_cancelled),
+        Expr::TextBuiltin { args, .. } | Expr::Call { args, .. } | Expr::Bytes { args, .. } => {
+            args.iter().any(reads_cancelled)
+        }
+        Expr::Index { base, index } => reads_cancelled(base) || reads_cancelled(index),
+        Expr::Copy { value, .. } => reads_cancelled(value),
         Expr::Outcome {
             tag,
             value,
@@ -3448,6 +3458,42 @@ pub fn evaluate_with(
             .clone()
             .expect("the checker binds a local before its use"),
         Expr::Field(field) => state[*field].clone(),
+        Expr::Call { function, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(eval(arg)?);
+            }
+            crate::run::pure::call(program, *function, values, reads)?
+        }
+        Expr::Index { base, index } => match base.as_ref() {
+            Expr::Local(local) => crate::run::pure::index(
+                locals[*local]
+                    .as_ref()
+                    .expect("the checker binds a local before its use"),
+                &eval(index)?,
+            )?,
+            base => crate::run::pure::index(&eval(base)?, &eval(index)?)?,
+        },
+        Expr::Bytes {
+            op: ir::BytesOp::Get,
+            args,
+        } if matches!(args[0], Expr::Local(_)) => {
+            let Expr::Local(local) = &args[0] else {
+                unreachable!("the guard matched a local");
+            };
+            let buffer = locals[*local]
+                .as_ref()
+                .expect("the checker binds a local before its use");
+            crate::run::pure::index(buffer, &eval(&args[1])?)?
+        }
+        Expr::Bytes { op, args } => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                values.push(eval(arg)?);
+            }
+            crate::run::pure::bytes(program, *op, args, values)?
+        }
+        Expr::Copy { value, .. } => eval(value)?,
         Expr::Member { base, index } => eval(base)?.as_variant().1[*index].clone(),
         Expr::Construct {
             variant, fields, ..
@@ -3462,10 +3508,21 @@ pub fn evaluate_with(
             op, left, right, ..
         } => binary(*op, eval(left)?, eval(right)?)?,
         Expr::Not(operand) => Value::Bool(!eval(operand)?.as_bool()),
-        Expr::Len(operand) => match eval(operand)? {
-            Value::List(items) => Value::U64(items.len() as u64),
-            other => panic!("the checker types len's operand as a list, found {other:?}"),
-        },
+        Expr::Len(operand) => {
+            let length = |value: &Value| match value {
+                Value::List(items) => items.len() as u64,
+                Value::Bytes(buffer) => buffer.len() as u64,
+                other => panic!("the checker types len's operand as a list, found {other:?}"),
+            };
+            match operand.as_ref() {
+                Expr::Local(local) => Value::U64(length(
+                    locals[*local]
+                        .as_ref()
+                        .expect("the checker binds a local before its use"),
+                )),
+                operand => Value::U64(length(&eval(operand)?)),
+            }
+        }
         Expr::TextLen(operand) => Value::U64(ir::utf16_len(eval(operand)?.as_text())),
         Expr::Truncate { text, tokens } => {
             let text = eval(text)?;
@@ -3531,6 +3588,14 @@ fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, String> {
         BinaryOp::Add => arithmetic(left.as_u64().checked_add(right.as_u64()), "overflow")?,
         BinaryOp::Subtract => arithmetic(left.as_u64().checked_sub(right.as_u64()), "underflow")?,
         BinaryOp::Multiply => arithmetic(left.as_u64().checked_mul(right.as_u64()), "overflow")?,
+        BinaryOp::Divide => arithmetic(
+            left.as_u64().checked_div(right.as_u64()),
+            "division by zero",
+        )?,
+        BinaryOp::Remainder => arithmetic(
+            left.as_u64().checked_rem(right.as_u64()),
+            "division by zero",
+        )?,
         BinaryOp::Concat => Value::Text(format!("{}{}", left.as_text(), right.as_text())),
         BinaryOp::Equal => Value::Bool(left == right),
         BinaryOp::NotEqual => Value::Bool(left != right),

@@ -104,6 +104,22 @@ impl<'a> Names<'a> {
                 let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
                 format!("{}({})", op.name(), args.join(", "))
             }
+            Expr::Call { function, args } => {
+                let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
+                format!(
+                    "{}({})",
+                    self.program.functions[*function].name,
+                    args.join(", ")
+                )
+            }
+            Expr::Bytes { op, args } => {
+                let args: Vec<String> = args.iter().map(|arg| self.expr(arg)).collect();
+                format!("{}({})", op.name(), args.join(", "))
+            }
+            Expr::Index { base, index } => {
+                format!("{}[{}]", self.operand(base), self.expr(index))
+            }
+            Expr::Copy { value, .. } => self.expr(value),
             Expr::Outcome { original, .. } => format!("paid {}", self.expr(original)),
             Expr::Cancelled => crate::check::CANCELLED_READ.to_owned(),
             Expr::ListingNotice(listing) => {
@@ -127,6 +143,14 @@ fn collect<'a>(
 ) {
     for statement in statements {
         match statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Effect { site, args, result } => {
                 effects.insert(*result, (*site, args.as_slice()));
             }

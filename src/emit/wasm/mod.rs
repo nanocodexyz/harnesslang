@@ -7,11 +7,12 @@ pub mod shake;
 use crate::ir::Program;
 use crate::target::Target;
 
-pub const RUNTIME: [&str; 23] = [
+pub const RUNTIME: [&str; 24] = [
     include_str!("runtime/base.wat"),
     include_str!("runtime/text.wat"),
     include_str!("runtime/json.wat"),
     include_str!("runtime/value.wat"),
+    include_str!("runtime/pure.wat"),
     include_str!("runtime/journal.wat"),
     include_str!("runtime/engine.wat"),
     include_str!("runtime/blob.wat"),

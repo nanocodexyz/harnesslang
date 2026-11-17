@@ -37,10 +37,22 @@ impl Prover<'_> {
                 self.value(state, operand);
                 None
             }
-            Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
+            Expr::Construct { fields, .. }
+            | Expr::TextBuiltin { args: fields, .. }
+            | Expr::Call { args: fields, .. }
+            | Expr::Bytes { args: fields, .. } => {
                 for field in fields {
                     self.value(state, field);
                 }
+                None
+            }
+            Expr::Index { base, index } => {
+                self.value(state, base);
+                self.value(state, index);
+                None
+            }
+            Expr::Copy { value: operand, .. } => {
+                self.value(state, operand);
                 None
             }
             Expr::Outcome {

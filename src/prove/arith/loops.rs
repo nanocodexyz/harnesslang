@@ -35,9 +35,12 @@ fn reads(condition: &Expr, quantities: &BTreeSet<Quantity>) -> bool {
         | Expr::ListingNotice(_)
         | Expr::Cancelled => false,
         Expr::Member { base, .. } => reads(base, quantities),
-        Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
-            fields.iter().any(|field| reads(field, quantities))
-        }
+        Expr::Construct { fields, .. }
+        | Expr::TextBuiltin { args: fields, .. }
+        | Expr::Call { args: fields, .. }
+        | Expr::Bytes { args: fields, .. } => fields.iter().any(|field| reads(field, quantities)),
+        Expr::Index { base, index } => reads(base, quantities) || reads(index, quantities),
+        Expr::Copy { value, .. } => reads(value, quantities),
         Expr::Outcome {
             tag,
             value,

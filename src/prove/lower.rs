@@ -224,6 +224,14 @@ pub fn lower(program: &Program, model: &target::Model, mutation: Mutation) -> Pl
 fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
     for statement in statements {
         match statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Parallel(parallel) if parallel.answer.is_some() => {}
             Stmt::Parallel(parallel) => out.push(parallel.site),
             Stmt::If {
@@ -266,6 +274,8 @@ fn arithmetic(value: &Expr) -> bool {
         | Expr::Truncate { text: operand, .. } => arithmetic(operand),
         Expr::With { list, entry } => arithmetic(list) || arithmetic(entry),
         Expr::Member { base, .. } => arithmetic(base),
+        Expr::Call { .. } | Expr::Index { .. } | Expr::Bytes { .. } => true,
+        Expr::Copy { value, .. } => arithmetic(value),
         Expr::Construct { fields, .. } | Expr::TextBuiltin { args: fields, .. } => {
             fields.iter().any(arithmetic)
         }
@@ -345,6 +355,14 @@ impl Lowering<'_> {
     fn collect_names(&self, statements: &[Stmt], names: &mut [String]) {
         for statement in statements {
             match statement {
+                Stmt::Set { .. }
+                | Stmt::SetIndex { .. }
+                | Stmt::PushLocal { .. }
+                | Stmt::While { .. } => {
+                    panic!(
+                        "vars and while loops live only in pure fns, which the prover reads as calls"
+                    )
+                }
                 Stmt::Effect { site, args, .. } => names[*site] = self.names.site(*site, args),
                 Stmt::If {
                     then, otherwise, ..
@@ -454,6 +472,14 @@ impl Lowering<'_> {
 
     fn statement(&self, statement: &Stmt, ops: &mut Vec<Op>) {
         match statement {
+            Stmt::Set { .. }
+            | Stmt::SetIndex { .. }
+            | Stmt::PushLocal { .. }
+            | Stmt::While { .. } => {
+                panic!(
+                    "vars and while loops live only in pure fns, which the prover reads as calls"
+                )
+            }
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } => {
                 self.arithmetic_trap(value, ops);
             }

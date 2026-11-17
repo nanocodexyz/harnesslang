@@ -12,6 +12,7 @@ pub enum Value {
     Variant(VariantId, Vec<Value>),
     List(Vec<Value>),
     Blob(String),
+    Bytes(Vec<u8>),
 }
 
 impl Value {
@@ -21,6 +22,7 @@ impl Value {
             Type::Bool => Some(Self::Bool(false)),
             Type::Text => Some(Self::Text(String::new())),
             Type::List { .. } => Some(Self::List(Vec::new())),
+            Type::Bytes(_) => Some(Self::Bytes(Vec::new())),
             Type::Sum(_) => program.text_enum(ty).map(|sum| {
                 assert!(!sum.variants.is_empty(), "a text enum has a value");
                 Self::Variant(0, Vec::new())
@@ -54,6 +56,13 @@ impl Value {
         match self {
             Self::List(items) => items,
             other => panic!("the checker types this value as a list, found {other:?}"),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Bytes(value) => value,
+            other => panic!("the checker types this value as bytes, found {other:?}"),
         }
     }
 
@@ -160,6 +169,7 @@ pub fn from_json(program: &Program, ty: &Type, json: &Json) -> Result<Value, Str
         Type::Blob(_) => {
             crate::run::blob::digest_of(json).map(|digest| Value::Blob(digest.to_owned()))
         }
+        Type::Bytes(_) => Err("bytes live only inside pure fns".to_owned()),
         Type::Sum(_) | Type::Known(_) | Type::Maybe(_) => variant_from_json(program, ty, json),
     }
 }

@@ -1,0 +1,11 @@
+harness reading
+
+tool read(path: text) -> text effect none
+
+fn peek(path: text) -> text {
+  return read(path)
+}
+
+on go(path: text) -> text {
+  return peek(path)
+}

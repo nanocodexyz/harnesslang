@@ -132,6 +132,27 @@ impl<'p> Function<'_, 'p> {
                 self.emit("call $list_append");
             }
             Expr::TextBuiltin { op, args } => self.text_builtin(*op, args)?,
+            Expr::Call { function, args } => {
+                for arg in args {
+                    self.expr(arg)?;
+                }
+                self.emit(format!("call $fn{function}"));
+            }
+            Expr::Index { base, index } => {
+                self.expr(base)?;
+                self.expr(index)?;
+                self.trap_name("index");
+                self.emit("call $list_index");
+            }
+            Expr::Bytes { op, args } => self.bytes(*op, args)?,
+            Expr::Copy { value, bytes } => {
+                self.expr(value)?;
+                self.emit(if *bytes {
+                    "call $bytes_copy"
+                } else {
+                    "call $list_copy"
+                });
+            }
             Expr::Outcome {
                 tag,
                 value,
@@ -200,6 +221,117 @@ impl<'p> Function<'_, 'p> {
         Ok(())
     }
 
+    fn trap_name(&mut self, text: &str) {
+        let name = self.tables.text(text);
+        self.emit(format!("i32.const {name}"));
+    }
+
+    fn bytes(&mut self, op: ir::BytesOp, args: &[Expr]) -> Result<(), String> {
+        match op {
+            ir::BytesOp::Empty | ir::BytesOp::EmptyList => {
+                self.emit("i64.const 0");
+                return Ok(());
+            }
+            ir::BytesOp::OfText => {
+                let Expr::Constant(capacity) = &args[1] else {
+                    panic!("the checker passes bytes_of its capacity constant");
+                };
+                let constant = &self.program().constants[*capacity];
+                self.expr(&args[0])?;
+                self.emit(format!("i64.const {}", constant.value));
+                self.trap_name(&constant.name.clone());
+                self.emit("call $bytes_of_text");
+                return Ok(());
+            }
+            ir::BytesOp::Get | ir::BytesOp::Slice | ir::BytesOp::ToText => {}
+        }
+        for arg in args {
+            self.expr(arg)?;
+        }
+        let (trap, call) = match op {
+            ir::BytesOp::Get => ("index", "call $bytes_get"),
+            ir::BytesOp::Slice => ("index", "call $bytes_slice"),
+            _ => ("text_of", "call $bytes_to_text"),
+        };
+        self.trap_name(trap);
+        self.emit(call);
+        Ok(())
+    }
+
+    fn local_capacity(&self, local: usize) -> (&'p Type, &'p ir::Bound) {
+        let ty = &self.handler.locals[local].ty;
+        match ty {
+            Type::List { capacity, .. } | Type::Bytes(capacity) => (ty, capacity),
+            other => panic!("the checker sets and pushes only lists and bytes, found {other:?}"),
+        }
+    }
+
+    fn set_index(&mut self, local: usize, index: &Expr, value: &Expr) -> Result<(), String> {
+        let (ty, _) = self.local_capacity(local);
+        self.emit(format!("local.get $l{local}"));
+        self.expr(index)?;
+        self.expr(value)?;
+        self.trap_name("index");
+        if matches!(ty, Type::Bytes(_)) {
+            self.trap_name("byte");
+            self.emit("call $bytes_set");
+        } else {
+            self.emit("call $list_set");
+        }
+        self.halt_check();
+        Ok(())
+    }
+
+    fn push_local(&mut self, local: usize, value: &Expr, append: bool) -> Result<(), String> {
+        let (ty, capacity) = self.local_capacity(local);
+        self.emit(format!("local.get $l{local}"));
+        self.expr(value)?;
+        self.emit(format!("i64.const {}", capacity.value));
+        self.trap_name(&capacity.name);
+        match (ty, append) {
+            (Type::Bytes(_), true) => self.emit("call $bytes_append"),
+            (Type::Bytes(_), false) => {
+                self.trap_name("byte");
+                self.emit("call $bytes_push");
+            }
+            _ => self.emit("call $list_push"),
+        }
+        self.halt_check();
+        self.emit(format!("local.set $l{local}"));
+        Ok(())
+    }
+
+    fn guarded(
+        &mut self,
+        index: usize,
+        bound: u64,
+        condition: &Expr,
+        body: &[Stmt],
+    ) -> Result<(), String> {
+        let label = self.label();
+        self.emit("i64.const 0");
+        self.emit(format!("local.set $l{index}"));
+        self.emit(format!("block $break{label}"));
+        self.emit(format!("loop $continue{label}"));
+        self.emit(format!("local.get $l{index}"));
+        self.emit(format!("i64.const {bound}"));
+        self.emit("i64.ge_u");
+        self.emit(format!("br_if $break{label}"));
+        self.expr(condition)?;
+        self.halt_check();
+        self.emit("i64.eqz");
+        self.emit(format!("br_if $break{label}"));
+        self.block(body)?;
+        self.emit(format!("local.get $l{index}"));
+        self.emit("i64.const 1");
+        self.emit("i64.add");
+        self.emit(format!("local.set $l{index}"));
+        self.emit(format!("br $continue{label}"));
+        self.emit("end");
+        self.emit("end");
+        Ok(())
+    }
+
     fn binary(
         &mut self,
         op: BinaryOp,
@@ -217,6 +349,17 @@ impl<'p> Function<'_, 'p> {
             BinaryOp::Add => vec!["call $u64_add".to_owned()],
             BinaryOp::Subtract => vec!["call $u64_subtract".to_owned()],
             BinaryOp::Multiply => vec!["call $u64_multiply".to_owned()],
+            BinaryOp::Divide | BinaryOp::Remainder => {
+                let name = self
+                    .tables
+                    .text(&format!("u64 division by zero in '{}'", op.symbol()));
+                let call = if op == BinaryOp::Divide {
+                    "call $u64_divide"
+                } else {
+                    "call $u64_remainder"
+                };
+                vec![format!("i32.const {name}"), call.to_owned()]
+            }
             BinaryOp::Concat => vec![
                 "i32.wrap_i64".to_owned(),
                 "call $text_concat".to_owned(),
@@ -256,11 +399,27 @@ impl<'p> Function<'_, 'p> {
 
     fn statement(&mut self, statement: &Stmt) -> Result<(), String> {
         match statement {
-            Stmt::Let { local, value } => {
+            Stmt::Let { local, value } | Stmt::Set { local, value } => {
                 self.expr(value)?;
                 self.halt_check();
                 self.emit(format!("local.set $l{local}"));
             }
+            Stmt::SetIndex {
+                local,
+                index,
+                value,
+            } => self.set_index(*local, index, value)?,
+            Stmt::PushLocal {
+                local,
+                value,
+                append,
+            } => self.push_local(*local, value, *append)?,
+            Stmt::While {
+                index,
+                bound,
+                condition,
+                body,
+            } => self.guarded(*index, bound.value, condition, body)?,
             Stmt::Assign { field, value } => {
                 self.emit("global.get $state");
                 self.expr(value)?;
@@ -756,6 +915,44 @@ fn handler_function<'p>(
     Ok(text)
 }
 
+fn pure_function<'p>(
+    tables: &mut Tables<'p>,
+    definition: &'p Handler,
+    id: usize,
+) -> Result<String, String> {
+    let mut function = Function {
+        tables,
+        handler: definition,
+        index: 0,
+        body: Vec::new(),
+        temps: 0,
+        labels: 0,
+    };
+    function.emit("block $exit");
+    function.block(&definition.body)?;
+    function.emit("unreachable");
+    function.emit("end");
+    let mut text = format!("(func $fn{id}");
+    for param in &definition.params {
+        write!(text, " (param $l{param} i64)").expect("writing to a string succeeds");
+    }
+    text.push_str(" (result i64) (local $result i64)");
+    for local in 0..definition.locals.len() {
+        if !definition.params.contains(&local) {
+            write!(text, " (local $l{local} i64)").expect("writing to a string succeeds");
+        }
+    }
+    for temp in 1..=function.temps {
+        write!(text, " (local $t{temp} i64)").expect("writing to a string succeeds");
+    }
+    text.push('\n');
+    for line in &function.body {
+        writeln!(text, "  {line}").expect("writing to a string succeeds");
+    }
+    text.push_str("  local.get $result)\n");
+    Ok(text)
+}
+
 fn refuse_unsupported(program: &Program) -> Result<(), String> {
     let refused = [(
         program.codes.iter().any(|code| code.interrupts.steer),
@@ -777,6 +974,9 @@ pub fn program_text(program: &Program, target: crate::target::Target) -> Result<
     let mut tables = Tables::new(program);
     tables.ty(&context_type())?;
     let mut functions = String::new();
+    for (id, definition) in program.functions.iter().enumerate() {
+        functions.push_str(&pure_function(&mut tables, definition, id)?);
+    }
     let functions_count = program.handlers.len() + program.sides.len();
     for index in 0..functions_count {
         let handler = program

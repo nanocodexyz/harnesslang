@@ -403,7 +403,10 @@ fn statement_cost(
         | Stmt::Take { .. }
         | Stmt::KeepBlobs { .. }
         | Stmt::Rewrite { .. }
-        | Stmt::Shrink { .. } => Ok(continuing(zero())),
+        | Stmt::Shrink { .. }
+        | Stmt::Set { .. }
+        | Stmt::SetIndex { .. }
+        | Stmt::PushLocal { .. } => Ok(continuing(zero())),
         Stmt::Effect { site, .. } => Ok(continuing(site_cost(program, handler.sites[*site].kind)?)),
         Stmt::Finish { .. } => Ok(Paths {
             through: None,
@@ -425,7 +428,10 @@ fn statement_cost(
             }
             Ok(widest_arm)
         }
-        Stmt::Loop { index, bound, body } => {
+        Stmt::Loop { index, bound, body }
+        | Stmt::While {
+            index, bound, body, ..
+        } => {
             let factor = Factor {
                 name: handler.locals[*index].name.clone(),
                 bound: bound.clone(),

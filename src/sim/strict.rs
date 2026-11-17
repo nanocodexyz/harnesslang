@@ -87,6 +87,9 @@ pub fn draw(program: &Program, ty: &Type, rng: &mut Rng, edges: &Edges) -> Value
         Type::Bool => Value::Bool(rng.draw() & 1 == 1),
         Type::Text => Value::Text(SimWorld::generated_text(rng)),
         Type::Blob(_) => panic!("the simulator draws no blob: blobs come from tools"),
+        Type::Bytes(_) => {
+            panic!("bytes live only inside pure fns, which the simulator never feeds")
+        }
         Type::List { element, .. } if element.holds_blob(program) => Value::List(Vec::new()),
         Type::List { element, capacity } => {
             let length = edges.length(rng, capacity.value);
