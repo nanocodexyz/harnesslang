@@ -8,7 +8,8 @@ scratch=output/gate
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 programs=$(echo examples/*.hl examples/inlined/*.hl examples/sound/*.hl)
 per_program_hosts="agent"
-counts="emitted_source_lines host_lines_beyond_fixed programs_not_on_wasm"
+counts="emitted_source_lines host_lines_beyond_fixed programs_not_on_wasm host_policy_lines"
+prose='"([^"\\]|\\.)*[A-Za-z]+ [A-Za-z]+ [A-Za-z]+ [A-Za-z]+([^"\\]|\\.)*"'
 
 fail() {
   echo "gate: $*" >&2
@@ -50,6 +51,13 @@ host_lines_beyond_fixed() {
   files=$(git ls-files -- $per_program_hosts)
   [ -n "$files" ] || { echo 0; return; }
   cat $files | wc -l
+}
+
+host_policy_lines() {
+  local files
+  files=$(git ls-files -- 'hosts/native/*.rs')
+  [ -n "$files" ] || { echo 0; return; }
+  cat $files | grep -cE "$prose" || true
 }
 
 fixed_host() {

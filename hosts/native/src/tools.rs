@@ -36,9 +36,6 @@ const BASH_WRAPPER: &str = "__hl_state=\"$1\"; shift; trap 'pwd -P > \"$__hl_sta
 const TRUNCATED: &str = "[Truncated: PARTIAL view \u{2014} ";
 const ALLOW_LARGE_UNAVAILABLE: &str =
     " allow_large is not available where this read runs; read it in parts with offset and limit.";
-const FILE_STATE: &str =
-    " (file state is current in your context \u{2014} no need to Read it back)";
-const BACKGROUND_STARTED: &str = "Command running in background";
 const BINARY_EXTENSIONS: [&str; 87] = [
     ".ico", ".tiff", ".tif", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
     ".mpeg", ".mpg", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".aiff", ".opus",
@@ -81,6 +78,7 @@ pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 pub struct Workspace {
+    pub texts: crate::texts::Texts,
     pub root: PathBuf,
     pub state: PathBuf,
     pub image_bytes_max: Option<u64>,
@@ -209,10 +207,12 @@ impl Workspace {
             return Recovered::Unknown;
         };
         match std::fs::read(&path) {
-            Ok(bytes) if bytes == content.as_bytes() => Recovered::Reply(Ran::Ok(format!(
-                "The file {} has been updated successfully.{FILE_STATE}",
-                path.display()
-            ))),
+            Ok(bytes) if bytes == content.as_bytes() => {
+                let shown = path.display().to_string();
+                Recovered::Reply(Ran::Ok(
+                    self.texts.fill("write_updated", &[("path", &shown)]),
+                ))
+            }
             _ if self.receipt(turn, seq, RECEIPT_STARTED).exists() => Recovered::Unknown,
             _ => Recovered::NotDispatched,
         }
@@ -237,10 +237,12 @@ impl Workspace {
         };
         match (content.contains(old), content.contains(new)) {
             (true, false) => Recovered::NotDispatched,
-            (false, true) => Recovered::Reply(Ran::Ok(format!(
-                "The file {} has been updated successfully.",
-                path.display()
-            ))),
+            (false, true) => {
+                let shown = path.display().to_string();
+                Recovered::Reply(Ran::Ok(
+                    self.texts.fill("edit_updated", &[("path", &shown)]),
+                ))
+            }
             _ => Recovered::Unknown,
         }
     }
@@ -335,11 +337,12 @@ impl Workspace {
         let existed = path.exists();
         atomic_write(&path, content)?;
         let shown = path.display().to_string();
-        Ok(if existed {
-            format!("The file {shown} has been updated successfully.{FILE_STATE}")
+        let name = if existed {
+            "write_updated"
         } else {
-            format!("File created successfully at: {shown}{FILE_STATE}")
-        })
+            "write_created"
+        };
+        Ok(self.texts.fill(name, &[("path", &shown)]))
     }
 
     fn edit(&self, input: &Value) -> Result<String, String> {
@@ -367,14 +370,13 @@ impl Workspace {
         let updated = apply_edit(&content, old, new, replace_all)?;
         let path = self.write_target(file_path)?;
         atomic_write(&path, &updated)?;
-        let shown = path.display();
-        Ok(if replace_all {
-            format!(
-                "The file {shown} has been updated. All occurrences were successfully replaced."
-            )
+        let shown = path.display().to_string();
+        let name = if replace_all {
+            "edit_replaced_all"
         } else {
-            format!("The file {shown} has been updated successfully.")
-        })
+            "edit_updated"
+        };
+        Ok(self.texts.fill(name, &[("path", &shown)]))
     }
 
     pub fn bash_job(&self, input: &Value, room: bool) -> Bashed {
@@ -424,20 +426,21 @@ impl Workspace {
             let started = self
                 .spawn_shell(command)
                 .map_err(|error| format!("command executor: {error}"))?;
-            return Ok(Bashed::Job(started, BACKGROUND_STARTED.to_owned()));
+            return Ok(Bashed::Job(
+                started,
+                self.texts.fill("bash_background", &[]),
+            ));
         }
         let waited = self
             .execute(command, timeout, room)
             .map_err(|error| format!("command executor: {error}"))?;
         Ok(match waited {
             Waited::Done(shell) => Bashed::Ran(rendered(&shell)),
-            Waited::Moved(started) => Bashed::Job(
-                started,
-                format!(
-                    "Command did not complete within its {}s timeout and was moved to the background",
-                    timeout.as_secs().max(1)
-                ),
-            ),
+            Waited::Moved(started) => {
+                let seconds = timeout.as_secs().max(1).to_string();
+                let message = self.texts.fill("bash_moved", &[("seconds", &seconds)]);
+                Bashed::Job(started, message)
+            }
         })
     }
 

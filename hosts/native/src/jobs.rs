@@ -1,27 +1,12 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::texts::Texts;
 use crate::tools::{self, Started};
 
 pub const JOB_POLL: Duration = Duration::from_millis(50);
 pub const DONE_PREFIX: &str = "done:";
 pub const STALL_PREFIX: &str = "stall:";
-const STALL_SILENCE: Duration = Duration::from_secs(45);
-const STALL_TAIL_BYTES: u64 = 1024;
-const NOTIFIED: &str = "You will be notified when it completes.";
-const ENDS_WITH_TURN: &str = "If it exits while you are still working you will be notified, but it is terminated when you give your final response and no notification can follow that \u{2014} so do not end your turn to wait for it; if you need its result, wait for it before giving your final response.";
-const STALL_ADVICE: &str = "The command is likely blocked on an interactive prompt. Stop this task and re-run with piped input (e.g., `echo y | command`) or a non-interactive flag if one exists.";
-const PROMPT_PHRASES: [&str; 5] = ["do you", "would you", "shall i", "are you sure", "ready to"];
-const PROMPT_PATTERNS: [&str; 7] = [
-    "(y/n)",
-    "[y/n]",
-    "(yes/no)",
-    "press any key",
-    "press enter",
-    "continue?",
-    "overwrite?",
-];
-
 struct Running {
     started: Started,
     command: String,
@@ -40,20 +25,22 @@ pub struct Notice {
 
 #[derive(Default)]
 pub struct Jobs {
+    pub texts: Texts,
     running: BTreeMap<String, Running>,
     finished: BTreeMap<String, String>,
     stalls: BTreeMap<String, String>,
 }
 
-pub fn started_text(key: &str, message: &str, held: bool) -> String {
-    if held {
-        format!("{message} (ID: {key}). {NOTIFIED}")
+pub fn started_text(texts: &Texts, key: &str, message: &str, held: bool) -> String {
+    let name = if held {
+        "job_started"
     } else {
-        format!("{message} with ID: {key}. {ENDS_WITH_TURN}")
-    }
+        "job_started_unheld"
+    };
+    texts.fill(name, &[("message", message), ("key", key)])
 }
 
-pub fn prompting(tail: &str) -> bool {
+pub fn prompting(texts: &Texts, tail: &str) -> bool {
     let line = tail
         .trim_end()
         .rsplit('\n')
@@ -61,15 +48,19 @@ pub fn prompting(tail: &str) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     let question = line.trim_end_matches(' ').ends_with('?')
-        && PROMPT_PHRASES.iter().any(|phrase| {
-            line.match_indices(phrase).any(|(at, _)| {
+        && texts.list("prompt_phrases").iter().any(|phrase| {
+            line.match_indices(phrase.as_str()).any(|(at, _)| {
                 let before = line[..at].chars().next_back();
                 let after = line[at + phrase.len()..].chars().next();
                 !before.is_some_and(char::is_alphanumeric)
                     && !after.is_some_and(char::is_alphanumeric)
             })
         });
-    question || PROMPT_PATTERNS.iter().any(|pattern| line.contains(pattern))
+    question
+        || texts
+            .list("prompt_patterns")
+            .iter()
+            .any(|pattern| line.contains(pattern.as_str()))
 }
 
 fn without_escapes(text: &str) -> String {
@@ -92,14 +83,16 @@ fn without_escapes(text: &str) -> String {
     out
 }
 
-fn stall_text(key: &str, command: &str, tail: &str) -> String {
-    format!(
-        "<task-notification>\n<task-id>{key}</task-id>\n<summary>Background command \"{command}\" appears to be waiting for interactive input</summary>\n</task-notification>\nLast output:\n{}\n\n{STALL_ADVICE}",
-        tail.trim_end()
-    )
-}
-
 impl Jobs {
+    pub fn new(texts: Texts) -> Self {
+        Jobs {
+            texts,
+            running: BTreeMap::new(),
+            finished: BTreeMap::new(),
+            stalls: BTreeMap::new(),
+        }
+    }
+
     pub fn start(&mut self, key: &str, started: Started, command: &str, held: bool) {
         let written = started.written_bytes();
         let previous = self.running.insert(
@@ -117,6 +110,13 @@ impl Jobs {
     }
 
     fn watch_stalls(&mut self) {
+        let (Some(silence_ms), Some(tail_bytes)) = (
+            self.texts.number("stall_silence_ms"),
+            self.texts.number("stall_tail_bytes"),
+        ) else {
+            return;
+        };
+        let silence = Duration::from_millis(silence_ms);
         for (key, job) in self.running.iter_mut().filter(|(_, job)| !job.stalled) {
             let written = job.started.written_bytes();
             if written > job.written {
@@ -124,20 +124,27 @@ impl Jobs {
                 job.quiet = Instant::now();
                 continue;
             }
-            if job.quiet.elapsed() < STALL_SILENCE {
+            if job.quiet.elapsed() < silence {
                 continue;
             }
-            let Some(tail) = job.started.stdout_tail(STALL_TAIL_BYTES) else {
+            let Some(tail) = job.started.stdout_tail(tail_bytes) else {
                 continue;
             };
             let tail = without_escapes(&tail);
-            if !prompting(&tail) {
+            if !prompting(&self.texts, &tail) {
                 job.quiet = Instant::now();
                 continue;
             }
             job.stalled = true;
-            self.stalls
-                .insert(key.clone(), stall_text(key, &job.command, &tail));
+            let notice = self.texts.fill(
+                "job_stalled",
+                &[
+                    ("key", key),
+                    ("command", &job.command),
+                    ("tail", tail.trim_end()),
+                ],
+            );
+            self.stalls.insert(key.clone(), notice);
         }
     }
 
@@ -161,20 +168,25 @@ impl Jobs {
             let notice = match tools::settled(started, status, false) {
                 Ok(shell) => {
                     let code = tools::exit_code(&shell);
-                    let (state, summary) = if code == 0 {
-                        ("completed", "completed".to_owned())
+                    let output = tools::shown(&shell);
+                    let name = if code == 0 {
+                        "job_completed"
                     } else {
-                        ("failed", format!("failed with exit code {code}"))
+                        "job_failed"
                     };
-                    format!(
-                        "<task-notification>\n<task-id>{key}</task-id>\n<status>{state}</status>\n<summary>Background command \"{}\" {summary}</summary>\n</task-notification>\n{}",
-                        job.command,
-                        tools::shown(&shell)
+                    self.texts.fill(
+                        name,
+                        &[
+                            ("key", &key),
+                            ("command", &job.command),
+                            ("code", &code.to_string()),
+                            ("output", &output),
+                        ],
                     )
                 }
-                Err(error) => format!(
-                    "<task-notification>\n<task-id>{key}</task-id>\n<status>failed</status>\n<summary>Background command \"{}\" lost its output: {error}</summary>\n</task-notification>",
-                    job.command
+                Err(error) => self.texts.fill(
+                    "job_lost",
+                    &[("key", &key), ("command", &job.command), ("error", &error)],
                 ),
             };
             self.stalls.remove(&key);

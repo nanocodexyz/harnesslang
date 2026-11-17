@@ -11,6 +11,7 @@ use crate::children::{self, Children};
 use crate::control;
 use crate::json::Value;
 use crate::ledger::{self, Ledger};
+use crate::texts::Texts;
 use crate::{codex, jobs, now_ms, random, tools, wire};
 
 pub const JOURNAL_FILE: &str = "journal.jsonl";
@@ -37,6 +38,7 @@ pub struct Spawn {
 
 #[derive(Clone)]
 pub struct Setup {
+    pub texts: Texts,
     pub module_dir: Option<PathBuf>,
     pub cwd: PathBuf,
     pub spawns: Vec<Spawn>,
@@ -171,12 +173,13 @@ impl Session {
         let ledger = Ledger::open(&directory.join(ledger::LEDGER_FILE))?;
         Ok(Session {
             workspace: tools::Workspace {
+                texts: setup.texts.clone(),
                 root: setup.cwd.clone(),
                 state: state.clone(),
                 image_bytes_max: Some(tools::IMAGE_BYTES_MAX),
             },
-            exec: codex::Exec::new(setup.cwd.clone(), state),
-            jobs: jobs::Jobs::default(),
+            exec: codex::Exec::new(setup.texts.clone(), setup.cwd.clone(), state),
+            jobs: jobs::Jobs::new(setup.texts.clone()),
             ledger,
             children: Children::new(directory, setup.clone(), cancel),
             control: control::directory(directory),
@@ -305,7 +308,12 @@ impl Session {
                     "{}: {turn}/{seq} Bash became background job {key}",
                     self.label
                 );
-                tools::Ran::Job(jobs::started_text(&key, &message, held))
+                tools::Ran::Job(jobs::started_text(
+                    &self.workspace.texts,
+                    &key,
+                    &message,
+                    held,
+                ))
             }
         }
     }

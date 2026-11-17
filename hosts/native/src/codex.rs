@@ -6,17 +6,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::json::Value;
+use crate::texts::Texts;
 use crate::tools::{self, Ran};
 
-pub const MIN_YIELD_TIME_MS: u64 = 250;
-pub const DEFAULT_YIELD_TIME_MS: u64 = 10_000;
-pub const MAX_YIELD_TIME_MS: u64 = 30_000;
-pub const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
-pub const MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 10_000;
 pub const OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 pub const MAX_PROCESSES: usize = 64;
-pub const BYTES_PER_TOKEN: u64 = 4;
 pub const POLL: Duration = Duration::from_millis(10);
 const SHELL: &str = "bash";
 const PTY_WRAPPER: &str = "script";
@@ -45,6 +39,7 @@ struct Session {
 }
 
 pub struct Exec {
+    texts: Texts,
     root: PathBuf,
     state: PathBuf,
     sessions: BTreeMap<u64, Session>,
@@ -72,12 +67,13 @@ fn bool_field(input: &Value, key: &str, default: bool) -> bool {
     }
 }
 
-pub fn truncate_tokens(text: &str, max_tokens: u64) -> (String, Option<u64>) {
-    let budget = usize::try_from(max_tokens.saturating_mul(BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
+pub fn truncate_tokens(texts: &Texts, text: &str, max_tokens: u64) -> (String, Option<u64>) {
+    let per_token = texts.number("bytes_per_token").unwrap_or(1).max(1);
+    let budget = usize::try_from(max_tokens.saturating_mul(per_token)).unwrap_or(usize::MAX);
     if text.len() <= budget {
         return (text.to_owned(), None);
     }
-    let original = (text.len() as u64).div_ceil(BYTES_PER_TOKEN);
+    let original = (text.len() as u64).div_ceil(per_token);
     let mut left = budget / 2;
     while !text.is_char_boundary(left) {
         left -= 1;
@@ -86,36 +82,41 @@ pub fn truncate_tokens(text: &str, max_tokens: u64) -> (String, Option<u64>) {
     while !text.is_char_boundary(right) {
         right += 1;
     }
-    let removed = ((right - left) as u64).div_ceil(BYTES_PER_TOKEN);
+    let removed = ((right - left) as u64).div_ceil(per_token).to_string();
+    let cut = texts.fill("exec_cut", &[("tokens", &removed)]);
     (
-        format!(
-            "{}…{removed} tokens truncated…{}",
-            &text[..left],
-            &text[right..]
-        ),
+        format!("{}{cut}{}", &text[..left], &text[right..]),
         Some(original),
     )
 }
 
+fn clamped(texts: &Texts, value: u64, min: &str, max: &str) -> u64 {
+    let low = texts.number(min).unwrap_or(0);
+    let high = texts.number(max).unwrap_or(u64::MAX).max(low);
+    value.clamp(low, high)
+}
+
 fn rendered(
+    texts: &Texts,
     wall: Duration,
     exit: Option<i32>,
     session: Option<u64>,
     output: &str,
     max_tokens: u64,
 ) -> String {
-    let (shown, original) = truncate_tokens(output, max_tokens);
-    let mut sections = vec![format!("Wall time: {:.4} seconds", wall.as_secs_f64())];
+    let (shown, original) = truncate_tokens(texts, output, max_tokens);
+    let seconds = format!("{:.4}", wall.as_secs_f64());
+    let mut sections = vec![texts.fill("exec_wall", &[("seconds", &seconds)])];
     if let Some(code) = exit {
-        sections.push(format!("Process exited with code {code}"));
+        sections.push(texts.fill("exec_exited", &[("code", &code.to_string())]));
     }
     if let Some(id) = session {
-        sections.push(format!("Process running with session ID {id}"));
+        sections.push(texts.fill("exec_running", &[("id", &id.to_string())]));
     }
     if let Some(original) = original {
-        sections.push(format!("Original token count: {original}"));
+        sections.push(texts.fill("exec_original", &[("tokens", &original.to_string())]));
     }
-    sections.push("Output:".to_owned());
+    sections.push(texts.fill("exec_output", &[]));
     sections.push(shown);
     sections.join("\n")
 }
@@ -138,8 +139,9 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 }
 
 impl Exec {
-    pub fn new(root: PathBuf, state: PathBuf) -> Self {
+    pub fn new(texts: Texts, root: PathBuf, state: PathBuf) -> Self {
         Self {
+            texts,
             root,
             state,
             sessions: BTreeMap::new(),
@@ -231,6 +233,7 @@ impl Exec {
             Settled::Exited(code) => {
                 let _ = std::fs::remove_file(&session.output);
                 Ran::Ok(rendered(
+                    &self.texts,
                     begun.elapsed(),
                     Some(code),
                     None,
@@ -250,6 +253,7 @@ impl Exec {
                 self.next += 1;
                 self.sessions.insert(id, session);
                 Ran::Ok(rendered(
+                    &self.texts,
                     begun.elapsed(),
                     None,
                     Some(id),
@@ -279,9 +283,13 @@ impl Exec {
         };
         let login = bool_field(input, "login", true);
         let tty = bool_field(input, "tty", false);
-        let yield_ms = u64_field(input, "yield_time_ms", DEFAULT_YIELD_TIME_MS)
-            .clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS);
-        let max_tokens = u64_field(input, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS);
+        let yield_ms = clamped(
+            &self.texts,
+            u64_field(input, "yield_time_ms", 0),
+            "exec_yield_min_ms",
+            "exec_yield_max_ms",
+        );
+        let max_tokens = u64_field(input, "max_output_tokens", u64::MAX);
         let output = self.state.join(format!("exec-{}.out", self.next));
         let flag = if login { "-lc" } else { "-c" };
         let pty = tty && on_path(PTY_WRAPPER);
@@ -333,7 +341,7 @@ impl Exec {
     pub fn write_stdin(&mut self, input: &Value, stop: &dyn Fn() -> bool) -> Ran {
         let id = u64_field(input, "session_id", 0);
         let chars = text_field(input, "chars");
-        let max_tokens = u64_field(input, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS);
+        let max_tokens = u64_field(input, "max_output_tokens", u64::MAX);
         let Some(mut session) = self.sessions.remove(&id) else {
             return Ran::Failed(format!("Unknown process id {id}"));
         };
@@ -341,7 +349,7 @@ impl Exec {
             let written = match session.stdin.as_mut() {
                 None => {
                     self.sessions.insert(id, session);
-                    return Ran::Failed("stdin is closed for this session; rerun exec_command with tty=true to keep stdin open".to_owned());
+                    return Ran::Failed(self.texts.fill("exec_stdin_closed", &[]));
                 }
                 Some(stdin) => stdin
                     .write_all(chars.as_bytes())
@@ -352,11 +360,21 @@ impl Exec {
                 return Ran::Failed("failed to write to stdin".to_owned());
             }
         }
-        let requested = u64_field(input, "yield_time_ms", MIN_YIELD_TIME_MS);
+        let requested = u64_field(input, "yield_time_ms", 0);
         let yield_ms = if chars.is_empty() {
-            requested.clamp(MIN_EMPTY_YIELD_TIME_MS, MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
+            clamped(
+                &self.texts,
+                requested,
+                "poll_yield_min_ms",
+                "poll_yield_max_ms",
+            )
         } else {
-            requested.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+            clamped(
+                &self.texts,
+                requested,
+                "exec_yield_min_ms",
+                "exec_yield_max_ms",
+            )
         };
         let begun = Instant::now();
         let until = begun + Duration::from_millis(yield_ms);
@@ -365,6 +383,7 @@ impl Exec {
                 let output = Self::drain(&mut session);
                 self.sessions.insert(id, session);
                 Ran::Ok(rendered(
+                    &self.texts,
                     begun.elapsed(),
                     None,
                     Some(id),

@@ -9,6 +9,7 @@ mod sql;
 mod store;
 mod store_postgres;
 mod store_sqlite;
+mod texts;
 mod tools;
 mod transport;
 mod wire;
@@ -21,27 +22,21 @@ use harnesslang::wasm::js::{Json, parse};
 use harnesslang::wasm::sim::Loaded;
 
 use host::{Ran, Session, Setup, Spawn};
+use texts::Texts;
 
 pub const EXIT_HARNESS_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
-const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> [--store jsonl|sqlite:<file>|postgres:<host:port>/<database>] [--session <key>] --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--escalate-model <id>] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host wire --request <file.json> --scratch <dir>
-       hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
+const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> [--store jsonl|sqlite:<file>|postgres:<host:port>/<database>] [--session <key>] --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --journal <dir> [--store <store>] [--session <key>] [--cwd <dir>] [--turn N] [--module-dir <dir>] [--<flag> <value>]...\n       hl-host wire --request <file.json> --scratch <dir>\n       hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
 const LABEL: &str = "hl-host";
-const HARNESS_CLAUDE: &str = "claude";
-const HARNESS_CODEX: &str = "codex";
-const CLAUDE_MODEL_PREFIX: &str = "claude";
-const PROGRAM_CLAUDE: &str = "claude_code";
-const PROGRAM_CLAUDE_CHILD: &str = "claude_code_child";
-const PROGRAM_CODEX: &str = "codex_agent";
-const CLAUDE_SPAWN_TOOL: &str = "spawn_agent";
-const CLAUDE_SPAWN_HANDLER: &str = "delegated";
-const PROMPT_HANDLER: &str = "prompt";
-const REFRESH_HANDLER: &str = "refresh";
-const EFFORT_DEFAULT: &str = "default";
-const FINISH_CHECKS_DEFAULT: &str = "2";
-const ROUNDS_DEFAULT: u64 = u32::MAX as u64;
-const KEEP_WARM_MAX: u64 = 64;
-const IDLE_REQUESTS_PER_REFRESH_MAX: u64 = 2;
+const ENTRY_PROGRAM: &str = "entry";
+const ENTRY_HANDLER: &str = "launch";
+const ENTRY_LAUNCH: &str = "launch";
+const ENTRY_REFUSED: &str = "refused";
+const FILE_KEY: &str = "$file";
+const NUMBER_KEY: &str = "$number";
+const STEPS_MAX: usize = 8;
+const IDLE_TURNS_MAX: u64 = 64;
+const IDLE_REQUESTS_PER_TURN_MAX: u64 = 2;
 const FIRST_TURN: u64 = 1;
 const NO_HANDLER: &str = "no handler";
 const ARGUMENTS_REFUSED: &str = "a turn request has a turn, a handler and arguments";
@@ -87,20 +82,12 @@ struct Flags {
     turn: Option<u64>,
     cwd: Option<PathBuf>,
     spawns: Vec<Spawn>,
-    instruction: Option<PathBuf>,
-    model: Option<String>,
-    harness: Option<String>,
-    max_turns: Option<u64>,
-    effort: Option<String>,
-    reviewer: Option<String>,
-    finish_checks: Option<String>,
-    escalate_model: Option<String>,
-    keep_warm: u64,
     text: Option<String>,
     request: Option<PathBuf>,
     scratch: Option<PathBuf>,
     store: Option<String>,
     session: Option<String>,
+    rest: Vec<(String, String)>,
 }
 
 fn spawn_flag(value: &str) -> Spawn {
@@ -136,30 +123,20 @@ fn flags(args: &[String]) -> Flags {
             "--turn" => flags.turn = Some(number_flag(flag, &value)),
             "--cwd" => flags.cwd = Some(PathBuf::from(value)),
             "--spawn" => flags.spawns.push(spawn_flag(&value)),
-            "--instruction" => flags.instruction = Some(PathBuf::from(value)),
-            "--model" => flags.model = Some(value),
-            "--harness" => flags.harness = Some(value),
-            "--max-turns" => flags.max_turns = Some(number_flag(flag, &value)),
-            "--effort" => flags.effort = Some(value),
-            "--reviewer-relay" => flags.reviewer = Some(value),
-            "--finish-checks" => flags.finish_checks = Some(value),
-            "--escalate-model" => flags.escalate_model = Some(value),
-            "--keep-warm" => flags.keep_warm = number_flag(flag, &value),
             "--text" => flags.text = Some(value),
             "--request" => flags.request = Some(PathBuf::from(value)),
             "--scratch" => flags.scratch = Some(PathBuf::from(value)),
             "--store" => flags.store = Some(value),
             "--session" => flags.session = Some(value),
-            other => fail_usage(&format!("unknown flag {other}")),
+            other if other.starts_with("--") => {
+                flags.rest.retain(|(name, _)| name != other);
+                flags.rest.push((other.to_owned(), value));
+            }
+            other => fail_usage(&format!("{other} is not a flag")),
         }
     }
     if flags.turn == Some(0) {
         fail_usage("--turn counts from 1");
-    }
-    if flags.keep_warm > KEEP_WARM_MAX {
-        fail_usage(&format!(
-            "--keep-warm is at most KEEP_WARM_MAX ({KEEP_WARM_MAX})"
-        ));
     }
     flags
 }
@@ -171,13 +148,20 @@ fn main() {
     match command {
         "steer" | "cancel" => send_event(command, &flags),
         "wire" => wire_once(&flags),
-        "run" if flags.instruction.is_some() => front(flags),
-        "run" => generic(flags),
+        "run" if flags.module.is_some() => generic(flags),
+        "run" => launch(flags),
         _ => fail_usage("the commands are run, wire, steer and cancel"),
     }
 }
 
+fn refuse_rest(flags: &Flags, known: &[String]) {
+    if let Some((name, _)) = flags.rest.iter().find(|(name, _)| !known.contains(name)) {
+        fail_usage(&format!("unknown flag {name}"));
+    }
+}
+
 fn send_event(command: &str, flags: &Flags) -> ! {
+    refuse_rest(flags, &[]);
     let journal = flags
         .journal
         .as_ref()
@@ -201,6 +185,7 @@ fn send_event(command: &str, flags: &Flags) -> ! {
 }
 
 fn wire_once(flags: &Flags) -> ! {
+    refuse_rest(flags, &[]);
     let path = flags
         .request
         .as_ref()
@@ -219,7 +204,18 @@ fn wire_once(flags: &Flags) -> ! {
     std::process::exit(0)
 }
 
-fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (PathBuf, Session) {
+fn canonical_cwd(flags: &Flags) -> PathBuf {
+    let cwd = flags.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+    std::fs::canonicalize(&cwd)
+        .unwrap_or_else(|error| fail_usage(&format!("--cwd {}: {error}", cwd.display())))
+}
+
+fn open(
+    flags: &Flags,
+    module_dir: Option<PathBuf>,
+    spawns: Vec<Spawn>,
+    texts: Texts,
+) -> (PathBuf, Session) {
     let journal = flags
         .journal
         .clone()
@@ -228,12 +224,10 @@ fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (Path
         .unwrap_or_else(|error| fail(&format!("{}: {error}", journal.display())));
     let journal = std::fs::canonicalize(&journal)
         .unwrap_or_else(|error| fail(&format!("{}: {error}", journal.display())));
-    let cwd = flags.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-    let cwd = std::fs::canonicalize(&cwd)
-        .unwrap_or_else(|error| fail_usage(&format!("--cwd {}: {error}", cwd.display())));
     let setup = Setup {
+        texts,
         module_dir,
-        cwd,
+        cwd: canonical_cwd(flags),
         spawns,
     };
     let cancel = control::directory(&journal);
@@ -248,11 +242,23 @@ fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (Path
     (journal, session)
 }
 
+struct Step {
+    handler: String,
+    arguments: Json,
+    refused: String,
+}
+
+struct Plan {
+    texts: Texts,
+    model: String,
+    raw: bool,
+    steps: Vec<Step>,
+    idle: Option<(String, u64)>,
+}
+
 fn generic(flags: Flags) {
-    let module = flags
-        .module
-        .clone()
-        .unwrap_or_else(|| fail_usage("run needs --module or --instruction"));
+    refuse_rest(&flags, &[]);
+    let module = flags.module.clone().expect("generic runs with --module");
     let handler = flags
         .handler
         .clone()
@@ -264,41 +270,318 @@ fn generic(flags: Flags) {
         .clone()
         .or_else(|| module.parent().map(Path::to_path_buf));
     let loaded = host::load(&module).unwrap_or_else(|error| fail(&error));
-    let (journal, mut session) = open(&flags, module_dir, flags.spawns.clone());
-    let turn = flags.turn.unwrap_or_else(|| {
+    let plan = Plan {
+        texts: Texts::default(),
+        model: text_of(arguments.get("model"))
+            .unwrap_or_default()
+            .to_owned(),
+        raw: true,
+        steps: vec![Step {
+            handler,
+            arguments,
+            refused: String::new(),
+        }],
+        idle: None,
+    };
+    let spawns = flags.spawns.clone();
+    run_plan(&flags, &loaded, module_dir, spawns, &plan);
+}
+
+fn text_of(json: &Json) -> Option<&str> {
+    match json {
+        Json::Text(text) => Some(text),
+        _ => None,
+    }
+}
+
+fn load_entry(module_dir: Option<&Path>) -> Loaded {
+    let own = module_dir
+        .map(|dir| host::module_path(dir, ENTRY_PROGRAM))
+        .filter(|path| path.exists());
+    let loaded = match own {
+        Some(path) => host::load(&path),
+        None => host::load_program(None, ENTRY_PROGRAM),
+    };
+    loaded.unwrap_or_else(|error| fail(&error))
+}
+
+fn entry_flags(flags: &Flags, cwd: Option<&Path>) -> String {
+    let mut text = String::new();
+    let cwd = cwd.map(|cwd| ("--cwd".to_owned(), cwd.display().to_string()));
+    for (name, value) in cwd.iter().chain(flags.rest.iter()) {
+        if value.contains('\n') {
+            fail_usage(&format!("{name} holds a newline"));
+        }
+        text.push('\n');
+        text.push_str(name);
+        text.push('\n');
+        text.push_str(value);
+    }
+    text.push('\n');
+    text
+}
+
+fn manifest(flags: &Flags) -> Json {
+    let cwd = flags.cwd.as_ref().map(|_| canonical_cwd(flags));
+    let entry = load_entry(flags.module_dir.as_deref());
+    let scratch = std::env::temp_dir().join(format!(
+        "{LABEL}-{ENTRY_PROGRAM}-{}-{:x}",
+        std::process::id(),
+        random()
+    ));
+    let setup = Setup {
+        texts: Texts::default(),
+        module_dir: None,
+        cwd: cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+        spawns: Vec::new(),
+    };
+    let arguments = host::object(vec![(
+        "flags",
+        Json::Text(entry_flags(flags, cwd.as_deref())),
+    )]);
+    let ran = Session::open(setup, &scratch, LABEL, &control::directory(&scratch)).and_then(
+        |mut session| {
+            let request = host::request(ENTRY_HANDLER, FIRST_TURN, arguments);
+            let ran = host::run_turn(&entry, &mut session, &request);
+            session.close();
+            ran
+        },
+    );
+    if let Err(error) = std::fs::remove_dir_all(&scratch) {
+        eprintln!("{LABEL}: {}: {error}", scratch.display());
+    }
+    let finish = match ran {
+        Ok(Ran::Finished(finish)) if finish.completed => finish,
+        other => {
+            let (_, _) = report(&other, true);
+            fail("the entry program did not launch");
+        }
+    };
+    match host::outcome_of(&finish.result) {
+        (name, text) if name == ENTRY_LAUNCH => parse(&text)
+            .unwrap_or_else(|error| fail(&format!("the launch manifest is not JSON: {error}"))),
+        (name, reason) if name == ENTRY_REFUSED => fail_usage(&reason),
+        (name, text) => fail(&format!("the entry program answered {name}: {text}")),
+    }
+}
+
+fn texts_list(json: &Json, what: &str) -> Vec<String> {
+    match json {
+        Json::Array(items) => items
+            .iter()
+            .map(|item| {
+                text_of(item)
+                    .unwrap_or_else(|| fail(&format!("the manifest's {what} are texts")))
+                    .to_owned()
+            })
+            .collect(),
+        _ => fail(&format!("the manifest has no {what}")),
+    }
+}
+
+fn entries<'a>(json: &'a Json, what: &str) -> &'a [(String, Json)] {
+    match json {
+        Json::Object(fields) => fields,
+        Json::Undefined => &[],
+        _ => fail(&format!("the manifest's {what} are an object")),
+    }
+}
+
+fn texts(manifest: &Json) -> Texts {
+    let mut texts = Texts::default();
+    for (name, value) in entries(manifest.get("texts"), "texts") {
+        let template = text_of(value).unwrap_or_else(|| fail(&format!("text {name} is a text")));
+        texts.templates.insert(name.clone(), template.to_owned());
+    }
+    for (name, value) in entries(manifest.get("numbers"), "numbers") {
+        let number = value
+            .bigint()
+            .ok()
+            .and_then(|number| u64::try_from(number).ok())
+            .unwrap_or_else(|| fail(&format!("number {name} is a number")));
+        texts.numbers.insert(name.clone(), number);
+    }
+    for (name, value) in entries(manifest.get("lists"), "lists") {
+        texts.lists.insert(name.clone(), texts_list(value, name));
+    }
+    texts
+}
+
+fn field(json: &Json, key: &str) -> String {
+    text_of(json.get(key))
+        .unwrap_or_else(|| fail(&format!("the manifest has no text {key}")))
+        .to_owned()
+}
+
+fn resolve(json: &Json) -> Json {
+    match json {
+        Json::Object(fields) if fields.len() == 1 && fields[0].0 == FILE_KEY => {
+            let path = text_of(&fields[0].1).unwrap_or_else(|| fail("a $file names a path"));
+            Json::Text(
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|error| fail_usage(&format!("{path}: {error}"))),
+            )
+        }
+        Json::Object(fields) if fields.len() == 1 && fields[0].0 == NUMBER_KEY => {
+            let value = text_of(&fields[0].1).unwrap_or_else(|| fail("a $number is a text"));
+            Json::int(number_flag("the value", value))
+        }
+        Json::Object(fields) => {
+            let mut fields: Vec<(String, Json)> = fields
+                .iter()
+                .map(|(key, value)| (key.clone(), resolve(value)))
+                .collect();
+            fields.sort_by(|left, right| left.0.cmp(&right.0));
+            Json::Object(fields)
+        }
+        Json::Array(items) => Json::Array(items.iter().map(resolve).collect()),
+        other => other.clone(),
+    }
+}
+
+fn launch(flags: Flags) {
+    let manifest = manifest(&flags);
+    refuse_rest(&flags, &texts_list(manifest.get("flags"), "flags"));
+    let spawns = match manifest.get("spawns") {
+        Json::Array(items) => items
+            .iter()
+            .map(|item| Spawn {
+                tool: field(item, "tool"),
+                program: field(item, "program"),
+                handler: field(item, "handler"),
+            })
+            .collect(),
+        _ => fail("the manifest has no spawns"),
+    };
+    let steps: Vec<Step> = match manifest.get("steps") {
+        Json::Array(items) if !items.is_empty() && items.len() <= STEPS_MAX => items
+            .iter()
+            .map(|item| Step {
+                handler: field(item, "handler"),
+                arguments: resolve(item.get("args")),
+                refused: field(item, "refused"),
+            })
+            .collect(),
+        _ => fail(&format!("the manifest has 1 to {STEPS_MAX} steps")),
+    };
+    let idle = match manifest.get("idle") {
+        Json::Undefined | Json::Null => None,
+        idle => {
+            let turns = resolve(idle.get("turns"))
+                .bigint()
+                .ok()
+                .and_then(|turns| u64::try_from(turns).ok())
+                .unwrap_or_else(|| fail("the manifest's idle turns are a number"));
+            if turns > IDLE_TURNS_MAX {
+                fail_usage(&format!(
+                    "{turns} idle turns is more than IDLE_TURNS_MAX ({IDLE_TURNS_MAX})"
+                ));
+            }
+            Some((field(idle, "handler"), turns))
+        }
+    };
+    let plan = Plan {
+        texts: texts(&manifest),
+        model: field(&manifest, "model"),
+        raw: field(&manifest, "print") != "text",
+        steps,
+        idle,
+    };
+    let program = field(&manifest, "program");
+    let module_dir = flags.module_dir.clone();
+    let loaded =
+        host::load_program(module_dir.as_deref(), &program).unwrap_or_else(|error| fail(&error));
+    run_plan(&flags, &loaded, module_dir, spawns, &plan);
+}
+
+fn first_step(flags: &Flags, session: &Session, plan: &Plan) -> (usize, u64) {
+    if let Some(turn) = flags.turn {
+        return (0, turn);
+    }
+    let held = session
+        .records()
+        .map(|records| last_turn(&records))
+        .unwrap_or_else(|error| fail(&error));
+    let Some(held) = held else {
+        return (0, FIRST_TURN);
+    };
+    let last = plan.steps.len() - 1;
+    if same(&held, &plan.steps[last]) {
+        return (last, held.turn);
+    }
+    let unfinished = plan.steps[..last]
+        .iter()
+        .position(|step| !held.finished && same(&held, step));
+    match unfinished {
+        Some(index) => (index, held.turn),
+        None => (0, held.turn + 1),
+    }
+}
+
+fn run_plan(
+    flags: &Flags,
+    loaded: &Loaded,
+    module_dir: Option<PathBuf>,
+    spawns: Vec<Spawn>,
+    plan: &Plan,
+) {
+    assert!(!plan.steps.is_empty(), "a plan has a step");
+    let (journal, mut session) = open(flags, module_dir, spawns, plan.texts.clone());
+    let (first, mut turn) = first_step(flags, &session, plan);
+    for step in plan
+        .steps
+        .iter()
+        .filter(|step| step.handler == host::CONFIGURE_HANDLER)
+    {
         session
-            .records()
-            .and_then(|records| planned_turn(&records, &handler, &arguments))
-            .unwrap_or_else(|error| fail(&error))
-    });
-    if handler == host::CONFIGURE_HANDLER {
-        session
-            .remember_configure(&arguments)
+            .remember_configure(&step.arguments)
             .unwrap_or_else(|error| fail(&error));
     }
     session.ledger.mark("start", now_ms());
-    let ran = host::run_turn(
-        &loaded,
-        &mut session,
-        &host::request(&handler, turn, arguments),
-    );
+    let last = plan.steps.len() - 1;
+    for step in &plan.steps[first..last] {
+        let request = host::request(&step.handler, turn, step.arguments.clone());
+        match host::run_turn(loaded, &mut session, &request) {
+            Ok(Ran::Finished(finish)) if finish.completed => {
+                let (name, reason) = host::outcome_of(&finish.result);
+                if name == "failed" {
+                    session.close();
+                    fail_usage(&reason);
+                }
+                turn += 1;
+            }
+            Err(error) if error.contains(ARGUMENTS_REFUSED) => {
+                session.close();
+                fail_usage(&format!("{} {}", step.refused, step.arguments.encode()));
+            }
+            Err(error) if error.contains(NO_HANDLER) => {
+                eprintln!(
+                    "{LABEL}: the program declares no {} handler; going on",
+                    step.handler
+                );
+            }
+            other => {
+                session.close();
+                let (_, _) = report(&other, plan.raw);
+                fail(&format!("the {} turn did not complete", step.handler));
+            }
+        }
+    }
+    let step = &plan.steps[last];
+    let request = host::request(&step.handler, turn, step.arguments.clone());
+    let ran = host::run_turn(loaded, &mut session, &request);
+    if let Some((handler, turns)) = &plan.idle
+        && matches!(&ran, Ok(Ran::Finished(_)))
+    {
+        idle_turns(loaded, &mut session, handler, *turns);
+    }
     session.close();
     session.ledger.mark("end", now_ms());
-    let model = text_argument(flags.args.as_deref(), "model");
-    let (finish, code) = report(&ran, true);
-    if let Err(error) = ledger::write_usage(&journal, &model, &finish) {
+    let (finish, code) = report(&ran, plan.raw);
+    if let Err(error) = ledger::write_usage(&journal, &plan.model, &finish) {
         fail(&error);
     }
     std::process::exit(code);
-}
-
-fn text_argument(args: Option<&str>, name: &str) -> String {
-    args.and_then(|text| parse(text).ok())
-        .and_then(|json| match json.get(name) {
-            Json::Text(text) => Some(text.clone()),
-            _ => None,
-        })
-        .unwrap_or_default()
 }
 
 fn report(ran: &Result<Ran, String>, raw: bool) -> (String, i32) {
@@ -344,7 +627,7 @@ struct Last {
     finished: bool,
 }
 
-fn last_turn(records: &[Record]) -> Result<Option<Last>, String> {
+fn last_turn(records: &[Record]) -> Option<Last> {
     let mut last: Option<Last> = None;
     for record in records.iter().cloned() {
         match record {
@@ -368,186 +651,21 @@ fn last_turn(records: &[Record]) -> Result<Option<Last>, String> {
             _ => {}
         }
     }
-    Ok(last)
+    last
 }
 
-fn same(held: &Last, handler: &str, arguments: &Json) -> bool {
-    held.handler == handler
-        && harnesslang::run::json::decode(&arguments.encode())
+fn same(held: &Last, step: &Step) -> bool {
+    held.handler == step.handler
+        && harnesslang::run::json::decode(&step.arguments.encode())
             .ok()
             .as_ref()
             == Some(&held.arguments)
 }
 
-fn planned_turn(records: &[Record], handler: &str, arguments: &Json) -> Result<u64, String> {
-    Ok(match last_turn(records)? {
-        None => FIRST_TURN,
-        Some(held) if same(&held, handler, arguments) => held.turn,
-        Some(held) => held.turn + 1,
-    })
-}
-
-fn front(flags: Flags) {
-    let model = flags
-        .model
-        .clone()
-        .unwrap_or_else(|| fail_usage("--model is required"));
-    let cwd = flags
-        .cwd
-        .clone()
-        .unwrap_or_else(|| fail_usage("--cwd is required"));
-    let harness = flags.harness.clone().unwrap_or_else(|| {
-        if model.starts_with(CLAUDE_MODEL_PREFIX) {
-            HARNESS_CLAUDE.to_owned()
-        } else {
-            HARNESS_CODEX.to_owned()
-        }
-    });
-    let instruction_path = flags
-        .instruction
-        .clone()
-        .expect("the front runs with --instruction");
-    let instruction = std::fs::read_to_string(&instruction_path)
-        .unwrap_or_else(|error| fail_usage(&format!("{}: {error}", instruction_path.display())));
-    let cwd_text = std::fs::canonicalize(&cwd)
-        .unwrap_or_else(|error| fail_usage(&format!("--cwd {}: {error}", cwd.display())))
-        .display()
-        .to_string();
-    let effort = flags
-        .effort
-        .clone()
-        .unwrap_or_else(|| EFFORT_DEFAULT.to_owned());
-    let (program, configure, spawns) = match harness.as_str() {
-        HARNESS_CLAUDE => {
-            if flags.reviewer.is_some()
-                || flags.finish_checks.is_some()
-                || flags.escalate_model.is_some()
-            {
-                fail_usage(
-                    "--reviewer-relay, --finish-checks and --escalate-model are for the Codex harness",
-                );
-            }
-            let configure = host::object(vec![
-                ("cwd", Json::text(&cwd_text)),
-                ("requested_effort", Json::text(&effort)),
-                ("model_name", Json::text(&model)),
-            ]);
-            let spawn = Spawn {
-                tool: CLAUDE_SPAWN_TOOL.to_owned(),
-                program: PROGRAM_CLAUDE_CHILD.to_owned(),
-                handler: CLAUDE_SPAWN_HANDLER.to_owned(),
-            };
-            (PROGRAM_CLAUDE, configure, vec![spawn])
-        }
-        HARNESS_CODEX => {
-            if flags.keep_warm > 0 {
-                fail_usage("--keep-warm is for the Claude harness");
-            }
-            let configure = host::object(vec![
-                ("cwd", Json::text(&cwd_text)),
-                ("requested_effort", Json::text(&effort)),
-                (
-                    "finish_checks",
-                    Json::text(
-                        flags
-                            .finish_checks
-                            .as_deref()
-                            .unwrap_or(FINISH_CHECKS_DEFAULT),
-                    ),
-                ),
-                ("model_name", Json::text(&model)),
-                (
-                    "reviewer",
-                    Json::text(flags.reviewer.as_deref().unwrap_or_default()),
-                ),
-                (
-                    "escalate_model",
-                    Json::text(flags.escalate_model.as_deref().unwrap_or_default()),
-                ),
-            ]);
-            (PROGRAM_CODEX, configure, Vec::new())
-        }
-        other => fail_usage(&format!("--harness {other} is not claude or codex")),
-    };
-    let module_dir = flags.module_dir.clone();
-    let loaded =
-        host::load_program(module_dir.as_deref(), program).unwrap_or_else(|error| fail(&error));
-    let (journal, mut session) = open(&flags, module_dir, spawns);
-    let prompt = host::object(vec![
-        ("input", Json::text(&instruction)),
-        (
-            "rounds",
-            Json::int(flags.max_turns.unwrap_or(ROUNDS_DEFAULT)),
-        ),
-    ]);
-    let held = session
-        .records()
-        .and_then(|records| last_turn(&records))
-        .unwrap_or_else(|error| fail(&error));
-    let (configure_turn, mut prompt_turn) = match (flags.turn, held) {
-        (Some(turn), _) => (Some(turn), turn + 1),
-        (None, Some(held)) if same(&held, PROMPT_HANDLER, &prompt) => (None, held.turn),
-        (None, Some(held))
-            if !held.finished && same(&held, host::CONFIGURE_HANDLER, &configure) =>
-        {
-            (Some(held.turn), held.turn + 1)
-        }
-        (None, Some(held)) => (Some(held.turn + 1), held.turn + 2),
-        (None, None) => (Some(FIRST_TURN), FIRST_TURN + 1),
-    };
-    session
-        .remember_configure(&configure)
-        .unwrap_or_else(|error| fail(&error));
-    session.ledger.mark("start", now_ms());
-    if let Some(turn) = configure_turn {
-        let request = host::request(host::CONFIGURE_HANDLER, turn, configure);
-        match host::run_turn(&loaded, &mut session, &request) {
-            Ok(Ran::Finished(finish)) if finish.completed => {
-                let (name, reason) = host::outcome_of(&finish.result);
-                if name == "failed" {
-                    session.close();
-                    fail_usage(&reason);
-                }
-            }
-            Err(error) if error.contains(ARGUMENTS_REFUSED) => {
-                session.close();
-                fail_usage(&format!(
-                    "{program} refused the configure arguments {}: check --model, --effort and --finish-checks",
-                    session
-                        .configured()
-                        .map(|json| json.encode())
-                        .unwrap_or_default()
-                ));
-            }
-            Err(error) if error.contains(NO_HANDLER) => {
-                eprintln!("{LABEL}: {program} declares no configure handler; prompting directly");
-                prompt_turn = turn;
-            }
-            other => {
-                session.close();
-                let (_, _) = report(&other, false);
-                fail("the configure turn did not complete");
-            }
-        }
-    }
-    let request = host::request(PROMPT_HANDLER, prompt_turn, prompt);
-    let ran = host::run_turn(&loaded, &mut session, &request);
-    if flags.keep_warm > 0 && matches!(&ran, Ok(Ran::Finished(_))) {
-        keep_warm(&loaded, &mut session, flags.keep_warm);
-    }
-    session.close();
-    session.ledger.mark("end", now_ms());
-    let (finish, code) = report(&ran, false);
-    if let Err(error) = ledger::write_usage(&journal, &model, &finish) {
-        fail(&error);
-    }
-    std::process::exit(code);
-}
-
-fn keep_warm(loaded: &Loaded, session: &mut Session, refreshes: u64) {
-    let mut refreshed = 0;
-    for _ in 0..refreshes * IDLE_REQUESTS_PER_REFRESH_MAX {
-        if refreshed == refreshes {
+fn idle_turns(loaded: &Loaded, session: &mut Session, handler: &str, turns: u64) {
+    let mut ran = 0;
+    for _ in 0..turns * IDLE_REQUESTS_PER_TURN_MAX {
+        if ran == turns {
             return;
         }
         let due = match host::idle_due(loaded, session) {
@@ -579,10 +697,10 @@ fn keep_warm(loaded: &Loaded, session: &mut Session, refreshes: u64) {
             );
             std::thread::sleep(std::time::Duration::from_millis(due - now));
         }
-        let request = host::request(REFRESH_HANDLER, turn, Json::Object(Vec::new()));
+        let request = host::request(handler, turn, Json::Object(Vec::new()));
         match host::run_once(loaded, session, &request) {
             Ok(Ran::Finished(finish)) => {
-                refreshed += 1;
+                ran += 1;
                 eprintln!("{LABEL}: idle turn {turn}: {}", finish.result.encode());
             }
             Ok(Ran::NotDue) => eprintln!("{LABEL}: idle turn {turn} is not due"),

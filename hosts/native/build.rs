@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use harnesslang::target::Target;
 
-const PROGRAMS: [&str; 3] = [
+const PROGRAMS: [&str; 4] = [
     "../../examples/claude_code.hl",
     "../../examples/claude_code_child.hl",
     "../../examples/codex_agent.hl",
+    "../../examples/entry.hl",
 ];
 const PLANT_NONE: &str = "none";
 const EMBEDDED_FILE: &str = "embedded.rs";
