@@ -30,6 +30,10 @@ const EFFECTS = ["none", "idempotent", "external"];
 const DELIVERY_FIELDS = { cancel: ["id"], steer: ["id", "message"], job: ["done", "id", "key", "notice"] };
 const FINISHED_EXITS = ["finished", "already_finished"];
 const NO_SIMULATION = { mutation: "none", hook() {}, gate() {}, tools: undefined };
+const WIRE_OPEN = "${";
+const WIRE_DEFAULT_MARK = ":-";
+const WIRE_EVENT_STREAM = "text/event-stream";
+const WIRE_EVENT_DEFAULT = "message";
 
 class Panic extends Error {}
 class Corrupt extends Error {}
@@ -151,6 +155,78 @@ class Session {
   }
 }
 
+function wireExpand(text, lookup) {
+  let out = "";
+  let rest = text;
+  for (let start = rest.indexOf(WIRE_OPEN); start >= 0; start = rest.indexOf(WIRE_OPEN)) {
+    out += rest.slice(0, start);
+    const after = rest.slice(start + WIRE_OPEN.length);
+    const end = after.indexOf("}");
+    if (end < 0) throw new HostError("an unclosed " + WIRE_OPEN + " in " + JSON.stringify(text));
+    const inner = after.slice(0, end);
+    const mark = inner.indexOf(WIRE_DEFAULT_MARK);
+    const name = mark < 0 ? inner : inner.slice(0, mark);
+    if (!/^[A-Za-z0-9_]+$/.test(name)) throw new HostError(WIRE_OPEN + inner + "} does not name an environment variable");
+    const value = lookup(name);
+    if (typeof value === "string" && value !== "") out += value;
+    else if (mark >= 0) out += inner.slice(mark + WIRE_DEFAULT_MARK.length);
+    else throw new HostError("the environment has no " + name);
+    rest = after.slice(end + 1);
+  }
+  return out + rest;
+}
+
+function wireEvents(body) {
+  const found = [];
+  let event = "";
+  let data = null;
+  const flush = () => {
+    if (data !== null) found.push([event === "" ? WIRE_EVENT_DEFAULT : event, data]);
+    event = "";
+    data = null;
+  };
+  for (const line of body.replaceAll("\r\n", "\n").split("\n")) {
+    if (line === "") flush();
+    if (line === "" || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    const value = colon < 0 ? "" : line.slice(colon + (line[colon + 1] === " " ? 2 : 1));
+    if (field === "event") event = value;
+    if (field === "data") data = data === null ? value : data + "\n" + value;
+  }
+  flush();
+  return found;
+}
+
+function wireText(value, what) {
+  if (typeof value !== "string") throw new HostError(what + " is not text: " + encodeJson(value ?? null));
+  return value;
+}
+
+async function wireCall(fetcher, lookup, http) {
+  let response;
+  let body;
+  try {
+    const listed = http.headers;
+    if (!Array.isArray(listed)) throw new HostError("a wire request's headers are not a list: " + encodeJson(listed ?? null));
+    const headers = listed.map((pair) => {
+      if (!Array.isArray(pair) || pair.length !== 2) throw new HostError("a header is not a [name, value] pair: " + encodeJson(pair));
+      return [wireExpand(wireText(pair[0], "a header's name"), lookup), wireExpand(wireText(pair[1], "a header's value"), lookup)];
+    });
+    const url = wireExpand(wireText(http.url, "a wire request's url"), lookup);
+    const init = { method: wireText(http.method, "a wire request's method"), headers, body: wireText(http.body, "a wire request's body") };
+    response = await fetcher(url, init);
+    body = await response.text();
+  } catch (error) {
+    if (error instanceof Panic) throw error;
+    return { transport: String(error?.message ?? error) };
+  }
+  const headers = [...response.headers];
+  const streamed = headers.some(([name, value]) => name === "content-type" && value.toLowerCase().includes(WIRE_EVENT_STREAM));
+  const status = BigInt(response.status);
+  return response.ok && streamed ? { events: wireEvents(body), headers, status } : { body, headers, status };
+}
+
 function defaultHost(config) {
   const post = async (url, text, signal) => {
     const response = await config.fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: text, signal });
@@ -166,8 +242,10 @@ function defaultHost(config) {
     listing(text) {
       return post(config.listingsUrl, text);
     },
-    model(text) {
-      return post(config.modelUrl, text);
+    async model(text) {
+      const request = decodeJson(text);
+      if (!isObject(request) || request.http === undefined) return post(config.modelUrl, text);
+      return encodeJson(await wireCall(config.fetch, (name) => config.env?.[name], request.http));
     },
     recover(text) {
       return config.recoverUrl === undefined ? '"unknown"' : post(config.recoverUrl, text);
@@ -482,6 +560,7 @@ class HarnessObject {
       recoverUrl: env.HL_RECOVER_URL,
       jobsUrl: env.HL_JOBS_URL,
       cellsUrl: env.HL_CELLS_URL,
+      env,
       now: () => Date.now(),
       random: platformRandom,
     });
@@ -790,7 +869,7 @@ const worker = {
 const harness = {
   target: "cloudflare",
   format: "wasm",
-  runtime: { Panic, Corrupt, DecodeError, HostError, ModuleFailure, encodeJson, decodeJson, finishJson, defaultHost, deliveryJson },
+  runtime: { Panic, Corrupt, DecodeError, HostError, ModuleFailure, encodeJson, decodeJson, finishJson, defaultHost, deliveryJson, wireCall },
   facts,
   statements: { schema: JOURNAL_SCHEMA, insert: JOURNAL_INSERT, load: JOURNAL_LOAD },
   ranHeader: RAN_HEADER,

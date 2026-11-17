@@ -14,6 +14,9 @@ const CELLS_URL = "https://cells.simulation.invalid/engine";
 const LISTINGS_URL = "https://listings.simulation.invalid/list";
 const TURN_URL = "https://harness.simulation.invalid/turn";
 const SIDE_URL = "https://harness.simulation.invalid/side";
+const SIM_URLS = [TOOLS_URL, MODEL_URL, RECOVER_URL, JOBS_URL, CELLS_URL, LISTINGS_URL];
+const SIM_SECRET_PREFIX = "sim-";
+const SIM_SECRETS = new Proxy({}, { get: (_, name) => SIM_SECRET_PREFIX + String(name) });
 const DETAIL_CHARACTERS_MAX = 400;
 const HTTP_OK = 200;
 
@@ -346,6 +349,23 @@ class Seed {
     return event.response;
   }
 
+  wire(url, init) {
+    const event = this.cursor.next("model", "a wire request to " + url);
+    const secret = (text) => text.replace(/\$\{([A-Za-z0-9_]+)(:-[^}]*)?\}/g, (_, name) => SIM_SECRET_PREFIX + name);
+    const expected = { ...event.http, url: secret(event.http.url), headers: event.http.headers.map((pair) => pair.map(secret)) };
+    try {
+      same("model http request", rt.encodeJson(expected), rt.encodeJson({ body: init.body, headers: init.headers, method: init.method, url }));
+    } catch (error) {
+      this.wireFailure = error;
+      throw error;
+    }
+    const answer = event.answer;
+    if (answer.transport !== undefined) throw new TypeError(answer.transport);
+    const lines = (data) => data.split("\n").map((line) => "data: " + line).join("\n");
+    const body = answer.events === undefined ? answer.body : answer.events.map(([name, data]) => "event: " + name + "\n" + lines(data) + "\n\n").join("");
+    return new Response(body, { status: Number(answer.status), headers: answer.headers });
+  }
+
   now() {
     return this.cursor.next("now", "now").answer;
   }
@@ -427,6 +447,10 @@ class Seed {
   host(fetchCheck) {
     const seed = this;
     const fakeFetch = async (url, init) => {
+      if (!SIM_URLS.includes(url)) {
+        fetchCheck(null);
+        return seed.wire(url, init);
+      }
       const body = rt.decodeJson(init.body);
       const side = Number(body.turn) === rt.SIDE_TURN;
       if (url === TOOLS_URL) {
@@ -451,7 +475,7 @@ class Seed {
       if (url === CELLS_URL) return new Response(rt.encodeJson(seed.cell(body)), { status: HTTP_OK });
       throw new Error(`unexpected fetch of ${url}`);
     };
-    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, recoverUrl: RECOVER_URL, jobsUrl: JOBS_URL, cellsUrl: CELLS_URL, now: () => seed.now(), random: () => seed.random() });
+    const host = harness.runtime.defaultHost({ fetch: fakeFetch, toolsUrl: TOOLS_URL, listingsUrl: LISTINGS_URL, modelUrl: MODEL_URL, env: SIM_SECRETS, recoverUrl: RECOVER_URL, jobsUrl: JOBS_URL, cellsUrl: CELLS_URL, now: () => seed.now(), random: () => seed.random() });
     return {
       ...host,
       async wait(cell, timer, untilMs) {
@@ -854,7 +878,9 @@ for (const traced of seeds) {
     seed.cursor.next("seed", "start of seed");
     if (values.target === "cloudflare") await cloudflareSeed(seed);
     else await vercelSeed(seed);
-  } catch (error) {
+    if (seed.wireFailure !== undefined) throw seed.wireFailure;
+  } catch (thrown) {
+    const error = seed.wireFailure ?? thrown;
     const invariant = error instanceof Failure ? error.invariant : "panic";
     const detail = error instanceof Failure ? error.message : (error?.stack ?? String(error));
     if (process.env.HL_JS_SIM_CONTEXT) {

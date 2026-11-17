@@ -19,15 +19,10 @@ native_targets="native-jsonl native-sqlite server-postgres"
 platform_targets="cloudflare vercel"
 platform_pending="
   vercel:docs/snippets/wire_openai.hl
-  cloudflare:docs/snippets/wire_openai.hl
   vercel:docs/snippets/wire.hl
-  cloudflare:docs/snippets/wire.hl
   vercel:examples/claude_code_child.hl
-  cloudflare:examples/claude_code_child.hl
   vercel:examples/claude_code.hl
-  cloudflare:examples/claude_code.hl
   vercel:examples/codex_agent.hl
-  cloudflare:examples/codex_agent.hl
 "
 examples=$(echo examples/*.hl)
 hl=target/release/hl
