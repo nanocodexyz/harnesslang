@@ -106,7 +106,7 @@ impl Jobs {
                 stalled: false,
             },
         );
-        assert!(previous.is_none(), "a call starts at most one job");
+        assert!(previous.is_none(), "duplicate job");
     }
 
     fn watch_stalls(&mut self) {
@@ -159,16 +159,13 @@ impl Jobs {
             })
             .collect();
         for key in done {
-            let job = self
-                .running
-                .remove(&key)
-                .expect("a finished job was running");
+            let job = self.running.remove(&key).expect("finished job missing");
             let mut started = job.started;
-            let status = started.child.wait().expect("wait for a finished job");
-            let notice = match tools::settled(started, status, false) {
+            let status = started.child.wait().expect("job wait");
+            let notice = match tools::settled(&self.texts, started, status, false) {
                 Ok(shell) => {
                     let code = tools::exit_code(&shell);
-                    let output = tools::shown(&shell);
+                    let output = tools::shown(&self.texts, &shell);
                     let name = if code == 0 {
                         "job_completed"
                     } else {

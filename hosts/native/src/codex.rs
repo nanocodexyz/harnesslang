@@ -16,17 +16,6 @@ const SHELL: &str = "bash";
 const PTY_WRAPPER: &str = "script";
 const PTY_FLAGS: [&str; 2] = ["-qfe", "-c"];
 const PTY_TRANSCRIPT: &str = "/dev/null";
-const BEGIN_PATCH: &str = "*** Begin Patch";
-const END_PATCH: &str = "*** End Patch";
-const ADD_FILE: &str = "*** Add File: ";
-const DELETE_FILE: &str = "*** Delete File: ";
-const UPDATE_FILE: &str = "*** Update File: ";
-const MOVE_TO: &str = "*** Move to: ";
-const END_OF_FILE: &str = "*** End of File";
-const CHANGE_CONTEXT: &str = "@@ ";
-const EMPTY_CHANGE_CONTEXT: &str = "@@";
-const HEREDOC_OPENERS: [&str; 3] = ["<<EOF", "<<'EOF'", "<<\"EOF\""];
-const HEREDOC_LINES_MIN: usize = 4;
 
 type LineMatch = dyn Fn(&str, &str) -> bool;
 
@@ -243,10 +232,8 @@ impl Exec {
             }
             Settled::Stopped => {
                 let _ = std::fs::remove_file(&session.output);
-                Ran::Failed(format!(
-                    "aborted by user after {:.1}s",
-                    begun.elapsed().as_secs_f64()
-                ))
+                let seconds = format!("{:.1}", begun.elapsed().as_secs_f64());
+                Ran::Failed(self.texts.fill("exec_aborted", &[("seconds", &seconds)]))
             }
             Settled::Running => {
                 let id = self.next;
@@ -267,7 +254,7 @@ impl Exec {
     pub fn exec_command(&mut self, input: &Value, stop: &dyn Fn() -> bool) -> Ran {
         let cmd = text_field(input, "cmd");
         if cmd.is_empty() {
-            return Ran::Failed("missing command line for unified exec request".to_owned());
+            return Ran::Failed(self.texts.fill("exec_no_command", &[]));
         }
         if self.sessions.len() >= MAX_PROCESSES
             && let Some(oldest) = self.sessions.keys().next().copied()
@@ -319,7 +306,8 @@ impl Exec {
         let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {
-                return Ran::Failed(format!("Failed to create unified exec process: {error}"));
+                let error = error.to_string();
+                return Ran::Failed(self.texts.fill("exec_spawn_failed", &[("error", &error)]));
             }
         };
         let begun = Instant::now();
@@ -334,7 +322,7 @@ impl Exec {
         let until = begun + Duration::from_millis(yield_ms);
         match Self::settle(&mut session, until, stop) {
             Ok(settled) => self.finish(session, settled, begun, max_tokens),
-            Err(error) => Ran::Failed(format!("Unified exec process failed: {error}")),
+            Err(error) => Ran::Failed(self.texts.fill("exec_failed", &[("error", &error)])),
         }
     }
 
@@ -343,7 +331,8 @@ impl Exec {
         let chars = text_field(input, "chars");
         let max_tokens = u64_field(input, "max_output_tokens", u64::MAX);
         let Some(mut session) = self.sessions.remove(&id) else {
-            return Ran::Failed(format!("Unknown process id {id}"));
+            let id = id.to_string();
+            return Ran::Failed(self.texts.fill("exec_unknown", &[("id", &id)]));
         };
         if !chars.is_empty() {
             let written = match session.stdin.as_mut() {
@@ -357,7 +346,7 @@ impl Exec {
             };
             if written.is_err() {
                 self.sessions.insert(id, session);
-                return Ran::Failed("failed to write to stdin".to_owned());
+                return Ran::Failed(self.texts.fill("exec_stdin_failed", &[]));
             }
         }
         let requested = u64_field(input, "yield_time_ms", 0);
@@ -392,36 +381,40 @@ impl Exec {
                 ))
             }
             Ok(settled) => self.finish(session, settled, begun, max_tokens),
-            Err(error) => Ran::Failed(format!("Unified exec process failed: {error}")),
+            Err(error) => Ran::Failed(self.texts.fill("exec_failed", &[("error", &error)])),
         }
     }
 }
 
-pub fn view_image(root: &Path, input: &Value) -> Ran {
+pub fn view_image(texts: &Texts, root: &Path, input: &Value) -> Ran {
     let path = text_field(input, "path");
     if path.is_empty() {
-        return Ran::Failed("view_image needs the path of an image file".to_owned());
+        return Ran::Failed(texts.fill("image_no_path", &[]));
     }
     let bytes = match std::fs::read(resolved(root, path)) {
         Ok(bytes) => bytes,
-        Err(error) => return Ran::Failed(format!("unable to read image at {path}: {error}")),
+        Err(error) => {
+            let error = error.to_string();
+            return Ran::Failed(
+                texts.fill("image_unreadable", &[("path", path), ("error", &error)]),
+            );
+        }
     };
     if tools::media_type(&bytes).is_none() {
-        return Ran::Failed(format!(
-            "{path} is not a PNG, JPEG, GIF or WebP image; convert or render it to PNG first"
-        ));
+        return Ran::Failed(texts.fill("image_kind", &[("path", path)]));
     }
     if bytes.len() as u64 > tools::IMAGE_BYTES_MAX {
-        return Ran::Failed(format!(
-            "{path} is {} bytes, more than the {} an image may have; scale it down or crop it first",
-            bytes.len(),
-            tools::IMAGE_BYTES_MAX
+        let bytes = bytes.len().to_string();
+        let max = tools::IMAGE_BYTES_MAX.to_string();
+        return Ran::Failed(texts.fill(
+            "image_size",
+            &[("path", path), ("bytes", &bytes), ("max", &max)],
         ));
     }
     Ran::Image(bytes)
 }
 
-pub fn update_plan(input: &Value) -> Ran {
+pub fn update_plan(texts: &Texts, input: &Value) -> Ran {
     let plan = text_field(input, "plan");
     match Value::decode(plan) {
         Ok(Value::Array(steps)) => {
@@ -430,13 +423,11 @@ pub fn update_plan(input: &Value) -> Ran {
                 .filter(|step| step.get("status").and_then(Value::as_str) == Some("in_progress"))
                 .count();
             if in_progress > 1 {
-                return Ran::Failed("At most one step can be in_progress at a time.".to_owned());
+                return Ran::Failed(texts.fill("plan_many", &[]));
             }
-            Ran::Ok("Plan updated".to_owned())
+            Ran::Ok(texts.fill("plan_updated", &[]))
         }
-        _ => Ran::Failed(format!(
-            "failed to parse function arguments: plan is not a list of steps: {plan}"
-        )),
+        _ => Ran::Failed(texts.fill("plan_invalid", &[("plan", plan)])),
     }
 }
 
@@ -455,32 +446,73 @@ enum Hunk {
     Update(String, Option<String>, Vec<Chunk>),
 }
 
-fn hunk_error(line: usize, message: &str) -> String {
-    format!("Invalid patch hunk on line {line}: {message}")
+struct Grammar {
+    begin: String,
+    end: String,
+    add: String,
+    delete: String,
+    update: String,
+    move_to: String,
+    end_of_file: String,
+    marker: String,
+    change: String,
+    change_empty: String,
+    heredocs: Vec<String>,
+    heredoc_end: String,
+    heredoc_lines_min: usize,
 }
 
-fn boundaries(patch: &str) -> Result<Vec<&str>, String> {
+impl Grammar {
+    fn of(texts: &Texts) -> Self {
+        let word = |name: &str| texts.fill(name, &[]);
+        Self {
+            begin: word("patch_begin"),
+            end: word("patch_end"),
+            add: word("patch_add"),
+            delete: word("patch_delete"),
+            update: word("patch_update"),
+            move_to: word("patch_move"),
+            end_of_file: word("patch_eof"),
+            marker: word("patch_marker"),
+            change: word("patch_change"),
+            change_empty: word("patch_change_empty"),
+            heredocs: texts.list("patch_heredocs").to_vec(),
+            heredoc_end: word("patch_heredoc_end"),
+            heredoc_lines_min: texts
+                .number("patch_heredoc_lines_min")
+                .and_then(|lines| usize::try_from(lines).ok())
+                .unwrap_or(usize::MAX),
+        }
+    }
+}
+
+fn hunk_error(texts: &Texts, line: usize, message: &str) -> String {
+    let line = line.to_string();
+    texts.fill("patch_hunk", &[("line", &line), ("message", message)])
+}
+
+fn boundaries<'a>(
+    texts: &Texts,
+    grammar: &Grammar,
+    patch: &'a str,
+) -> Result<Vec<&'a str>, String> {
     let lines: Vec<&str> = patch.trim().lines().collect();
     let strict = |lines: &[&str]| -> Result<(), String> {
         match (
             lines.first().map(|line| line.trim()),
             lines.last().map(|line| line.trim()),
         ) {
-            (Some(BEGIN_PATCH), Some(END_PATCH)) => Ok(()),
-            (Some(first), _) if first != BEGIN_PATCH => Err(
-                "Invalid patch: The first line of the patch must be '*** Begin Patch'".to_owned(),
-            ),
-            _ => {
-                Err("Invalid patch: The last line of the patch must be '*** End Patch'".to_owned())
-            }
+            (Some(first), Some(last)) if first == grammar.begin && last == grammar.end => Ok(()),
+            (Some(first), _) if first != grammar.begin => Err(texts.fill("patch_first", &[])),
+            _ => Err(texts.fill("patch_last", &[])),
         }
     };
     match strict(&lines) {
         Ok(()) => Ok(lines),
         Err(error) => {
-            let wrapped = lines.len() >= HEREDOC_LINES_MIN
-                && HEREDOC_OPENERS.contains(&lines[0])
-                && lines[lines.len() - 1].ends_with("EOF");
+            let wrapped = lines.len() >= grammar.heredoc_lines_min
+                && grammar.heredocs.iter().any(|opener| opener == lines[0])
+                && lines[lines.len() - 1].ends_with(grammar.heredoc_end.as_str());
             if !wrapped {
                 return Err(error);
             }
@@ -491,15 +523,16 @@ fn boundaries(patch: &str) -> Result<Vec<&str>, String> {
     }
 }
 
-fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
-    let lines = boundaries(patch)?;
+fn parse_patch(texts: &Texts, patch: &str) -> Result<Vec<Hunk>, String> {
+    let grammar = Grammar::of(texts);
+    let lines = boundaries(texts, &grammar, patch)?;
     let body = &lines[1..lines.len() - 1];
     let mut hunks = Vec::new();
     let mut at = 0;
     while at < body.len() {
         let number = at + 2;
         let line = body[at].trim();
-        if let Some(path) = line.strip_prefix(ADD_FILE) {
+        if let Some(path) = line.strip_prefix(grammar.add.as_str()) {
             let mut contents = String::new();
             at += 1;
             while at < body.len() && body[at].starts_with('+') {
@@ -508,32 +541,34 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
                 at += 1;
             }
             hunks.push(Hunk::Add(path.to_owned(), contents));
-        } else if let Some(path) = line.strip_prefix(DELETE_FILE) {
+        } else if let Some(path) = line.strip_prefix(grammar.delete.as_str()) {
             hunks.push(Hunk::Delete(path.to_owned()));
             at += 1;
-        } else if let Some(path) = line.strip_prefix(UPDATE_FILE) {
+        } else if let Some(path) = line.strip_prefix(grammar.update.as_str()) {
             at += 1;
             let mut moved = None;
             if at < body.len()
-                && let Some(to) = body[at].trim().strip_prefix(MOVE_TO)
+                && let Some(to) = body[at].trim().strip_prefix(grammar.move_to.as_str())
             {
                 moved = Some(to.to_owned());
                 at += 1;
             }
             let mut chunks: Vec<Chunk> = Vec::new();
-            while at < body.len() && !body[at].trim().starts_with("*** ")
-                || at < body.len() && body[at].trim() == END_OF_FILE
+            while at < body.len() && !body[at].trim().starts_with(grammar.marker.as_str())
+                || at < body.len() && body[at].trim() == grammar.end_of_file
             {
                 let text = body[at];
-                if text.trim() == END_OF_FILE {
+                if text.trim() == grammar.end_of_file {
                     if let Some(chunk) = chunks.last_mut() {
                         chunk.end_of_file = true;
                     }
                     at += 1;
                     continue;
                 }
-                if text == EMPTY_CHANGE_CONTEXT || text.starts_with(CHANGE_CONTEXT) {
-                    let context = text.strip_prefix(CHANGE_CONTEXT).map(str::to_owned);
+                if text == grammar.change_empty || text.starts_with(grammar.change.as_str()) {
+                    let context = text
+                        .strip_prefix(grammar.change.as_str())
+                        .map(str::to_owned);
                     chunks.push(Chunk {
                         context,
                         old: Vec::new(),
@@ -551,7 +586,7 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
                         end_of_file: false,
                     });
                 }
-                let chunk = chunks.last_mut().expect("a chunk was just pushed");
+                let chunk = chunks.last_mut().expect("chunk pushed");
                 match text.chars().next() {
                     Some('+') => chunk.new.push(text[1..].to_owned()),
                     Some('-') => chunk.old.push(text[1..].to_owned()),
@@ -564,12 +599,8 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
                         chunk.new.push(String::new());
                     }
                     Some(_) => {
-                        return Err(hunk_error(
-                            at + 2,
-                            &format!(
-                                "Unexpected line found in update hunk: '{text}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"
-                            ),
-                        ));
+                        let message = texts.fill("patch_line", &[("text", text)]);
+                        return Err(hunk_error(texts, at + 2, &message));
                     }
                 }
                 at += 1;
@@ -578,19 +609,13 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, String> {
                 .iter()
                 .all(|chunk| chunk.old.is_empty() && chunk.new.is_empty())
             {
-                return Err(hunk_error(
-                    number,
-                    &format!("Update file hunk for path '{path}' is empty"),
-                ));
+                let message = texts.fill("patch_empty", &[("path", path)]);
+                return Err(hunk_error(texts, number, &message));
             }
             hunks.push(Hunk::Update(path.to_owned(), moved, chunks));
         } else {
-            return Err(hunk_error(
-                number,
-                &format!(
-                    "'{line}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
-                ),
-            ));
+            let message = texts.fill("patch_header", &[("line", line)]);
+            return Err(hunk_error(texts, number, &message));
         }
     }
     Ok(hunks)
@@ -645,7 +670,7 @@ fn seek(lines: &[String], pattern: &[String], start: usize, end_of_file: bool) -
     None
 }
 
-fn updated(original: &str, path: &str, chunks: &[Chunk]) -> Result<String, String> {
+fn updated(texts: &Texts, original: &str, path: &str, chunks: &[Chunk]) -> Result<String, String> {
     let mut lines: Vec<String> = original.split('\n').map(str::to_owned).collect();
     if lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -656,7 +681,11 @@ fn updated(original: &str, path: &str, chunks: &[Chunk]) -> Result<String, Strin
         if let Some(context) = &chunk.context {
             match seek(&lines, std::slice::from_ref(context), at, false) {
                 Some(found) => at = found + 1,
-                None => return Err(format!("Failed to find context '{context}' in {path}")),
+                None => {
+                    return Err(
+                        texts.fill("patch_context", &[("context", context), ("path", path)])
+                    );
+                }
             }
         }
         if chunk.old.is_empty() {
@@ -674,10 +703,8 @@ fn updated(original: &str, path: &str, chunks: &[Chunk]) -> Result<String, Strin
             found = seek(&lines, pattern, at, chunk.end_of_file);
         }
         let Some(start) = found else {
-            return Err(format!(
-                "Failed to find expected lines in {path}:\n{}",
-                chunk.old.join("\n")
-            ));
+            let lines = chunk.old.join("\n");
+            return Err(texts.fill("patch_lines", &[("path", path), ("lines", &lines)]));
         };
         replacements.push((start, pattern.len(), new.to_vec()));
         at = start + pattern.len();
@@ -700,27 +727,36 @@ fn resolved(root: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn write_file(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Failed to create parent directories for {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-    std::fs::write(path, contents)
-        .map_err(|error| format!("Failed to write file {}: {error}", path.display()))
+fn failed(texts: &Texts, name: &str, path: &Path, error: std::io::Error) -> String {
+    let shown = path.display().to_string();
+    let error = error.to_string();
+    texts.fill(name, &[("path", &shown), ("error", &error)])
 }
 
-pub fn apply_patch(root: &Path, input: &Value) -> Ran {
+fn write_file(texts: &Texts, path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| failed(texts, "patch_mkdir_failed", path, error))?;
+    }
+    std::fs::write(path, contents).map_err(|error| failed(texts, "patch_write_failed", path, error))
+}
+
+fn unverified(texts: &Texts, error: &str) -> Ran {
+    Ran::Failed(texts.fill("patch_unverified", &[("error", error)]))
+}
+
+fn patched(texts: &Texts, summary: &str) -> Ran {
+    Ran::Ok(texts.fill("patch_done", &[("summary", summary)]))
+}
+
+pub fn apply_patch(texts: &Texts, root: &Path, input: &Value) -> Ran {
     let patch = text_field(input, "input");
-    let hunks = match parse_patch(patch) {
+    let hunks = match parse_patch(texts, patch) {
         Ok(hunks) => hunks,
-        Err(error) => return Ran::Failed(format!("apply_patch verification failed: {error}")),
+        Err(error) => return unverified(texts, &error),
     };
     if hunks.is_empty() {
-        return Ran::Failed("No files were modified.".to_owned());
+        return Ran::Failed(texts.fill("patch_none", &[]));
     }
     let mut planned: Vec<(char, String, Option<PathBuf>, Option<String>)> = Vec::new();
     for hunk in &hunks {
@@ -730,9 +766,8 @@ pub fn apply_patch(root: &Path, input: &Value) -> Ran {
             }
             Hunk::Delete(path) => {
                 if !resolved(root, path).is_file() {
-                    return Ran::Failed(format!(
-                        "apply_patch verification failed: Failed to read {path}: No such file or directory"
-                    ));
+                    let error = texts.fill("patch_no_file", &[("path", path)]);
+                    return unverified(texts, &error);
                 }
                 planned.push(('D', path.clone(), None, None));
             }
@@ -740,39 +775,37 @@ pub fn apply_patch(root: &Path, input: &Value) -> Ran {
                 let original = match std::fs::read_to_string(resolved(root, path)) {
                     Ok(original) => original,
                     Err(error) => {
-                        return Ran::Failed(format!(
-                            "apply_patch verification failed: Failed to read file to update {path}: {error}"
-                        ));
+                        let error = error.to_string();
+                        let error =
+                            texts.fill("patch_unreadable", &[("path", path), ("error", &error)]);
+                        return unverified(texts, &error);
                     }
                 };
-                match updated(&original, path, chunks) {
+                match updated(texts, &original, path, chunks) {
                     Ok(contents) => planned.push((
                         'M',
                         moved.clone().unwrap_or_else(|| path.clone()),
                         moved.as_ref().map(|_| resolved(root, path)),
                         Some(contents),
                     )),
-                    Err(error) => {
-                        return Ran::Failed(format!("apply_patch verification failed: {error}"));
-                    }
+                    Err(error) => return unverified(texts, &error),
                 }
             }
         }
     }
-    let mut summary = String::from("Success. Updated the following files:\n");
+    let mut summary = String::new();
     for (kind, path, source, contents) in &planned {
         let target = resolved(root, path);
         let done = match (kind, contents) {
             ('D', _) => std::fs::remove_file(&target)
-                .map_err(|error| format!("Failed to delete file {}: {error}", target.display())),
-            (_, Some(contents)) => write_file(&target, contents).and_then(|()| match source {
-                Some(source) if *source != target => {
-                    std::fs::remove_file(source).map_err(|error| {
-                        format!("Failed to remove original {}: {error}", source.display())
-                    })
-                }
-                _ => Ok(()),
-            }),
+                .map_err(|error| failed(texts, "patch_delete_failed", &target, error)),
+            (_, Some(contents)) => {
+                write_file(texts, &target, contents).and_then(|()| match source {
+                    Some(source) if *source != target => std::fs::remove_file(source)
+                        .map_err(|error| failed(texts, "patch_remove_failed", source, error)),
+                    _ => Ok(()),
+                })
+            }
             (_, None) => Ok(()),
         };
         if let Err(error) = done {
@@ -780,14 +813,12 @@ pub fn apply_patch(root: &Path, input: &Value) -> Ran {
         }
         summary.push_str(&format!("{kind} {path}\n"));
     }
-    Ran::Ok(format!(
-        "Exit code: 0\nWall time: 0 seconds\nOutput:\n{summary}"
-    ))
+    patched(texts, &summary)
 }
 
-pub fn patch_applied(root: &Path, input: &Value) -> Option<Ran> {
-    let hunks = parse_patch(text_field(input, "input")).ok()?;
-    let mut summary = String::from("Success. Updated the following files:\n");
+pub fn patch_applied(texts: &Texts, root: &Path, input: &Value) -> Option<Ran> {
+    let hunks = parse_patch(texts, text_field(input, "input")).ok()?;
+    let mut summary = String::new();
     for hunk in &hunks {
         match hunk {
             Hunk::Add(path, contents) => {
@@ -805,9 +836,5 @@ pub fn patch_applied(root: &Path, input: &Value) -> Option<Ran> {
             Hunk::Update(..) => return None,
         }
     }
-    (!hunks.is_empty()).then(|| {
-        Ran::Ok(format!(
-            "Exit code: 0\nWall time: 0 seconds\nOutput:\n{summary}"
-        ))
-    })
+    (!hunks.is_empty()).then(|| patched(texts, &summary))
 }

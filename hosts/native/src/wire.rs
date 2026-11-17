@@ -31,14 +31,12 @@ pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Str
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
         if !valid {
-            return Err(format!(
-                "{OPEN}{inner}}} does not name an environment variable"
-            ));
+            return Err(format!("{OPEN}{inner}}}: bad variable"));
         }
         match (lookup(name).filter(|value| !value.is_empty()), default) {
             (Some(value), _) => out.push_str(&value),
             (None, Some(default)) => out.push_str(default),
-            (None, None) => return Err(format!("the environment has no {name}")),
+            (None, None) => return Err(format!("unset: {name}")),
         }
         rest = &after[end + 1..];
     }
@@ -148,23 +146,17 @@ pub fn request(http: &Json, lookup: &dyn Fn(&str) -> Option<String>) -> Result<R
     let body = text_of(http.get("body"), "a wire request's body")?.to_owned();
     let Json::Array(listed) = http.get("headers") else {
         return Err(format!(
-            "a wire request's headers are not a list: {}",
+            "headers: not list: {}",
             http.get("headers").encode()
         ));
     };
     let mut headers = Vec::with_capacity(listed.len());
     for pair in listed {
         let Json::Array(parts) = pair else {
-            return Err(format!(
-                "a header is not a [name, value] pair: {}",
-                pair.encode()
-            ));
+            return Err(format!("header: not pair: {}", pair.encode()));
         };
         let [name, value] = parts.as_slice() else {
-            return Err(format!(
-                "a header is not a [name, value] pair: {}",
-                pair.encode()
-            ));
+            return Err(format!("header: not pair: {}", pair.encode()));
         };
         headers.push((
             expand(text_of(name, "a header's name")?, lookup)?,

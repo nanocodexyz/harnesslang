@@ -49,7 +49,7 @@ pub fn write_durably(path: &Path, text: &str) -> Result<(), String> {
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("{}: {error}", temporary.display()))?;
     std::fs::rename(&temporary, path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let parent = path.parent().expect("a durable file is inside a directory");
+    let parent = path.parent().expect("durable file parent");
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("{}: {error}", parent.display()))
@@ -82,21 +82,14 @@ impl Children {
         configure: Option<Json>,
     ) -> tools::Ran {
         let key = format!("{turn}{}{seq}", harnesslang::ir::SPAWN_KEY_SEPARATOR);
-        assert!(
-            is_key(&key),
-            "a spawn's key is its call's turn and sequence number"
-        );
+        assert!(is_key(&key), "spawn key");
         if self.running() >= RUNNING_MAX {
-            return tools::Ran::Failed(format!(
-                "{RUNNING_MAX} subagents are already running; wait for one before starting another"
-            ));
+            let max = RUNNING_MAX.to_string();
+            return tools::Ran::Failed(self.setup.texts.fill("spawn_full", &[("max", &max)]));
         }
         let directory = self.directory.join(&key);
         if directory.join(SPAWN_FILE).exists() {
-            return tools::Ran::Failed(format!(
-                "{} already exists: the journal and its children directory disagree",
-                directory.display()
-            ));
+            return tools::Ran::Failed(format!("{}: stale spawn", directory.display()));
         }
         let configure = configure.map_or(Value::Null, |json| host::to_value(&json));
         let spawn = Value::object([
@@ -129,7 +122,7 @@ impl Children {
             return;
         }
         let Some(Child::Running(handle)) = self.started.remove(key) else {
-            panic!("a running child is in the map");
+            panic!("running child missing");
         };
         let ended = handle
             .join()
@@ -139,14 +132,17 @@ impl Children {
 
     pub fn join(&mut self, key: &str) -> Option<String> {
         if !is_key(key) {
-            return Some(failed(&format!(
-                "{key:?} is not an agent ID that a spawn returned"
-            )));
+            let shown = format!("{key:?}");
+            return Some(failed(
+                &self.setup.texts.fill("agent_id_bad", &[("key", &shown)]),
+            ));
         }
         let directory = self.directory.join(key);
         if !self.started.contains_key(key) {
             if !directory.join(SPAWN_FILE).exists() {
-                return Some(failed(&format!("no subagent has the ID {key}")));
+                return Some(failed(
+                    &self.setup.texts.fill("agent_missing", &[("key", key)]),
+                ));
             }
             let ended = run(&self.setup, &directory, key, &self.cancel);
             self.started.insert(key.to_owned(), Child::Ended(ended));
@@ -159,7 +155,7 @@ impl Children {
                 self.started.remove(key);
                 None
             }
-            _ => panic!("a settled child has ended"),
+            _ => panic!("settled child running"),
         }
     }
 
@@ -239,7 +235,7 @@ impl Children {
             .map(|(key, _)| key.clone())
             .collect();
         for key in running {
-            eprintln!("hl-host: waiting for subagent {key}, whose result the turn did not read");
+            eprintln!("hl-host: unread subagent {key}");
             self.settle(&key);
         }
     }
@@ -303,8 +299,8 @@ fn run(setup: &Setup, directory: &Path, key: &str, cancel: &Path) -> Result<Stri
             eprintln!("{label}: finished {}", finish.result.encode());
             Ok(finish.result.encode())
         }
-        Ok(Ran::Suspended { seq, .. }) => Err(format!("the child turn waits on suspend {seq}")),
-        Ok(Ran::NotDue) => Err("the child turn was refused as not due".to_owned()),
+        Ok(Ran::Suspended { seq, .. }) => Err(format!("child suspended: {seq}")),
+        Ok(Ran::NotDue) => Err("child turn undue".to_owned()),
         Err(error) => Err(error),
     }
 }

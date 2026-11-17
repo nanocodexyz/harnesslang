@@ -30,10 +30,10 @@ fn main() {
             embedded,
             "    ({stem:?}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{stem}.wasm\"))),"
         )
-        .expect("write to a String");
+        .expect("String write");
     }
     embedded.push_str("];\n");
-    std::fs::write(out.join(EMBEDDED_FILE), embedded).expect("write the embedded module table");
+    std::fs::write(out.join(EMBEDDED_FILE), embedded).expect("embedded table write");
 }
 
 fn emit(path: &str, plant: &str, out: &Path) -> String {
@@ -43,9 +43,8 @@ fn emit(path: &str, plant: &str, out: &Path) -> String {
     let stem = Path::new(path)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .expect("a program path ends in <stem>.hl")
+        .expect("program stem")
         .to_owned();
-    std::fs::write(out.join(format!("{stem}.wasm")), &module)
-        .expect("write the module into OUT_DIR");
+    std::fs::write(out.join(format!("{stem}.wasm")), &module).expect("module write");
     stem
 }

@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::json::Value;
+use crate::texts::Texts;
 
 pub const COMMAND_BYTES_MAX: usize = 1024 * 1024;
 pub const DESCRIPTION_BYTES_MAX: usize = 1024;
@@ -33,9 +34,6 @@ const SHELL: &str = "bash";
 pub const SHELL_FALLBACK: &str = "/bin/sh";
 const GROUP_KILL: &str = "kill -KILL -\"$1\"";
 const BASH_WRAPPER: &str = "__hl_state=\"$1\"; shift; trap 'pwd -P > \"$__hl_state-cwd.new\" && mv \"$__hl_state-cwd.new\" \"$__hl_state-cwd\"' EXIT; . \"$__hl_state-command\"";
-const TRUNCATED: &str = "[Truncated: PARTIAL view \u{2014} ";
-const ALLOW_LARGE_UNAVAILABLE: &str =
-    " allow_large is not available where this read runs; read it in parts with offset and limit.";
 const BINARY_EXTENSIONS: [&str; 87] = [
     ".ico", ".tiff", ".tif", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
     ".mpeg", ".mpg", ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".aiff", ".opus",
@@ -48,9 +46,6 @@ const BINARY_EXTENSIONS: [&str; 87] = [
 ];
 const MEDIA_EXTENSIONS: [&str; 6] = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"];
 const IMAGE_EXTENSIONS: [&str; 5] = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
-const IMAGE_TOO_LARGE: &str =
-    "image content omitted because it exceeded the supported size limit; use a smaller image";
-const IMAGE_UNPROCESSABLE: &str = "image content omitted because it could not be processed";
 const PNG_SIGNATURE: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 const JPEG_SIGNATURE: &[u8] = &[0xff, 0xd8, 0xff];
 const GIF_SIGNATURES: [&[u8]; 2] = [b"GIF87a", b"GIF89a"];
@@ -78,7 +73,7 @@ pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 pub struct Workspace {
-    pub texts: crate::texts::Texts,
+    pub texts: Texts,
     pub root: PathBuf,
     pub state: PathBuf,
     pub image_bytes_max: Option<u64>,
@@ -128,7 +123,7 @@ impl Workspace {
         let outcome = match tool {
             "Bash" => self.bash(input, false).map(|bashed| match bashed {
                 Bashed::Ran(ran) => ran,
-                Bashed::Job(..) => unreachable!("a Bash call without room never becomes a job"),
+                Bashed::Job(..) => unreachable!("roomless Bash job"),
             }),
             "Read" => self.read(input),
             "Edit" => self.edit(input).map(Ran::Ok),
@@ -137,7 +132,7 @@ impl Workspace {
         };
         match outcome {
             Ok(ran) => ran,
-            Err(error) => Ran::Failed(format!("<tool_use_error>{error}</tool_use_error>")),
+            Err(error) => Ran::Failed(self.texts.fill("tool_error", &[("error", &error)])),
         }
     }
 
@@ -166,7 +161,7 @@ impl Workspace {
             Ran::Image(_) => return,
         };
         let path = self.receipt(turn, seq, RECEIPT_DONE);
-        if let Err(error) = atomic_write(&path, &value.encode()) {
+        if let Err(error) = atomic_write(&self.texts, &path, &value.encode()) {
             eprintln!("hl-host: {}: {error}", path.display());
         }
     }
@@ -249,25 +244,23 @@ impl Workspace {
 
     fn resolve(&self, text: &str) -> Result<PathBuf, String> {
         if text.is_empty() {
-            return Err("file path is empty".into());
+            return Err(self.texts.fill("path_empty", &[]));
         }
         Ok(self.root.join(text))
     }
 
     fn missing(&self, path: &Path) -> String {
-        let mut text = format!(
-            "File does not exist. Note: your current working directory is {}.",
-            self.root.display()
-        );
+        let cwd = self.root.display().to_string();
+        let mut text = self.texts.fill("file_missing", &[("cwd", &cwd)]);
         if let Some(similar) = similar(path) {
-            text.push_str(&format!(" Did you mean {similar}?"));
+            text.push_str(&self.texts.fill("file_similar", &[("path", &similar)]));
         }
         text
     }
 
     fn read(&self, input: &Value) -> Result<Ran, String> {
         let file_path = text_field(input, "file_path")?;
-        if let Some(error) = binary(file_path) {
+        if let Some(error) = binary(&self.texts, file_path) {
             return Err(error);
         }
         let path = self.resolve(file_path)?;
@@ -277,12 +270,12 @@ impl Workspace {
             }
             Err(error) => return Err(format!("path: {error}")),
             Ok(real) if real.is_dir() => {
-                return Ok(Ran::Failed(format!(
-                    "EISDIR: illegal operation on a directory, read '{}'",
-                    path.display()
-                )));
+                let shown = path.display().to_string();
+                return Ok(Ran::Failed(
+                    self.texts.fill("read_directory", &[("path", &shown)]),
+                ));
             }
-            Ok(real) if !real.is_file() => return Err("path is not a regular file".into()),
+            Ok(real) if !real.is_file() => return Err(self.texts.fill("read_not_file", &[])),
             Ok(_) => {}
         }
         let image = IMAGE_EXTENSIONS
@@ -295,16 +288,14 @@ impl Workspace {
             .iter()
             .find(|extension| file_path.to_ascii_lowercase().ends_with(*extension))
         {
-            return Err(format!(
-                "this harness reads text only and cannot return {extension} files as images or documents"
-            ));
+            return Err(self.texts.fill("read_media", &[("extension", extension)]));
         }
         if !text_field(input, "pages")?.is_empty() {
-            return Err("pages is only applicable to PDF files".into());
+            return Err(self.texts.fill("read_pages", &[]));
         }
         let bytes = std::fs::read(&path).map_err(|error| format!("read: {error}"))?;
         let text = String::from_utf8(bytes).map_err(|error| format!("read: {error}"))?;
-        read_view(file_path, &text, input).map(|view| match view {
+        read_view(&self.texts, file_path, &text, input).map(|view| match view {
             Ok(text) => Ran::Ok(text),
             Err(text) => Ran::Failed(text),
         })
@@ -313,10 +304,10 @@ impl Workspace {
     fn read_image(&self, path: &Path, bytes_max: u64) -> Result<Ran, String> {
         let bytes = std::fs::read(path).map_err(|error| format!("read: {error}"))?;
         if media_type(&bytes).is_none() {
-            return Ok(Ran::Failed(IMAGE_UNPROCESSABLE.to_owned()));
+            return Ok(Ran::Failed(self.texts.fill("image_unprocessable", &[])));
         }
         if bytes.len() as u64 > bytes_max {
-            return Ok(Ran::Failed(IMAGE_TOO_LARGE.to_owned()));
+            return Ok(Ran::Failed(self.texts.fill("image_too_large", &[])));
         }
         Ok(Ran::Image(bytes))
     }
@@ -324,9 +315,11 @@ impl Workspace {
     fn write_target(&self, text: &str) -> Result<PathBuf, String> {
         let path = self.resolve(text)?;
         if path.is_dir() {
-            return Err("target is not a regular file".into());
+            return Err(self.texts.fill("write_directory", &[]));
         }
-        let parent = path.parent().ok_or("file has no parent")?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| self.texts.fill("write_no_parent", &[]))?;
         std::fs::create_dir_all(parent).map_err(|error| format!("create directory: {error}"))?;
         Ok(path)
     }
@@ -335,7 +328,7 @@ impl Workspace {
         let content = text_field(input, "content")?;
         let path = self.write_target(text_field(input, "file_path")?)?;
         let existed = path.exists();
-        atomic_write(&path, content)?;
+        atomic_write(&self.texts, &path, content)?;
         let shown = path.display().to_string();
         let name = if existed {
             "write_updated"
@@ -359,17 +352,14 @@ impl Workspace {
                 String::new()
             }
             Err(_) if path.is_dir() => {
-                return Err(
-                    "Error calling tool (Edit): EISDIR: illegal operation on a directory, read"
-                        .into(),
-                );
+                return Err(self.texts.fill("edit_directory", &[]));
             }
             Err(error) => return Err(format!("read: {error}")),
             Ok(content) => content,
         };
-        let updated = apply_edit(&content, old, new, replace_all)?;
+        let updated = apply_edit(&self.texts, &content, old, new, replace_all)?;
         let path = self.write_target(file_path)?;
-        atomic_write(&path, &updated)?;
+        atomic_write(&self.texts, &path, &updated)?;
         let shown = path.display().to_string();
         let name = if replace_all {
             "edit_replaced_all"
@@ -382,28 +372,24 @@ impl Workspace {
     pub fn bash_job(&self, input: &Value, room: bool) -> Bashed {
         match self.bash(input, room) {
             Ok(bashed) => bashed,
-            Err(error) => Bashed::Ran(Ran::Failed(format!(
-                "<tool_use_error>{error}</tool_use_error>"
-            ))),
+            Err(error) => Bashed::Ran(Ran::Failed(
+                self.texts.fill("tool_error", &[("error", &error)]),
+            )),
         }
     }
 
     fn bash(&self, input: &Value, room: bool) -> Result<Bashed, String> {
         if bool_field(input, "dangerouslyDisableSandbox")? {
-            return Err("this host does not authorize disabling the sandbox".into());
+            return Err(self.texts.fill("bash_sandbox", &[]));
         }
         let background = bool_field(input, "run_in_background")?;
         if background && !room {
-            return Err(
-                "no background job can start now: the session keeps its limit of background jobs running"
-                    .into(),
-            );
+            return Err(self.texts.fill("bash_jobs_full", &[]));
         }
         let command = text_field(input, "command")?;
         if command.trim().is_empty() || command.len() > COMMAND_BYTES_MAX {
-            return Err(format!(
-                "command must be nonblank and at most {COMMAND_BYTES_MAX} bytes"
-            ));
+            let bytes = COMMAND_BYTES_MAX.to_string();
+            return Err(self.texts.fill("bash_command_size", &[("bytes", &bytes)]));
         }
         if input
             .get("description")
@@ -412,14 +398,17 @@ impl Workspace {
             .len()
             > DESCRIPTION_BYTES_MAX
         {
-            return Err(format!("description exceeds {DESCRIPTION_BYTES_MAX} bytes"));
+            let bytes = DESCRIPTION_BYTES_MAX.to_string();
+            return Err(self
+                .texts
+                .fill("bash_description_size", &[("bytes", &bytes)]));
         }
         let requested = match input.get("timeout") {
             None => TIMEOUT_DEFAULT_MS,
             Some(_) => u64_field(input, "timeout")?,
         };
         if requested == 0 {
-            return Err("timeout must be at least 1 millisecond".into());
+            return Err(self.texts.fill("bash_timeout_zero", &[]));
         }
         let timeout = Duration::from_millis(requested.min(TIMEOUT_MAX_MS));
         if background {
@@ -435,7 +424,7 @@ impl Workspace {
             .execute(command, timeout, room)
             .map_err(|error| format!("command executor: {error}"))?;
         Ok(match waited {
-            Waited::Done(shell) => Bashed::Ran(rendered(&shell)),
+            Waited::Done(shell) => Bashed::Ran(rendered(&self.texts, &shell)),
             Waited::Moved(started) => {
                 let seconds = timeout.as_secs().max(1).to_string();
                 let message = self.texts.fill("bash_moved", &[("seconds", &seconds)]);
@@ -503,16 +492,14 @@ impl Workspace {
                 }
                 kill_group(&mut started.child)?;
                 let status = started.child.wait().map_err(|error| error.to_string())?;
-                let mut shell = settled(started, status, true)?;
-                shell.message = Some(format!(
-                    "Command timed out after {}",
-                    timed_out_after(timeout)
-                ));
+                let mut shell = settled(&self.texts, started, status, true)?;
+                let after = timed_out_after(timeout);
+                shell.message = Some(self.texts.fill("bash_timed_out", &[("after", &after)]));
                 return Ok(Waited::Done(shell));
             }
             std::thread::sleep(TIMEOUT_POLL);
         };
-        Ok(Waited::Done(settled(started, status, false)?))
+        Ok(Waited::Done(settled(&self.texts, started, status, false)?))
     }
 }
 
@@ -572,12 +559,13 @@ pub fn kill_group(child: &mut std::process::Child) -> Result<(), String> {
 }
 
 pub fn settled(
+    texts: &Texts,
     started: Started,
     status: std::process::ExitStatus,
     timed_out: bool,
 ) -> Result<Shell, String> {
-    let stdout = captured(&started.stdout, "stdout")?;
-    let stderr = captured(&started.stderr, "stderr")?;
+    let stdout = captured(texts, &started.stdout, "stdout")?;
+    let stderr = captured(texts, &started.stderr, "stderr")?;
     let _ = std::fs::remove_file(&started.stdout);
     let _ = std::fs::remove_file(&started.stderr);
     let code = match (timed_out, status.code()) {
@@ -596,8 +584,8 @@ pub fn settled(
     })
 }
 
-pub fn shown(shell: &Shell) -> String {
-    match rendered(shell) {
+pub fn shown(texts: &Texts, shell: &Shell) -> String {
+    match rendered(texts, shell) {
         Ran::Ok(text) | Ran::Failed(text) | Ran::Job(text) => text,
         Ran::Image(_) => String::new(),
     }
@@ -616,7 +604,7 @@ pub struct Shell {
     message: Option<String>,
 }
 
-fn captured(path: &Path, stream: &str) -> Result<String, String> {
+fn captured(texts: &Texts, path: &Path, stream: &str) -> Result<String, String> {
     let failed = |error: std::io::Error| format!("{}: {error}", path.display());
     let mut file = std::fs::File::open(path).map_err(failed)?;
     let total = file.metadata().map_err(failed)?.len();
@@ -641,9 +629,13 @@ fn captured(path: &Path, stream: &str) -> Result<String, String> {
     } else {
         "\n"
     };
-    Ok(format!(
-        "{head}{line}[{stream}: {elided} of {total} bytes elided from the middle. To see them, rerun the command with its output sent to a file and read parts of it with grep -n, sed -n 'START,ENDp' or tail]\n{tail}"
-    ))
+    let elided = elided.to_string();
+    let total = total.to_string();
+    let marker = texts.fill(
+        "bash_elided",
+        &[("stream", stream), ("elided", &elided), ("total", &total)],
+    );
+    Ok(format!("{head}{line}{marker}\n{tail}"))
 }
 
 fn timed_out_after(timeout: Duration) -> String {
@@ -670,9 +662,10 @@ fn without_empty_lines(text: &str) -> String {
     lines[start..].join("\n").trim_end().to_owned()
 }
 
-fn rendered(shell: &Shell) -> Ran {
+fn rendered(texts: &Texts, shell: &Shell) -> Ran {
+    let code = shell.code.to_string();
     let parts = [
-        (shell.code != 0).then(|| format!("Exit code {}", shell.code)),
+        (shell.code != 0).then(|| texts.fill("bash_exit", &[("code", &code)])),
         Some(without_empty_lines(&shell.stdout)),
         Some(without_empty_lines(&shell.stderr)),
         shell.message.clone(),
@@ -684,13 +677,13 @@ fn rendered(shell: &Shell) -> Ran {
         .collect::<Vec<_>>()
         .join("\n");
     match (shell.code, text.is_empty()) {
-        (0, true) => Ran::Ok("(Bash completed with no output)".to_owned()),
+        (0, true) => Ran::Ok(texts.fill("bash_no_output", &[])),
         (0, false) => Ran::Ok(text),
-        _ => Ran::Failed(truncated_error(text)),
+        _ => Ran::Failed(truncated_error(texts, text)),
     }
 }
 
-fn truncated_error(text: String) -> String {
+fn truncated_error(texts: &Texts, text: String) -> String {
     let units = text.encode_utf16().count();
     if units <= ERROR_CHARS + ERROR_CHARS_SLACK {
         return text;
@@ -709,19 +702,16 @@ fn truncated_error(text: String) -> String {
         }
         tail = (at, tail.1 + c.len_utf16());
     }
-    format!(
-        "{}\n\n... [{} characters truncated] ...\n\n{}",
-        &text[..head.0],
-        units - head.1 - tail.1,
-        &text[tail.0..]
-    )
+    let count = (units - head.1 - tail.1).to_string();
+    let cut = texts.fill("bash_error_cut", &[("count", &count)]);
+    format!("{}{cut}{}", &text[..head.0], &text[tail.0..])
 }
 
-fn binary(file_path: &str) -> Option<String> {
+fn binary(texts: &Texts, file_path: &str) -> Option<String> {
     let extension = file_path[file_path.rfind('.')?..].to_ascii_lowercase();
-    BINARY_EXTENSIONS.contains(&extension.as_str()).then(|| {
-        format!("This tool cannot read binary files. The file appears to be a binary {extension} file. Use a skill for this file type if one is available, or a shell command or script that can read the format.")
-    })
+    BINARY_EXTENSIONS
+        .contains(&extension.as_str())
+        .then(|| texts.fill("read_binary", &[("extension", &extension)]))
 }
 
 fn similar(path: &Path) -> Option<String> {
@@ -749,10 +739,10 @@ fn similar(path: &Path) -> Option<String> {
         .map(|entry| parent.join(entry).display().to_string())
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+fn atomic_write(texts: &Texts, path: &Path, content: &str) -> Result<(), String> {
     let name = path
         .file_name()
-        .ok_or("file has no name")?
+        .ok_or_else(|| texts.fill("write_no_name", &[]))?
         .to_string_lossy();
     let temporary = path.with_file_name(format!(".{name}.hl-host-write"));
     std::fs::write(&temporary, content).map_err(|error| format!("write: {error}"))?;
@@ -763,6 +753,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 }
 
 pub fn apply_edit(
+    texts: &Texts,
     content: &str,
     old: &str,
     new: &str,
@@ -770,23 +761,20 @@ pub fn apply_edit(
 ) -> Result<String, String> {
     if old.is_empty() {
         if !content.trim().is_empty() {
-            return Err("Cannot create new file - file already exists.".into());
+            return Err(texts.fill("edit_exists", &[]));
         }
         return Ok(new.to_owned());
     }
     if old == new {
-        return Err("No changes to make: old_string and new_string are exactly the same.".into());
+        return Err(texts.fill("edit_same", &[]));
     }
     let count = content.matches(old).count();
     if count == 0 {
-        return Err(format!(
-            "String to replace not found in file.\nString: {old}"
-        ));
+        return Err(texts.fill("edit_missing", &[("old", old)]));
     }
     if count != 1 && !replace_all {
-        return Err(format!(
-            "Found {count} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: {old}"
-        ));
+        let count = count.to_string();
+        return Err(texts.fill("edit_many", &[("count", &count), ("old", old)]));
     }
     Ok(if replace_all {
         content.replace(old, new)
@@ -807,20 +795,28 @@ fn size_text(bytes: u64) -> String {
     format!("{}MB", trimmed(kilobytes / 1024.0))
 }
 
-fn read_view(file_path: &str, text: &str, input: &Value) -> Result<Result<String, String>, String> {
+fn read_view(
+    texts: &Texts,
+    file_path: &str,
+    text: &str,
+    input: &Value,
+) -> Result<Result<String, String>, String> {
     let offset = u64_field(input, "offset")?;
     let limit = Some(u64_field(input, "limit")?).filter(|limit| *limit > 0);
     let hint = if bool_field(input, "allow_large")? {
-        ALLOW_LARGE_UNAVAILABLE
+        texts.fill("read_allow_large", &[])
     } else {
-        ""
+        String::new()
     };
     let size = text.len() as u64;
     if limit.is_none() && size > READ_BYTES_MAX {
-        return Ok(Err(format!(
-            "File content ({}) exceeds maximum allowed size ({}). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.{hint}",
-            size_text(size),
-            size_text(READ_BYTES_MAX)
+        return Ok(Err(texts.fill(
+            "read_too_big",
+            &[
+                ("size", &size_text(size)),
+                ("max", &size_text(READ_BYTES_MAX)),
+                ("hint", &hint),
+            ],
         )));
     }
     let selected_max = READ_TOKENS_MAX as u64 * SELECTED_BYTES_PER_TOKEN;
@@ -853,9 +849,9 @@ fn read_view(file_path: &str, text: &str, input: &Value) -> Result<Result<String
         if index >= start && end.is_none_or(|end| index < end) {
             selected += line.len() as u64 + u64::from(!lines.is_empty());
             if limit.is_some() && selected > selected_max {
-                return Ok(Err(format!(
-                    "The requested line range contains over {} of text, more than a read can return. Use a smaller limit \u{2014} or, if a single line is this large, no limit will fit it: search for specific content instead.{hint}",
-                    size_text(selected_max)
+                return Ok(Err(texts.fill(
+                    "read_range_too_big",
+                    &[("max", &size_text(selected_max)), ("hint", &hint)],
                 )));
             }
             lines.push(*line);
@@ -869,16 +865,29 @@ fn read_view(file_path: &str, text: &str, input: &Value) -> Result<Result<String
     let mut banner = None;
     if tokens > READ_TOKENS_MAX {
         if offset > 1 || limit.is_some() {
-            return Ok(Err(format!(
-                "File content ({tokens} tokens) exceeds maximum allowed tokens ({READ_TOKENS_MAX}). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.{hint}"
+            return Ok(Err(texts.fill(
+                "read_too_many_tokens",
+                &[
+                    ("tokens", &tokens.to_string()),
+                    ("max", &READ_TOKENS_MAX.to_string()),
+                    ("hint", &hint),
+                ],
             )));
         }
         let (kept, count) = first_page(&lines, &content, tokens);
         page = kept;
         shown = count;
-        banner = Some(format!(
-            "{TRUNCATED}{file_path}: showing lines 1-{count} of {total} total ({tokens} tokens, cap {READ_TOKENS_MAX}). Call Read with offset={} limit={count} for the next page, or Grep to find a specific section.{hint} Do NOT answer from this page alone if the answer may be further in the file.]",
-            count + 1
+        banner = Some(texts.fill(
+            "read_page",
+            &[
+                ("path", file_path),
+                ("count", &count.to_string()),
+                ("total", &total.to_string()),
+                ("tokens", &tokens.to_string()),
+                ("max", &READ_TOKENS_MAX.to_string()),
+                ("next", &(count + 1).to_string()),
+                ("hint", &hint),
+            ],
         ));
     }
     let mut out = if !page.is_empty() || (shown >= 1 && total > 1) {
@@ -888,15 +897,15 @@ fn read_view(file_path: &str, text: &str, input: &Value) -> Result<Result<String
             .collect::<Vec<_>>()
             .join("\n")
     } else if shown >= 1 || total == 0 {
-        "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>"
-            .to_owned()
+        texts.fill("read_empty", &[])
     } else {
-        format!(
-            "<system-reminder>Warning: the file exists but is shorter than the provided offset ({first}). The file has {total} lines.</system-reminder>"
+        texts.fill(
+            "read_short",
+            &[("first", &first.to_string()), ("total", &total.to_string())],
         )
     };
     if let Some(banner) = banner {
-        out.push_str(&format!("\n<system-reminder>{banner}</system-reminder>"));
+        out.push_str(&texts.fill("read_banner", &[("banner", &banner)]));
     }
     Ok(Ok(out))
 }

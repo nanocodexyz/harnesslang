@@ -317,6 +317,17 @@ def codex_generated(levels):
     return out
 
 
+def policies(path):
+    with open(path, encoding="utf-8") as file:
+        lines = file.read().split(NL)
+    for name, fixture in [("claude_policy", "claude-host.json"), ("codex_policy", "codex-host.json")]:
+        prefix = "  let " + name + " = "
+        at = next(i for i, line in enumerate(lines) if line.startswith(prefix))
+        lines[at] = prefix + L(J(json.loads(read(fixture)))[1:-1])
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(NL.join(lines))
+
+
 def splice(path, fns):
     with open(path, encoding="utf-8") as file:
         lines = file.read().split(NL)
@@ -358,3 +369,4 @@ if __name__ == "__main__":
     splice(examples + "claude_code.hl", claude_generated("parent", ["low", "medium", "high"]))
     splice(examples + "claude_code_child.hl", claude_generated("child", []))
     splice(examples + "codex_agent.hl", codex_generated(["medium", "low", "high", "xhigh"]))
+    policies(examples + "entry.hl")

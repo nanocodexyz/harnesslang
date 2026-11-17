@@ -1,0 +1,77 @@
+{
+  "texts": {
+    "exec_cut": "…{tokens} tokens truncated…",
+    "exec_wall": "Wall time: {seconds} seconds",
+    "exec_exited": "Process exited with code {code}",
+    "exec_running": "Process running with session ID {id}",
+    "exec_original": "Original token count: {tokens}",
+    "exec_output": "Output:",
+    "exec_stdin_closed": "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open",
+    "exec_aborted": "aborted by user after {seconds}s",
+    "exec_no_command": "missing command line for unified exec request",
+    "exec_spawn_failed": "Failed to create unified exec process: {error}",
+    "exec_failed": "Unified exec process failed: {error}",
+    "exec_unknown": "Unknown process id {id}",
+    "exec_stdin_failed": "failed to write to stdin",
+    "image_no_path": "view_image needs the path of an image file",
+    "image_unreadable": "unable to read image at {path}: {error}",
+    "image_kind": "{path} is not a PNG, JPEG, GIF or WebP image; convert or render it to PNG first",
+    "image_size": "{path} is {bytes} bytes, more than the {max} an image may have; scale it down or crop it first",
+    "plan_many": "At most one step can be in_progress at a time.",
+    "plan_updated": "Plan updated",
+    "plan_invalid": "failed to parse function arguments: plan is not a list of steps: {plan}",
+    "patch_hunk": "Invalid patch hunk on line {line}: {message}",
+    "patch_first": "Invalid patch: The first line of the patch must be '*** Begin Patch'",
+    "patch_last": "Invalid patch: The last line of the patch must be '*** End Patch'",
+    "patch_line": "Unexpected line found in update hunk: '{text}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)",
+    "patch_empty": "Update file hunk for path '{path}' is empty",
+    "patch_header": "'{line}' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'",
+    "patch_context": "Failed to find context '{context}' in {path}",
+    "patch_lines": "Failed to find expected lines in {path}:\n{lines}",
+    "patch_mkdir_failed": "Failed to create parent directories for {path}: {error}",
+    "patch_write_failed": "Failed to write file {path}: {error}",
+    "patch_unverified": "apply_patch verification failed: {error}",
+    "patch_none": "No files were modified.",
+    "patch_no_file": "Failed to read {path}: No such file or directory",
+    "patch_unreadable": "Failed to read file to update {path}: {error}",
+    "patch_delete_failed": "Failed to delete file {path}: {error}",
+    "patch_remove_failed": "Failed to remove original {path}: {error}",
+    "patch_done": "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\n{summary}",
+    "patch_begin": "*** Begin Patch",
+    "patch_end": "*** End Patch",
+    "patch_add": "*** Add File: ",
+    "patch_delete": "*** Delete File: ",
+    "patch_update": "*** Update File: ",
+    "patch_move": "*** Move to: ",
+    "patch_eof": "*** End of File",
+    "patch_marker": "*** ",
+    "patch_change": "@@ ",
+    "patch_change_empty": "@@",
+    "patch_heredoc_end": "EOF"
+  },
+  "numbers": {
+    "bytes_per_token": 4,
+    "exec_yield_min_ms": 250,
+    "exec_yield_max_ms": 30000,
+    "poll_yield_min_ms": 5000,
+    "poll_yield_max_ms": 300000,
+    "patch_heredoc_lines_min": 4
+  },
+  "lists": {
+    "receipted_tools": [
+      "exec_command",
+      "apply_patch"
+    ],
+    "cancellable_tools": [
+      "exec_command",
+      "write_stdin"
+    ],
+    "list_tools": [],
+    "submit_tools": [],
+    "patch_heredocs": [
+      "<<EOF",
+      "<<'EOF'",
+      "<<\"EOF\""
+    ]
+  }
+}

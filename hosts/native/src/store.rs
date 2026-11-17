@@ -64,9 +64,7 @@ pub fn open(spec: &Spec, journal: &Path) -> Result<Opened, String> {
     };
     match sql::open_journal(*target, location, OWNER, lease, Mutation::None)? {
         sql::Opened::Owned(journal) => Ok(Opened::Sql(journal)),
-        sql::Opened::Held => Err(format!(
-            "session {session} in {location} is held by another owner's lease"
-        )),
+        sql::Opened::Held => Err(format!("session {session} in {location}: leased elsewhere")),
     }
 }
 

@@ -1,0 +1,90 @@
+{
+  "texts": {
+    "write_updated": "The file {path} has been updated successfully. (file state is current in your context — no need to Read it back)",
+    "write_created": "File created successfully at: {path} (file state is current in your context — no need to Read it back)",
+    "edit_updated": "The file {path} has been updated successfully.",
+    "edit_replaced_all": "The file {path} has been updated. All occurrences were successfully replaced.",
+    "bash_background": "Command running in background",
+    "bash_moved": "Command did not complete within its {seconds}s timeout and was moved to the background",
+    "job_started": "{message} (ID: {key}). You will be notified when it completes.",
+    "job_started_unheld": "{message} with ID: {key}. If it exits while you are still working you will be notified, but it is terminated when you give your final response and no notification can follow that — so do not end your turn to wait for it; if you need its result, wait for it before giving your final response.",
+    "job_completed": "<task-notification>\n<task-id>{key}</task-id>\n<status>completed</status>\n<summary>Background command \"{command}\" completed</summary>\n</task-notification>\n{output}",
+    "job_failed": "<task-notification>\n<task-id>{key}</task-id>\n<status>failed</status>\n<summary>Background command \"{command}\" failed with exit code {code}</summary>\n</task-notification>\n{output}",
+    "job_lost": "<task-notification>\n<task-id>{key}</task-id>\n<status>failed</status>\n<summary>Background command \"{command}\" lost its output: {error}</summary>\n</task-notification>",
+    "job_stalled": "<task-notification>\n<task-id>{key}</task-id>\n<summary>Background command \"{command}\" appears to be waiting for interactive input</summary>\n</task-notification>\nLast output:\n{tail}\n\nThe command is likely blocked on an interactive prompt. Stop this task and re-run with piped input (e.g., `echo y | command`) or a non-interactive flag if one exists.",
+    "tool_error": "<tool_use_error>{error}</tool_use_error>",
+    "path_empty": "file path is empty",
+    "file_missing": "File does not exist. Note: your current working directory is {cwd}.",
+    "file_similar": " Did you mean {path}?",
+    "read_directory": "EISDIR: illegal operation on a directory, read '{path}'",
+    "read_not_file": "path is not a regular file",
+    "read_media": "this harness reads text only and cannot return {extension} files as images or documents",
+    "read_pages": "pages is only applicable to PDF files",
+    "read_binary": "This tool cannot read binary files. The file appears to be a binary {extension} file. Use a skill for this file type if one is available, or a shell command or script that can read the format.",
+    "read_allow_large": " allow_large is not available where this read runs; read it in parts with offset and limit.",
+    "read_too_big": "File content ({size}) exceeds maximum allowed size ({max}). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.{hint}",
+    "read_range_too_big": "The requested line range contains over {max} of text, more than a read can return. Use a smaller limit — or, if a single line is this large, no limit will fit it: search for specific content instead.{hint}",
+    "read_too_many_tokens": "File content ({tokens} tokens) exceeds maximum allowed tokens ({max}). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.{hint}",
+    "read_page": "[Truncated: PARTIAL view — {path}: showing lines 1-{count} of {total} total ({tokens} tokens, cap {max}). Call Read with offset={next} limit={count} for the next page, or Grep to find a specific section.{hint} Do NOT answer from this page alone if the answer may be further in the file.]",
+    "read_banner": "\n<system-reminder>{banner}</system-reminder>",
+    "read_empty": "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>",
+    "read_short": "<system-reminder>Warning: the file exists but is shorter than the provided offset ({first}). The file has {total} lines.</system-reminder>",
+    "image_too_large": "image content omitted because it exceeded the supported size limit; use a smaller image",
+    "image_unprocessable": "image content omitted because it could not be processed",
+    "write_directory": "target is not a regular file",
+    "write_no_parent": "file has no parent",
+    "write_no_name": "file has no name",
+    "edit_directory": "Error calling tool (Edit): EISDIR: illegal operation on a directory, read",
+    "edit_exists": "Cannot create new file - file already exists.",
+    "edit_same": "No changes to make: old_string and new_string are exactly the same.",
+    "edit_missing": "String to replace not found in file.\nString: {old}",
+    "edit_many": "Found {count} matches of the string to replace, but replace_all is false. To replace all occurrences, set replace_all to true. To replace only one occurrence, please provide more context to uniquely identify the instance.\nString: {old}",
+    "bash_sandbox": "this host does not authorize disabling the sandbox",
+    "bash_jobs_full": "no background job can start now: the session keeps its limit of background jobs running",
+    "bash_command_size": "command must be nonblank and at most {bytes} bytes",
+    "bash_description_size": "description exceeds {bytes} bytes",
+    "bash_timeout_zero": "timeout must be at least 1 millisecond",
+    "bash_timed_out": "Command timed out after {after}",
+    "bash_exit": "Exit code {code}",
+    "bash_no_output": "(Bash completed with no output)",
+    "bash_elided": "[{stream}: {elided} of {total} bytes elided from the middle. To see them, rerun the command with its output sent to a file and read parts of it with grep -n, sed -n 'START,ENDp' or tail]",
+    "bash_error_cut": "\n\n... [{count} characters truncated] ...\n\n",
+    "spawn_full": "{max} subagents are already running; wait for one before starting another",
+    "agent_id_bad": "{key} is not an agent ID that a spawn returned",
+    "agent_missing": "no subagent has the ID {key}",
+    "submit_no_output": "submit_result needs output, a string"
+  },
+  "numbers": {
+    "stall_silence_ms": 45000,
+    "stall_tail_bytes": 1024
+  },
+  "lists": {
+    "prompt_phrases": [
+      "do you",
+      "would you",
+      "shall i",
+      "are you sure",
+      "ready to"
+    ],
+    "prompt_patterns": [
+      "(y/n)",
+      "[y/n]",
+      "(yes/no)",
+      "press any key",
+      "press enter",
+      "continue?",
+      "overwrite?"
+    ],
+    "receipted_tools": [
+      "Bash",
+      "Write"
+    ],
+    "cancellable_tools": [],
+    "list_tools": [
+      "list_agents"
+    ],
+    "submit_tools": [
+      "submit_result"
+    ]
+  }
+}

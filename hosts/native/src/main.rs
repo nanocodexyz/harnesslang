@@ -26,7 +26,7 @@ use texts::Texts;
 
 pub const EXIT_HARNESS_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
-const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> [--store jsonl|sqlite:<file>|postgres:<host:port>/<database>] [--session <key>] --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --journal <dir> [--store <store>] [--session <key>] [--cwd <dir>] [--turn N] [--module-dir <dir>] [--<flag> <value>]...\n       hl-host wire --request <file.json> --scratch <dir>\n       hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
+const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> [--store jsonl|sqlite:<file>|postgres:<host:port>/<database>] [--session <key>] --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]... [--texts <file.json>]...\n       hl-host run --journal <dir> [--store <store>] [--session <key>] [--cwd <dir>] [--turn N] [--module-dir <dir>] [--<flag> <value>]...\n       hl-host wire --request <file.json> --scratch <dir>\n       hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
 const LABEL: &str = "hl-host";
 const ENTRY_PROGRAM: &str = "entry";
 const ENTRY_HANDLER: &str = "launch";
@@ -39,19 +39,19 @@ const IDLE_TURNS_MAX: u64 = 64;
 const IDLE_REQUESTS_PER_TURN_MAX: u64 = 2;
 const FIRST_TURN: u64 = 1;
 const NO_HANDLER: &str = "no handler";
-const ARGUMENTS_REFUSED: &str = "a turn request has a turn, a handler and arguments";
+const ARGUMENTS_REFUSED: &str = "handler and arguments";
 
 pub fn now_ms() -> u64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970");
+        .expect("clock before 1970");
     u64::try_from(elapsed.as_millis()).expect("milliseconds since 1970 fit in u64")
 }
 
 pub fn random() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970")
+        .expect("clock before 1970")
         .subsec_nanos();
     u64::from(nanos) ^ now_ms().rotate_left(u32::BITS)
 }
@@ -69,7 +69,7 @@ fn fail(message: &str) -> ! {
 fn number_flag(flag: &str, value: &str) -> u64 {
     value
         .parse()
-        .unwrap_or_else(|_| fail_usage(&format!("{flag} {value} is not a number")))
+        .unwrap_or_else(|_| fail_usage(&format!("{flag} {value}: not numeric")))
 }
 
 #[derive(Default)]
@@ -82,6 +82,7 @@ struct Flags {
     turn: Option<u64>,
     cwd: Option<PathBuf>,
     spawns: Vec<Spawn>,
+    texts: Vec<PathBuf>,
     text: Option<String>,
     request: Option<PathBuf>,
     scratch: Option<PathBuf>,
@@ -123,6 +124,7 @@ fn flags(args: &[String]) -> Flags {
             "--turn" => flags.turn = Some(number_flag(flag, &value)),
             "--cwd" => flags.cwd = Some(PathBuf::from(value)),
             "--spawn" => flags.spawns.push(spawn_flag(&value)),
+            "--texts" => flags.texts.push(PathBuf::from(value)),
             "--text" => flags.text = Some(value),
             "--request" => flags.request = Some(PathBuf::from(value)),
             "--scratch" => flags.scratch = Some(PathBuf::from(value)),
@@ -132,7 +134,7 @@ fn flags(args: &[String]) -> Flags {
                 flags.rest.retain(|(name, _)| name != other);
                 flags.rest.push((other.to_owned(), value));
             }
-            other => fail_usage(&format!("{other} is not a flag")),
+            other => fail_usage(&format!("unknown flag: {other}")),
         }
     }
     if flags.turn == Some(0) {
@@ -150,7 +152,7 @@ fn main() {
         "wire" => wire_once(&flags),
         "run" if flags.module.is_some() => generic(flags),
         "run" => launch(flags),
-        _ => fail_usage("the commands are run, wire, steer and cancel"),
+        _ => fail_usage("commands: run, wire, steer, cancel"),
     }
 }
 
@@ -270,8 +272,16 @@ fn generic(flags: Flags) {
         .clone()
         .or_else(|| module.parent().map(Path::to_path_buf));
     let loaded = host::load(&module).unwrap_or_else(|error| fail(&error));
+    let mut texts = Texts::default();
+    for path in &flags.texts {
+        let read = std::fs::read_to_string(path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| parse(&text));
+        let json = read.unwrap_or_else(|error| fail_usage(&format!("{}: {error}", path.display())));
+        texts_into(&mut texts, &json);
+    }
     let plan = Plan {
-        texts: Texts::default(),
+        texts,
         model: text_of(arguments.get("model"))
             .unwrap_or_default()
             .to_owned(),
@@ -354,14 +364,15 @@ fn manifest(flags: &Flags) -> Json {
         Ok(Ran::Finished(finish)) if finish.completed => finish,
         other => {
             let (_, _) = report(&other, true);
-            fail("the entry program did not launch");
+            fail("entry not launched");
         }
     };
     match host::outcome_of(&finish.result) {
-        (name, text) if name == ENTRY_LAUNCH => parse(&text)
-            .unwrap_or_else(|error| fail(&format!("the launch manifest is not JSON: {error}"))),
+        (name, text) if name == ENTRY_LAUNCH => {
+            parse(&text).unwrap_or_else(|error| fail(&format!("manifest JSON: {error}")))
+        }
         (name, reason) if name == ENTRY_REFUSED => fail_usage(&reason),
-        (name, text) => fail(&format!("the entry program answered {name}: {text}")),
+        (name, text) => fail(&format!("entry answered {name}: {text}")),
     }
 }
 
@@ -375,7 +386,7 @@ fn texts_list(json: &Json, what: &str) -> Vec<String> {
                     .to_owned()
             })
             .collect(),
-        _ => fail(&format!("the manifest has no {what}")),
+        _ => fail(&format!("manifest lacks {what}")),
     }
 }
 
@@ -387,8 +398,7 @@ fn entries<'a>(json: &'a Json, what: &str) -> &'a [(String, Json)] {
     }
 }
 
-fn texts(manifest: &Json) -> Texts {
-    let mut texts = Texts::default();
+fn texts_into(texts: &mut Texts, manifest: &Json) {
     for (name, value) in entries(manifest.get("texts"), "texts") {
         let template = text_of(value).unwrap_or_else(|| fail(&format!("text {name} is a text")));
         texts.templates.insert(name.clone(), template.to_owned());
@@ -404,26 +414,25 @@ fn texts(manifest: &Json) -> Texts {
     for (name, value) in entries(manifest.get("lists"), "lists") {
         texts.lists.insert(name.clone(), texts_list(value, name));
     }
-    texts
 }
 
 fn field(json: &Json, key: &str) -> String {
     text_of(json.get(key))
-        .unwrap_or_else(|| fail(&format!("the manifest has no text {key}")))
+        .unwrap_or_else(|| fail(&format!("manifest lacks text {key}")))
         .to_owned()
 }
 
 fn resolve(json: &Json) -> Json {
     match json {
         Json::Object(fields) if fields.len() == 1 && fields[0].0 == FILE_KEY => {
-            let path = text_of(&fields[0].1).unwrap_or_else(|| fail("a $file names a path"));
+            let path = text_of(&fields[0].1).unwrap_or_else(|| fail("$file path"));
             Json::Text(
                 std::fs::read_to_string(path)
                     .unwrap_or_else(|error| fail_usage(&format!("{path}: {error}"))),
             )
         }
         Json::Object(fields) if fields.len() == 1 && fields[0].0 == NUMBER_KEY => {
-            let value = text_of(&fields[0].1).unwrap_or_else(|| fail("a $number is a text"));
+            let value = text_of(&fields[0].1).unwrap_or_else(|| fail("$number text"));
             Json::int(number_flag("the value", value))
         }
         Json::Object(fields) => {
@@ -451,7 +460,7 @@ fn launch(flags: Flags) {
                 handler: field(item, "handler"),
             })
             .collect(),
-        _ => fail("the manifest has no spawns"),
+        _ => fail("manifest lacks spawns"),
     };
     let steps: Vec<Step> = match manifest.get("steps") {
         Json::Array(items) if !items.is_empty() && items.len() <= STEPS_MAX => items
@@ -471,17 +480,19 @@ fn launch(flags: Flags) {
                 .bigint()
                 .ok()
                 .and_then(|turns| u64::try_from(turns).ok())
-                .unwrap_or_else(|| fail("the manifest's idle turns are a number"));
+                .unwrap_or_else(|| fail("idle turns numeric"));
             if turns > IDLE_TURNS_MAX {
                 fail_usage(&format!(
-                    "{turns} idle turns is more than IDLE_TURNS_MAX ({IDLE_TURNS_MAX})"
+                    "{turns} idle turns > IDLE_TURNS_MAX ({IDLE_TURNS_MAX})"
                 ));
             }
             Some((field(idle, "handler"), turns))
         }
     };
+    let mut texts = Texts::default();
+    texts_into(&mut texts, &manifest);
     let plan = Plan {
-        texts: texts(&manifest),
+        texts,
         model: field(&manifest, "model"),
         raw: field(&manifest, "print") != "text",
         steps,
@@ -525,7 +536,7 @@ fn run_plan(
     spawns: Vec<Spawn>,
     plan: &Plan,
 ) {
-    assert!(!plan.steps.is_empty(), "a plan has a step");
+    assert!(!plan.steps.is_empty(), "empty plan");
     let (journal, mut session) = open(flags, module_dir, spawns, plan.texts.clone());
     let (first, mut turn) = first_step(flags, &session, plan);
     for step in plan
@@ -555,15 +566,12 @@ fn run_plan(
                 fail_usage(&format!("{} {}", step.refused, step.arguments.encode()));
             }
             Err(error) if error.contains(NO_HANDLER) => {
-                eprintln!(
-                    "{LABEL}: the program declares no {} handler; going on",
-                    step.handler
-                );
+                eprintln!("{LABEL}: no {} handler; going on", step.handler);
             }
             other => {
                 session.close();
                 let (_, _) = report(&other, plan.raw);
-                fail(&format!("the {} turn did not complete", step.handler));
+                fail(&format!("{} turn incomplete", step.handler));
             }
         }
     }
@@ -597,20 +605,18 @@ fn report(ran: &Result<Ran, String>, raw: bool) -> (String, i32) {
         }
         Ok(Ran::Finished(finish)) => {
             eprintln!(
-                "{LABEL}: the program trapped in turn {}: {}",
+                "{LABEL}: trap in turn {}: {}",
                 finish.turn,
                 finish.result.encode()
             );
             ("trap".to_owned(), EXIT_HARNESS_ERROR)
         }
         Ok(Ran::Suspended { turn, seq }) => {
-            eprintln!(
-                "{LABEL}: turn {turn} waits on suspend {seq}, which this host could not resume"
-            );
+            eprintln!("{LABEL}: turn {turn}: unresumable suspend {seq}");
             ("suspended".to_owned(), EXIT_HARNESS_ERROR)
         }
         Ok(Ran::NotDue) => {
-            eprintln!("{LABEL}: the turn was refused as an idle turn");
+            eprintln!("{LABEL}: idle turn refused");
             ("error".to_owned(), EXIT_HARNESS_ERROR)
         }
         Err(error) => {
@@ -671,7 +677,7 @@ fn idle_turns(loaded: &Loaded, session: &mut Session, handler: &str, turns: u64)
         let due = match host::idle_due(loaded, session) {
             Ok(Some(due)) => due,
             Ok(None) => {
-                eprintln!("{LABEL}: no idle handler is armed");
+                eprintln!("{LABEL}: idle unarmed");
                 return;
             }
             Err(error) => {
@@ -691,10 +697,7 @@ fn idle_turns(loaded: &Loaded, session: &mut Session, handler: &str, turns: u64)
         };
         let now = now_ms();
         if due > now {
-            eprintln!(
-                "{LABEL}: idle {} ms until the idle turn due at {due}",
-                due - now
-            );
+            eprintln!("{LABEL}: idle {} ms, due {due}", due - now);
             std::thread::sleep(std::time::Duration::from_millis(due - now));
         }
         let request = host::request(handler, turn, Json::Object(Vec::new()));

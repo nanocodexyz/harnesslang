@@ -32,10 +32,8 @@ impl Ledger {
     pub fn append(&mut self, line: Value) {
         let mut text = line.encode();
         text.push('\n');
-        self.file
-            .write_all(text.as_bytes())
-            .expect("append to the usage ledger");
-        self.file.sync_data().expect("sync the usage ledger");
+        self.file.write_all(text.as_bytes()).expect("ledger append");
+        self.file.sync_data().expect("ledger sync");
     }
 
     pub fn mark(&mut self, kind: &str, at_ms: u64) {

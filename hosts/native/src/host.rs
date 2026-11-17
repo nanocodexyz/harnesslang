@@ -23,10 +23,10 @@ pub const JOINS_PER_TURN_MAX: u64 = 4096;
 const FIRST_TURN: u64 = 1;
 const SUSPEND_TOOL: &str = "suspend";
 const SUSPEND_KEY: &str = "key";
-const RECEIPTED_TOOLS: [&str; 4] = ["Bash", "Write", "exec_command", "apply_patch"];
-const CANCELLABLE_TOOLS: [&str; 2] = ["exec_command", "write_stdin"];
-const LIST_TOOL: &str = "list_agents";
-const SUBMIT_TOOL: &str = "submit_result";
+const RECEIPTED_LIST: &str = "receipted_tools";
+const CANCELLABLE_LIST: &str = "cancellable_tools";
+const CHILDREN_LIST: &str = "list_tools";
+const SUBMIT_LIST: &str = "submit_tools";
 const ANSWER_FULL: &str = "full";
 
 #[derive(Clone)]
@@ -101,11 +101,11 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
 }
 
 pub fn to_value(json: &Json) -> Value {
-    Value::decode(&json.encode()).expect("the module writes valid JSON")
+    Value::decode(&json.encode()).expect("module JSON")
 }
 
 pub fn to_json(value: &Value) -> Json {
-    parse(&value.encode()).expect("the host writes valid JSON")
+    parse(&value.encode()).expect("host JSON")
 }
 
 pub fn request(handler: &str, turn: u64, arguments: Json) -> Json {
@@ -129,7 +129,7 @@ fn number(json: &Json, what: &str) -> Result<u64, String> {
     json.bigint()
         .ok()
         .and_then(|value| u64::try_from(value).ok())
-        .ok_or_else(|| format!("{what} is not a number: {}", json.encode()))
+        .ok_or_else(|| format!("{what}: not numeric: {}", json.encode()))
 }
 
 fn text(json: &Json) -> Option<&str> {
@@ -154,10 +154,10 @@ pub fn output_json(ran: tools::Ran) -> Json {
     }
 }
 
-pub fn submitted(input: &Value) -> tools::Ran {
+pub fn submitted(texts: &Texts, input: &Value) -> tools::Ran {
     match input.get("output").and_then(Value::as_str) {
         Some(output) => tools::Ran::Ok(output.to_owned()),
-        None => tools::Ran::Failed("submit_result needs output, a string".to_owned()),
+        None => tools::Ran::Failed(texts.fill("submit_no_output", &[])),
     }
 }
 
@@ -244,11 +244,15 @@ impl Session {
         let turn = number(request.get("turn"), "a tool request's turn")?;
         let seq = number(request.get("seq"), "a tool request's seq")?;
         let tool = text(request.get("tool"))
-            .ok_or("a tool request names its tool")?
+            .ok_or("tool request unnamed")?
             .to_owned();
         let input = to_value(request.get("input"));
         let room = matches!(request.get("job"), Json::Bool(true));
-        let receipted = RECEIPTED_TOOLS.contains(&tool.as_str());
+        let kind = |list: &str| self.setup.texts.list(list).contains(&tool);
+        let receipted = kind(RECEIPTED_LIST);
+        let cancellable = kind(CANCELLABLE_LIST);
+        let listing = kind(CHILDREN_LIST);
+        let submitting = kind(SUBMIT_LIST);
         if receipted && let Err(error) = self.workspace.dispatching(turn, seq) {
             return Ok(tools::Ran::Failed(format!("receipt: {error}")));
         }
@@ -271,21 +275,25 @@ impl Session {
         .find_map(|key| input.get(key).and_then(Value::as_str))
         .unwrap_or("");
         eprintln!("{}: {call} {tool}: {shown}", self.label);
-        let stop = self.stop(CANCELLABLE_TOOLS.contains(&tool.as_str()));
+        let stop = self.stop(cancellable);
         let configured = self.configured();
         let ran = match (tool.as_str(), self.spawn_of(request, &tool)) {
             (_, Some((program, handler))) => self
                 .children
                 .spawn(turn, seq, &program, &handler, &input, configured),
-            (LIST_TOOL, None) => self.children.list(&input),
-            (SUBMIT_TOOL, None) => submitted(&input),
+            (_, None) if listing => self.children.list(&input),
+            (_, None) if submitting => submitted(&self.setup.texts, &input),
             ("Bash", None) if room => self.bash_job(turn, seq, &input),
             ("Bash" | "Read" | "Edit" | "Write", None) => self.workspace.run(&tool, &input),
             ("exec_command", None) => self.exec.exec_command(&input, &stop),
             ("write_stdin", None) => self.exec.write_stdin(&input, &stop),
-            ("apply_patch", None) => codex::apply_patch(&self.workspace.root, &input),
-            ("update_plan", None) => codex::update_plan(&input),
-            ("view_image", None) => codex::view_image(&self.workspace.root, &input),
+            ("apply_patch", None) => {
+                codex::apply_patch(&self.workspace.texts, &self.workspace.root, &input)
+            }
+            ("update_plan", None) => codex::update_plan(&self.workspace.texts, &input),
+            ("view_image", None) => {
+                codex::view_image(&self.workspace.texts, &self.workspace.root, &input)
+            }
             (other, None) => tools::Ran::Failed(format!("no syscall {other}")),
         };
         if receipted {
@@ -304,10 +312,7 @@ impl Session {
                     .is_some_and(|value| matches!(value, Value::Bool(true)));
                 let command = input.get("command").and_then(Value::as_str).unwrap_or("");
                 self.jobs.start(&key, started, command, held);
-                eprintln!(
-                    "{}: {turn}/{seq} Bash became background job {key}",
-                    self.label
-                );
+                eprintln!("{}: {turn}/{seq} backgrounded: {key}", self.label);
                 tools::Ran::Job(jobs::started_text(
                     &self.workspace.texts,
                     &key,
@@ -356,10 +361,10 @@ impl Session {
 
     fn answer(&mut self, request: &Json) -> Result<Json, String> {
         let Json::Array(answers) = request.get("answers") else {
-            return Err("an answer request lists its answers".to_owned());
+            return Err("answers missing".to_owned());
         };
         for answer in answers {
-            let id = text(answer.get("id")).ok_or("an answer names its event")?;
+            let id = text(answer.get("id")).ok_or("answer unnamed")?;
             let name = text(answer.get("answer")).unwrap_or_default();
             if control::is_delivery(id) {
                 if name == ANSWER_FULL {
@@ -379,13 +384,14 @@ impl Session {
         let turn = number(request.get("turn"), "a recovery's turn")?;
         let seq = number(request.get("seq"), "a recovery's seq")?;
         let tool = text(request.get("tool"))
-            .ok_or("a recovery names its tool")?
+            .ok_or("recovery unnamed")?
             .to_owned();
         let input = to_value(request.get("input"));
-        let recovered = match codex::patch_applied(&self.workspace.root, &input) {
-            Some(ran) if tool == "apply_patch" => tools::Recovered::Reply(ran),
-            _ => self.workspace.recover(turn, seq, &tool, &input),
-        };
+        let recovered =
+            match codex::patch_applied(&self.workspace.texts, &self.workspace.root, &input) {
+                Some(ran) if tool == "apply_patch" => tools::Recovered::Reply(ran),
+                _ => self.workspace.recover(turn, seq, &tool, &input),
+            };
         let name = match &recovered {
             tools::Recovered::Reply(_) => "reply",
             tools::Recovered::NotDispatched => "not_dispatched",
@@ -429,9 +435,7 @@ impl Session {
                     .to_owned());
             }
         }
-        Err(format!(
-            "the module resumes {turn}/{seq}, which has no suspend call in the journal"
-        ))
+        Err(format!("resume {turn}/{seq}: no suspend"))
     }
 
     fn resume(&mut self, request: &Json) -> Result<Json, String> {
@@ -456,10 +460,7 @@ impl World for Session {
     fn model(&mut self, request: &Json) -> Result<Json, String> {
         let http = request.get("http");
         if !matches!(http, Json::Object(_)) {
-            return Err(format!(
-                "hl-host answers only wire model requests, which carry an http request: {}",
-                request.get("seq").encode()
-            ));
+            return Err(format!("non-wire request: {}", request.get("seq").encode()));
         }
         let call = format!(
             "{}/{}",
@@ -509,7 +510,7 @@ impl World for Session {
             "jobs" => {
                 self.jobs.poll();
                 let Json::Array(open) = request.get("open") else {
-                    return Err("a jobs request lists its open jobs".to_owned());
+                    return Err("jobs missing".to_owned());
                 };
                 let lost = open
                     .iter()
@@ -571,10 +572,7 @@ pub fn run_once(loaded: &Loaded, session: &mut Session, request: &Json) -> Resul
     let exit = native::run(loaded, &mut journal, request, session)?;
     match text(exit.get("exit")) {
         Some("finished") => {
-            let finish = session
-                .finish
-                .take()
-                .ok_or("a finished turn is acknowledged")?;
+            let finish = session.finish.take().ok_or("finish unacknowledged")?;
             finish_of(&finish).map(Ran::Finished)
         }
         Some("already_finished") => finish_of(exit.get("finish")).map(Ran::Finished),
@@ -583,10 +581,7 @@ pub fn run_once(loaded: &Loaded, session: &mut Session, request: &Json) -> Resul
             seq: number(exit.get("seq"), "a suspension's seq")?,
         }),
         Some("not_due") => Ok(Ran::NotDue),
-        Some("corrupt") => Err(format!(
-            "the journal is corrupt: {}",
-            exit.get("error").encode()
-        )),
+        Some("corrupt") => Err(format!("corrupt journal: {}", exit.get("error").encode())),
         _ => Err(format!("the module exited {}", exit.encode())),
     }
 }

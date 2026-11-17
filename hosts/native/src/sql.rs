@@ -6,8 +6,7 @@ use harnesslang::wasm::native::Store;
 use crate::store_postgres::PostgresStore;
 use crate::store_sqlite::SqliteStore;
 
-pub const FENCED_ERROR: &str =
-    "SQLITE_CONSTRAINT_NOTNULL: NOT NULL constraint failed: hl_journal.epoch";
+pub const FENCED_ERROR: &str = catalogue::Dialect::Sqlite.fenced_error();
 pub const POSTGRES_FENCED_ERROR: &str = "SQLSTATE 23502 not_null_violation on hl_journal.epoch";
 pub const POSTGRES_USER: &str = "postgres";
 pub const BUSY_TIMEOUT_MS: i32 = 10_000;
@@ -77,7 +76,7 @@ pub fn connect(target: Target, location: &str, application: &str) -> Result<Data
             assert_eq!(
                 catalogue::Dialect::Postgres.fenced_error(),
                 POSTGRES_FENCED_ERROR,
-                "the adapter maps the fence the catalogue names"
+                "fence mismatch"
             );
             let (address, database) = location
                 .split_once('/')
@@ -85,7 +84,7 @@ pub fn connect(target: Target, location: &str, application: &str) -> Result<Data
             PostgresStore::connect(address, POSTGRES_USER, database, application)
                 .map(Database::Postgres)
         }
-        other => Err(format!("{} keeps no SQL journal", other.name())),
+        other => Err(format!("{}: not SQL", other.name())),
     }
 }
 
@@ -147,7 +146,7 @@ impl Lease {
             "epoch" => SqlValue::Integer(epoch),
             "head" => SqlValue::Integer(head),
             "batch" => SqlValue::Json(batch.to_owned()),
-            other => panic!("the catalogue names only journal parameters, found {other}"),
+            other => panic!("unknown parameter: {other}"),
         }
     }
 
@@ -165,7 +164,7 @@ fn column(row: &[Option<String>], statement: &Statement, name: &str) -> Result<S
         .returns
         .iter()
         .position(|returned| *returned == name)
-        .expect("the statement returns the column");
+        .expect("column missing");
     row.get(index)
         .and_then(|value| value.clone())
         .ok_or_else(|| format!("{} returned no {name}", statement.name))
@@ -189,13 +188,13 @@ pub fn acquire(
         .query(acquire, &lease.values(acquire, 0, 0, ""))
         .map_err(|error| format!("acquire: {error:?}"))?;
     let [row] = rows.as_slice() else {
-        assert!(rows.is_empty(), "acquire returns at most one row");
+        assert!(rows.is_empty(), "acquire: many rows");
         return Ok(None);
     };
     let read = |name: &str| -> Result<u64, String> {
         column(row, acquire, name)?
             .parse()
-            .map_err(|_| format!("acquire returned no number for {name}"))
+            .map_err(|_| format!("acquire: {name} not numeric"))
     };
     Ok(Some((read("epoch")?, read("head")?)))
 }
@@ -205,13 +204,9 @@ pub fn load_lines(sql: &mut dyn Sql, load: &Statement, lease: &Lease) -> Result<
     let mut text = String::new();
     for (index, row) in rows.iter().enumerate() {
         let seq = column(row, load, "seq").map_err(SqlError::Other)?;
-        assert_eq!(
-            seq,
-            (index + 1).to_string(),
-            "rows load in seq order without gaps"
-        );
+        assert_eq!(seq, (index + 1).to_string(), "seq gap");
         let record = column(row, load, "record").map_err(SqlError::Other)?;
-        assert!(!record.contains(LINE_END), "a row holds one journal line");
+        assert!(!record.contains(LINE_END), "multiline row");
         text.push_str(&record);
         text.push(LINE_END);
     }
@@ -294,20 +289,16 @@ impl<'h> SqlJournal<'h> {
     }
 
     fn batch(&self, bytes: &[u8]) -> Result<(String, u64), String> {
-        let text = std::str::from_utf8(bytes).map_err(|_| "a flush is UTF-8".to_owned())?;
+        let text = std::str::from_utf8(bytes).map_err(|_| "flush not UTF-8".to_owned())?;
         let lines: Vec<&str> = text.split_terminator(LINE_END).collect();
         assert!(
             !lines.is_empty() && text.ends_with(LINE_END),
-            "a flush appends whole lines"
+            "partial flush line"
         );
         let mut rows = Vec::with_capacity(lines.len());
         for (index, line) in lines.iter().enumerate() {
             let record = harnesslang::run::journal::decode_line(line, false)
-                .map_err(|error| {
-                    format!(
-                        "a flushed line does not decode, so the module was not compiled for an SQL target: {error}"
-                    )
-                })?;
+                .map_err(|error| format!("flush undecodable (non-SQL module?): {error}"))?;
             rows.push(object(vec![
                 ("kind", Json::text(catalogue::record_kind(&record))),
                 ("record", Json::text(line)),
@@ -341,8 +332,7 @@ impl Store for SqlJournal<'_> {
         if let Some(hook) = self.before_append {
             hook();
         }
-        let epoch =
-            u64::try_from(epoch).map_err(|_| "a flush names a negative epoch".to_owned())?;
+        let epoch = u64::try_from(epoch).map_err(|_| "negative epoch".to_owned())?;
         let (batch, rows) = self.batch(bytes)?;
         for statement in &self.statements.commit {
             let values = self.lease.values(statement, epoch, self.head, &batch);
@@ -351,12 +341,12 @@ impl Store for SqlJournal<'_> {
                 Err(SqlError::Fenced) => {
                     self.db.sql().rollback();
                     self.failure = Some(Failure::Fenced);
-                    return Err(format!("fenced: epoch {epoch} no longer owns the session"));
+                    return Err(format!("fenced: epoch {epoch} superseded"));
                 }
                 Err(SqlError::Other(error)) => {
                     self.db.sql().rollback();
                     self.failure = Some(Failure::Lost);
-                    return Err(format!("store lost during a flush: {error}"));
+                    return Err(format!("store lost mid-flush: {error}"));
                 }
             }
         }
@@ -370,7 +360,7 @@ impl Store for SqlJournal<'_> {
             return Ok(());
         }
         Err(format!(
-            "an SQL journal commits whole batches, so it has no torn tail to drop ({length} of {} bytes kept)",
+            "SQL journal untorn ({length} of {} bytes kept)",
             self.read
         ))
     }

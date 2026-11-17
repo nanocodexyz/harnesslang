@@ -92,7 +92,7 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
     child
         .stdin
         .take()
-        .expect("curl's stdin is piped")
+        .expect("curl stdin")
         .write_all(config.as_bytes())
         .map_err(|error| format!("curl stdin: {error}"))?;
     loop {
@@ -116,9 +116,7 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
         let reason = if code == CURL_TIMED_OUT {
-            format!(
-                " (the stream stalled for STREAM_IDLE_SECONDS_MAX, {STREAM_IDLE_SECONDS_MAX} s)"
-            )
+            format!(" (stream idle: STREAM_IDLE_SECONDS_MAX, {STREAM_IDLE_SECONDS_MAX} s)")
         } else {
             String::new()
         };
@@ -130,7 +128,7 @@ fn curl(request: &Post<'_>) -> Result<Sent, String> {
     let status: u16 = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
-        .map_err(|_| "curl printed no HTTP status".to_owned())?;
+        .map_err(|_| "no HTTP status".to_owned())?;
     let size = std::fs::metadata(request.partial)
         .map_err(|error| format!("read response: {error}"))?
         .len();
@@ -220,7 +218,7 @@ fn plain(rest: &str, request: &Post<'_>) -> Result<Sent, String> {
             {
                 if heard.elapsed() >= Duration::from_secs(STREAM_IDLE_SECONDS_MAX) {
                     return Err(format!(
-                        "receive: the stream stalled for STREAM_IDLE_SECONDS_MAX, {STREAM_IDLE_SECONDS_MAX} s"
+                        "receive: stream idle: STREAM_IDLE_SECONDS_MAX, {STREAM_IDLE_SECONDS_MAX} s"
                     ));
                 }
                 continue;
@@ -247,14 +245,14 @@ fn parse(response: &[u8]) -> Result<Response, String> {
     let end = response
         .windows(HEADER_END.len())
         .position(|window| window == HEADER_END)
-        .ok_or("response has no header end")?;
+        .ok_or("headers unterminated")?;
     let head = String::from_utf8_lossy(&response[..end]).into_owned();
     let status: u16 = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
-        .ok_or_else(|| format!("bad status line in {head}"))?;
+        .ok_or_else(|| format!("bad status: {head}"))?;
     let headers = header_pairs(&head);
     let header = |name: &str| {
         headers
@@ -269,9 +267,7 @@ fn parse(response: &[u8]) -> Result<Response, String> {
         let length: usize = length
             .parse()
             .map_err(|_| format!("bad content-length {length}"))?;
-        raw.get(..length)
-            .ok_or("response shorter than its content-length")?
-            .to_vec()
+        raw.get(..length).ok_or("short body")?.to_vec()
     } else {
         raw.to_vec()
     };
@@ -288,7 +284,7 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, String> {
         let line_end = raw
             .windows(2)
             .position(|window| window == b"\r\n")
-            .ok_or("chunk without a size line")?;
+            .ok_or("chunk size missing")?;
         let size_text = String::from_utf8_lossy(&raw[..line_end]);
         let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| format!("bad chunk size {size_text}"))?;
@@ -296,8 +292,8 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, String> {
         if size == 0 {
             return Ok(body);
         }
-        let chunk = raw.get(..size).ok_or("chunk shorter than its size")?;
+        let chunk = raw.get(..size).ok_or("short chunk")?;
         body.extend_from_slice(chunk);
-        raw = raw.get(size + 2..).ok_or("chunk without its line end")?;
+        raw = raw.get(size + 2..).ok_or("chunk unterminated")?;
     }
 }

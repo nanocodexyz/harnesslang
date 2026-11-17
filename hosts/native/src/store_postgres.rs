@@ -77,10 +77,7 @@ impl Fields {
 }
 
 fn put_cstr(out: &mut Vec<u8>, text: &str) {
-    assert!(
-        !text.as_bytes().contains(&0),
-        "a protocol string holds no NUL byte"
-    );
+    assert!(!text.as_bytes().contains(&0), "NUL in protocol");
     out.extend_from_slice(text.as_bytes());
     out.push(0);
 }
@@ -95,14 +92,13 @@ fn put_i16(out: &mut Vec<u8>, value: i16) {
 
 fn frame(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
     out.push(tag);
-    let length =
-        i32::try_from(body.len() + LENGTH_BYTES).expect("a frontend message fits its length field");
+    let length = i32::try_from(body.len() + LENGTH_BYTES).expect("frontend message size");
     put_i32(out, length);
     out.extend_from_slice(body);
 }
 
 fn count_i16(count: usize) -> i16 {
-    i16::try_from(count).expect("a statement's parameter count fits the protocol's int16")
+    i16::try_from(count).expect("parameter count")
 }
 
 fn oid(ty: ParamType) -> i32 {
@@ -145,15 +141,11 @@ fn bind_message(statement: &Statement, values: &[SqlValue]) -> Vec<u8> {
                 | (ParamType::Integer, SqlValue::Integer(_))
                 | (ParamType::Json, SqlValue::Json(_))
         );
-        assert!(
-            fits,
-            "parameter {} of {} has its declared type",
-            param.name, statement.name
-        );
+        assert!(fits, "parameter {} of {}: type", param.name, statement.name);
         let text = value_text(value);
         put_i32(
             &mut body,
-            i32::try_from(text.len()).expect("a parameter fits the protocol's length"),
+            i32::try_from(text.len()).expect("parameter size"),
         );
         body.extend_from_slice(text.as_bytes());
     }
@@ -170,16 +162,12 @@ fn execute_message() -> Vec<u8> {
 }
 
 fn read_i16(body: &[u8], at: usize) -> Result<i16, String> {
-    let bytes = body
-        .get(at..at + 2)
-        .ok_or("a message ends inside an int16")?;
+    let bytes = body.get(at..at + 2).ok_or("short int16")?;
     Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_i32(body: &[u8], at: usize) -> Result<i32, String> {
-    let bytes = body
-        .get(at..at + 4)
-        .ok_or("a message ends inside an int32")?;
+    let bytes = body.get(at..at + 4).ok_or("short int32")?;
     Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
@@ -194,11 +182,8 @@ fn data_row(body: &[u8]) -> Result<Vec<Option<String>>, String> {
             row.push(None);
             continue;
         }
-        let length =
-            usize::try_from(length).map_err(|_| format!("a column has length {length}"))?;
-        let bytes = body
-            .get(at..at + length)
-            .ok_or("a data row ends inside a column")?;
+        let length = usize::try_from(length).map_err(|_| format!("column length {length}"))?;
+        let bytes = body.get(at..at + length).ok_or("short column")?;
         row.push(Some(String::from_utf8_lossy(bytes).into_owned()));
         at += length;
     }
@@ -229,7 +214,7 @@ impl PostgresStore {
             broken: None,
         };
         store.startup(user, database, application)?;
-        assert!(store.backend_pid > 0, "the server names its backend");
+        assert!(store.backend_pid > 0, "backend unnamed");
         Ok(store)
     }
 
@@ -248,7 +233,7 @@ impl PostgresStore {
         let mut out = Vec::new();
         put_i32(
             &mut out,
-            i32::try_from(body.len() + LENGTH_BYTES).expect("a startup message is short"),
+            i32::try_from(body.len() + LENGTH_BYTES).expect("startup size"),
         );
         out.extend_from_slice(&body);
         self.writer
@@ -292,11 +277,10 @@ impl PostgresStore {
             .read_exact(&mut header)
             .map_err(|error| format!("read: {error}"))?;
         let length = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        let length =
-            usize::try_from(length).map_err(|_| format!("a message has length {length}"))?;
+        let length = usize::try_from(length).map_err(|_| format!("message length {length}"))?;
         if length < LENGTH_BYTES || length > MESSAGE_BYTES_MAX {
             return Err(format!(
-                "a message has length {length}, outside 4..={MESSAGE_BYTES_MAX}"
+                "message length {length} outside 4..={MESSAGE_BYTES_MAX}"
             ));
         }
         let mut body = vec![0u8; length - LENGTH_BYTES];
@@ -329,8 +313,7 @@ impl PostgresStore {
                 b'D' => rows.push(data_row(&message.body)?),
                 b'E' => failure = failure.or(Some(Fields::parse(&message.body))),
                 b'Z' => {
-                    self.transaction =
-                        *message.body.first().ok_or("ReadyForQuery has no status")?;
+                    self.transaction = *message.body.first().ok_or("ReadyForQuery: no status")?;
                     return Ok(failure.map_or(Ok(rows), Err));
                 }
                 b'1' | b'2' | b'C' | b'n' | b'I' | b'N' | b'S' | b's' => {}
@@ -352,11 +335,7 @@ impl Sql for PostgresStore {
         statement: &Statement,
         values: &[SqlValue],
     ) -> Result<Vec<Vec<Option<String>>>, SqlError> {
-        assert_eq!(
-            values.len(),
-            statement.params.len(),
-            "one value per parameter"
-        );
+        assert_eq!(values.len(), statement.params.len(), "value count");
         if let Some(broken) = &self.broken {
             return Err(SqlError::Other(format!("{}: {broken}", statement.name)));
         }

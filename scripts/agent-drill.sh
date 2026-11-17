@@ -131,11 +131,11 @@ if [ "$mode" = mock ]; then
   run_agent &
   pid=$!
   for _ in $(seq 1 "$job_wait_polls"); do
-    grep -q 'became background job' "$out/agent.err" 2> /dev/null && break
+    grep -q 'backgrounded:' "$out/agent.err" 2> /dev/null && break
     kill -0 "$pid" 2> /dev/null || break
     sleep 0.05
   done
-  if kill -0 "$pid" 2> /dev/null && grep -q 'became background job' "$out/agent.err"; then
+  if kill -0 "$pid" 2> /dev/null && grep -q 'backgrounded:' "$out/agent.err"; then
     kill_run "$pid"
     kills_job=1
     echo "agent-drill: kill during the background job" >> "$out/kills.log"

@@ -99,7 +99,7 @@ impl Value {
         let value = parser.value(0)?;
         parser.space();
         if parser.at != parser.bytes.len() {
-            return Err(format!("trailing characters at byte {}", parser.at));
+            return Err(format!("trailing bytes at {}", parser.at));
         }
         Ok(value)
     }
@@ -148,11 +148,11 @@ impl Parser<'_> {
 
     fn value(&mut self, depth: usize) -> Result<Value, String> {
         if depth >= DEPTH_MAX {
-            return Err(format!("JSON nests deeper than DEPTH_MAX ({DEPTH_MAX})"));
+            return Err(format!("JSON depth > DEPTH_MAX ({DEPTH_MAX})"));
         }
         self.space();
         let Some(&byte) = self.bytes.get(self.at) else {
-            return Err("unexpected end of JSON".to_owned());
+            return Err("truncated JSON".to_owned());
         };
         match byte {
             b'n' => self.expect("null").map(|()| Value::Null),
@@ -217,7 +217,7 @@ impl Parser<'_> {
         loop {
             self.space();
             if self.bytes.get(self.at) != Some(&b'"') {
-                return Err(format!("expected a key at byte {}", self.at));
+                return Err(format!("key expected at {}", self.at));
             }
             let key = self.string()?;
             if entries.iter().any(|(name, _)| *name == key) {
@@ -256,7 +256,7 @@ impl Parser<'_> {
             let start = self.at;
             while self.at < self.bytes.len() && !matches!(self.bytes[self.at], b'"' | b'\\') {
                 if self.bytes[self.at] < 0x20 {
-                    return Err(format!("control character in string at byte {}", self.at));
+                    return Err(format!("control byte at {}", self.at));
                 }
                 self.at += 1;
             }

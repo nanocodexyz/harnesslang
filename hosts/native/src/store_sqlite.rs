@@ -39,15 +39,15 @@ macro_rules! sqlite_api {
         }
 
         fn load_api() -> Result<Api, String> {
-            let file = CString::new(LIBRARY).expect("the library name holds no NUL byte");
+            let file = CString::new(LIBRARY).expect("NUL in library");
             let library = unsafe { dlopen(file.as_ptr(), RTLD_NOW) };
             if library.is_null() {
-                return Err(format!("cannot load {LIBRARY}, which the SQLite journal needs"));
+                return Err(format!("cannot load {LIBRARY}"));
             }
             Ok(Api {
                 $($name: {
                     let symbol_name =
-                        CString::new(stringify!($name)).expect("a symbol name holds no NUL byte");
+                        CString::new(stringify!($name)).expect("NUL in symbol");
                     let symbol = unsafe { dlsym(library, symbol_name.as_ptr()) };
                     if symbol.is_null() {
                         return Err(format!("{LIBRARY} has no {}", stringify!($name)));
@@ -98,7 +98,7 @@ fn loaded() -> Result<&'static Api, String> {
 }
 
 fn api() -> &'static Api {
-    loaded().expect("a connection opens only once libsqlite3 loaded")
+    loaded().expect("libsqlite3 unloaded")
 }
 
 pub struct SqliteStore {
@@ -115,10 +115,10 @@ impl SqliteStore {
         let version = version()?;
         if version < JSON_EACH_AND_RETURNING_VERSION_MIN {
             return Err(format!(
-                "libsqlite3 {version} is older than {JSON_EACH_AND_RETURNING_VERSION_MIN}, which json_each and RETURNING need"
+                "libsqlite3 {version} < {JSON_EACH_AND_RETURNING_VERSION_MIN} (json_each, RETURNING)"
             ));
         }
-        let path_text = CString::new(path).map_err(|_| format!("{path:?} holds a NUL byte"))?;
+        let path_text = CString::new(path).map_err(|_| format!("NUL in {path:?}"))?;
         let mut db = std::ptr::null_mut();
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
         let opened =
@@ -127,10 +127,7 @@ impl SqliteStore {
         if opened != SQLITE_OK {
             return Err(format!("open {path}: {}", store.error_text()));
         }
-        assert!(
-            !store.db.is_null(),
-            "a successful open returns a connection"
-        );
+        assert!(!store.db.is_null(), "open: no connection");
         unsafe {
             sqlite3_extended_result_codes(store.db, 1);
             sqlite3_busy_timeout(store.db, busy_timeout_ms);
@@ -151,7 +148,7 @@ impl SqliteStore {
         let message = self.error_text();
         let fenced_message = FENCED_ERROR
             .strip_prefix(FENCED_CODE_PREFIX)
-            .expect("the catalogue names the SQLite fence by its extended code");
+            .expect("fence code prefix");
         if code == SQLITE_CONSTRAINT_NOTNULL && message == fenced_message {
             return SqlError::Fenced;
         }
@@ -162,7 +159,7 @@ impl SqliteStore {
     }
 
     fn prepare(&self, statement: &Statement) -> Result<*mut Prepared, SqlError> {
-        let sql = CString::new(statement.sql).expect("catalogue SQL holds no NUL byte");
+        let sql = CString::new(statement.sql).expect("NUL in SQL");
         let mut prepared = std::ptr::null_mut();
         let result = unsafe {
             sqlite3_prepare_v2(
@@ -176,7 +173,7 @@ impl SqliteStore {
         if result != SQLITE_OK {
             return Err(self.error(statement));
         }
-        assert!(!prepared.is_null(), "a catalogue statement is not empty");
+        assert!(!prepared.is_null(), "empty statement");
         Ok(prepared)
     }
 
@@ -190,26 +187,20 @@ impl SqliteStore {
         assert_eq!(
             count as usize,
             statement.params.len(),
-            "{} binds every parameter it names",
+            "{}: unbound parameter",
             statement.name
         );
-        assert_eq!(
-            values.len(),
-            statement.params.len(),
-            "one value per parameter"
-        );
+        assert_eq!(values.len(), statement.params.len(), "value count");
         for (index, (param, value)) in statement.params.iter().zip(values).enumerate() {
             let position = index as c_int + 1;
             let result = match (param.ty, value) {
                 (ParamType::Integer, SqlValue::Integer(number)) => {
-                    let number =
-                        i64::try_from(*number).expect("journal integers fit SQLite's INTEGER");
+                    let number = i64::try_from(*number).expect("INTEGER range");
                     unsafe { sqlite3_bind_int64(prepared, position, number) }
                 }
                 (ParamType::Text, SqlValue::Text(text))
                 | (ParamType::Json, SqlValue::Json(text)) => {
-                    let bytes =
-                        c_int::try_from(text.len()).expect("a bound text fits SQLite's length");
+                    let bytes = c_int::try_from(text.len()).expect("text size");
                     unsafe {
                         sqlite3_bind_text(
                             prepared,
@@ -220,10 +211,7 @@ impl SqliteStore {
                         )
                     }
                 }
-                _ => panic!(
-                    "parameter {} of {} has its declared type",
-                    param.name, statement.name
-                ),
+                _ => panic!("parameter {} of {}: type", param.name, statement.name),
             };
             if result != SQLITE_OK {
                 return Err(self.error(statement));
