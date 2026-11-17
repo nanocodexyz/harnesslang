@@ -564,9 +564,17 @@ fn log_request(body: &str) {
     let Some(path) = std::env::var_os("MOCK_REQUEST_LOG") else {
         return;
     };
-    let _held = REQUEST_LOG.lock().expect("the request log lock is never poisoned");
-    let line = Value::decode(body).map(|value| value.encode()).unwrap_or_else(|_| body.to_owned());
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    let _held = REQUEST_LOG
+        .lock()
+        .expect("the request log lock is never poisoned");
+    let line = Value::decode(body)
+        .map(|value| value.encode())
+        .unwrap_or_else(|_| body.to_owned());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(file, "{line}");
     }
 }

@@ -620,7 +620,15 @@ pub fn shown(shell: &Shell) -> String {
     let err_end = err.head.len() + err.tail.len();
     format!(
         "{SHELL_MARK}\n{}\n{timeout}\n{}\n{}\n{out_end}\n{}\n{}\n{err_end}\n{}{}{}{}",
-        shell.code, out.total, out.head.len(), err.total, err.head.len(), out.head, out.tail, err.head, err.tail
+        shell.code,
+        out.total,
+        out.head.len(),
+        err.total,
+        err.head.len(),
+        out.head,
+        out.tail,
+        err.head,
+        err.tail
     )
 }
 
@@ -651,7 +659,11 @@ fn captured(path: &Path) -> Result<Captured, String> {
         let mut kept = Vec::with_capacity(total as usize);
         file.read_to_end(&mut kept).map_err(failed)?;
         let head = String::from_utf8_lossy(&kept).into_owned();
-        return Ok(Captured { total, head, tail: String::new() });
+        return Ok(Captured {
+            total,
+            head,
+            tail: String::new(),
+        });
     }
     let side = STREAM_BYTES_MAX / 2;
     let mut head = vec![0; side];

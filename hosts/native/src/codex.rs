@@ -71,7 +71,10 @@ fn rendered(
 ) -> String {
     let exit = exit.map(|code| code.to_string()).unwrap_or_default();
     let session = session.map(|id| id.to_string()).unwrap_or_default();
-    format!("{}\n{exit}\n{session}\n{max_tokens}\n{output}", wall.as_nanos())
+    format!(
+        "{}\n{exit}\n{session}\n{max_tokens}\n{output}",
+        wall.as_nanos()
+    )
 }
 
 fn quoted(text: &str) -> String {
