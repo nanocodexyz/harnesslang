@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use harnesslang::wasm::js::Json;
+use harnesslang::wasm::js::{Json, parse};
 
 use crate::transport::{self, Post, Sent};
 
@@ -11,6 +11,25 @@ const SUCCESS_LAST: u16 = 299;
 const PARTIAL_FILE: &str = "wire-partial";
 const OPEN: &str = "${";
 const DEFAULT_MARK: &str = ":-";
+const FILE_MARK: char = '@';
+const FIELD_MARK: char = '#';
+const FIELD_SEPARATOR: char = '.';
+
+fn file_value(reference: &str) -> Option<String> {
+    let (path, fields) = reference.split_once(FIELD_MARK).unwrap_or((reference, ""));
+    let text = std::fs::read_to_string(path).ok()?;
+    if fields.is_empty() {
+        return Some(text.trim().to_owned());
+    }
+    let mut value = parse(&text).ok()?;
+    for field in fields.split(FIELD_SEPARATOR) {
+        value = value.get(field).clone();
+    }
+    match value {
+        Json::Text(text) => Some(text),
+        _ => None,
+    }
+}
 
 pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
@@ -26,14 +45,20 @@ pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Str
             Some((name, default)) => (name, Some(default)),
             None => (inner, None),
         };
-        let valid = !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-        if !valid {
-            return Err(format!("{OPEN}{inner}}}: bad variable"));
-        }
-        match (lookup(name).filter(|value| !value.is_empty()), default) {
+        let found = match name.strip_prefix(FILE_MARK) {
+            Some(reference) if !reference.is_empty() => file_value(reference),
+            _ => {
+                let valid = !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+                if !valid {
+                    return Err(format!("{OPEN}{inner}}}: bad variable"));
+                }
+                lookup(name)
+            }
+        };
+        match (found.filter(|value| !value.is_empty()), default) {
             (Some(value), _) => out.push_str(&value),
             (None, Some(default)) => out.push_str(default),
             (None, None) => return Err(format!("unset: {name}")),

@@ -1323,8 +1323,13 @@ the program, not the host, build the model's HTTP request. The call sends
 `anthropic`, Responses input for `openai`) and `tail` to `url` with
 `headers`, all four `text` settings the program sets, and decodes the
 answer into the model's reply itself. The host only moves bytes: it
-substitutes `${NAME}` in headers from its environment, sends the request
-and hands back the status, headers and body. A wire model's reply type must
+substitutes `${NAME}` in headers from its environment, and `${@PATH}` with
+the trimmed text of the file at `PATH`, or `${@PATH#a.b}` with the text
+field `a.b` of that file's JSON (either takes a `:-default`), sends the
+request and hands back the status, headers and body. The value never enters
+the journal, so a program can name a login file (`codex_agent.hl` names
+Codex's `auth.json`, `claude_code.hl` Claude Code's `.credentials.json`)
+and the host reads its current token at each request. A wire model's reply type must
 have the shape its wire decodes, and its settings must name those four
 fields. The interpreter, the simulator and the compiled targets share one
 codec (`src/wire`, mirrored in the WebAssembly runtime), so the request a
