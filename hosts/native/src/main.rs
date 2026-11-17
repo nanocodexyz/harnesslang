@@ -5,6 +5,10 @@ mod host;
 mod jobs;
 mod json;
 mod ledger;
+mod sql;
+mod store;
+mod store_postgres;
+mod store_sqlite;
 mod tools;
 mod transport;
 mod wire;
@@ -20,7 +24,7 @@ use host::{Ran, Session, Setup, Spawn};
 
 pub const EXIT_HARNESS_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
-const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--escalate-model <id>] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host wire --request <file.json> --scratch <dir>
+const USAGE: &str = "usage: hl-host run --module <file.wasm> --journal <dir> [--store jsonl|sqlite:<file>|postgres:<host:port>/<database>] [--session <key>] --handler <name> --args <json> [--turn N] [--cwd <dir>] [--module-dir <dir>] [--spawn <tool>=<program>:<handler>]...\n       hl-host run --instruction <file> --cwd <dir> --model <id> --journal <dir> [--harness claude|codex] [--max-turns N] [--effort <level>] [--reviewer-relay <dir>] [--finish-checks N] [--escalate-model <id>] [--keep-warm N] [--turn N] [--module-dir <dir>]\n       hl-host wire --request <file.json> --scratch <dir>
        hl-host steer --journal <dir> --text <message>\n       hl-host cancel --journal <dir>";
 const LABEL: &str = "hl-host";
 const HARNESS_CLAUDE: &str = "claude";
@@ -95,6 +99,8 @@ struct Flags {
     text: Option<String>,
     request: Option<PathBuf>,
     scratch: Option<PathBuf>,
+    store: Option<String>,
+    session: Option<String>,
 }
 
 fn spawn_flag(value: &str) -> Spawn {
@@ -142,6 +148,8 @@ fn flags(args: &[String]) -> Flags {
             "--text" => flags.text = Some(value),
             "--request" => flags.request = Some(PathBuf::from(value)),
             "--scratch" => flags.scratch = Some(PathBuf::from(value)),
+            "--store" => flags.store = Some(value),
+            "--session" => flags.session = Some(value),
             other => fail_usage(&format!("unknown flag {other}")),
         }
     }
@@ -229,8 +237,14 @@ fn open(flags: &Flags, module_dir: Option<PathBuf>, spawns: Vec<Spawn>) -> (Path
         spawns,
     };
     let cancel = control::directory(&journal);
-    let session =
+    let mut session =
         Session::open(setup, &journal, LABEL, &cancel).unwrap_or_else(|error| fail(&error));
+    let key = flags
+        .session
+        .clone()
+        .unwrap_or_else(|| journal.display().to_string());
+    session.store = store::parse(flags.store.as_deref().unwrap_or("jsonl"), &key)
+        .unwrap_or_else(|error| fail_usage(&error));
     (journal, session)
 }
 
@@ -252,7 +266,9 @@ fn generic(flags: Flags) {
     let loaded = host::load(&module).unwrap_or_else(|error| fail(&error));
     let (journal, mut session) = open(&flags, module_dir, flags.spawns.clone());
     let turn = flags.turn.unwrap_or_else(|| {
-        planned_turn(&session.journal_path(), &handler, &arguments)
+        session
+            .records()
+            .and_then(|records| planned_turn(&records, &handler, &arguments))
             .unwrap_or_else(|error| fail(&error))
     });
     if handler == host::CONFIGURE_HANDLER {
@@ -328,12 +344,9 @@ struct Last {
     finished: bool,
 }
 
-fn last_turn(path: &Path) -> Result<Option<Last>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
+fn last_turn(records: &[Record]) -> Result<Option<Last>, String> {
     let mut last: Option<Last> = None;
-    for record in ledger::records(path)? {
+    for record in records.iter().cloned() {
         match record {
             Record::Admitted {
                 turn,
@@ -366,8 +379,8 @@ fn same(held: &Last, handler: &str, arguments: &Json) -> bool {
             == Some(&held.arguments)
 }
 
-fn planned_turn(path: &Path, handler: &str, arguments: &Json) -> Result<u64, String> {
-    Ok(match last_turn(path)? {
+fn planned_turn(records: &[Record], handler: &str, arguments: &Json) -> Result<u64, String> {
+    Ok(match last_turn(records)? {
         None => FIRST_TURN,
         Some(held) if same(&held, handler, arguments) => held.turn,
         Some(held) => held.turn + 1,
@@ -467,8 +480,10 @@ fn front(flags: Flags) {
             Json::int(flags.max_turns.unwrap_or(ROUNDS_DEFAULT)),
         ),
     ]);
-    let path = session.journal_path();
-    let held = last_turn(&path).unwrap_or_else(|error| fail(&error));
+    let held = session
+        .records()
+        .and_then(|records| last_turn(&records))
+        .unwrap_or_else(|error| fail(&error));
     let (configure_turn, mut prompt_turn) = match (flags.turn, held) {
         (Some(turn), _) => (Some(turn), turn + 1),
         (None, Some(held)) if same(&held, PROMPT_HANDLER, &prompt) => (None, held.turn),
@@ -546,7 +561,10 @@ fn keep_warm(loaded: &Loaded, session: &mut Session, refreshes: u64) {
                 return;
             }
         };
-        let turn = match host::next_turn(&session.journal_path()) {
+        let turn = match session
+            .records()
+            .and_then(|records| host::next_turn(&records))
+        {
             Ok(turn) => turn,
             Err(error) => {
                 eprintln!("{LABEL}: journal: {error}");

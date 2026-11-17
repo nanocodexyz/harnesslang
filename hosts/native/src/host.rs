@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use harnesslang::run::journal::Record;
+
+use crate::store;
 use harnesslang::wasm::js::{Json, parse};
-use harnesslang::wasm::native::{self, Journal, World};
+use harnesslang::wasm::native::{self, World};
 use harnesslang::wasm::sim::Loaded;
 
 use crate::children::{self, Children};
@@ -63,6 +65,7 @@ pub struct Session {
     pub children: Children,
     pub control: PathBuf,
     pub cancel: PathBuf,
+    pub store: store::Spec,
     finish: Option<Json>,
 }
 
@@ -181,12 +184,17 @@ impl Session {
             directory: directory.to_path_buf(),
             label: label.to_owned(),
             setup,
+            store: store::Spec::Jsonl,
             finish: None,
         })
     }
 
     pub fn journal_path(&self) -> PathBuf {
         self.directory.join(JOURNAL_FILE)
+    }
+
+    pub fn records(&self) -> Result<Vec<Record>, String> {
+        store::records(&self.store, &self.journal_path())
     }
 
     pub fn configured(&self) -> Option<Json> {
@@ -394,7 +402,7 @@ impl Session {
     }
 
     fn suspend_key(&self, turn: u64, seq: u64) -> Result<String, String> {
-        for record in ledger::records(&self.journal_path())? {
+        for record in self.records()? {
             if let Record::Call {
                 turn: at,
                 seq: site,
@@ -550,7 +558,7 @@ fn finish_of(json: &Json) -> Result<Finish, String> {
 }
 
 pub fn run_once(loaded: &Loaded, session: &mut Session, request: &Json) -> Result<Ran, String> {
-    let mut journal = Journal::open(&session.journal_path())?;
+    let mut journal = store::open(&session.store, &session.journal_path())?;
     session.finish = None;
     let exit = native::run(loaded, &mut journal, request, session)?;
     match text(exit.get("exit")) {
@@ -592,15 +600,12 @@ pub fn run_turn(loaded: &Loaded, session: &mut Session, request: &Json) -> Resul
 }
 
 pub fn idle_due(loaded: &Loaded, session: &mut Session) -> Result<Option<u64>, String> {
-    let mut journal = Journal::open(&session.journal_path())?;
+    let mut journal = store::open(&session.store, &session.journal_path())?;
     native::idle(loaded, &mut journal, session)
 }
 
-pub fn next_turn(path: &Path) -> Result<u64, String> {
-    if !path.exists() {
-        return Ok(FIRST_TURN);
-    }
-    let last = ledger::records(path)?
+pub fn next_turn(records: &[Record]) -> Result<u64, String> {
+    let last = records
         .iter()
         .filter_map(|record| match record {
             Record::Admitted { turn, .. } => Some(*turn),

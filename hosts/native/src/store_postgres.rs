@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 
-use crate::harness::{ParamType, Sql, SqlError, SqlValue, Statement};
+use crate::sql::{ParamType, Sql, SqlError, SqlValue, Statement};
 
 const PROTOCOL_VERSION_3: i32 = 196_608;
 const AUTHENTICATION_OK: i32 = 0;

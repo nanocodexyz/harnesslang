@@ -102,13 +102,10 @@ build() {
   mkdir -p "$dir"
   [ "$mutation" = flush_after_dispatch ] && plant=flush_after_dispatch
   "$hl" emit --target "$target" --plant "$plant" "$file" > "$dir/program.wasm"
-  for source in module_sql_drill_host sql_drill_checks sqlite_store postgres_store; do
-    cp "scripts/rust/$source.rs" "$dir/$source.rs"
-  done
   local key
-  key=$(cat "$dir"/*.rs target/release/libharnesslang.rlib | cksum | cut -d' ' -f1)
+  key=$(cat scripts/rust/module_sql_drill_host.rs scripts/rust/sql_drill_checks.rs hosts/native/src/sql.rs hosts/native/src/store_sqlite.rs hosts/native/src/store_postgres.rs target/release/libharnesslang.rlib | cksum | cut -d' ' -f1)
   if [ ! -x "$dir/host" ] || [ "$(cat "$dir/key" 2> /dev/null)" != "$key" ]; then
-    nice rustc --edition 2024 -O -o "$dir/host" "$dir/module_sql_drill_host.rs" \
+    nice rustc --edition 2024 -O -o "$dir/host" scripts/rust/module_sql_drill_host.rs \
       --extern harnesslang=target/release/libharnesslang.rlib -L target/release/deps
     echo "$key" > "$dir/key"
   fi

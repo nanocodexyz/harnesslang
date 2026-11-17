@@ -12,6 +12,8 @@ mkdir -p "$out/modules" "$out/ws"
 for program in syscalls syscalls_child; do
   target/release/hl emit --target native-jsonl --format wasm "scripts/fixtures/programs/$program.hl" > "$out/modules/$program.wasm"
 done
+mkdir -p "$out/sqlite-modules"
+target/release/hl emit --target native-sqlite --format wasm scripts/fixtures/programs/syscalls.hl > "$out/sqlite-modules/syscalls.wasm"
 workspace=$(cd "$out/ws" && pwd)
 
 run() {
@@ -23,6 +25,11 @@ files=$(run files files "{\"dir\":\"$workspace\"}")
 [ "$files" = '{"done":"beta\ngamma|no syscall mystery"}' ] || { echo "host-probe: files answered $files" >&2; exit 1; }
 again=$(run files files "{\"dir\":\"$workspace\"}")
 [ "$again" = "$files" ] || { echo "host-probe: a second run answered $again" >&2; exit 1; }
+stored=$("$host" run --module "$out/sqlite-modules/syscalls.wasm" --journal "$out/sqlite" --store "sqlite:$out/sqlite.db" --cwd "$workspace" --handler files --args "{\"dir\":\"$workspace\"}" 2>> "$out/host.err")
+[ "$stored" = "$files" ] || { echo "host-probe: the SQLite journal answered $stored" >&2; exit 1; }
+stored_again=$("$host" run --module "$out/sqlite-modules/syscalls.wasm" --journal "$out/sqlite" --store "sqlite:$out/sqlite.db" --cwd "$workspace" --handler files --args "{\"dir\":\"$workspace\"}" 2>> "$out/host.err")
+[ "$stored_again" = "$files" ] || { echo "host-probe: a second SQLite run answered $stored_again" >&2; exit 1; }
+[ ! -e "$out/sqlite/journal.jsonl" ] || { echo "host-probe: the SQLite run wrote a jsonl journal" >&2; exit 1; }
 delegated=$(run delegate delegate '{"task":"hi"}')
 [ "$delegated" = '{"done":"{\"finished\":\"child:hi\"}"}' ] || { echo "host-probe: delegate answered $delegated" >&2; exit 1; }
 "$host" steer --journal "$out/delegate" --text "probe" > /dev/null
