@@ -3356,7 +3356,7 @@ a reply stops early (`max_tokens`, `refusal`, `context_exceeded` or `pause`) in
 
 ```console
 $ hl sim --target native-jsonl --seeds 0..200 docs/snippets/recovery.hl
-ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1351 crashes=847 power_losses=80 torn_writes=104 takeovers=0 fenced=0 dispatches=416 unknown=122 sleeps=63 suspensions=0
+ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=1351 crashes=847 power_losses=81 torn_writes=104 takeovers=0 fenced=0 dispatches=410 unknown=122 sleeps=64 suspensions=0
 ```
 
 Two planted bugs show the journal is what makes these replays exact.
@@ -4058,6 +4058,29 @@ The compiler places the flushes; a program cannot move them.
 3. Nothing else forces a flush. Results of `none` and `idempotent` effects
    and model replies ride the next flush; a crash that loses them only
    repeats work that is safe to repeat.
+
+### Long call inputs
+
+A call record holds its tool's input so replay can check that the program
+asked for the same thing again, and so an open call can be sent again after a
+crash. A text argument of 65,536 bytes or more is journaled as a digest,
+`{"bytes":N,"crc32":"xxxxxxxx"}` (its UTF-8 length and its CRC-32 in hex), in
+place of the text; every other argument, and every result, is journaled whole.
+
+- Replay matches a recorded call when each argument is equal, or is a digest
+  of the live argument. A different text of the same length still fails the
+  CRC check and halts the run as diverged, as any other changed input does.
+- A call the journal holds open, or whose outcome is unknown, is sent again
+  with the live input the program just computed, never with the digest. The
+  program is deterministic up to that call, so the live input is the one the
+  record was written for.
+- An input that carries a fork's `state` is never digested, since replay reads
+  it back.
+- The runtime's own tools (`wait`, `hold`, `suspend`, `deny` and `respond`) keep
+  their whole input, since hosts read a deadline or a resume key back from the
+  durable record.
+- Results stay whole because replay returns them without running the tool
+  again.
 
 ### What each target guarantees
 

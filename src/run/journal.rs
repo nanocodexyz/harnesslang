@@ -196,6 +196,88 @@ impl Record {
     }
 }
 
+pub const INPUT_DIGEST_BYTES: usize = 65_536;
+const DIGEST_BYTES: &str = "bytes";
+const DIGEST_CRC32: &str = "crc32";
+
+fn digested(value: &Json) -> Option<&str> {
+    match value {
+        Json::String(text) if text.len() >= INPUT_DIGEST_BYTES => Some(text),
+        _ => None,
+    }
+}
+
+fn digest_of(text: &str) -> Json {
+    Json::object([
+        (DIGEST_BYTES, Json::Number(text.len() as u64)),
+        (
+            DIGEST_CRC32,
+            Json::String(format!("{:08x}", crc32(text.as_bytes()))),
+        ),
+    ])
+}
+
+pub fn input_digests(input: &Json) -> bool {
+    match input {
+        Json::Object(members) => {
+            !members.contains_key(crate::ir::FORK_STATE)
+                && members.values().any(|value| digested(value).is_some())
+        }
+        _ => false,
+    }
+}
+
+pub fn restores_input(recorded: &Json, live: &Json) -> bool {
+    match recorded {
+        Json::Object(members) => recorded != live && !members.contains_key(crate::ir::FORK_STATE),
+        _ => false,
+    }
+}
+
+pub fn keeps_input(tool: &str) -> bool {
+    [
+        crate::ir::WAIT_TOOL,
+        crate::ir::HOLD_TOOL,
+        crate::ir::SUSPEND_TOOL,
+        crate::ir::DENY_TOOL,
+        crate::ir::RESPOND_TOOL,
+    ]
+    .contains(&tool)
+}
+
+pub fn journaled_input(tool: &str, input: &Json) -> Json {
+    match input {
+        Json::Object(members) if !keeps_input(tool) && input_digests(input) => Json::Object(
+            members
+                .iter()
+                .map(|(key, value)| {
+                    let value = digested(value).map_or_else(|| value.clone(), digest_of);
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => input.clone(),
+    }
+}
+
+pub fn input_same(recorded: &Json, live: &Json) -> bool {
+    if recorded == live {
+        return true;
+    }
+    let (Json::Object(recorded), Json::Object(live)) = (recorded, live) else {
+        return false;
+    };
+    recorded.len() == live.len()
+        && recorded
+            .iter()
+            .zip(live)
+            .all(|((key, value), (live_key, live_value))| {
+                key == live_key
+                    && (value == live_value
+                        || digested(live_value).is_some_and(|text| *value == digest_of(text)))
+            })
+}
+
 pub fn call_id(turn: u64, seq: u64) -> String {
     format!("{turn}/{seq}")
 }
@@ -326,7 +408,7 @@ pub fn to_json(record: &Record) -> Json {
             Json::object([
                 ("call_id", Json::String(call_id(*turn, *seq))),
                 ("effect", Json::text(effect.name())),
-                ("input", input.clone()),
+                ("input", journaled_input(tool, input)),
                 ("seq", Json::Number(*seq)),
                 ("tool", Json::text(tool)),
                 ("turn", turn_text(*turn)),
@@ -829,8 +911,16 @@ pub fn encode_line(record: &Record, checksum: bool) -> String {
         body
     };
     let decoded = decode_line(&line, checksum).expect("a line we encode decodes");
-    assert_eq!(&decoded, record, "a record survives its encoding");
+    assert_eq!(decoded, journaled(record), "a record survives its encoding");
     line
+}
+
+pub fn journaled(record: &Record) -> Record {
+    let mut journaled = record.clone();
+    if let Record::Call { tool, input, .. } = &mut journaled {
+        *input = journaled_input(tool, input);
+    }
+    journaled
 }
 
 pub fn decode_line(line: &str, checksum: bool) -> Result<Record, String> {

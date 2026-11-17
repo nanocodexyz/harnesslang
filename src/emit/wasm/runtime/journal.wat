@@ -191,6 +191,92 @@
   (call $buf_u64 (local.get $buffer) (local.get $turn))
   (call $buf_text (local.get $buffer) (i32.const $s_w_close2))
   (call $buf_finish (local.get $buffer)))
+(global $INPUT_DIGEST_BYTES i32 (i32.const 65536))
+(global $DIGEST_MEMBERS i32 (i32.const 2))
+(text $s_digest_bytes "bytes")
+(text $s_digest_crc32 "crc32")
+(func $digested (param $value i32) (result i32)
+  (if (i32.ne (call $json_tag (local.get $value)) (global.get $JSON_STRING)) (then (return (i32.const 0))))
+  (i32.ge_u (call $text_len (call $json_text (local.get $value))) (global.get $INPUT_DIGEST_BYTES)))
+(func $digest_of (param $text i32) (result i32) (local $crc i32) (local $buffer i32) (local $shift i32) (local $node i32)
+  (local.set $crc (call $crc32 (call $text_bytes (local.get $text)) (call $text_len (local.get $text))))
+  (local.set $buffer (call $buf_new))
+  (local.set $shift (i32.const 24))
+  block $done
+    loop $next
+      (call $buf_hex_byte (local.get $buffer) (i32.and (i32.shr_u (local.get $crc) (local.get $shift)) (global.get $BYTE_MASK)))
+      (br_if $done (i32.eqz (local.get $shift)))
+      (local.set $shift (i32.sub (local.get $shift) (global.get $BITS_PER_BYTE)))
+      br $next
+    end
+  end
+  (local.set $node (call $json_object (global.get $DIGEST_MEMBERS)))
+  (call $json_object_set (local.get $node) (i32.const 0) (i32.const $s_digest_bytes) (call $json_number (i64.extend_i32_u (call $text_len (local.get $text)))))
+  (call $json_object_set (local.get $node) (i32.const 1) (i32.const $s_digest_crc32) (call $json_string (call $buf_finish (local.get $buffer))))
+  (local.get $node))
+(func $input_digests (param $input i32) (result i32) (local $count i32) (local $index i32)
+  (if (i32.ne (call $json_tag (local.get $input)) (global.get $JSON_OBJECT)) (then (return (i32.const 0))))
+  (if (call $json_get (local.get $input) (i32.const $s_state)) (then (return (i32.const 0))))
+  (local.set $count (call $json_count (local.get $input)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (local.get $count)))
+      (if (call $digested (call $json_value (local.get $input) (local.get $index))) (then (return (i32.const 1))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (i32.const 0))
+(func $keeps_input (param $tool i32) (result i32)
+  (i32.or
+    (i32.or (call $text_eq (local.get $tool) (i32.const $e_wait)) (call $text_eq (local.get $tool) (i32.const $e_hold)))
+    (i32.or (call $text_eq (local.get $tool) (i32.const $e_suspend))
+      (i32.or (call $text_eq (local.get $tool) (i32.const $e_deny)) (call $text_eq (local.get $tool) (i32.const $e_respond))))))
+(func $input_journaled (param $tool i32) (param $input i32) (result i32) (local $count i32) (local $index i32) (local $node i32) (local $value i32)
+  (if (call $keeps_input (local.get $tool)) (then (return (local.get $input))))
+  (if (i32.eqz (call $input_digests (local.get $input))) (then (return (local.get $input))))
+  (local.set $count (call $json_count (local.get $input)))
+  (local.set $node (call $json_object (local.get $count)))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (local.get $count)))
+      (local.set $value (call $json_value (local.get $input) (local.get $index)))
+      (if (call $digested (local.get $value)) (then (local.set $value (call $digest_of (call $json_text (local.get $value))))))
+      (call $json_object_set (local.get $node) (local.get $index) (call $json_key (local.get $input) (local.get $index)) (local.get $value))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (local.get $node))
+(func $digest_matches (param $recorded i32) (param $live i32) (result i32)
+  (if (i32.eqz (call $digested (local.get $live))) (then (return (i32.const 0))))
+  (call $json_equal (local.get $recorded) (call $digest_of (call $json_text (local.get $live)))))
+(func $input_same (param $recorded i32) (param $live i32) (result i32) (local $count i32) (local $index i32) (local $value i32)
+  (if (call $json_equal (local.get $recorded) (local.get $live)) (then (return (i32.const 1))))
+  (if (i32.ne (call $json_tag (local.get $recorded)) (global.get $JSON_OBJECT)) (then (return (i32.const 0))))
+  (if (i32.ne (call $json_tag (local.get $live)) (global.get $JSON_OBJECT)) (then (return (i32.const 0))))
+  (local.set $count (call $json_count (local.get $recorded)))
+  (if (i32.ne (local.get $count) (call $json_count (local.get $live))) (then (return (i32.const 0))))
+  block $done
+    loop $next
+      (br_if $done (i32.ge_u (local.get $index) (local.get $count)))
+      (if (i32.eqz (call $text_eq (call $json_key (local.get $recorded) (local.get $index)) (call $json_key (local.get $live) (local.get $index))))
+        (then (return (i32.const 0))))
+      (local.set $value (call $json_value (local.get $recorded) (local.get $index)))
+      (if (i32.eqz (call $json_equal (local.get $value) (call $json_value (local.get $live) (local.get $index))))
+        (then
+          (if (i32.eqz (call $digest_matches (local.get $value) (call $json_value (local.get $live) (local.get $index))))
+            (then (return (i32.const 0))))))
+      (local.set $index (i32.add (local.get $index) (i32.const 1)))
+      br $next
+    end
+  end
+  (i32.const 1))
+(func $input_restore (param $recorded i32) (param $live i32)
+  (if (call $json_equal (call $call_input (local.get $recorded)) (call $call_input (local.get $live))) (then (return)))
+  (if (i32.ne (call $json_tag (call $call_input (local.get $recorded))) (global.get $JSON_OBJECT)) (then (return)))
+  (if (call $json_get (call $call_input (local.get $recorded)) (i32.const $s_state)) (then (return)))
+  (i32.store offset=8 (local.get $recorded) (call $call_input (local.get $live))))
 (func $record_call (param $turn i64) (param $seq i64) (param $tool i32) (param $effect i32) (param $input i32) (result i32) (local $buffer i32)
   (local.set $buffer (call $buf_new))
   (call $buf_text (local.get $buffer) (i32.const $s_w_call))
@@ -198,7 +284,7 @@
   (call $buf_text (local.get $buffer) (i32.const $s_w_effect))
   (call $buf_text (local.get $buffer) (call $effect_name (local.get $effect)))
   (call $buf_text (local.get $buffer) (i32.const $s_w_input))
-  (call $json_write (local.get $buffer) (local.get $input) (i32.const 0))
+  (call $json_write (local.get $buffer) (call $input_journaled (local.get $tool) (local.get $input)) (i32.const 0))
   (call $buf_text (local.get $buffer) (i32.const $s_w_seq))
   (call $buf_u64 (local.get $buffer) (local.get $seq))
   (call $buf_text (local.get $buffer) (i32.const $s_w_tool))

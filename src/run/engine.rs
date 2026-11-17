@@ -1206,20 +1206,20 @@ impl<'a> Engine<'a> {
         let seq = self.seq;
         let call = self.resolve(site, std::slice::from_ref(item));
         match self.sites.get(&seq).cloned() {
-            Some(SiteLog::Done(recorded, output)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Done(mut recorded, output)) => {
+                self.same(seq, &mut recorded, &call)?;
                 let site = site.clone();
                 values[index] = Some(self.settle(&site, &recorded, &output)?);
                 Ok(None)
             }
             Some(SiteLog::Reply(..)) => Err(self.diverged(seq, "a model reply", &call.tool)),
-            Some(SiteLog::Unknown(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Unknown(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 values[index] = Some(Value::Variant(ir::UNKNOWN, Vec::new()));
                 Ok(None)
             }
-            Some(SiteLog::Open(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Open(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 self.require_live(seq)?;
                 let in_step = matches!(self.target.recovery, Recovery::InStep { .. });
                 assert!(
@@ -1759,8 +1759,8 @@ impl<'a> Engine<'a> {
         }
         let site = &self.handler.sites[site_id];
         match self.sites.get(&seq).cloned() {
-            Some(SiteLog::Done(recorded, output)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Done(mut recorded, output)) => {
+                self.same(seq, &mut recorded, &call)?;
                 let site = site.clone();
                 self.settle(&site, &recorded, &output)
             }
@@ -1786,15 +1786,15 @@ impl<'a> Engine<'a> {
                 }
                 self.reply(&response)
             }
-            Some(SiteLog::Unknown(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Unknown(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 if !site.result.reports_unknown(self.program) {
                     return self.reopen(site_id, seq, recorded, &args);
                 }
                 Ok(Value::Variant(ir::UNKNOWN, Vec::new()))
             }
-            Some(SiteLog::Open(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Open(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 self.reopen(site_id, seq, recorded, &args)
             }
             None => {
@@ -1870,16 +1870,16 @@ impl<'a> Engine<'a> {
     fn suspend_site(&mut self, site_id: usize, seq: u64, call: Call) -> Result<Value, Halt> {
         let live = matches!(self.mode, Mode::Live { .. });
         match self.sites.get(&seq).cloned() {
-            Some(SiteLog::Done(recorded, output)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Done(mut recorded, output)) => {
+                self.same(seq, &mut recorded, &call)?;
                 if live && self.mutation == Mutation::ResumeReplaysSuspend {
                     return self.suspend_fresh(seq, call);
                 }
                 let site = &self.handler.sites[site_id];
                 self.decode(site, &call, &output)
             }
-            Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Open(mut recorded) | SiteLog::Unknown(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 self.require_live(seq)?;
                 if let Some(answer) = self.take_resume(seq, &recorded)? {
                     let site = &self.handler.sites[site_id];
@@ -1964,12 +1964,12 @@ impl<'a> Engine<'a> {
     ) -> Result<Value, Halt> {
         match self.sites.get(&seq).cloned() {
             Some(SiteLog::Done(recorded, output)) => {
-                self.same(seq, &without_until(&recorded), &call)?;
+                self.same(seq, &mut without_until(&recorded), &call)?;
                 let site = &self.handler.sites[site_id];
                 self.decode(site, &call, &output)
             }
             Some(SiteLog::Open(recorded) | SiteLog::Unknown(recorded)) => {
-                self.same(seq, &without_until(&recorded), &call)?;
+                self.same(seq, &mut without_until(&recorded), &call)?;
                 self.require_live(seq)?;
                 if self.mutation == Mutation::WaitRerunSkips {
                     let clock = self.world().clock();
@@ -2043,8 +2043,8 @@ impl<'a> Engine<'a> {
     fn cell_site(&mut self, code: crate::ir::CodeId, seq: u64, call: Call) -> Result<Value, Halt> {
         let rerun = matches!(self.sites.get(&seq), Some(SiteLog::Open(_)));
         match self.sites.get(&seq).cloned() {
-            Some(SiteLog::Done(recorded, output)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Done(mut recorded, output)) => {
+                self.same(seq, &mut recorded, &call)?;
                 if self.mutation == Mutation::CellRerunAfterFinish
                     && matches!(self.mode, Mode::Live { .. })
                     && let Some(log) = self.cells.get(&seq).cloned()
@@ -2053,15 +2053,15 @@ impl<'a> Engine<'a> {
                 }
                 return self.decode_cell(&output);
             }
-            Some(SiteLog::Unknown(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Unknown(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 return Ok(Value::Variant(ir::UNKNOWN, Vec::new()));
             }
             Some(SiteLog::Reply(..)) => {
                 return Err(self.diverged(seq, "a model reply", &call.tool));
             }
-            Some(SiteLog::Open(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Open(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 self.require_live(seq)?;
             }
             None => {
@@ -2145,19 +2145,19 @@ impl<'a> Engine<'a> {
         call: Call,
     ) -> Result<Value, Halt> {
         let rerun = match self.sites.get(&seq).cloned() {
-            Some(SiteLog::Done(recorded, output)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Done(mut recorded, output)) => {
+                self.same(seq, &mut recorded, &call)?;
                 return self.decode_cell(&output);
             }
-            Some(SiteLog::Unknown(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Unknown(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 return Ok(Value::Variant(ir::UNKNOWN, Vec::new()));
             }
             Some(SiteLog::Reply(..)) => {
                 return Err(self.diverged(seq, "a model reply", &call.tool));
             }
-            Some(SiteLog::Open(recorded)) => {
-                self.same(seq, &recorded, &call)?;
+            Some(SiteLog::Open(mut recorded)) => {
+                self.same(seq, &mut recorded, &call)?;
                 self.require_live(seq)?;
                 true
             }
@@ -3040,7 +3040,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn same(&self, seq: u64, recorded: &Call, call: &Call) -> Result<(), Halt> {
+    fn same(&self, seq: u64, recorded: &mut Call, call: &Call) -> Result<(), Halt> {
         if recorded.tool != call.tool {
             return Err(self.diverged(seq, &recorded.tool, &call.tool));
         }
@@ -3048,11 +3048,14 @@ impl<'a> Engine<'a> {
             Some(at) => crate::run::fork::request_of(at, &recorded.input),
             None => recorded.input.clone(),
         };
-        if recorded.effect != call.effect || input != call.input {
+        if recorded.effect != call.effect || !crate::run::journal::input_same(&input, &call.input) {
             return Err(Halt::Exit(Exit::Corrupt(format!(
                 "replay of turn {} diverged at seq {seq}: tool '{}' was recorded with another class or input",
                 self.turn, call.tool
             ))));
+        }
+        if crate::run::journal::restores_input(&recorded.input, &call.input) {
+            recorded.input = call.input.clone();
         }
         Ok(())
     }

@@ -1,0 +1,35 @@
+harness digest
+
+const doublings: u64 = 15
+
+tool put(path: text, data: text) -> text effect idempotent
+tool send(data: text) -> text effect external
+tool look(data: text) -> text effect none
+
+fn widen(seed: text) -> text {
+  var wide: text = seed ++ "."
+  loop step below doublings {
+    wide = wide ++ wide
+  }
+  return wide
+}
+
+on store(seed: text) -> text {
+  let wide = widen(seed)
+
+  match put("out", wide) {
+    ok(written) => {
+      match send(wide) {
+        ok(sent) => {
+          match look(wide) {
+            ok(seen) => { return written ++ sent ++ seen }
+            failed(error) => { return error }
+          }
+        }
+        failed(error) => { return error }
+        unknown => { return "send unknown" }
+      }
+    }
+    failed(error) => { return error }
+  }
+}

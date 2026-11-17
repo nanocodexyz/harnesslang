@@ -324,8 +324,10 @@
         (call $text_eq (call $call_tool (local.get $recorded)) (call $call_tool (local.get $call)))
         (i32.and
           (i32.eq (call $call_effect (local.get $recorded)) (call $call_effect (local.get $call)))
-          (call $json_equal (call $fork_request_of (local.get $recorded)) (call $call_input (local.get $call)))))
-    (then (return (i32.const 1))))
+          (call $input_same (call $fork_request_of (local.get $recorded)) (call $call_input (local.get $call)))))
+    (then
+      (call $input_restore (local.get $recorded) (local.get $call))
+      (return (i32.const 1))))
   (call $corrupt (i32.const $s_diverged))
   (i32.const 0))
 (func $returned_name (param $type i32) (result i32) (local $kind i32)
