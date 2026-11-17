@@ -1,7 +1,7 @@
 use crate::check::{
     ALLOW, CANCELLED_READ, Checked, DENY, EVENT_JOB, EVENT_RESUME, EVENT_STEER, Globals,
-    JOB_PARAMETER, JOBS_READ, JOIN, STEER_PARAMETER, STEERS_READ, WILDCARD, bound, error, quoted,
-    resolve,
+    JOB_PARAMETER, JOBS_READ, JOIN, RESPOND, STEER_PARAMETER, STEERS_READ, WILDCARD, bound, error,
+    quoted, resolve,
 };
 use crate::effect::EffectClass;
 use crate::ir::{
@@ -28,6 +28,7 @@ struct Checker<'a> {
     reads_events: bool,
     in_hook: bool,
     spawn_subject: bool,
+    lane_answer: Option<Option<ir::Answer>>,
     side: Option<String>,
     forked: bool,
     used: std::collections::BTreeSet<ast::HookKind>,
@@ -50,6 +51,7 @@ pub fn check(
         reads_events: false,
         in_hook: false,
         spawn_subject: false,
+        lane_answer: None,
         side: definition.side.then(|| definition.name.text.clone()),
         forked: false,
         used: std::collections::BTreeSet::new(),
@@ -136,6 +138,7 @@ pub fn invariant(
         reads_events: false,
         in_hook: false,
         spawn_subject: false,
+        lane_answer: None,
         side: None,
         forked: false,
         used: std::collections::BTreeSet::new(),
@@ -552,13 +555,17 @@ impl Checker<'_> {
             ast::Stmt::Climb(_) | ast::Stmt::Yield { .. } => {
                 panic!("climbs are expanded before handlers are lowered")
             }
-            ast::Stmt::Call { callee, .. } if callee.text == DENY || callee.text == ALLOW => error(
-                callee.at,
-                format!(
-                    "'{}' decides the call of a 'before tool' or 'after tool' block: nothing follows it, and an if or match that holds it ends its block",
-                    callee.text
-                ),
-            ),
+            ast::Stmt::Call { callee, .. }
+                if callee.text == DENY || callee.text == ALLOW || callee.text == RESPOND =>
+            {
+                error(
+                    callee.at,
+                    format!(
+                        "'{}' decides the call of a 'before tool' or 'after tool' block: nothing follows it, and an if or match that holds it ends its block",
+                        callee.text
+                    ),
+                )
+            }
             ast::Stmt::Call { callee, .. } => {
                 panic!(
                     "fn calls are inlined before checking, yet '{}' is still a call",
@@ -736,14 +743,9 @@ impl Checker<'_> {
             );
         }
         self.forked_parallel(at)?;
-        if self.dispatch_hooks().contains(&ast::HookKind::BeforeTool) {
-            return error(
-                at,
-                format!(
-                    "a parallel for dispatches its calls at once, so '{}' cannot run before each: use a sequential for",
-                    ast::HookKind::BeforeTool.describe()
-                ),
-            );
+        let answers = self.dispatch_hooks().contains(&ast::HookKind::BeforeTool);
+        if answers {
+            self.answered_parallel(at)?;
         }
         let list_at = list.at();
         let (list, ty) = self.expr(list, None, out)?;
@@ -759,13 +761,23 @@ impl Checker<'_> {
                 self.lane_statement(statement)?;
             }
         }
-        let (item, lowered) = self.scoped(|checker| {
+        if answers {
+            self.lane_answer = Some(None);
+        }
+        let scoped = self.scoped(|checker| {
             let item = checker.declare(name, *element)?;
             let mut lowered = Vec::new();
             let returned = checker.match_statement(match_at, subject, arms, &mut lowered)?;
             assert!(!returned, "the arms of a parallel for only push");
             Ok((item, lowered))
-        })?;
+        });
+        let answer = self.lane_answer.take().flatten();
+        let (item, lowered) = scoped?;
+        assert_eq!(
+            answer.is_some(),
+            answers,
+            "a parallel for under a before tool block answers"
+        );
         let at_dispatch = lowered
             .iter()
             .position(|statement| matches!(statement, Stmt::Effect { .. }))
@@ -814,6 +826,7 @@ impl Checker<'_> {
             args: args.clone(),
             result: *result,
             body: tail.to_vec(),
+            answer,
         }));
         Ok(false)
     }
@@ -1695,7 +1708,7 @@ impl Checker<'_> {
                 self.wait(at, args, true, out)
             }
             JOIN => self.join(at, args, out),
-            DENY | ALLOW => error(
+            DENY | ALLOW | RESPOND => error(
                 at,
                 format!(
                     "'{}' is a statement of a 'before tool' or 'after tool' block, not a value",

@@ -497,7 +497,7 @@ Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `hold` `join` `json_escape` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
+Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `hold` `join` `json_escape` `len` `now` `random` `respond` `suspend` `trim` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -911,7 +911,7 @@ rerun sends it again:
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listing_unchecked examples/codex_agent.hl | head -n 1
 FAIL invariant=tool_admitted seed=27 target=native-jsonl profile=clean mutation=listing_unchecked: listed call 2/10 (mcp__delta) ran as Some("delta-v1") while listing mcp admitted None in turn 2: a tool that changed since admission must be refused
 $ hl sim --target native-jsonl --seeds 0..200 --mutation input_unchecked examples/codex_agent.hl | head -n 1
-FAIL invariant=tool_admitted seed=25 target=native-jsonl profile=errors mutation=input_unchecked: call 2/10 (update_plan) ran with input "{\"alpha-33\":true,\"plan\":\"theta-29\"}", which does not fit its declared input: not a JSON object
+FAIL invariant=tool_admitted seed=25 target=native-jsonl profile=errors mutation=input_unchecked: call 2/7 (exec_command) ran with input "{\"beta-24\":true,\"cmd\":\"gamma-43\",\"shell\":\"delta-62\",\"tty\":false}", which does not fit its declared input: not a JSON object
 $ hl sim --target native-jsonl --seeds 0..200 --mutation listed_class_dropped examples/codex_agent.hl | head -n 1
 FAIL invariant=replay_equal seed=13 target=native-jsonl profile=async mutation=listed_class_dropped: replaying the journal failed: Corrupt("replay of turn 4 diverged at seq 14: tool 'mcp__alpha' was recorded with another class or input")
 ```
@@ -1962,7 +1962,13 @@ In `before tool`, `deny(reason)` refuses the call: the runtime appends a
 `{"id","input","reason","tool"}`, then its `failed(reason)` result, without
 contacting the host, and the match takes its `failed` arm. `allow(input)`
 dispatches the call with that text as its input instead, which the input gate
-then checks as it checks the model's. In `after tool`, `deny(reason)` withholds
+then checks as it checks the model's. `respond(text)` answers the call
+in the program, so a tool the model calls by name can be one the program
+implements rather than the host: the call's input passes the same input gate
+`dispatch` would apply, and the runtime appends a `call` record with tool
+`respond` and the same input as a `deny`, then an `ok(text)` result when
+the input was admitted and the gate's `failed` otherwise, without contacting
+the host. In `after tool`, `deny(reason)` withholds
 an outcome the tool already returned: the match takes `failed(reason)` though
 the tool's result stays in the journal. A block that ends without either lets
 the call through as it is. Statements after an `if` or `match` that decided
@@ -2057,7 +2063,7 @@ on prompt(input: text) -> outcome
 
 ```console
 $ hl check docs/snippets/hooks.hl
-docs/snippets/hooks.hl: harness guarded: 2 tool(s), 7 state field(s), 1 handler(s)
+docs/snippets/hooks.hl: harness guarded: 2 tool(s), 8 state field(s), 1 handler(s)
   handler prompt: worst case 20 effects, 39 journal records, 20 outbound requests
     effects: round below rounds_max (4) x call below calls_max (4)
     journal records: round below rounds_max (4) x call below calls_max (4)
@@ -2066,14 +2072,68 @@ docs/snippets/hooks.hl: harness guarded: 2 tool(s), 7 state field(s), 1 handler(
 ...
 ```
 
-The checker lowers the decision to four hidden state fields,
-`_hook_decided`, `_hook_denied`, `_hook_reason` and `_hook_input`, so a hook's
+The checker lowers the decision to five hidden state fields,
+`_hook_decided`, `_hook_denied`, `_hook_responded`, `_hook_reason` and
+`_hook_input`, so a hook's
 code is inlined once per dispatch and the match's arms at most three times:
 after a deny, after a withheld outcome and after the call ran. `on session
 start` adds `_session_started` and `on session end` adds `_session_ended`, which
 every handler's `requires` then tests. Names starting with `_` are reserved, so
-no program can name them. A deny writes two records and no outbound request,
-so a denied path never costs more than the dispatch it replaces.
+no program can name them. A deny or a response writes two records and no
+outbound request, so it never costs more than the dispatch it replaces.
+
+A program implements `update_plan` and refuses a plan with two steps in progress:
+
+```hl docs/snippets/respond.hl
+harness planner
+
+const calls_max: u64 = 4
+const rounds_max: u64 = 8
+const context_max: u64 = 64
+
+type outcome = done(text) | exhausted
+
+tool update_plan(plan: text, explanation: text = "") -> text effect none
+tool bash(command: text) -> text effect external
+
+model think calls calls_max
+
+state {
+  context: list<entry, context_max>
+}
+
+before tool(c: call) {
+  if c.tool == "update_plan" {
+    if contains(after(c.input, "\"in_progress\""), "\"in_progress\"") {
+      deny("At most one step can be in_progress at a time.")
+    }
+    respond("Plan updated")
+  }
+}
+
+on ask(question: text) -> outcome
+  requires len(context) + 1 + rounds_max * (1 + calls_max) <= context_max
+{
+  push context user(question)
+  loop round below rounds_max {
+    let reply = think(context)
+    push context assistant(reply)
+    match reply {
+      answer(words) => { return done(words) }
+      calls(requested) => {
+        for call in requested parallel {
+          match dispatch(call) {
+            ok(output) => { push context result(call, output) }
+            failed(error) => { push context error(call, error) }
+            unknown => { push context unknown(call) }
+          }
+        }
+      }
+    }
+  }
+  return exhausted
+}
+```
 
 What the checker refuses:
 
@@ -2081,7 +2141,7 @@ What the checker refuses:
 $ hl check docs/snippets/errors/deny-outside.hl
 docs/snippets/errors/deny-outside.hl:6:3: error: 'deny' belongs in a 'before tool' or 'after tool' block, not in handler 'ping'
 $ hl check docs/snippets/errors/deny-loop.hl
-docs/snippets/errors/deny-loop.hl:8:3: error: a 'deny' or 'allow' decides the call once, so it cannot sit inside a loop
+docs/snippets/errors/deny-loop.hl:8:3: error: a 'deny', 'allow' or 'respond' decides the call once, so it cannot sit inside a loop
 $ hl check docs/snippets/errors/hook-dispatch.hl
 docs/snippets/errors/hook-dispatch.hl:14:9: error: a hook cannot dispatch: a dispatch inside it would run without the hooks every dispatch runs
 $ hl check docs/snippets/errors/plain-dispatch.hl
@@ -2184,8 +2244,14 @@ on ping(path: text) -> u64 {
 }
 ```
 
-A parallel for dispatches its calls at once, so a harness with `before tool`,
-`after tool` or `on subagent start` refuses one. The simulator watches the
+A parallel for dispatches its calls at once, so a harness with `on subagent
+start` refuses one, and one whose `before tool` block runs an effect, `allow`s a
+rewritten input or sits beside an `after tool` block (see [Lanes](#lanes)).
+Otherwise the block decides every call of the batch before any is sent, and
+a call it denies or answers with `respond` is settled in list order between
+the batch's groups, so `examples/codex_agent.hl` answers `update_plan` in its
+parallel round. The proofs and the cost bounds read the batch as the
+sequential for it equals. The simulator watches the
 host: a tool request that arrives between a deny site's run points is
 `denied_unrun`, and the mutation `deny_dispatches`, a runtime that runs the
 denied call anyway, is caught at once:
@@ -3932,9 +3998,12 @@ call's result, and its effects are ordinary effects: each takes the next
 sequence number after the batch's, appends its own records and follows its
 own durability point, so a crash in a lane leaves the batch's results
 journaled and the lane's call as a crash leaves any call. An `after tool`
-hook runs in each lane, before the match takes an arm; a `before tool` hook
-would decide each call before the batch dispatches it, which a lane cannot
-do, so a harness with one is refused a parallel for:
+hook runs in each lane, before the match takes an arm. A `before tool` hook
+decides each call before the batch instead, so it cannot share a parallel for
+with an `after tool` hook, run an effect or `allow` a rewritten input; the
+calls it denies or answers take their sequence numbers in list order, and the
+batch's calls on either side of them go out as separate groups, so the
+journal still equals the plain loop's:
 
 ```hl docs/snippets/lanes.hl
 harness lanes

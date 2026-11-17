@@ -18,13 +18,23 @@
   (i32.store offset=16 (local.get $entry) (local.get $reopened)))
 (func $pending_external (param $pending i32) (param $at i32) (result i32)
   (i32.eq (call $call_effect (i32.load offset=12 (call $vec_at (local.get $pending) (local.get $at)))) (global.get $EFFECT_EXTERNAL)))
-(func $parallel (param $site i32) (param $items i64) (result i32) (local $count i32) (local $values i32) (local $pending i32) (local $index i32) (local $seq i64) (local $args i32) (local $call i32) (local $entry i32) (local $state i32) (local $recorded i32) (local $start i32) (local $end i32)
+(func $parallel (param $site i32) (param $items i64) (param $answer_site i32) (param $answers i32) (result i32) (local $answer i32) (local $count i32) (local $values i32) (local $pending i32) (local $index i32) (local $seq i64) (local $args i32) (local $call i32) (local $entry i32) (local $state i32) (local $recorded i32)
   (local.set $count (call $list_len (local.get $items)))
   (local.set $values (call $alloc (i32.shl (i32.add (local.get $count) (i32.const 1)) (i32.const 3))))
   (local.set $pending (call $vec_new (global.get $PENDING_BYTES)))
   block $resolved
     loop $next
       (br_if $resolved (i32.ge_u (local.get $index) (local.get $count)))
+      (local.set $answer (if (result i32) (local.get $answers) (then (i32.load (i32.add (local.get $answers) (i32.shl (local.get $index) (i32.const 2))))) (else (i32.const 0))))
+      (if (local.get $answer)
+        (then
+          (call $parallel_groups (local.get $site) (local.get $pending) (local.get $values))
+          (if (global.get $halt) (then (return (local.get $values))))
+          (local.set $pending (call $vec_new (global.get $PENDING_BYTES)))
+          (i64.store (i32.add (local.get $values) (i32.shl (local.get $index) (i32.const 3))) (call $effect (local.get $answer_site) (local.get $answer)))
+          (if (global.get $halt) (then (return (local.get $values))))
+          (local.set $index (i32.add (local.get $index) (i32.const 1)))
+          (br $next)))
       (global.set $seq (i64.add (global.get $seq) (i64.const 1)))
       (local.set $seq (global.get $seq))
       (local.set $args (call $alloc (i32.const 8)))
@@ -58,6 +68,9 @@
       br $next
     end
   end
+  (call $parallel_groups (local.get $site) (local.get $pending) (local.get $values))
+  (local.get $values))
+(func $parallel_groups (param $site i32) (param $pending i32) (param $values i32) (local $start i32) (local $end i32)
   block $grouped
     loop $group
       (br_if $grouped (i32.ge_u (local.get $start) (call $vec_count (local.get $pending))))
@@ -73,12 +86,11 @@
             end
           end))
       (call $batch_group (local.get $site) (local.get $pending) (local.get $start) (local.get $end) (local.get $values))
-      (if (global.get $halt) (then (return (local.get $values))))
+      (if (global.get $halt) (then (return)))
       (local.set $start (local.get $end))
       br $group
     end
-  end
-  (local.get $values))
+  end)
 (func $batch_request (param $seq i64) (param $call i32) (param $admitted i32) (param $room i32) (result i32) (local $node i32) (local $at i32)
   (local.set $node (call $json_object (i32.add (i32.add (i32.const 5) (i32.ne (local.get $admitted) (i32.const 0))) (i32.ne (local.get $room) (i32.const 0)))))
   (if (local.get $room) (then (call $json_object_set (local.get $node) (i32.add (i32.const 5) (i32.ne (local.get $admitted) (i32.const 0))) (i32.const $e_job) (call $json_bool (i32.const 1)))))

@@ -1012,10 +1012,12 @@ pub const WAIT_TOOL: &str = "wait";
 pub const HOLD_TOOL: &str = "hold";
 pub const SUSPEND_TOOL: &str = "suspend";
 pub const DENY_TOOL: &str = "deny";
+pub const RESPOND_TOOL: &str = "respond";
 pub const SESSION_STARTED_FIELD: &str = "_session_started";
 pub const SESSION_ENDED_FIELD: &str = "_session_ended";
 pub const HOOK_DECIDED_FIELD: &str = "_hook_decided";
 pub const HOOK_DENIED_FIELD: &str = "_hook_denied";
+pub const HOOK_RESPONDED_FIELD: &str = "_hook_responded";
 pub const HOOK_REASON_FIELD: &str = "_hook_reason";
 pub const HOOK_INPUT_FIELD: &str = "_hook_input";
 pub const IDLE_RUNS_FIELD: &str = "_idle_runs";
@@ -1152,6 +1154,15 @@ pub struct Parallel {
     pub args: Vec<Expr>,
     pub result: LocalId,
     pub body: Vec<Stmt>,
+    pub answer: Option<Answer>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Answer {
+    pub prelude: Vec<Stmt>,
+    pub decided: Expr,
+    pub site: SiteId,
+    pub args: Vec<Expr>,
 }
 
 impl Parallel {
@@ -1165,7 +1176,21 @@ impl Parallel {
 
     pub fn sequential(&self) -> Stmt {
         let mut body = Vec::with_capacity(self.body.len() + 1);
-        body.push(self.dispatch());
+        match &self.answer {
+            None => body.push(self.dispatch()),
+            Some(answer) => {
+                body.extend(sequential_block(&answer.prelude));
+                body.push(Stmt::If {
+                    condition: answer.decided.clone(),
+                    then: vec![Stmt::Effect {
+                        site: answer.site,
+                        args: answer.args.clone(),
+                        result: self.result,
+                    }],
+                    otherwise: vec![self.dispatch()],
+                });
+            }
+        }
         body.extend(sequential_block(&self.body));
         Stmt::For {
             item: self.item,
@@ -1232,7 +1257,7 @@ fn sequential_statement(statement: &Stmt) -> Stmt {
     }
 }
 
-fn runs_effects(statements: &[Stmt]) -> bool {
+pub fn runs_effects(statements: &[Stmt]) -> bool {
     statements.iter().any(|statement| match statement {
         Stmt::Effect { .. } | Stmt::Parallel(_) => true,
         Stmt::If {
@@ -1358,6 +1383,14 @@ fn block_cuts(statements: &[Stmt], constants: &[Constant], out: &mut Vec<u64>) {
                     .iter()
                     .for_each(|arg| expr_cuts(arg, constants, out));
                 block_cuts(&parallel.body, constants, out);
+                if let Some(answer) = &parallel.answer {
+                    block_cuts(&answer.prelude, constants, out);
+                    expr_cuts(&answer.decided, constants, out);
+                    answer
+                        .args
+                        .iter()
+                        .for_each(|arg| expr_cuts(arg, constants, out));
+                }
             }
             Stmt::Effect { args, .. } => args.iter().for_each(|arg| expr_cuts(arg, constants, out)),
             Stmt::Rewrite { arms, .. } => {

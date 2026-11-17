@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::check::{
-    ALLOW, BUILTIN_FUNCTIONS, CANCELLED_READ, Checked, DENY, Globals, WILDCARD, claim, error,
-    variant_names,
+    ALLOW, BUILTIN_FUNCTIONS, CANCELLED_READ, Checked, DENY, Globals, RESPOND, WILDCARD, claim,
+    error, variant_names,
 };
 use crate::ir;
 use crate::syntax::Position;
@@ -352,6 +352,8 @@ impl<'a> Inliner<'a> {
         if !allowed {
             let place = if callee.text == DENY {
                 "a 'before tool' or 'after tool' block"
+            } else if callee.text == RESPOND {
+                "a 'before tool' block, which may answer a call instead of its tool"
             } else {
                 "a 'before tool' block, which may rewrite a call before it runs"
             };
@@ -446,7 +448,9 @@ impl<'a> Inliner<'a> {
             Stmt::If { .. } | Stmt::Match { .. } | Stmt::Loop { .. } | Stmt::For { .. } => {
                 self.compound(walk, statement)
             }
-            Stmt::Call { callee, args } if callee.text == DENY || callee.text == ALLOW => {
+            Stmt::Call { callee, args }
+                if callee.text == DENY || callee.text == ALLOW || callee.text == RESPOND =>
+            {
                 self.verdict(walk, callee, args)
             }
             Stmt::Call { callee, args } => self.call(walk, callee, args),

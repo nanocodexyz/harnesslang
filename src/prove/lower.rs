@@ -224,6 +224,7 @@ pub fn lower(program: &Program, model: &target::Model, mutation: Mutation) -> Pl
 fn batch_sites(statements: &[Stmt], out: &mut Vec<SiteId>) {
     for statement in statements {
         match statement {
+            Stmt::Parallel(parallel) if parallel.answer.is_some() => {}
             Stmt::Parallel(parallel) => out.push(parallel.site),
             Stmt::If {
                 then, otherwise, ..
@@ -359,6 +360,10 @@ impl Lowering<'_> {
                 }
                 Stmt::Parallel(parallel) => {
                     names[parallel.site] = self.names.site(parallel.site, &parallel.args);
+                    if let Some(answer) = &parallel.answer {
+                        names[answer.site] = self.names.site(answer.site, &answer.args);
+                        self.collect_names(&answer.prelude, names);
+                    }
                     self.collect_names(&parallel.body, names);
                 }
                 Stmt::Let { .. }
@@ -532,6 +537,9 @@ impl Lowering<'_> {
                     every_iteration: false,
                     body: self.block(body),
                 });
+            }
+            Stmt::Parallel(parallel) if parallel.answer.is_some() => {
+                self.statement(&parallel.sequential(), ops);
             }
             Stmt::Parallel(parallel) => self.parallel(parallel, ops),
             Stmt::Effect { site, args, .. } => {

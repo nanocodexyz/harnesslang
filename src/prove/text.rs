@@ -144,7 +144,9 @@ fn collect<'a>(
                 .for_each(|arm| collect(&arm.body, effects, takes)),
             Stmt::Loop { body, .. } | Stmt::For { body, .. } => collect(body, effects, takes),
             Stmt::Parallel(parallel) => {
-                effects.insert(parallel.result, (parallel.site, parallel.args.as_slice()));
+                if parallel.answer.is_none() {
+                    effects.insert(parallel.result, (parallel.site, parallel.args.as_slice()));
+                }
                 collect(&parallel.body, effects, takes);
             }
             Stmt::Let { .. }

@@ -142,6 +142,7 @@ wasm default_unfilled docs/snippets/defaults.hl native-jsonl,native-sqlite,serve
 wasm text_before_whole docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm text_after_kept docs/snippets/text.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm json_escape_raw docs/snippets/json_escape.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm respond_unadmitted docs/snippets/respond.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm payment_unset docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm paid_outcome_original docs/snippets/payments.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm recover_skipped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal

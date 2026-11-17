@@ -34,6 +34,7 @@ const CUT_PERCENT: u64 = 30;
 const CUT_TOKENS_VALUES: [u64; 5] = [0, 1, 2, 10, 25000];
 const DEFAULT_PERCENT: u64 = 30;
 const DISPATCH_HOOKS_PERCENT: u64 = 25;
+const ANSWERING_PERCENT: u64 = 50;
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -141,6 +142,7 @@ pub fn generate(rng: &mut Rng) -> Decls {
     tools(rng, &mut decls);
     fields(rng, &mut decls);
     decls.dispatch_hooks = chance(rng, DISPATCH_HOOKS_PERCENT);
+    decls.answering = decls.dispatch_hooks && chance(rng, ANSWERING_PERCENT);
     decls
 }
 

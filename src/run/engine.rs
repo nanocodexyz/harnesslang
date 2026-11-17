@@ -1120,22 +1120,35 @@ impl<'a> Engine<'a> {
         );
         let mut values: Vec<Option<Value>> = vec![None; items.len()];
         let mut pending = Vec::with_capacity(items.len());
+        let mut answers: Vec<Option<Vec<Value>>> = vec![None; items.len()];
+        if let Some(answer) = &parallel.answer {
+            for (index, item) in items.iter().enumerate() {
+                self.locals[parallel.item] = Some(item.clone());
+                if let Flow::Return(_) = self.block(&answer.prelude)? {
+                    panic!("an answer's prelude never returns");
+                }
+                if self.eval(&answer.decided)?.as_bool() {
+                    let mut args = Vec::with_capacity(answer.args.len());
+                    for arg in &answer.args {
+                        args.push(self.eval(arg)?);
+                    }
+                    answers[index] = Some(args);
+                }
+            }
+        }
         let first = self.seq;
         for (index, item) in items.iter().enumerate() {
+            if let (Some(args), Some(answer)) = (answers[index].take(), &parallel.answer) {
+                self.batch_groups(parallel, &pending, &mut values)?;
+                pending.clear();
+                values[index] = Some(self.effect(answer.site, args)?);
+                continue;
+            }
             if let Some(waiting) = self.batch_call(parallel, index, item, &mut values)? {
                 pending.push(waiting);
             }
         }
-        let mut start = 0;
-        while start < pending.len() {
-            let alone = pending[start].call.effect.may_be_unknown();
-            let mut end = start + 1;
-            while !alone && end < pending.len() && !pending[end].call.effect.may_be_unknown() {
-                end += 1;
-            }
-            self.batch_group(parallel, &pending[start..end], &mut values)?;
-            start = end;
-        }
+        self.batch_groups(parallel, &pending, &mut values)?;
         let mut ordered: Vec<(usize, Value)> = items.into_iter().enumerate().collect();
         if self.mutation == Mutation::BatchPushesReversed {
             ordered.reverse();
@@ -1152,6 +1165,25 @@ impl<'a> Engine<'a> {
             if let Flow::Return(_) = self.block(&parallel.body)? {
                 panic!("the arms of a parallel for never return");
             }
+        }
+        Ok(())
+    }
+
+    fn batch_groups(
+        &mut self,
+        parallel: &Parallel,
+        pending: &[Pending],
+        values: &mut [Option<Value>],
+    ) -> Result<(), Halt> {
+        let mut start = 0;
+        while start < pending.len() {
+            let alone = pending[start].call.effect.may_be_unknown();
+            let mut end = start + 1;
+            while !alone && end < pending.len() && !pending[end].call.effect.may_be_unknown() {
+                end += 1;
+            }
+            self.batch_group(parallel, &pending[start..end], values)?;
+            start = end;
         }
         Ok(())
     }
@@ -1586,8 +1618,13 @@ impl<'a> Engine<'a> {
             SiteKind::Dispatch => self.dispatched_call(&args[0]),
             SiteKind::Deny => {
                 let (_, fields) = args[0].as_variant();
+                let tool = if args[2].as_bool() {
+                    ir::RESPOND_TOOL
+                } else {
+                    ir::DENY_TOOL
+                };
                 Call {
-                    tool: ir::DENY_TOOL.to_owned(),
+                    tool: tool.to_owned(),
                     effect: EffectClass::None,
                     input: deny_input(
                         fields[ir::CALL_ID].as_text(),
@@ -2650,7 +2687,16 @@ impl<'a> Engine<'a> {
                     });
                     drop(ran);
                 }
-                Output::Failed(args[1].as_text().to_owned())
+                if !args[2].as_bool() {
+                    return Output::Failed(args[1].as_text().to_owned());
+                }
+                let (_, fields) = args[0].as_variant();
+                let tool = fields[ir::CALL_TOOL].as_text();
+                let raw = fields[ir::CALL_INPUT].as_text();
+                match value::tool_input(self.program, tool, raw) {
+                    value::Input::Invalid(error) => Output::Failed(error),
+                    _ => Output::Ok(Json::String(args[1].as_text().to_owned())),
+                }
             }
             SiteKind::Listing(listing) => {
                 let listing = &self.program.listings[listing];

@@ -414,23 +414,6 @@ pub fn view_image(texts: &Texts, root: &Path, input: &Value) -> Ran {
     Ran::Image(bytes)
 }
 
-pub fn update_plan(texts: &Texts, input: &Value) -> Ran {
-    let plan = text_field(input, "plan");
-    match Value::decode(plan) {
-        Ok(Value::Array(steps)) => {
-            let in_progress = steps
-                .iter()
-                .filter(|step| step.get("status").and_then(Value::as_str) == Some("in_progress"))
-                .count();
-            if in_progress > 1 {
-                return Ran::Failed(texts.fill("plan_many", &[]));
-            }
-            Ran::Ok(texts.fill("plan_updated", &[]))
-        }
-        _ => Ran::Failed(texts.fill("plan_invalid", &[("plan", plan)])),
-    }
-}
-
 #[derive(Debug)]
 struct Chunk {
     context: Option<String>,

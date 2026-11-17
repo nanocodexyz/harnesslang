@@ -57,6 +57,7 @@ const PARALLEL_PERCENT: u64 = 50;
 const WALK_CALLS_PERCENT: u64 = 60;
 const ALLOW_PERCENT: u64 = 30;
 const DENY_PERCENT: u64 = 70;
+const RESPOND_PERCENT: u64 = 40;
 
 struct Body<'a> {
     context: Context<'a>,
@@ -137,8 +138,8 @@ pub fn dispatch_hooks(rng: &mut Rng, decls: &Decls) -> Vec<String> {
     let mut used = decls.names.clone();
     let call = fresh(rng, &mut used, "c".to_owned());
     let outcome = fresh(rng, &mut used, "outcome".to_owned());
-    let before = rng.below(2) == 0;
-    let after = !before || rng.below(2) == 0;
+    let before = decls.answering || rng.below(2) == 0;
+    let after = !decls.answering && (!before || rng.below(2) == 0);
     let mut lines = Vec::new();
     let mut context = Context {
         decls,
@@ -153,7 +154,14 @@ pub fn dispatch_hooks(rng: &mut Rng, decls: &Decls) -> Vec<String> {
         lines.push(String::new());
         lines.push(format!("before tool({call}: call) {{"));
         lines.extend(decision(rng, &mut context, 1));
-        if chance(rng, ALLOW_PERCENT) {
+        if chance(rng, RESPOND_PERCENT) {
+            let condition = context.boolean(rng, EXPRESSION_DEPTH_MAX);
+            let answer = context.text_expr(rng);
+            lines.push(format!("{INDENT}if {condition} {{"));
+            lines.push(format!("{INDENT}{INDENT}respond({answer})"));
+            lines.push(format!("{INDENT}}}"));
+        }
+        if !decls.answering && chance(rng, ALLOW_PERCENT) {
             let input = context.text_expr(rng);
             lines.push(format!("{INDENT}allow({input})"));
         }
@@ -681,7 +689,7 @@ impl Body<'_> {
         }
         self.statements_left = self.statements_left.saturating_sub(1);
         let times = self.context.decls.constants[capacity].1;
-        if !self.context.decls.dispatch_hooks && chance(rng, PARALLEL_PERCENT) {
+        if self.lanes_allowed() && chance(rng, PARALLEL_PERCENT) {
             self.parallel_statement(rng, depth, &list, times);
             return false;
         }
@@ -697,6 +705,10 @@ impl Body<'_> {
         self.multiplier = saved;
         self.line(depth, "}".to_owned());
         false
+    }
+
+    fn lanes_allowed(&self) -> bool {
+        !self.context.decls.dispatch_hooks || self.context.decls.answering
     }
 
     fn parallel_statement(&mut self, rng: &mut Rng, depth: u32, list: &str, times: u64) {
@@ -727,7 +739,7 @@ impl Body<'_> {
         let times = self.context.decls.constants[capacity].1;
         let parallel = *element == Ty::Sum(CALL)
             && !self.context.lane
-            && !self.context.decls.dispatch_hooks
+            && self.lanes_allowed()
             && chance(rng, PARALLEL_PERCENT);
         if parallel {
             self.parallel_statement(rng, depth, &list, times);

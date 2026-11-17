@@ -14,7 +14,7 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 16] = [
+pub const BUILTIN_FUNCTIONS: [&str; 17] = [
     "dispatch",
     "now",
     "random",
@@ -30,10 +30,12 @@ pub const BUILTIN_FUNCTIONS: [&str; 16] = [
     "truncate_middle",
     "deny",
     "allow",
+    "respond",
     "join",
 ];
 pub const DENY: &str = "deny";
 pub const ALLOW: &str = "allow";
+pub const RESPOND: &str = "respond";
 pub const JOIN: &str = "join";
 pub const WILDCARD: &str = "_";
 pub const EVENT_CANCEL: &str = "cancel";
@@ -2069,6 +2071,7 @@ fn state(
         (ir::SESSION_ENDED_FIELD, Type::Bool, ends),
         (ir::HOOK_DECIDED_FIELD, Type::Bool, decides),
         (ir::HOOK_DENIED_FIELD, Type::Bool, decides),
+        (ir::HOOK_RESPONDED_FIELD, Type::Bool, decides),
         (ir::HOOK_REASON_FIELD, Type::Text, decides),
         (ir::HOOK_INPUT_FIELD, Type::Text, decides),
         (ir::IDLE_RUNS_FIELD, Type::U64, idles),

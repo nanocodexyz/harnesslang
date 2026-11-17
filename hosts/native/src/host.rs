@@ -290,7 +290,6 @@ impl Session {
             ("apply_patch", None) => {
                 codex::apply_patch(&self.workspace.texts, &self.workspace.root, &input)
             }
-            ("update_plan", None) => codex::update_plan(&self.workspace.texts, &input),
             ("view_image", None) => {
                 codex::view_image(&self.workspace.texts, &self.workspace.root, &input)
             }

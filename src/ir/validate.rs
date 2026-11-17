@@ -453,6 +453,29 @@ fn block(program: &Program, handler: &Handler, statements: &[Stmt], used: &mut [
                     used,
                 );
                 block(program, handler, &parallel.body, used);
+                if let Some(answer) = &parallel.answer {
+                    assert_eq!(
+                        handler.sites[answer.site].kind,
+                        SiteKind::Deny,
+                        "a parallel for answers through a deny site"
+                    );
+                    assert!(
+                        !crate::ir::runs_effects(&answer.prelude),
+                        "an answer's prelude runs no effect"
+                    );
+                    block(program, handler, &answer.prelude, used);
+                    expr(program, handler, &answer.decided);
+                    block(
+                        program,
+                        handler,
+                        &[Stmt::Effect {
+                            site: answer.site,
+                            args: answer.args.clone(),
+                            result: parallel.result,
+                        }],
+                        used,
+                    );
+                }
             }
             Stmt::Effect { site, args, result } => {
                 assert!(*result < handler.locals.len(), "an effect binds a local");

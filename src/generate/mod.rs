@@ -56,6 +56,7 @@ pub struct Decls {
     pub provable: bool,
     pub wait_ms: Option<usize>,
     pub dispatch_hooks: bool,
+    pub answering: bool,
     pub cut_tokens: Option<usize>,
     pub defaults: Vec<Vec<Option<String>>>,
 }

@@ -431,6 +431,26 @@ fn stopped(stop: stop) {
   }
 }
 
+before tool(c: call) {
+  if c.tool == "update_plan" {
+    let raw = trim(after(after(c.input, "\"plan\""), ":"))
+    let many = "At most one step can be in_progress at a time."
+    if before(raw, "\"[") == "" and contains(raw, "\"[") {
+      if contains(after(raw, "\\\"in_progress\\\""), "\\\"in_progress\\\"") {
+        deny(many)
+      }
+      respond("Plan updated")
+    }
+    if before(raw, "[") == "" and contains(raw, "[") {
+      if contains(after(raw, "\"in_progress\""), "\"in_progress\"") {
+        deny(many)
+      }
+      respond("Plan updated")
+    }
+    deny("failed to parse function arguments: plan is not a list of steps: " ++ before(after(raw, "\""), "\""))
+  }
+}
+
 on set_effort(level: effort_level) -> outcome {
   effort = level
   return completed("")

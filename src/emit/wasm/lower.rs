@@ -3,6 +3,7 @@ use std::fmt::Write;
 use super::data::{Tables, context_type};
 use crate::ir::{self, BinaryOp, Expr, Handler, Program, Stmt, Type};
 
+const ANSWER_BYTES: usize = 4;
 const SLOT_BYTES: usize = 8;
 const SUM_FIELDS_OFFSET: usize = 8;
 const SUM_FIELDS_DIRECT_MAX: usize = 3;
@@ -377,8 +378,20 @@ impl<'p> Function<'_, 'p> {
         self.expr(&parallel.list)?;
         self.halt_check();
         self.emit(format!("local.set {items}"));
+        let answers = self.temp();
+        self.emit("i64.const 0");
+        self.emit(format!("local.set {answers}"));
+        if let Some(answer) = &parallel.answer {
+            self.answers(parallel, answer, &items, &answers)?;
+        }
         self.emit(format!("i32.const $site{}_{}", self.index, parallel.site));
         self.emit(format!("local.get {items}"));
+        match &parallel.answer {
+            Some(answer) => self.emit(format!("i32.const $site{}_{}", self.index, answer.site)),
+            None => self.emit("i32.const 0"),
+        }
+        self.emit(format!("local.get {answers}"));
+        self.emit("i32.wrap_i64");
         self.emit("call $parallel");
         self.emit("i64.extend_i32_u");
         self.emit(format!("local.set {values}"));
@@ -407,6 +420,73 @@ impl<'p> Function<'_, 'p> {
         self.emit("i64.load");
         self.emit(format!("local.set $l{}", parallel.result));
         self.block(&parallel.body)?;
+        self.emit(format!("local.get {at}"));
+        self.emit("i64.const 1");
+        self.emit("i64.add");
+        self.emit(format!("local.set {at}"));
+        self.emit(format!("br $continue{label}"));
+        self.emit("end");
+        self.emit("end");
+        Ok(())
+    }
+
+    fn answers(
+        &mut self,
+        parallel: &ir::Parallel,
+        answer: &ir::Answer,
+        items: &str,
+        answers: &str,
+    ) -> Result<(), String> {
+        let label = self.label();
+        let at = self.temp();
+        self.emit(format!("local.get {items}"));
+        self.emit("call $list_len");
+        self.emit(format!("i32.const {ANSWER_BYTES}"));
+        self.emit("i32.mul");
+        self.emit("call $alloc");
+        self.emit("i64.extend_i32_u");
+        self.emit(format!("local.set {answers}"));
+        self.emit("i64.const 0");
+        self.emit(format!("local.set {at}"));
+        self.emit(format!("block $break{label}"));
+        self.emit(format!("loop $continue{label}"));
+        self.emit(format!("local.get {at}"));
+        self.emit(format!("local.get {items}"));
+        self.emit(format!("i64.const {LOW_WORD}"));
+        self.emit("i64.and");
+        self.emit("i64.ge_u");
+        self.emit(format!("br_if $break{label}"));
+        self.emit(format!("local.get {items}"));
+        self.emit(format!("local.get {at}"));
+        self.emit("i32.wrap_i64");
+        self.emit("call $list_get");
+        self.emit(format!("local.set $l{}", parallel.item));
+        self.block(&answer.prelude)?;
+        self.expr(&answer.decided)?;
+        self.emit("i64.const 0");
+        self.emit("i64.ne");
+        self.emit("if");
+        self.emit(format!(
+            "i32.const {}",
+            answer.args.len().max(1) * SLOT_BYTES
+        ));
+        self.emit("call $alloc");
+        self.emit("local.set $args");
+        for (position, arg) in answer.args.iter().enumerate() {
+            self.emit("local.get $args");
+            self.expr(arg)?;
+            self.emit(format!("i64.store offset={}", position * SLOT_BYTES));
+        }
+        self.emit(format!("local.get {answers}"));
+        self.emit(format!("local.get {at}"));
+        self.emit(format!("i64.const {ANSWER_BYTES}"));
+        self.emit("i64.mul");
+        self.emit("i64.add");
+        self.emit("i32.wrap_i64");
+        self.emit("local.get $args");
+        self.emit("i32.store");
+        self.emit("end");
+        self.halt_check();
         self.emit(format!("local.get {at}"));
         self.emit("i64.const 1");
         self.emit("i64.add");

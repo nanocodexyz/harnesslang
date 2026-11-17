@@ -33,7 +33,7 @@ pub const RUNTIME: [&str; 23] = [
     include_str!("runtime/host.wat"),
 ];
 
-pub const PLANTS: [(&str, &str, &str); 54] = [
+pub const PLANTS: [(&str, &str, &str); 55] = [
     (
         "flush_after_dispatch",
         "(if (i32.or (local.get $required) (i32.and (call $target_gate)",
@@ -254,6 +254,11 @@ pub const PLANTS: [(&str, &str, &str); 54] = [
         "text_before_whole",
         "(call $text_value (call $text_slice (local.get $text) (i32.const 0) (local.get $at)))",
         "(local.get $subject)",
+    ),
+    (
+        "respond_unadmitted",
+        "(if (local.get $unadmitted) (then (return (call $output_new (global.get $OUTPUT_FAILED) (local.get $unadmitted)))))",
+        "",
     ),
     (
         "json_escape_raw",

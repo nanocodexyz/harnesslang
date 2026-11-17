@@ -17,6 +17,7 @@ pub fn forked(program: &ir::Program, globals: &Globals, hook: &ast::Hook) -> Che
         reads_events: false,
         in_hook: true,
         spawn_subject: false,
+        lane_answer: None,
         side: None,
         forked: true,
         used: std::collections::BTreeSet::new(),

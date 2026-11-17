@@ -1,5 +1,5 @@
 use super::{Checker, statement_at};
-use crate::check::{ALLOW, Checked, DENY, error, resolve};
+use crate::check::{ALLOW, Checked, DENY, RESPOND, error, resolve};
 use crate::effect::EffectClass;
 use crate::ir::{self, BinaryOp, Expr, LocalId, SiteClass, SiteKind, Stmt, Type};
 use crate::syntax::Position;
@@ -17,6 +17,7 @@ type Scopes = Vec<Vec<(String, LocalId)>>;
 struct Flags {
     decided: ir::FieldId,
     denied: ir::FieldId,
+    responded: ir::FieldId,
     reason: ir::FieldId,
     input: ir::FieldId,
 }
@@ -347,6 +348,9 @@ impl Checker<'_> {
         let (call, ty) = self.expr(arg, Some(&call_type), out)?;
         self.expect(arg_at, &call_type, &ty)?;
         let original = self.hidden("call", call_type.clone());
+        if self.lane_answer.is_some() {
+            return self.lane_dispatch(at, original, call, arms, out);
+        }
         out.push(Stmt::Let {
             local: original,
             value: call,
@@ -379,7 +383,11 @@ impl Checker<'_> {
             SiteKind::Deny,
             SiteClass::Fixed(EffectClass::None),
             outcome_type(),
-            vec![Expr::Local(original), Expr::Field(flags.reason)],
+            vec![
+                Expr::Local(original),
+                Expr::Field(flags.reason),
+                Expr::Field(flags.responded),
+            ],
             out,
         );
         let denied_site = out.pop().expect("the deny site just added its effect");
@@ -397,11 +405,105 @@ impl Checker<'_> {
         Ok(refused_returns && ran_returns)
     }
 
+    pub(super) fn answered_parallel(&self, at: Position) -> Checked<()> {
+        let refusal = |what: &str| {
+            error(
+                at,
+                format!(
+                    "a parallel for decides its calls before its batch, so '{}' cannot {what}: use a sequential for",
+                    HookKind::BeforeTool.describe()
+                ),
+            )
+        };
+        if self.globals.hooks.contains_key(&HookKind::AfterTool) {
+            return refusal(&format!(
+                "share it with '{}'",
+                HookKind::AfterTool.describe()
+            ));
+        }
+        if self.starts_subagents() {
+            return refusal("decide a subagent's start");
+        }
+        let hook = &self.globals.hooks[&HookKind::BeforeTool];
+        if allows(&hook.body.statements) {
+            return refusal("rewrite a call with 'allow'");
+        }
+        Ok(())
+    }
+
+    fn lane_dispatch(
+        &mut self,
+        at: Position,
+        original: LocalId,
+        call: Expr,
+        arms: &[ast::Arm],
+        out: &mut Vec<Stmt>,
+    ) -> Checked<bool> {
+        let call_type = Type::Sum(ir::CALL);
+        let flags = self.flags();
+        let mut prelude = vec![
+            Stmt::Let {
+                local: original,
+                value: call.clone(),
+            },
+            Stmt::Assign {
+                field: flags.input,
+                value: Expr::Member {
+                    base: Box::new(Expr::Local(original)),
+                    index: ir::CALL_INPUT,
+                },
+            },
+        ];
+        let before = self.globals.hooks[&HookKind::BeforeTool].clone();
+        self.decide(
+            &before,
+            HookKind::BeforeTool,
+            vec![(Expr::Local(original), call_type)],
+            at,
+            &mut prelude,
+        )?;
+        if ir::runs_effects(&prelude) {
+            return error(
+                at,
+                format!(
+                    "a parallel for decides each call before its batch, so its '{}' block cannot run an effect: use a sequential for",
+                    HookKind::BeforeTool.describe()
+                ),
+            );
+        }
+        let args = vec![
+            Expr::Local(original),
+            Expr::Field(flags.reason),
+            Expr::Field(flags.responded),
+        ];
+        let result_type = self.program.dispatch_result();
+        let mut parked = Vec::new();
+        self.site(
+            SiteKind::Deny,
+            SiteClass::Fixed(EffectClass::None),
+            result_type.clone(),
+            args.clone(),
+            &mut parked,
+        );
+        let [Stmt::Effect { site, .. }] = parked.as_slice() else {
+            unreachable!("a site adds one effect");
+        };
+        self.lane_answer = Some(Some(ir::Answer {
+            prelude,
+            decided: Expr::Field(flags.denied),
+            site: *site,
+            args,
+        }));
+        let (result, ty) = self.dispatch_site(result_type, vec![call], out);
+        self.outcome(at, (result, ty), None, arms, out)
+    }
+
     fn flags(&self) -> Flags {
         let field = |name: &str| self.globals.fields[name];
         Flags {
             decided: field(ir::HOOK_DECIDED_FIELD),
             denied: field(ir::HOOK_DENIED_FIELD),
+            responded: field(ir::HOOK_RESPONDED_FIELD),
             reason: field(ir::HOOK_REASON_FIELD),
             input: field(ir::HOOK_INPUT_FIELD),
         }
@@ -417,7 +519,7 @@ impl Checker<'_> {
     ) -> Checked<()> {
         self.used.insert(kind);
         let flags = self.flags();
-        for field in [flags.decided, flags.denied] {
+        for field in [flags.decided, flags.denied, flags.responded] {
             out.push(Stmt::Assign {
                 field,
                 value: Expr::Bool(false),
@@ -516,7 +618,7 @@ impl Checker<'_> {
             for (index, statement) in statements.iter().enumerate() {
                 let rest = &statements[index + 1..];
                 if let ast::Stmt::Call { callee, args } = statement
-                    && (callee.text == DENY || callee.text == ALLOW)
+                    && (callee.text == DENY || callee.text == ALLOW || callee.text == RESPOND)
                 {
                     if let Some(next) = rest.first() {
                         return error(
@@ -632,11 +734,22 @@ impl Checker<'_> {
         let at = arg.at();
         let (value, ty) = self.expr(arg, Some(&Type::Text), out)?;
         self.expect(at, &Type::Text, &ty)?;
-        let target = if callee.text == DENY {
-            out.push(Stmt::Assign {
-                field: flags.denied,
-                value: Expr::Bool(true),
-            });
+        let target = if callee.text == DENY || callee.text == RESPOND {
+            let mut fields = vec![flags.denied];
+            if callee.text == RESPOND {
+                assert_eq!(
+                    kind,
+                    HookKind::BeforeTool,
+                    "the inliner admits 'respond' only in a before tool block"
+                );
+                fields.push(flags.responded);
+            }
+            for field in fields {
+                out.push(Stmt::Assign {
+                    field,
+                    value: Expr::Bool(true),
+                });
+            }
             flags.reason
         } else {
             assert_eq!(
@@ -701,6 +814,22 @@ impl Checker<'_> {
     }
 }
 
+fn allows(statements: &[ast::Stmt]) -> bool {
+    statements.iter().any(|statement| match statement {
+        ast::Stmt::Call { callee, .. } => callee.text == ALLOW,
+        ast::Stmt::If {
+            then, otherwise, ..
+        } => {
+            allows(&then.statements)
+                || otherwise
+                    .as_ref()
+                    .is_some_and(|block| allows(&block.statements))
+        }
+        ast::Stmt::Match { arms, .. } => arms.iter().any(|arm| allows(&arm.body.statements)),
+        _ => false,
+    })
+}
+
 fn decides(statement: &ast::Stmt) -> Checked<bool> {
     let any = |statements: &[ast::Stmt]| -> Checked<bool> {
         for statement in statements {
@@ -711,7 +840,9 @@ fn decides(statement: &ast::Stmt) -> Checked<bool> {
         Ok(false)
     };
     match statement {
-        ast::Stmt::Call { callee, .. } => Ok(callee.text == DENY || callee.text == ALLOW),
+        ast::Stmt::Call { callee, .. } => {
+            Ok(callee.text == DENY || callee.text == ALLOW || callee.text == RESPOND)
+        }
         ast::Stmt::If {
             then, otherwise, ..
         } => Ok(any(&then.statements)?
@@ -730,7 +861,7 @@ fn decides(statement: &ast::Stmt) -> Checked<bool> {
             if any(&body.statements)? {
                 return error(
                     statement_at(statement),
-                    "a 'deny' or 'allow' decides the call once, so it cannot sit inside a loop",
+                    "a 'deny', 'allow' or 'respond' decides the call once, so it cannot sit inside a loop",
                 );
             }
             Ok(false)
