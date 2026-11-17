@@ -43,7 +43,8 @@ on files(dir: text) -> outcome {
     unknown => { return broke("apply_patch: unknown") }
   }
   match Bash("cat note.txt patched.txt", bash_timeout_ms, "", false, false) {
-    ok(shown) => {
+    ok(raw) => {
+      let shown = shell_shown(raw)
       match mystery("x") {
         ok(said) => { return broke("mystery answered " ++ said) }
         failed(error) => { return done(shown ++ "|" ++ error) }

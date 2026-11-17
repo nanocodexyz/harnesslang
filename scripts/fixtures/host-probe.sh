@@ -9,11 +9,12 @@ cargo build --release --locked --quiet
 cargo build --release --locked --quiet --manifest-path hosts/native/Cargo.toml
 rm -rf "$out"
 mkdir -p "$out/modules" "$out/ws"
-for program in syscalls syscalls_child; do
-  target/release/hl emit --target native-jsonl --format wasm "scripts/fixtures/programs/$program.hl" > "$out/modules/$program.wasm"
-done
+cat scripts/fixtures/programs/syscalls.hl scripts/fixtures/shell.hl > "$out/syscalls.hl"
+cat scripts/fixtures/programs/syscalls_child.hl scripts/fixtures/shell.hl > "$out/syscalls_child.hl"
+target/release/hl emit --target native-jsonl --format wasm "$out/syscalls.hl" > "$out/modules/syscalls.wasm"
+target/release/hl emit --target native-jsonl --format wasm "$out/syscalls_child.hl" > "$out/modules/syscalls_child.wasm"
 mkdir -p "$out/sqlite-modules"
-target/release/hl emit --target native-sqlite --format wasm scripts/fixtures/programs/syscalls.hl > "$out/sqlite-modules/syscalls.wasm"
+target/release/hl emit --target native-sqlite --format wasm "$out/syscalls.hl" > "$out/sqlite-modules/syscalls.wasm"
 workspace=$(cd "$out/ws" && pwd)
 
 run() {
