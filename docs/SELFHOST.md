@@ -274,7 +274,7 @@ this section; (est.) marks an estimate of what the .hl version costs.
 | # | What | Lines it removes | Needs |
 | --- | --- | --- | --- |
 | 1 | Code implemented twice: wire codec, JSON, journal | 8,485 | an embedding of pure .hl in the interpreter, recursion-free trees, raw bytes in and out |
-| 2 | Pure text work left in hosts | about 380 | pure entries a host calls, text builtins |
+| 2 | Pure text work left in hosts | about 380 | integer-exact rounding, an unjournaled host-to-pure-fn call, a computed-edit-list tool protocol |
 | 3 | The compiler | 21,266 | the porting order above |
 | 4 | The prover | 6,828 | the compiler's features, plus rationals or bounded big integers |
 | 5 | The rest of the .wat runtime | 6,002 | effects and imports declared in .hl, control of memory layout |
@@ -301,19 +301,26 @@ this section; (est.) marks an estimate of what the .hl version costs.
    out of a pure entry without hex. `bytes_of_hex` and `hex_of` make hex
    cheap today (see How fast compiled .hl runs above) but a raw bytes argument and
    result, which the hosts must carry, removes the doubling.
-2. **Pure text work in hosts.** Lane 23 moved SSE splitting into the wasm
-   wire codec and Bash and codex exec rendering into .hl pure fns, which cut
-   hosts from 7,787 to 7,573 lines. What is left: the apply_patch grammar
-   (`hosts/native/src/codex.rs`, 195 lines of parsing and matching from
-   `parse_patch` to `updated`, 315 with its file writes), Read paging
-   (`first_page` in `hosts/native/src/tools.rs`), stall-line detection
-   (`prompting` in `hosts/native/src/jobs.rs`) and `${VAR}` expansion
-   (`wireExpand` in `hosts/cloudflare.mjs` and `hosts/vercel.mjs`, 20 lines
-   each). DECISIONS.md says why each of the first three stays for now: Read
-   paging rounds f64 twice per step, stall detection decides what the
-   journal admits, and apply_patch needs every touched file's contents, so
-   moving it is a new tool protocol. They need: an f64-exact integer
-   formulation or a decimal type, and a read-then-write tool shape.
+2. **Pure text work left in hosts.** Lane 23 moved SSE splitting into the
+   wasm wire codec, and Bash and codex exec rendering into .hl pure fns,
+   which cut hosts from 7,787 to 7,573 lines. Three pieces stay, about 380
+   lines, each waiting on one feature:
+   - Read paging (`first_page` in `hosts/native/src/tools.rs`) sizes pages
+     with f64 math and two roundings per step. It needs a decision on an
+     integer-exact rounding (an integer version differs only where the
+     exact quotient lands on an integer) and fast per-byte loops, which
+     the bounds proofs and fused byte loops above start on.
+   - Stall-line detection (`prompting` in `hosts/native/src/jobs.rs`)
+     decides whether a notice is admitted at all. It needs a host-to-pure-fn
+     call that writes no journal record.
+   - The apply_patch grammar (`hosts/native/src/codex.rs`, 195 lines of
+     parsing and matching from `parse_patch` to `updated`, 315 with its
+     file writes) needs the contents of every file the patch touches. It
+     needs a tool protocol where the program reads the files, computes the
+     edit list and hands the host the writes, deletes and renames.
+   - `${VAR}` expansion (`wireExpand` in `hosts/cloudflare.mjs` and
+     `hosts/vercel.mjs`, 20 lines each) needs only a pure entry the host
+     calls.
 3. **The compiler.** `src/syntax` (2,591), `src/check` (9,289), `src/ir`
    (3,072) and `src/emit` (6,314): 21,266 lines, by the porting order above.
 4. **The prover.** `src/prove` (6,828). It needs everything the compiler
