@@ -123,7 +123,7 @@ wasm listing_unchecked docs/snippets/listing.hl native-jsonl,native-sqlite,serve
 wasm discovery_unchecked docs/snippets/catalog.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm search_unchecked docs/snippets/catalog.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm listing_bound_unchecked docs/snippets/listing.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
-wasm interrupt_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
+wasm interrupt_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare backend_equal
 wasm recover_reply_ignored docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm job_unopened docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
 wasm job_lost_dropped docs/snippets/in_flight.hl native-jsonl,native-sqlite,server-postgres,cloudflare,vercel backend_equal
@@ -156,6 +156,7 @@ wasm nested_recovery_skipped vercel: Vercel recovers an open nested external cal
 wasm recovery_skipped vercel: Vercel recovers an open external call inside its step, by its attempt count, so the skipped recovery record is never reached
 wasm recovery_unreported vercel: Vercel recovers an open external call inside its step, by its attempt count, so the unreported recovery record is never reached
 wasm event_redelivered vercel: a Vercel hook delivers each payload once, so no delivery repeats an id the turn recorded and the skipped duplicate check is never reached
+wasm interrupt_ignored vercel: Vercel drains its inbox only between steps, so no event arrives while an effect runs and an interrupt only preempts the next one
 wasm batch_drain_skipped vercel: Vercel drains its inbox after a flush, not after a run, so the skipped drain after a batch runs on no Vercel turn
 wasm cancel_read_unstamped native-jsonl: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 118
 wasm cancel_read_unstamped native-sqlite: a cancel read before its stamp needs a rerun past a crash after the drain; seeds 0..2000 catch it first at seed 206

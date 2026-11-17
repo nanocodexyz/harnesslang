@@ -316,6 +316,12 @@ impl Mutation {
             ],
             Self::IdempotentReportedUnknown => vec![Target::NativeJsonl, Target::Cloudflare],
             Self::GateReleasesEarly => vec![Target::Cloudflare],
+            Self::InterruptIgnored | Self::InterruptReruns => vec![
+                Target::NativeJsonl,
+                Target::NativeSqlite,
+                Target::ServerPostgres,
+                Target::Cloudflare,
+            ],
             Self::RecoveryReportsFailed => vec![
                 Target::NativeJsonl,
                 Target::NativeSqlite,
@@ -359,9 +365,7 @@ impl Mutation {
             | Self::SideLiveState
             | Self::SideJournaled
             | Self::IdleEarly
-            | Self::InterruptIgnored
             | Self::InterruptedUndecoded
-            | Self::InterruptReruns
             | Self::RecoverTrustsLost
             | Self::JobLostDropped
             | Self::JobLostAll

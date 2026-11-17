@@ -83,10 +83,6 @@
 (func $interrupted_by (param $before i32) (param $interrupts i32) (param $preempted i32) (result i32)
   (i32.and (call $interrupting_since (local.get $before) (local.get $interrupts)) (i32.eqz (local.get $preempted))))
 (func $events_now (result i32) (call $vec_count (call $log_events (global.get $log))))
-(func $drain_interrupting (param $interrupts i32)
-  (if (call $flushes_to_interrupt (local.get $interrupts))
-    (then (call $drain))
-    (else (call $drain_at (global.get $DRAIN_AFTER_RUN)))))
 (func $interrupted_output (result i32) (call $output_new (global.get $OUTPUT_FAILED) (i32.const $j_interrupted)))
 (func $interrupted_response (result i32) (call $json_one (i32.const $j_interrupted_variant) (call $json_array (i32.const 0))))
 (func $unknown_site (param $seq i64) (param $call i32) (result i64) (local $unknown i32)
@@ -468,6 +464,7 @@
     (then
       (call $append (call $record_recovery_attested (global.get $turn) (local.get $attempt) (local.get $none) (i32.const 0) (i32.const 0) (local.get $listed)))
       (call $flush)
+      (call $assert (i64.eq (call $host_attempt (global.get $turn) (local.get $seq)) (i64.const 1)) (i32.const $s_first_attempt))
       (return (global.get $RETRIED_RUN))))
   (call $append (call $record_recovery_attested (global.get $turn) (local.get $attempt) (local.get $none) (i32.const 0) (local.get $listed) (i32.const 0)))
   (call $append (call $record_result (global.get $turn) (local.get $seq) (global.get $recovered_output)))

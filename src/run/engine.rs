@@ -884,12 +884,7 @@ impl<'a> Engine<'a> {
 
     fn drain_interrupting(&mut self, interrupts: ir::Interrupts) -> Result<bool, Halt> {
         let before = self.events.len();
-        let own = inbound::of(self.target.target).drain != Drain::AfterRun;
-        if interrupts.any() && own {
-            self.drain()?;
-        } else {
-            self.drain_at(Drain::AfterRun)?;
-        }
+        self.drain_at(Drain::AfterRun)?;
         Ok(self.events[before..]
             .iter()
             .any(|event| event.delivery.inbound.interrupts(interrupts)))
@@ -1295,11 +1290,7 @@ impl<'a> Engine<'a> {
         let replayed = !matches!(self.sites.get(&self.seq), Some(SiteLog::Open(_)));
         let before = self.events.len();
         if !replayed || self.mutation == Mutation::BatchDrainsReplayed {
-            if self.flushes_to_interrupt(interrupting) {
-                self.drain()?;
-            } else {
-                self.drain_at(Drain::AfterRun)?;
-            }
+            self.drain_at(Drain::AfterRun)?;
         }
         let arrived: Vec<Inbound> = self.events[before..]
             .iter()
@@ -2353,6 +2344,9 @@ impl<'a> Engine<'a> {
             }
             Recovered::NotDispatched => {
                 self.flush()?;
+                let turn = self.turn;
+                let attempt = self.world().attempt(turn, seq)?;
+                assert!(attempt == 1, "a not-dispatched recovery ends its step");
                 Ok(Retried::Run)
             }
             Recovered::Reply(output) => {
@@ -2477,11 +2471,7 @@ impl<'a> Engine<'a> {
                     self.sleep(seq, call)?
                 };
                 self.hook(Point::AfterRun(site.kind, call.effect))?;
-                if matches!(site.kind, SiteKind::Hold(_)) {
-                    self.drain()?;
-                } else {
-                    self.drain_at(Drain::AfterRun)?;
-                }
+                self.drain_at(Drain::AfterRun)?;
                 return self.waited(site_id, seq, call, woke);
             }
             SiteKind::Cell(_) => unreachable!("a cell site runs through the cell runner"),

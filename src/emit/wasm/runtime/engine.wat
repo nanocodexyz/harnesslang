@@ -482,7 +482,7 @@
             (then (local.set $response (call $wire_decode (local.get $wire) (local.get $response) (i32.ne (call $events_model_interrupts) (i32.const 0))))))))))
   (call $hook (global.get $POINT_AFTER_RUN) (global.get $KIND_MODEL) (call $call_effect (local.get $call)))
   (local.set $before (call $events_now))
-  (call $drain_interrupting (local.get $interrupts))
+  (call $drain_at (global.get $DRAIN_AFTER_RUN))
   (if (call $interrupted_by (local.get $before) (local.get $interrupts) (local.get $preempted)) (then (local.set $response (call $interrupted_response))))
   (call $append (call $record_model (global.get $turn) (local.get $seq) (local.get $response) (call $site_mode (local.get $site)) (local.get $settings)))
   (call $site_put (global.get $log) (local.get $seq) (global.get $SITE_REPLY) (call $sent_new (call $site_mode (local.get $site)) (local.get $settings)) (local.get $response))
@@ -500,7 +500,7 @@
     (else (local.set $output (call $run_site (local.get $site) (local.get $seq) (local.get $call) (local.get $preempted)))))
   (call $hook (global.get $POINT_AFTER_RUN) (local.get $kind) (call $call_effect (local.get $call)))
   (local.set $before (call $events_now))
-  (call $drain_interrupting (local.get $interrupts))
+  (call $drain_at (global.get $DRAIN_AFTER_RUN))
   (if (call $interrupted_by (local.get $before) (local.get $interrupts) (local.get $preempted))
     (then
       (call $jobs_remove (global.get $jobs) (call $job_key (global.get $turn) (local.get $seq)))

@@ -464,7 +464,7 @@ exports:
 
 ```console
 $ hl emit --format wat --target native-jsonl examples/agent.hl | grep -oE '\(export "[a-z_]+"' | cut -d'"' -f2 | paste -sd' '
-memory hl_alloc hl_side hl_run hl_facts hl_check hl_idle
+memory hl_alloc hl_side hl_seq hl_run hl_facts hl_check hl_idle
 ```
 
 [Targets](#targets) lists what every target generates.
@@ -5134,10 +5134,10 @@ the harness must declare, abandon the effect:
   calls of an interrupted batch.
 
 Replay needs nothing new: the result records already hold the outcome, and the
-event records hold when each event arrived. On Vercel, whose events enter at
-step boundaries, an interruptible effect runs in a step of its own: it flushes
-before it runs and takes the events that arrived while it ran before its
-result is recorded. A cell's nested calls are not interruptible one by one, but a
+event records hold when each event arrived. On Vercel, whose events enter in a
+drain step between steps, an interruptible effect flushes before it runs, so
+an event that arrived before it is taken at that flush and preempts it; one
+that arrives while it runs is taken after its result. A cell's nested calls are not interruptible one by one, but a
 cancel can stop the whole cell: [Stopping a cell](#stopping-a-cell).
 
 #### Jobs
@@ -5331,7 +5331,7 @@ ok target=native-jsonl mutation=none seeds=0..200 (200 seeds): turns=504 runs=19
 $ hl sim --target server-postgres --seeds 0..200 docs/snippets/in_flight.hl
 ok target=server-postgres mutation=none seeds=0..200 (200 seeds): turns=504 runs=1396 crashes=823 power_losses=0 torn_writes=0 takeovers=115 fenced=69 dispatches=739 unknown=145 events=124 sleeps=36 suspensions=0 interrupted=28 recovered=110 not_dispatched=141 recover_unknown=105 jobs=58 job_notices=23 jobs_died=25
 $ hl sim --target vercel --seeds 0..200 docs/snippets/in_flight.hl
-ok target=vercel mutation=none seeds=0..200 (200 seeds): turns=504 runs=1671 crashes=1167 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=808 unknown=96 events=173 sleeps=31 suspensions=0 interrupted=48 recovered=61 not_dispatched=49 recover_unknown=43 jobs=60 job_notices=24 jobs_died=26
+ok target=vercel mutation=none seeds=0..200 (200 seeds): turns=504 runs=1680 crashes=1176 power_losses=0 torn_writes=0 takeovers=0 fenced=0 dispatches=813 unknown=93 events=146 sleeps=35 suspensions=0 interrupted=41 recovered=63 not_dispatched=51 recover_unknown=42 jobs=63 job_notices=14 jobs_died=28
 ```
 
 | Invariant | Holds | Planted bug |

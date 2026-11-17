@@ -32,4 +32,6 @@ caught() {
 caught vercel_step_continues examples/minimal.hl
 caught vercel_ack_unhooked examples/minimal.hl
 caught vercel_resumed_dropped examples/hooks.hl
+caught vercel_drain_skipped docs/snippets/events.hl
+caught vercel_answer_dropped docs/snippets/events.hl
 echo "host mutations: ok"

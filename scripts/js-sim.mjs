@@ -667,7 +667,6 @@ class SimWorkflow {
     this.statusLive = false;
     this.notDueLive = false;
     this.slept = new Set();
-    this.lastInbox = null;
   }
 
   async inbox(turn, live) {
@@ -676,23 +675,14 @@ class SimWorkflow {
     const name = `inbox ${turn}`;
     if (index < log.length && log[index].name === name) {
       this.stepIndex += 1;
-      this.lastInbox = { entry: log[index], live: false };
       return log[index].deliveries;
     }
     if (!live) return null;
     if (index < log.length) throw differ(`workflow step ${index} on replay`, log[index].name, name);
     this.stepIndex += 1;
-    const entry = { name, output: { lines: [] }, deliveries: this.seed.inbox(turn) };
+    const entry = { name, output: { lines: [] }, deliveries: this.seed.inbox(turn).map((delivery) => delivery.json) };
     log.push(entry);
-    this.lastInbox = { entry, live: true };
     return entry.deliveries;
-  }
-
-  async record(lines) {
-    const { entry, live } = this.lastInbox;
-    if (!live) return;
-    this.seed.flushed(lines.map((line) => line + "\n").join(""));
-    entry.output.lines.push(...lines);
   }
 
   async request(index) {
@@ -774,7 +764,8 @@ class SimWorkflow {
     };
     const output = await harness.runStep(input, context);
     if (input.kind === "run" && output.notDue === true) this.notDueLive = true;
-    if (input.kind === "run" && output.wait === undefined && output.suspended === undefined && output.notDue === undefined && output.ran === undefined) {
+    if (input.drain !== undefined && output.lines.length > 0) this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
+    if (input.kind === "run" && input.drain === undefined && output.wait === undefined && output.suspended === undefined && output.notDue === undefined && output.ran === undefined) {
       this.seed.flushed(output.lines.map((line) => line + "\n").join(""));
       this.seed.checks.flushed([...this.state.lines(), ...output.lines]);
       const request = rt.decodeJson(input.request);

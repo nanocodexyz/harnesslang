@@ -23,8 +23,9 @@ class HostError extends Error {}
 class ModuleFailure extends Error {}
 
 class StepEnd {
-  constructor(lines) {
+  constructor(lines, answer = null) {
     this.lines = lines;
+    this.answer = answer;
   }
 }
 
@@ -317,8 +318,11 @@ function suspensionIn(lines, exit) {
 }
 
 class StepWorld {
-  constructor(context, delivered, cells = NO_CELLS) {
+  constructor(context, delivered, cells = NO_CELLS, drain = null, lost = null) {
     this.context = context;
+    this.lost = lost;
+    this.drain = drain;
+    this.drained = [];
     this.delivered = delivered;
     this.waited = new Set(cells.waited);
     this.deadlines = new Map(cells.deadlines);
@@ -334,7 +338,8 @@ class StepWorld {
 
   flush(epoch, text) {
     assert(epoch === EPOCH, "a workflow run has one owner");
-    throw new StepEnd(linesOf(text));
+    if (this.drain === null) throw new StepEnd(linesOf(text));
+    this.drained = linesOf(text);
   }
 
   keep() {
@@ -416,7 +421,8 @@ class StepWorld {
       case "recover":
         return '{"answer":' + (await host.recover(encodeJson({ input: request.input, seq: request.seq, tool: request.tool, turn: request.turn }))) + "}";
       case "jobs":
-        return '{"answer":' + (await host.jobs(encodeJson({ open: request.open, turn: request.turn }))) + "}";
+        this.lost ??= decodeJson(await host.jobs(encodeJson({ open: request.open, turn: request.turn })));
+        return encodeJson({ answer: this.lost });
       case "side":
         return this.side(request);
       case "side_tool":
@@ -424,8 +430,11 @@ class StepWorld {
       case "side_answer":
         return this.sided(request);
       case "inbox":
+        assert(this.drain !== null, "a step takes events only at the drain the workflow passed it");
+        return encodeJson({ answer: this.drain.inbox });
       case "answer":
-        throw new Panic("a step takes and answers no events: the module asks for them inside its step, which a Vercel step cannot read");
+        assert(this.drain !== null, "a step answers events only at its drain");
+        throw new StepEnd(this.drained, encodeJson({ answers: request.answers, position: request.position, turn: request.turn }));
       default:
         throw new Panic("the module made an unknown world request '" + request.event + "'");
     }
@@ -482,26 +491,42 @@ async function dispatchConcurrently(world, requests, limit) {
 }
 
 async function runStep(input, context) {
+  if (input.kind !== "run") return otherStep(input, context);
+  const world = new StepWorld(context, input.resume === undefined || input.resume === null ? null : resumeFrom(decodeJson(input.resume)), input.cells, input.drain ?? null, input.jobs ?? null);
+  const output = await runOutput(input, world);
+  output.jobs = world.lost ?? [];
+  return output;
+}
+
+async function otherStep(input, context) {
   if (input.kind === "acknowledge") {
     await context.acknowledge(finishFromJson(decodeJson(input.finish)));
     return { lines: [] };
   }
-  if (input.kind === "idle") {
-    const idle = new Instance(QUIET_WORLD).idle(journalOf(input.lines));
-    if (idle.exit === "corrupt") throw new Corrupt(idle.error);
-    return { lines: [], due: idle.due === null ? null : idle.due.toString() };
+  if (input.kind === "answer") {
+    const answer = decodeJson(input.answer);
+    await context.answer(Number(answer.turn), Number(answer.position), answer.answers.map((each) => [each.id, each.answer]));
+    return { lines: [] };
   }
-  assert(input.kind === "run", "a step acknowledges, reads the idle due or runs");
+  assert(input.kind === "idle", "a step acknowledges, answers, reads the idle due or runs");
+  const idle = new Instance(QUIET_WORLD).idle(journalOf(input.lines));
+  if (idle.exit === "corrupt") throw new Corrupt(idle.error);
+  return { lines: [], due: idle.due === null ? null : idle.due.toString() };
+}
+
+async function runOutput(input, world) {
   const request = checkedRequest(input.request);
-  const delivered = input.resume === undefined || input.resume === null ? null : resumeFrom(decodeJson(input.resume));
-  const world = new StepWorld(context, delivered, input.cells);
+  const drain = world.drain;
+  const instance = new Instance(world);
+  const text = drain === null || drain.position === null ? request.text : encodeJson({ ...decodeJson(request.text), drain: BigInt(drain.position) });
   let exit;
   try {
-    exit = await new Instance(world).run(request.text, journalOf(input.lines));
+    exit = await instance.run(text, journalOf(input.lines));
   } catch (error) {
     if (error instanceof StepWait) return { lines: [], wait: error.wait, deadlines: [...world.pending] };
     if (!(error instanceof StepEnd)) throw error;
-    const output = { lines: error.lines, deadlines: [...world.pending] };
+    if (drain !== null) return { lines: error.lines, answer: error.answer };
+    const output = { lines: error.lines, deadlines: [...world.pending], position: String(instance.exports.hl_seq()) };
     const answered = world.resuming;
     if (answered !== null && error.lines.some((line) => {
       const { tag, body } = tagged(line);
@@ -513,6 +538,7 @@ async function runStep(input, context) {
     return output;
   }
   if (exit.exit === "corrupt") throw new Corrupt(exit.error);
+  if (drain !== null) return { lines: [] };
   if (exit.exit === "suspended") return { lines: [], suspended: encodeJson(suspensionJson(suspensionIn(input.lines, exit))) };
   if (exit.exit === "not_due") return { lines: [], notDue: true };
   throw new Panic("a step ends at a flush, found the turn " + exit.exit);
@@ -532,7 +558,6 @@ async function side(lines, requestText, host) {
 
 async function session(platform) {
   const known = facts();
-  if (known.events) throw new Panic("this module takes events inside its step, which the fixed Vercel host cannot deliver");
   const lines = (platform.entry ?? []).slice();
   const state = folded(lines);
   for (let index = 0; index < platform.turnsMax; index++) {
@@ -555,16 +580,19 @@ async function driveTurn(platform, lines, state, requestText, known) {
   const stepsMax = (STEPS_PER_EFFECT_MAX + STEPS_PER_SUSPENSION_MAX) * Number(handler.effects_max) + STEPS_PER_TURN_FIXED;
   let live = false;
   let resume = null;
+  const lost = { keys: [], live: false };
   const cells = { waited: [], deadlines: [] };
   for (let step = 0; step < stepsMax; step++) {
     const log = state.turns.get(request.turn);
     if (log !== undefined && log.finished !== null) {
       if (live) await platform.hook(POINT_BEFORE_ACKNOWLEDGE);
       const finish = { turn: request.turn, outcome: log.finished.outcome, result: log.finished.result };
-      await platform.step("acknowledge " + request.turn, { kind: "acknowledge", finish: encodeJson(finishJson(finish)) });
+      const acknowledged = await platform.step("acknowledge " + request.turn, { kind: "acknowledge", finish: encodeJson(finishJson(finish)) });
+      if (known.events) await drained(platform, lines, state, request, "close " + request.turn, { position: null, lost }, live || acknowledged.live);
       return;
     }
-    const done = await platform.step("turn " + request.turn + " step " + step, { kind: "run", lines: lines.slice(), request: requestText, resume, cells });
+    const done = await platform.step("turn " + request.turn + " step " + step, { kind: "run", lines: lines.slice(), request: requestText, resume, cells, jobs: lost.live ? lost.keys : null });
+    lostAfter(lost, done);
     resume = null;
     if (done.output.notDue === true) return;
     cells.deadlines.push(...(done.output.deadlines ?? []));
@@ -586,12 +614,32 @@ async function driveTurn(platform, lines, state, requestText, known) {
     }
     live = done.live;
     if (live) await platform.hook(POINT_AFTER_FLUSH);
+    if (known.events && state.turns.get(request.turn).finished === null) {
+      await drained(platform, lines, state, request, "turn " + request.turn + " drain " + step, { position: done.output.position, lost }, live);
+    }
     if (live && done.output.resumed !== undefined) {
       const answered = decodeJson(done.output.resumed);
       await platform.resumed(suspensionFrom(answered.suspension), resumeFrom(answered.resume), true);
     }
   }
   throw new Panic("turn " + request.turn + " did not finish within its " + stepsMax + " steps");
+}
+
+function lostAfter(lost, done) {
+  lost.keys = done.output.jobs ?? lost.keys;
+  lost.live ||= done.live;
+}
+
+async function drained(platform, lines, state, request, name, { position, lost }, live) {
+  const inbox = await platform.inbox(request.turn, live);
+  if (inbox === null || (inbox.length === 0 && lost.keys.length === 0)) return;
+  const done = await platform.step(name, { kind: "run", lines: lines.slice(), request: request.text, drain: { inbox, position }, jobs: lost.live ? lost.keys : null });
+  lostAfter(lost, done);
+  for (const line of done.output.lines) {
+    lines.push(line);
+    state.apply(line);
+  }
+  if (done.output.answer !== undefined) await platform.step(name + " answer", { kind: "answer", answer: done.output.answer });
 }
 
 const harness = {

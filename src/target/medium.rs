@@ -124,6 +124,19 @@ impl Rows {
         *attempts
     }
 
+    pub fn undispatched(&mut self, records: &[Record]) {
+        for record in records {
+            if let Record::Recovery {
+                turn, undispatched, ..
+            } = record
+            {
+                for seq in undispatched {
+                    self.attempts.remove(&(*turn, *seq));
+                }
+            }
+        }
+    }
+
     pub fn step_reexecuted(&mut self, records: &[Record]) {
         let mut open = std::collections::BTreeSet::new();
         for record in records {

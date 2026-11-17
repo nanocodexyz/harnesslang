@@ -206,7 +206,6 @@
     end
   end
   (local.set $before (call $events_now))
-  (if (i32.and (call $seq_open (global.get $seq)) (call $flushes_to_interrupt (local.get $interrupting))) (then (call $drain)))
   (if (call $seq_open (global.get $seq)) (then (call $drain_at (global.get $DRAIN_AFTER_RUN))))
   (local.set $position (i32.const 0))
   block $recorded

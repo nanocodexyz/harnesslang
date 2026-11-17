@@ -841,6 +841,11 @@ impl World for SimWorld<'_> {
             }
         }
         let result = self.flush_medium(epoch, records);
+        if let (Ok(()), Medium::Rows(rows), Recovery::InStep { .. }) =
+            (&result, &mut self.medium, self.target.recovery)
+        {
+            rows.undispatched(records);
+        }
         let checksum = match &self.medium {
             Medium::Jsonl(file) => file.checksum,
             Medium::Rows(_) => false,

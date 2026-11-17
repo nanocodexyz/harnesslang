@@ -159,6 +159,7 @@
     end
   end
   (local.get $unknown))
+(func $seq_now (export "hl_seq") (result i64) (global.get $seq))
 (func $run (export "hl_run") (param $request_bytes i32) (param $request_length i32) (param $journal_bytes i32) (param $journal_length i32) (param $epoch i64) (result i64)
   (local $request i32) (local $turn i64) (local $name i32) (local $handler i32) (local $args i32) (local $arguments i32) (local $records i32) (local $log i32) (local $state i32) (local $pending i32) (local $unknown i32) (local $finished i32) (local $next i64) (local $ran i32) (local $due i64) (local $clock i64) (local $nested i32)
   (global.set $halt (i32.const 0))
@@ -222,6 +223,13 @@
   (global.set $snapshot (call $state_copy (local.get $state)))
   (call $engine_start (i32.const 1) (local.get $turn) (local.get $log) (local.get $state))
   (global.set $next_cell (call $next_cell_of_session))
+  (if (call $json_get (local.get $request) (i32.const $e_drain))
+    (then
+      (global.set $jobs (call $jobs_copy (global.get $session_jobs)))
+      (global.set $lost (call $lost_jobs (local.get $turn)))
+      (global.set $seq (call $field_number (local.get $request) (i32.const $e_drain)))
+      (call $drain)
+      (return (call $exit_suspended))))
   (if (local.get $pending) (then (call $append (local.get $pending))))
   (if (i32.or (i32.or (call $vec_count (local.get $unknown)) (call $vec_count (local.get $nested))) (i32.or (call $vec_count (global.get $recover_replied)) (call $vec_count (global.get $recover_undispatched))))
     (then (call $append (call $record_recovery_attested (local.get $turn) (call $next_attempt) (local.get $unknown) (local.get $nested) (global.get $recover_replied) (global.get $recover_undispatched)))))

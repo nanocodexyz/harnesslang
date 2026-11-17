@@ -28,14 +28,6 @@ platform_pending="
   cloudflare:examples/claude_code.hl
   vercel:examples/codex_agent.hl
   cloudflare:examples/codex_agent.hl
-  vercel:examples/autoresearch.hl
-  vercel:examples/claude_agent.hl
-  vercel:examples/mpp_agent.hl
-  vercel:docs/snippets/climb.hl
-  vercel:docs/snippets/code_stop.hl
-  vercel:docs/snippets/events.hl
-  vercel:docs/snippets/in_flight.hl
-  vercel:docs/snippets/payments.hl
 "
 examples=$(echo examples/*.hl)
 hl=target/release/hl
