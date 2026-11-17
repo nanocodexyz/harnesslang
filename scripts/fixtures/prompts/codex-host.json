@@ -1,11 +1,5 @@
 {
   "texts": {
-    "exec_cut": "…{tokens} tokens truncated…",
-    "exec_wall": "Wall time: {seconds} seconds",
-    "exec_exited": "Process exited with code {code}",
-    "exec_running": "Process running with session ID {id}",
-    "exec_original": "Original token count: {tokens}",
-    "exec_output": "Output:",
     "exec_stdin_closed": "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open",
     "exec_aborted": "aborted by user after {seconds}s",
     "exec_no_command": "missing command line for unified exec request",
@@ -47,7 +41,6 @@
     "patch_heredoc_end": "EOF"
   },
   "numbers": {
-    "bytes_per_token": 4,
     "exec_yield_min_ms": 250,
     "exec_yield_max_ms": 30000,
     "poll_yield_min_ms": 5000,

@@ -56,29 +56,6 @@ fn bool_field(input: &Value, key: &str, default: bool) -> bool {
     }
 }
 
-pub fn truncate_tokens(texts: &Texts, text: &str, max_tokens: u64) -> (String, Option<u64>) {
-    let per_token = texts.number("bytes_per_token").unwrap_or(1).max(1);
-    let budget = usize::try_from(max_tokens.saturating_mul(per_token)).unwrap_or(usize::MAX);
-    if text.len() <= budget {
-        return (text.to_owned(), None);
-    }
-    let original = (text.len() as u64).div_ceil(per_token);
-    let mut left = budget / 2;
-    while !text.is_char_boundary(left) {
-        left -= 1;
-    }
-    let mut right = text.len() - (budget - left);
-    while !text.is_char_boundary(right) {
-        right += 1;
-    }
-    let removed = ((right - left) as u64).div_ceil(per_token).to_string();
-    let cut = texts.fill("exec_cut", &[("tokens", &removed)]);
-    (
-        format!("{}{cut}{}", &text[..left], &text[right..]),
-        Some(original),
-    )
-}
-
 fn clamped(texts: &Texts, value: u64, min: &str, max: &str) -> u64 {
     let low = texts.number(min).unwrap_or(0);
     let high = texts.number(max).unwrap_or(u64::MAX).max(low);
@@ -86,28 +63,15 @@ fn clamped(texts: &Texts, value: u64, min: &str, max: &str) -> u64 {
 }
 
 fn rendered(
-    texts: &Texts,
     wall: Duration,
     exit: Option<i32>,
     session: Option<u64>,
     output: &str,
     max_tokens: u64,
 ) -> String {
-    let (shown, original) = truncate_tokens(texts, output, max_tokens);
-    let seconds = format!("{:.4}", wall.as_secs_f64());
-    let mut sections = vec![texts.fill("exec_wall", &[("seconds", &seconds)])];
-    if let Some(code) = exit {
-        sections.push(texts.fill("exec_exited", &[("code", &code.to_string())]));
-    }
-    if let Some(id) = session {
-        sections.push(texts.fill("exec_running", &[("id", &id.to_string())]));
-    }
-    if let Some(original) = original {
-        sections.push(texts.fill("exec_original", &[("tokens", &original.to_string())]));
-    }
-    sections.push(texts.fill("exec_output", &[]));
-    sections.push(shown);
-    sections.join("\n")
+    let exit = exit.map(|code| code.to_string()).unwrap_or_default();
+    let session = session.map(|id| id.to_string()).unwrap_or_default();
+    format!("{}\n{exit}\n{session}\n{max_tokens}\n{output}", wall.as_nanos())
 }
 
 fn quoted(text: &str) -> String {
@@ -222,7 +186,6 @@ impl Exec {
             Settled::Exited(code) => {
                 let _ = std::fs::remove_file(&session.output);
                 Ran::Ok(rendered(
-                    &self.texts,
                     begun.elapsed(),
                     Some(code),
                     None,
@@ -240,7 +203,6 @@ impl Exec {
                 self.next += 1;
                 self.sessions.insert(id, session);
                 Ran::Ok(rendered(
-                    &self.texts,
                     begun.elapsed(),
                     None,
                     Some(id),
@@ -372,7 +334,6 @@ impl Exec {
                 let output = Self::drain(&mut session);
                 self.sessions.insert(id, session);
                 Ran::Ok(rendered(
-                    &self.texts,
                     begun.elapsed(),
                     None,
                     Some(id),

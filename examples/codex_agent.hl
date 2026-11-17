@@ -44,6 +44,113 @@ model responses calls calls_per_round_max reply codex_reply window context_windo
 on cancel
 on steer(message: text) bound steers_per_turn_max
 
+const exec_line_bytes_max: u64 = 80
+const exec_digits_max: u64 = 20
+const exec_number_digits_max: u64 = 19
+const exec_output_bytes_max: u64 = 4194304
+const exec_bytes_per_token: u64 = 4
+const exec_utf8_tail_max: u64 = 4
+const exec_ns_per_tick: u64 = 100000
+const exec_ticks_per_second: u64 = 10000
+const exec_tick_digits: u64 = 4
+
+fn exec_digits(line: text, empty_ok: bool, signed: bool) -> bool {
+  if len(line) == 0 {
+    return empty_ok
+  }
+  if len(line) > exec_number_digits_max {
+    return false
+  }
+  let source: bytes<exec_line_bytes_max> = bytes_of(line)
+  var good = true
+  loop i below exec_line_bytes_max while good and i < len(source) {
+    if source[i] < '0' or source[i] > '9' {
+      good = signed and i == 0 and source[i] == '-' and len(source) > 1
+    }
+  }
+  return good
+}
+
+fn exec_number(line: text) -> u64 {
+  let source: bytes<exec_line_bytes_max> = bytes_of(line)
+  var value: u64 = 0
+  loop i below exec_number_digits_max while i < len(source) {
+    value = value * 10 + source[i] - '0'
+  }
+  return value
+}
+
+fn exec_decimal(n: u64, width: u64) -> text {
+  var reversed: bytes<exec_digits_max> = []
+  var rest = n
+  push reversed '0' + rest % 10
+  rest = rest / 10
+  loop step below exec_digits_max while rest > 0 or len(reversed) < width {
+    push reversed '0' + rest % 10
+    rest = rest / 10
+  }
+  var out: bytes<exec_digits_max> = []
+  loop i below exec_digits_max while i < len(reversed) {
+    push out reversed[len(reversed) - 1 - i]
+  }
+  return text_of(out)
+}
+
+fn exec_continuation(source: bytes<exec_output_bytes_max>, at: u64) -> bool {
+  if at >= len(source) {
+    return false
+  }
+  return source[at] >= 0x80 and source[at] < 0xc0
+}
+
+fn exec_body(output: text, tokens: u64) -> text {
+  let source: bytes<exec_output_bytes_max> = bytes_of(output)
+  let original = (len(source) + exec_bytes_per_token - 1) / exec_bytes_per_token
+  if original <= tokens {
+    return "Output:\n" ++ output
+  }
+  let budget = tokens * exec_bytes_per_token
+  var left = budget / 2
+  loop step below exec_utf8_tail_max while exec_continuation(source, left) {
+    left = left - 1
+  }
+  var right = len(source) - (budget - left)
+  loop step below exec_utf8_tail_max while exec_continuation(source, right) {
+    right = right + 1
+  }
+  let removed = (right - left + exec_bytes_per_token - 1) / exec_bytes_per_token
+  return "Original token count: " ++ exec_decimal(original, 1) ++ "\nOutput:\n" ++ text_of(slice(source, 0, left)) ++ "…" ++ exec_decimal(removed, 1) ++ " tokens truncated…" ++ text_of(slice(source, right, len(source)))
+}
+
+fn exec_shown(raw: text) -> text {
+  let wall = before(raw, "\n")
+  let after_wall = after(raw, "\n")
+  let exit_line = before(after_wall, "\n")
+  let after_code = after(after_wall, "\n")
+  let session = before(after_code, "\n")
+  let after_session = after(after_code, "\n")
+  let tokens = before(after_session, "\n")
+  if not contains(after_session, "\n") or not exec_digits(wall, false, false) or not exec_digits(exit_line, true, true) or not exec_digits(session, true, false) or not exec_digits(tokens, false, false) {
+    return raw
+  }
+  let ticks = (exec_number(wall) + exec_ns_per_tick / 2) / exec_ns_per_tick
+  var shown = "Wall time: " ++ exec_decimal(ticks / exec_ticks_per_second, 1) ++ "." ++ exec_decimal(ticks % exec_ticks_per_second, exec_tick_digits) ++ " seconds\n"
+  if len(exit_line) > 0 {
+    shown = shown ++ "Process exited with code " ++ exit_line ++ "\n"
+  }
+  if len(session) > 0 {
+    shown = shown ++ "Process running with session ID " ++ session ++ "\n"
+  }
+  return shown ++ exec_body(after(after_session, "\n"), exec_number(tokens))
+}
+
+fn exec_result(name: text, raw: text) -> text {
+  if name == "exec_command" or name == "write_stdin" {
+    return exec_shown(raw)
+  }
+  return raw
+}
+
 const mpp_payments_max: u64 = 100
 
 state {
@@ -414,7 +521,7 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
   for call in requested parallel {
     match dispatch(call) {
       ok(output) => {
-        let cut = truncate_middle(output, result_tokens_max)
+        let cut = truncate_middle(exec_result(call.tool, output), result_tokens_max)
         pending_units = pending_units + len(cut)
         push context result(call, cut)
       }
