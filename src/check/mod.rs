@@ -14,7 +14,7 @@ use crate::syntax::{Diagnostic, Position};
 
 pub const BUILTIN_TYPES: [&str; 6] = ["u64", "bool", "text", "list", "known", "maybe"];
 pub const BUILTIN_SUM_NAMES: [&str; 3] = ["call", "reply", "entry"];
-pub const BUILTIN_FUNCTIONS: [&str; 15] = [
+pub const BUILTIN_FUNCTIONS: [&str; 16] = [
     "dispatch",
     "now",
     "random",
@@ -26,6 +26,7 @@ pub const BUILTIN_FUNCTIONS: [&str; 15] = [
     "before",
     "after",
     "trim",
+    "json_escape",
     "truncate_middle",
     "deny",
     "allow",

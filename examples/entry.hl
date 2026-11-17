@@ -10,19 +10,16 @@ state {
 }
 
 on launch(flags: text) -> outcome {
-  if contains(flags, "\"") or contains(flags, "\\") {
-    return refused("a flag value holds a quote or a backslash, which the launch manifest cannot carry")
-  }
-  let model_id = before(after(flags, "\n--model\n"), "\n")
-  let instruction = before(after(flags, "\n--instruction\n"), "\n")
-  let cwd = before(after(flags, "\n--cwd\n"), "\n")
-  let named = before(after(flags, "\n--harness\n"), "\n")
-  let requested = before(after(flags, "\n--effort\n"), "\n")
-  let rounds = before(after(flags, "\n--max-turns\n"), "\n")
-  let warm = before(after(flags, "\n--keep-warm\n"), "\n")
-  let checks = before(after(flags, "\n--finish-checks\n"), "\n")
-  let reviewer = before(after(flags, "\n--reviewer-relay\n"), "\n")
-  let escalate = before(after(flags, "\n--escalate-model\n"), "\n")
+  let model_id = json_escape(before(after(flags, "\n--model\n"), "\n"))
+  let instruction = json_escape(before(after(flags, "\n--instruction\n"), "\n"))
+  let cwd = json_escape(before(after(flags, "\n--cwd\n"), "\n"))
+  let named = json_escape(before(after(flags, "\n--harness\n"), "\n"))
+  let requested = json_escape(before(after(flags, "\n--effort\n"), "\n"))
+  let rounds = json_escape(before(after(flags, "\n--max-turns\n"), "\n"))
+  let warm = json_escape(before(after(flags, "\n--keep-warm\n"), "\n"))
+  let checks = json_escape(before(after(flags, "\n--finish-checks\n"), "\n"))
+  let reviewer = json_escape(before(after(flags, "\n--reviewer-relay\n"), "\n"))
+  let escalate = json_escape(before(after(flags, "\n--escalate-model\n"), "\n"))
   if instruction == "" {
     return refused("--instruction is required")
   }

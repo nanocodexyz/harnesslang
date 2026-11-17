@@ -32,7 +32,7 @@ const PARENS_PERCENT: u64 = 20;
 const CUT_PIECE_PERCENT: u64 = 25;
 const BOUNDED_WAIT_PERCENT: u64 = 50;
 const TEXT_BUILTIN_PERCENT: u64 = 15;
-const TEXT_BUILTINS: [&str; 3] = ["before", "after", "trim"];
+const TEXT_BUILTINS: [&str; 4] = ["before", "after", "trim", "json_escape"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pick {
@@ -332,8 +332,8 @@ impl Context<'_> {
             return piece;
         }
         let builtin = TEXT_BUILTINS[rng.pick(TEXT_BUILTINS.len())];
-        if builtin == "trim" {
-            return format!("trim({piece})");
+        if builtin == "trim" || builtin == "json_escape" {
+            return format!("{builtin}({piece})");
         }
         let separator = text_literal(TEXT_LITERALS[rng.pick(TEXT_LITERALS.len())]);
         format!("{builtin}({piece}, {separator})")

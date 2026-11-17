@@ -497,7 +497,7 @@ Contextual words: `accept` `after` `at` `before` `below` `best` `blob` `blobs` `
 
 Builtin functions, whose names declarations may not take:
 
-Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `hold` `join` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
+Builtins: `after` `allow` `before` `contains` `deny` `dispatch` `hold` `join` `json_escape` `len` `now` `random` `suspend` `trim` `truncate_middle` `wait`
 
 ```console
 $ hl check docs/snippets/errors/comment.hl
@@ -2407,7 +2407,7 @@ on echo(input: text) -> text {
 
 ### Text
 
-Four builtins read text without an effect, so they replay like any
+Five builtins read text without an effect, so they replay like any
 expression, and every backend implements them identically:
 
 - `contains(t, s)` is whether `s` occurs in `t`.
@@ -2417,6 +2417,11 @@ expression, and every backend implements them identically:
   not occur.
 - `trim(t)` is `t` without leading and trailing ASCII whitespace (space, tab,
   newline, form feed, carriage return).
+- `json_escape(t)` is `t` written as the inside of a JSON string: `"` and `\`
+  take a backslash, newline, carriage return and tab become `\n`, `\r` and
+  `\t`, and the other characters below U+0020 become `\u00XX`. A program that
+  builds JSON by joining text, as `examples/entry.hl` builds the launch
+  manifest from command-line flags, escapes every value it did not write.
 
 None of them counts or indexes characters, so nothing depends on how a
 platform measures text (bytes in Rust, UTF-16 units in JavaScript), and none
@@ -2469,6 +2474,20 @@ docs/snippets/errors/text-argument.hl:3:65: error: expected text, found u64
 harness notes
 
 on ping(page: text, count: u64) -> bool { return contains(page, count) }
+```
+
+```hl docs/snippets/json_escape.hl
+harness quoting
+
+on wrap(path: text) -> text {
+  let note = "say \"hi\" to C:\\tmp\n"
+  return "{\"path\":\"" ++ json_escape(path) ++ "\",\"note\":\"" ++ json_escape(note) ++ "\"}"
+}
+```
+
+```console
+$ hl run docs/snippets/json_escape.hl --handler wrap --arg 'a "b"' | grep -o '"result":"[^}]*}'
+"result":"{\"path\":\"a \\\"b\\\"\",\"note\":\"say \\\"hi\\\" to C:\\\\tmp\\n\"}
 ```
 
 ### Text enums

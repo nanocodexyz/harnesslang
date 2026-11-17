@@ -1550,12 +1550,19 @@ pub enum TextOp {
     After,
     Trim,
     WithPayment,
+    JsonEscape,
 }
 
 pub const TEXT_WHITESPACE: [char; 5] = [' ', '\t', '\n', '\x0c', '\r'];
 
 impl TextOp {
-    pub const ALL: [Self; 4] = [Self::Contains, Self::Before, Self::After, Self::Trim];
+    pub const ALL: [Self; 5] = [
+        Self::Contains,
+        Self::Before,
+        Self::After,
+        Self::Trim,
+        Self::JsonEscape,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -1564,26 +1571,49 @@ impl TextOp {
             Self::After => "after",
             Self::Trim => "trim",
             Self::WithPayment => "_with_payment",
+            Self::JsonEscape => "json_escape",
         }
     }
 
     pub const fn arity(self) -> usize {
         match self {
             Self::Contains | Self::Before | Self::After | Self::WithPayment => 2,
-            Self::Trim => 1,
+            Self::Trim | Self::JsonEscape => 1,
         }
     }
 
     pub fn result(self) -> Type {
         match self {
             Self::Contains => Type::Bool,
-            Self::Before | Self::After | Self::Trim | Self::WithPayment => Type::Text,
+            Self::Before | Self::After | Self::Trim | Self::WithPayment | Self::JsonEscape => {
+                Type::Text
+            }
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|op| op.name() == name)
     }
+}
+
+pub const JSON_CONTROL_END: u32 = 0x20;
+
+pub fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if u32::from(control) < JSON_CONTROL_END => {
+                out.push_str(&format!("\\u{:04x}", u32::from(control)));
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub enum TextValue {
@@ -1610,6 +1640,7 @@ pub fn text_op(op: TextOp, subject: &str, separator: Option<&str>) -> TextValue 
         (TextOp::Trim, None) => {
             TextValue::Text(subject.trim_matches(TEXT_WHITESPACE.as_slice()).to_owned())
         }
+        (TextOp::JsonEscape, None) => TextValue::Text(json_escape(subject)),
         (op, separator) => panic!(
             "text builtin {} takes {} argument(s), given a separator: {}",
             op.name(),

@@ -1650,3 +1650,8 @@ The native host held harness decisions: which program a model name runs, the hl-
 - The apply_patch grammar stays in the host as a file primitive, but its markers (`patch_begin` through `patch_heredoc_end`, `patch_heredocs`, `patch_heredoc_lines_min`) come from the manifest. A program that declares none parses no patch.
 - `hl-host run --module` (the probes' generic mode) takes `--texts <file.json>`, merged in order, so the host probe runs its patch through the same Codex texts.
 - The host's own diagnostics (panics, store, wire and usage errors) are short, under four words in a row, since they are not policy. `host_policy_lines` is 0.
+
+## 2026-11-17: json_escape(t) lets a program build JSON from text it did not write
+
+- `json_escape(t)` is a pure text builtin (`TextOp::JsonEscape`): the inside of a JSON string, with `"` and `\` escaped, newline, carriage return and tab as `\n`, `\r`, `\t` and other characters below U+0020 as `\u00XX`. The interpreter's `ir::json_escape` is the reference; the wasm runtime's `$text_json_escape` reuses `$json_write_string` and drops its quotes. The generator draws it with the other text builtins over literals holding quotes, backslashes, controls and U+2028, so the wasm diffs compare it on every backend, and the wasm plant `json_escape_raw` (the builtin returns its input) is caught by `backend_equal` on `docs/snippets/json_escape.hl`.
+- `entry.hl` escapes every flag value it puts in the launch manifest, so it no longer refuses a quote or a backslash: an instruction file or working directory named with either launches. A newline is still refused by hl-host, since the flags text is newline-framed and a value holding `\n--model\n` would forge another flag.

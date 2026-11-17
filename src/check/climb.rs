@@ -42,12 +42,13 @@ const ENDS: [&str; 8] = [
     "full",
 ];
 const RULE_NAMES: usize = 3;
-const PURE_BUILTINS: [&str; 6] = [
+const PURE_BUILTINS: [&str; 7] = [
     "len",
     "contains",
     "before",
     "after",
     "trim",
+    "json_escape",
     "truncate_middle",
 ];
 

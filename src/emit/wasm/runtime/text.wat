@@ -14,6 +14,7 @@
 (global $TEXT_BEFORE i32 (i32.const 1))
 (global $TEXT_TRIM i32 (i32.const 3))
 (global $TEXT_WITH_PAYMENT i32 (i32.const 4))
+(global $TEXT_JSON_ESCAPE i32 (i32.const 5))
 (text $s_payment "payment")
 (text $s_truncation_open "\e2\80\a6")
 (text $s_truncation_close " tokens truncated\e2\80\a6")
@@ -78,9 +79,15 @@
     end
   end
   (call $text_slice (local.get $text) (local.get $from) (local.get $to)))
+(func $text_json_escape (param $text i32) (result i32) (local $buffer i32) (local $quoted i32)
+  (local.set $buffer (call $buf_new))
+  (call $json_write_string (local.get $buffer) (local.get $text))
+  (local.set $quoted (call $buf_finish (local.get $buffer)))
+  (call $text_slice (local.get $quoted) (i32.const 1) (i32.sub (call $text_len (local.get $quoted)) (i32.const 1))))
 (func $text_op (param $op i32) (param $subject i64) (param $separator i64) (result i64) (local $text i32) (local $at i32)
   (local.set $text (call $value_text (local.get $subject)))
   (if (i32.eq (local.get $op) (global.get $TEXT_TRIM)) (then (return (call $text_value (call $text_trim (local.get $text))))))
+  (if (i32.eq (local.get $op) (global.get $TEXT_JSON_ESCAPE)) (then (return (call $text_value (call $text_json_escape (local.get $text))))))
   (if (i32.eq (local.get $op) (global.get $TEXT_WITH_PAYMENT))
     (then (return (call $text_value (call $with_payment (local.get $text) (call $value_text (local.get $separator)))))))
   (local.set $at (call $text_find (local.get $text) (call $value_text (local.get $separator))))

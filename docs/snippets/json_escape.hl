@@ -1,0 +1,6 @@
+harness quoting
+
+on wrap(path: text) -> text {
+  let note = "say \"hi\" to C:\\tmp\n"
+  return "{\"path\":\"" ++ json_escape(path) ++ "\",\"note\":\"" ++ json_escape(note) ++ "\"}"
+}
