@@ -19,7 +19,7 @@ use harnesslang::load::{load, load_within};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format wasm|mjs|wat] [--plant NAME] FILE
+        "usage: hl check [--target {targets}] FILE\n       hl run FILE --handler NAME [--arg VALUE | --arg-file PATH]... [--seed S]\n       hl sim --target {targets} --seeds A..B [--twice] [--strict [--any-state]] [--mutation {mutations}] [--trace PATH] [--scope KEY] [--dump-journal DIR] FILE\n       hl sim --exhaustive [--depth N] [--cuts lines|bytes] --target {targets} --seeds A..B [--mutation {mutations}] FILE\n       hl sim --target {targets} --summarize JOURNAL [--seed S] FILE\n       hl emit --target {targets} [--format wasm|mjs|wat|flat] [--plant NAME] FILE
        hl wasm-sim --target {targets} --module FILE.wasm --trace TRACE.jsonl [--records-max HANDLER=N]... [--requests-max HANDLER=N]...
        hl bundle --target {targets} --out DIR [--plant NAME] FILE
        {deploy}
@@ -139,6 +139,10 @@ fn flags(args: &[String]) -> Option<Flags> {
             "--mutation" => flags.mutation = Mutation::parse(rest.next()?)?,
             "--handler" => flags.handler = Some(rest.next()?.clone()),
             "--arg" => flags.arguments.push(rest.next()?.clone()),
+            "--arg-file" => {
+                let text = std::fs::read_to_string(rest.next()?).ok()?;
+                flags.arguments.push(text);
+            }
             "--seed" => flags.seed = rest.next()?.parse().ok()?,
             "--trace" => flags.trace = Some(rest.next()?.clone()),
             "--scope" => flags.scope = rest.next()?.clone(),
@@ -799,6 +803,10 @@ fn emit_command(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }),
         "wat" => emit::wasm::emit_text_planted(&program, target, plant).map(|text| {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }),
+        "flat" => emit::wasm::emit_flat(&program, target).map(|text| {
             print!("{text}");
             ExitCode::SUCCESS
         }),

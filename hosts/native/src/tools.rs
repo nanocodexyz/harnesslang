@@ -128,6 +128,8 @@ impl Workspace {
             "Read" => self.read(input),
             "Edit" => self.edit(input).map(Ran::Ok),
             "Write" => self.write(input).map(Ran::Ok),
+            "read_file" => self.read_file(input),
+            "write_bytes" => self.write_bytes(input).map(Ran::Ok),
             other => Ok(Ran::Failed(format!("no syscall {other}"))),
         };
         match outcome {
@@ -322,6 +324,37 @@ impl Workspace {
             .ok_or_else(|| self.texts.fill("write_no_parent", &[]))?;
         std::fs::create_dir_all(parent).map_err(|error| format!("create directory: {error}"))?;
         Ok(path)
+    }
+
+    fn read_file(&self, input: &Value) -> Result<Ran, String> {
+        let path = self.resolve(text_field(input, "file_path")?)?;
+        match std::fs::read(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Ran::Failed(self.missing(&path)))
+            }
+            Err(error) => Err(format!("read: {error}")),
+            Ok(bytes) => String::from_utf8(bytes)
+                .map(Ran::Ok)
+                .map_err(|_| format!("read: {} is not UTF-8", path.display())),
+        }
+    }
+
+    fn write_bytes(&self, input: &Value) -> Result<String, String> {
+        let hex = text_field(input, "hex")?.as_bytes();
+        if hex.len() % 2 != 0 {
+            return Err("write_bytes: odd-length hex".to_owned());
+        }
+        let nibble = |digit: u8| char::from(digit).to_digit(16);
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.chunks_exact(2) {
+            let (Some(high), Some(low)) = (nibble(pair[0]), nibble(pair[1])) else {
+                return Err("write_bytes: not hex".to_owned());
+            };
+            bytes.push(u8::try_from(high * 16 + low).expect("nibbles"));
+        }
+        let path = self.write_target(text_field(input, "file_path")?)?;
+        atomic_write(&self.texts, &path, &bytes)?;
+        Ok(bytes.len().to_string())
     }
 
     fn write(&self, input: &Value) -> Result<String, String> {
@@ -739,7 +772,7 @@ fn similar(path: &Path) -> Option<String> {
         .map(|entry| parent.join(entry).display().to_string())
 }
 
-fn atomic_write(texts: &Texts, path: &Path, content: &str) -> Result<(), String> {
+fn atomic_write(texts: &Texts, path: &Path, content: impl AsRef<[u8]>) -> Result<(), String> {
     let name = path
         .file_name()
         .ok_or_else(|| texts.fill("write_no_name", &[]))?

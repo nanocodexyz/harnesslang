@@ -284,7 +284,9 @@ impl Session {
             (_, None) if listing => self.children.list(&input),
             (_, None) if submitting => submitted(&self.setup.texts, &input),
             ("Bash", None) if room => self.bash_job(turn, seq, &input),
-            ("Bash" | "Read" | "Edit" | "Write", None) => self.workspace.run(&tool, &input),
+            ("Bash" | "Read" | "Edit" | "Write" | "read_file" | "write_bytes", None) => {
+                self.workspace.run(&tool, &input)
+            }
             ("exec_command", None) => self.exec.exec_command(&input, &stop),
             ("write_stdin", None) => self.exec.write_stdin(&input, &stop),
             ("apply_patch", None) => {

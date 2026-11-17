@@ -1,6 +1,7 @@
 pub mod assemble;
 pub mod data;
 pub mod encode;
+pub mod flat;
 pub mod lower;
 pub mod shake;
 
@@ -376,6 +377,13 @@ pub fn module_js(bytes: &[u8]) -> String {
 
 pub fn emit(program: &Program, target: Target) -> Result<Vec<u8>, String> {
     emit_planted(program, target, "none")
+}
+
+pub fn emit_flat(program: &Program, target: Target) -> Result<String, String> {
+    let text = emit_text_planted(program, target, "none")?;
+    let module = assemble::assemble_folded(&text, shake::Arms::Taken)
+        .unwrap_or_else(|error| panic!("the runtime and lowered program assemble: {error}"));
+    Ok(flat::hex(&flat::flatten(&module)))
 }
 
 pub fn emit_planted(program: &Program, target: Target, plant: &str) -> Result<Vec<u8>, String> {

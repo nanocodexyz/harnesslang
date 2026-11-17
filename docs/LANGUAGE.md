@@ -6398,8 +6398,8 @@ and the kill -9 drills of the compiled module on real files, SQLite and Postgres
 | `hl prove [--target T] [--mutation M] FILE` | the proofs alone; a mutation plants a lowering bug the proofs must catch |
 | `hl sim --target T --seeds A..B [--twice] [--strict [--any-state]] [--mutation M] FILE` | simulate seeds on a target's fault model; `--twice` requires identical journals from two runs; `--strict` also checks what the proofs promise (no trap but requires and model replies, invariants after every turn, the worst case within the target's limit), and `--any-state` starts each session from a drawn state that satisfies the invariants |
 | `hl sim --exhaustive [--depth N] [--cuts lines\|bytes] --target T --seeds A..B [--mutation M] FILE` | explore every crash point of each seed's workload up to N faults per session, cell hooks included; takes neither `--twice`, `--strict`, `--trace` nor `--dump-journal`, and refuses `--mutation divergence_dispatches`, since it injects no engine divergence |
-| `hl run FILE --handler NAME [--arg VALUE]... [--seed S]` | run one turn in the interpreter and print the journal |
-| `hl emit --target T [--format wasm\|wat\|source] FILE` | print the program as a WebAssembly module (the default), its text, or source |
+| `hl run FILE --handler NAME [--arg VALUE | --arg-file PATH]... [--seed S]` | run one turn in the interpreter and print the journal; `--arg-file` passes a file's text as a text argument |
+| `hl emit --target T [--format wasm\|wat\|flat\|source] FILE` | print the program as a WebAssembly module (the default), its text, the assembled module as hex in the flat layout `compiler/encode.hl` reads (docs/SELFHOST.md), or source |
 
 `check`, `prove` and `sim` exit 1 when something fails and 2 on a usage error.
 

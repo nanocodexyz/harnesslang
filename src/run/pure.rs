@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::ir::{self, BytesOp, Expr, FunctionId, Program, Stmt, Type};
 use crate::run::engine::{Reads, evaluate_with};
 use crate::run::value::Value;
@@ -60,7 +62,7 @@ pub fn bytes(
             if from > to || to > buffer.len() as u64 {
                 return Err("index".to_owned());
             }
-            Value::Bytes(buffer[from as usize..to as usize].to_vec())
+            Value::Bytes(Rc::new(buffer[from as usize..to as usize].to_vec()))
         }
         BytesOp::OfText => {
             let Expr::Constant(capacity) = &exprs[1] else {
@@ -71,12 +73,12 @@ pub fn bytes(
             if text.len() as u64 > capacity.value {
                 return Err(format!("bound({})", capacity.name));
             }
-            Value::Bytes(text.as_bytes().to_vec())
+            Value::Bytes(Rc::new(text.as_bytes().to_vec()))
         }
         BytesOp::ToText => Value::Text(
             String::from_utf8(args[0].as_bytes().to_vec()).map_err(|_| "text_of".to_owned())?,
         ),
-        BytesOp::Empty => Value::Bytes(Vec::new()),
+        BytesOp::Empty => Value::Bytes(Rc::default()),
         BytesOp::EmptyList => Value::List(Vec::new()),
     })
 }
@@ -200,11 +202,11 @@ impl Frame<'_, '_> {
                         items.len()
                     }
                     (Value::Bytes(buffer), Value::Bytes(more)) if *append => {
-                        buffer.extend_from_slice(&more);
+                        Rc::make_mut(buffer).extend_from_slice(&more);
                         buffer.len()
                     }
                     (Value::Bytes(buffer), value) => {
-                        buffer.push(byte(&value)?);
+                        Rc::make_mut(buffer).push(byte(&value)?);
                         buffer.len()
                     }
                     (other, _) => panic!("the checker types a local push, found {other:?}"),
@@ -230,7 +232,9 @@ impl Frame<'_, '_> {
                     }
                     Value::Bytes(buffer) => {
                         let byte = byte(&value)?;
-                        *buffer.get_mut(at).ok_or_else(|| "index".to_owned())? = byte;
+                        *Rc::make_mut(buffer)
+                            .get_mut(at)
+                            .ok_or_else(|| "index".to_owned())? = byte;
                     }
                     other => panic!("the checker types an indexed set, found {other:?}"),
                 }

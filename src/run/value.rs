@@ -12,7 +12,7 @@ pub enum Value {
     Variant(VariantId, Vec<Value>),
     List(Vec<Value>),
     Blob(String),
-    Bytes(Vec<u8>),
+    Bytes(std::rc::Rc<Vec<u8>>),
 }
 
 impl Value {
@@ -22,7 +22,7 @@ impl Value {
             Type::Bool => Some(Self::Bool(false)),
             Type::Text => Some(Self::Text(String::new())),
             Type::List { .. } => Some(Self::List(Vec::new())),
-            Type::Bytes(_) => Some(Self::Bytes(Vec::new())),
+            Type::Bytes(_) => Some(Self::Bytes(std::rc::Rc::default())),
             Type::Sum(_) => program.text_enum(ty).map(|sum| {
                 assert!(!sum.variants.is_empty(), "a text enum has a value");
                 Self::Variant(0, Vec::new())
