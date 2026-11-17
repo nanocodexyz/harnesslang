@@ -1,0 +1,16 @@
+harness push_full
+
+const cap: u64 = 2
+
+state {
+  items: list<u64, cap>
+  total: u64
+}
+
+invariant fits: len(items) <= cap
+
+on add(n: u64) -> u64 {
+  push items n
+  total = total + n
+  return len(items)
+}

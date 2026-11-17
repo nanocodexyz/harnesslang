@@ -649,9 +649,7 @@ impl Body<'_> {
             format!("loop {name} below {} {{", decls.constants[bound].0),
         );
         self.context.locals.push((name, Ty::U64));
-        self.loops += 1;
-        self.block(rng, depth + 1);
-        self.loops -= 1;
+        self.repeated(rng, depth, decls.constants[bound].1);
         self.context.locals.pop();
         self.line(depth, "}".to_owned());
     }

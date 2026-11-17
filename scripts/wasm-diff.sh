@@ -8,6 +8,7 @@ files="${WASM_DIFF_FILES:-$(echo examples/*.hl)}"
 plant="${WASM_DIFF_PLANT:-none}"
 host="${WASM_DIFF_HOST:-node}"
 scope="${WASM_DIFF_SCOPE:-}"
+unproved_arith="${WASM_DIFF_UNPROVED_ARITH:-0}"
 scope_args=()
 suffix=
 if [ -n "$scope" ]; then
@@ -20,9 +21,19 @@ mkdir -p "$out"
 
 [ -x "$hl" ] || cargo build --release --locked
 
+arith_only() {
+  local log=$1 others arith="no_overflow|push_bound|wait_bound|invariant_initial|invariant_preserved"
+  [ "$unproved_arith" = 1 ] || return 1
+  grep -qE ': error: [0-9]+ proof obligation\(s\) failed for ' "$log" || return 1
+  others=$(grep -E ': error: ' "$log" \
+    | grep -vE ": error: handler '[^']*'( on [a-z-]+)?: ($arith): " \
+    | grep -vE ': error: [0-9]+ proof obligation\(s\) failed for ' || true)
+  [ -z "$others" ]
+}
+
 proved_bounds() {
   local file=$1 target=$2 log=$3 line
-  if ! "$hl" prove --target "$target" "$file" > "$log" 2>&1; then
+  if ! "$hl" prove --target "$target" "$file" > "$log" 2>&1 && ! arith_only "$log"; then
     echo "wasm-diff: hl prove failed $file on $target:" >&2
     cat "$log" >&2
     return 1

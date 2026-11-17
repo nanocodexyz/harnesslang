@@ -27,7 +27,7 @@ for target in $backends; do
     failed=1
     continue
   fi
-  if ! WASM_DIFF_OUT="$root/$target" WASM_DIFF_HOST=$host WASM_DIFF_SEEDS=$seeds WASM_DIFF_TARGETS=$target WASM_DIFF_FILES=$file scripts/wasm-diff.sh > "$root/$target.log" 2>&1; then
+  if ! WASM_DIFF_UNPROVED_ARITH="${FUZZ_UNPROVED_ARITH:-0}" WASM_DIFF_OUT="$root/$target" WASM_DIFF_HOST=$host WASM_DIFF_SEEDS=$seeds WASM_DIFF_TARGETS=$target WASM_DIFF_FILES=$file scripts/wasm-diff.sh > "$root/$target.log" 2>&1; then
     echo "FAIL file=$file backend=wasm-$target: $(grep -m1 -E 'FAIL|error|failed' "$root/$target.log" | head -c 600)"
     failed=1
     continue

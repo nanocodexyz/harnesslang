@@ -64,10 +64,11 @@ fn gen_many(seeds: std::ops::Range<u64>, out: &str) -> ExitCode {
             return ExitCode::from(FAILURE_EXIT);
         }
         println!(
-            "{path} attempt={} effects_max={} lines={}",
+            "{path} attempt={} effects_max={} lines={} provable={}",
             generated.attempt,
             generated.effects_max,
-            generated.source.lines().count()
+            generated.source.lines().count(),
+            generated.provable
         );
     }
     ExitCode::SUCCESS

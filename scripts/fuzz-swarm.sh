@@ -31,7 +31,11 @@ one() {
     local rust=($rust_targets)
     backends="${rust[index % ${#rust[@]}]} $js_targets"
   fi
-  FUZZ_BACKENDS=$backends FUZZ_DIR=$root/run scripts/fuzz-one.sh "$file" > "$log" 2>&1 || status=1
+  local unproved=0
+  if awk -v file="$file" '$1 == file && / provable=false$/ { found = 1 } END { exit !found }' "$root/gen.log"; then
+    unproved=1
+  fi
+  FUZZ_UNPROVED_ARITH=$unproved FUZZ_BACKENDS=$backends FUZZ_DIR=$root/run scripts/fuzz-one.sh "$file" > "$log" 2>&1 || status=1
   if [ "$exhaustive_depth" -gt 0 ]; then
     for target in $exhaustive_targets; do
       if ! "$hl" sim --exhaustive --depth "$exhaustive_depth" --target "$target" --seeds "$exhaustive_seeds" "$file" > "$dir/exhaustive-$target.log" 2>&1; then

@@ -124,12 +124,13 @@ pub struct Generated {
     pub source: String,
     pub attempt: u64,
     pub effects_max: u64,
+    pub provable: bool,
 }
 
 pub fn program(seed: u64) -> Result<Generated, String> {
     for attempt in 0..ATTEMPTS_MAX {
         let mut rng = Rng::derive_keyed(seed, "generate", &[attempt]);
-        let source = render(&mut rng, seed);
+        let (source, provable) = render(&mut rng, seed);
         let parsed = crate::syntax::parse(&source).unwrap_or_else(|diagnostic| {
             panic!(
                 "a generated program parses: {}\n{source}",
@@ -153,6 +154,7 @@ pub fn program(seed: u64) -> Result<Generated, String> {
                 source,
                 attempt,
                 effects_max,
+                provable,
             });
         }
     }
@@ -161,7 +163,7 @@ pub fn program(seed: u64) -> Result<Generated, String> {
     ))
 }
 
-fn render(rng: &mut Rng, seed: u64) -> String {
+fn render(rng: &mut Rng, seed: u64) -> (String, bool) {
     let decls = decls::generate(rng);
     let mut lines = vec![format!("harness fuzz{seed}"), String::new()];
     lines.extend(decls::render(rng, &decls));
@@ -176,5 +178,5 @@ fn render(rng: &mut Rng, seed: u64) -> String {
     }
     let mut source = lines.join("\n");
     source.push('\n');
-    source
+    (source, decls.provable)
 }

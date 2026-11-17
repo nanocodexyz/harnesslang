@@ -1,0 +1,15 @@
+harness cut_zero_tokens
+
+const none: u64 = 0
+const cap: u64 = 2
+
+state {
+  notes: list<text, cap>
+}
+
+on add(note: text) -> u64
+  requires len(notes) + 1 <= cap
+{
+  push notes truncate_middle("State" ++ note, none)
+  return len(notes)
+}

@@ -143,6 +143,17 @@ pub fn check_program(
         .iter()
         .all(|finding| Some(finding.property) == ignored);
     stats.proved += u64::from(proved);
+    if generated.provable && !proved {
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| Some(finding.property) != ignored)
+            .expect("an unproved program has a finding");
+        return Err(format!(
+            "program seed {seed} was generated to prove, yet hl prove refuses it: {}",
+            finding.render()
+        ));
+    }
     for target in Target::ALL {
         for sim_seed in 0..sim_seeds {
             let run = crate::sim::run_seed(&program, target, crate::run::Mutation::None, sim_seed);
