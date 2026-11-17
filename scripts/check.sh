@@ -415,6 +415,7 @@ agent() {
 
 stage build build
 stage census scripts/mutations.sh --census
+stage selfhost-prepare scripts/selfhost-encode.sh --prepare
 queue rules rules
 queue examples examples_pass
 queue invalid invalid_fail
@@ -440,6 +441,9 @@ for file in $examples docs/snippets/*.hl; do
   for target in $platform_targets; do
     platform_ready "$target" "$file" && wasm_lowered "$target" "$file" && queue wasm-diff-platform wasm_platform_diff_one "$target" "$file"
   done
+done
+for file in $examples docs/snippets/*.hl; do
+  queue selfhost-encode scripts/selfhost-encode.sh "$file"
 done
 for mutation in $(scripts/mutations.sh --plans); do
   queue mutations mutation_one "$mutation"

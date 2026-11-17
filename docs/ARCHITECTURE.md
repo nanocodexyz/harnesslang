@@ -860,6 +860,9 @@ made.
     `destroy` against the Cloudflare and Vercel APIs and local installs
   - `sim/`: the deterministic simulator, faults, invariants and mutations
 - `examples/`: harnesses
+- `compiler/`: the compiler written in harnesslang, ported from `src/` one
+  module at a time (docs/SELFHOST.md); `encode.hl` is the wasm binary encoder,
+  checked byte for byte against `encode.rs` by `scripts/selfhost-encode.sh`
 - `hosts/native/`: `hl-host`, the fixed native host, outside the build:
   it embeds `examples/claude_code.hl`, its subagent
   `examples/claude_code_child.hl` and `examples/codex_agent.hl` compiled to
@@ -885,6 +888,8 @@ made.
 
 ## Next
 
+- Self-host the compiler (docs/SELFHOST.md): port the assembler, shake,
+  lowering, data tables, IR, checker, parser and prover to `compiler/`.
 - Write nanocode's Claude and Codex harness loops in harnesslang and compile
   them into nanocode drivers.
 - The simulator at 100K children.
