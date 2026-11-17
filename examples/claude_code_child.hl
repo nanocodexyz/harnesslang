@@ -1,5 +1,16 @@
 harness claude_code_child
 
+const shell_header_lines: u64 = 8
+const shell_line_bytes_max: u64 = 80
+const shell_digits_max: u64 = 20
+const shell_number_digits_max: u64 = 19
+const shell_body_bytes_max: u64 = 1048576
+const shell_stream_bytes_max: u64 = 30000
+const shell_error_units: u64 = 10000
+const shell_error_units_slack: u64 = 1024
+const shell_ms_per_second: u64 = 1000
+const shell_ms_per_minute: u64 = 60000
+const shell_utf8_tail_max: u64 = 4
 const rounds_max: u64 = 512
 const calls_per_round_max: u64 = 16
 const context_entries_max: u64 = 4096
@@ -109,6 +120,338 @@ invariant pending_bounded: pending_units <= calls_per_round_max * direct_result_
 invariant round_bounded: round_entries <= 1 + calls_per_round_max
 invariant delay_bounded: delay_ms <= retry_delay_max_ms
 
+fn shell_digits(line: text, empty_ok: bool, signed: bool) -> bool {
+  if len(line) == 0 {
+    return empty_ok
+  }
+  if len(line) > shell_number_digits_max {
+    return false
+  }
+  let source: bytes<shell_line_bytes_max> = bytes_of(line)
+  var good = true
+  loop i below shell_line_bytes_max while good and i < len(source) {
+    if source[i] < '0' or source[i] > '9' {
+      good = signed and i == 0 and source[i] == '-' and len(source) > 1
+    }
+  }
+  return good
+}
+
+fn shell_number(line: text) -> u64 {
+  let source: bytes<shell_line_bytes_max> = bytes_of(line)
+  var value: u64 = 0
+  loop i below shell_number_digits_max while i < len(source) {
+    value = value * 10 + source[i] - '0'
+  }
+  return value
+}
+
+fn shell_decimal(n: u64) -> text {
+  var reversed: bytes<shell_digits_max> = []
+  var rest = n
+  push reversed '0' + rest % 10
+  rest = rest / 10
+  loop step below shell_digits_max while rest > 0 {
+    push reversed '0' + rest % 10
+    rest = rest / 10
+  }
+  var out: bytes<shell_digits_max> = []
+  loop i below shell_digits_max while i < len(reversed) {
+    push out reversed[len(reversed) - 1 - i]
+  }
+  return text_of(out)
+}
+
+fn shell_space_at(source: bytes<shell_body_bytes_max>, at: u64, stop: u64) -> u64 {
+  let b = source[at]
+  if b == ' ' or (b >= 0x09 and b <= 0x0d) {
+    return 1
+  }
+  if at + 1 >= stop {
+    return 0
+  }
+  if b == 0xc2 {
+    if source[at + 1] == 0x85 or source[at + 1] == 0xa0 {
+      return 2
+    }
+    return 0
+  }
+  if at + 2 >= stop {
+    return 0
+  }
+  let b1 = source[at + 1]
+  let b2 = source[at + 2]
+  if b == 0xe1 and b1 == 0x9a and b2 == 0x80 {
+    return 3
+  }
+  if b == 0xe3 and b1 == 0x80 and b2 == 0x80 {
+    return 3
+  }
+  if b == 0xe2 and b1 == 0x80 and (b2 <= 0x8a or b2 == 0xa8 or b2 == 0xa9 or b2 == 0xaf) {
+    return 3
+  }
+  if b == 0xe2 and b1 == 0x81 and b2 == 0x9f {
+    return 3
+  }
+  return 0
+}
+
+fn shell_space_before(source: bytes<shell_body_bytes_max>, start: u64, end: u64) -> u64 {
+  if end <= start {
+    return 0
+  }
+  if source[end - 1] < 0x80 {
+    return shell_space_at(source, end - 1, end)
+  }
+  if end < start + 2 {
+    return 0
+  }
+  if source[end - 2] == 0xc2 {
+    return shell_space_at(source, end - 2, end)
+  }
+  if end < start + 3 {
+    return 0
+  }
+  if shell_space_at(source, end - 3, end) == 3 {
+    return 3
+  }
+  return 0
+}
+
+fn shell_line_start(source: bytes<shell_body_bytes_max>, start: u64, at: u64) -> u64 {
+  var line = at
+  var going = line > start
+  loop step below shell_body_bytes_max while going {
+    if source[line - 1] == '\n' {
+      going = false
+    } else {
+      line = line - 1
+      going = line > start
+    }
+  }
+  return line
+}
+
+fn shell_unpadded(source: bytes<shell_body_bytes_max>, start: u64, end: u64) -> text {
+  var first = start
+  var found = false
+  loop step below shell_body_bytes_max while not found and first < end {
+    let width = shell_space_at(source, first, end)
+    if width == 0 {
+      found = true
+    } else {
+      first = first + width
+    }
+  }
+  if not found {
+    return ""
+  }
+  let line = shell_line_start(source, start, first)
+  var last = end
+  var trimming = true
+  loop step below shell_body_bytes_max while trimming and last > first {
+    let width = shell_space_before(source, first, last)
+    if width == 0 {
+      trimming = false
+    } else {
+      last = last - width
+    }
+  }
+  return text_of(slice(source, line, last))
+}
+
+fn shell_stream(source: bytes<shell_body_bytes_max>, start: u64, middle: u64, end: u64, total: u64, name: text) -> text {
+  if total <= shell_stream_bytes_max {
+    return shell_unpadded(source, start, end)
+  }
+  var line = "\n"
+  if middle == start {
+    line = ""
+  } else {
+    if source[middle - 1] == '\n' {
+      line = ""
+    }
+  }
+  let marker = "[" ++ name ++ ": " ++ shell_decimal(total - shell_stream_bytes_max) ++ " of " ++ shell_decimal(total) ++ " bytes elided from the middle. To see them, rerun the command with its output sent to a file and read parts of it with grep -n, sed -n 'START,ENDp' or tail]"
+  let whole = text_of(slice(source, start, middle)) ++ line ++ marker ++ "\n" ++ text_of(slice(source, middle, end))
+  let joined: bytes<shell_body_bytes_max> = bytes_of(whole)
+  return shell_unpadded(joined, 0, len(joined))
+}
+
+fn shell_timed_out(ms: u64) -> text {
+  if ms < shell_ms_per_minute {
+    return shell_decimal(ms / shell_ms_per_second) ++ "s"
+  }
+  let minutes = ms / shell_ms_per_minute
+  let seconds = (ms % shell_ms_per_minute + shell_ms_per_second / 2) / shell_ms_per_second
+  if seconds * shell_ms_per_second == shell_ms_per_minute {
+    return shell_decimal(minutes + 1) ++ "m 0s"
+  }
+  return shell_decimal(minutes) ++ "m " ++ shell_decimal(seconds) ++ "s"
+}
+
+fn shell_continuation(source: bytes<shell_body_bytes_max>, at: u64) -> bool {
+  if at == 0 {
+    return false
+  }
+  return source[at] >= 0x80 and source[at] < 0xc0
+}
+
+fn shell_units(lead: u64) -> u64 {
+  if lead >= 0xf0 {
+    return 2
+  }
+  return 1
+}
+
+fn shell_width(lead: u64) -> u64 {
+  if lead < 0x80 {
+    return 1
+  }
+  if lead < 0xe0 {
+    return 2
+  }
+  if lead < 0xf0 {
+    return 3
+  }
+  return 4
+}
+
+fn shell_error_cut(error: text) -> text {
+  let units = len(error)
+  if units <= shell_error_units + shell_error_units_slack {
+    return error
+  }
+  let source: bytes<shell_body_bytes_max> = bytes_of(error)
+  var front = 0
+  var front_units = 0
+  var going = true
+  loop step below shell_body_bytes_max while going and front < len(source) {
+    let more = shell_units(source[front])
+    if front_units + more > shell_error_units / 2 {
+      going = false
+    } else {
+      front_units = front_units + more
+      front = front + shell_width(source[front])
+    }
+  }
+  var back = len(source)
+  var back_units = 0
+  going = true
+  loop step below shell_body_bytes_max while going and back > front {
+    var at = back - 1
+    loop hop below shell_utf8_tail_max while shell_continuation(source, at) {
+      at = at - 1
+    }
+    let more = shell_units(source[at])
+    if back_units + more > shell_error_units - shell_error_units / 2 or at < front {
+      going = false
+    } else {
+      back_units = back_units + more
+      back = at
+    }
+  }
+  return text_of(slice(source, 0, front)) ++ "\n\n... [" ++ shell_decimal(units - front_units - back_units) ++ " characters truncated] ...\n\n" ++ text_of(slice(source, back, len(source)))
+}
+
+fn shell_joined(shown: text, part: text) -> text {
+  if len(part) == 0 {
+    return shown
+  }
+  if len(shown) == 0 {
+    return part
+  }
+  return shown ++ "\n" ++ part
+}
+
+fn shell_shown(raw: text) -> text {
+  if not contains(raw, "\n") or before(raw, "\n") != "@@hl-bash@@" {
+    return raw
+  }
+  var rest = after(raw, "\n")
+  var fields: list<text, shell_header_lines> = []
+  var good = true
+  loop i below shell_header_lines while good {
+    if contains(rest, "\n") {
+      push fields before(rest, "\n")
+      rest = after(rest, "\n")
+    } else {
+      good = false
+    }
+  }
+  if not good {
+    return raw
+  }
+  if not shell_digits(fields[0], false, true) or not shell_digits(fields[1], true, false) {
+    return raw
+  }
+  loop i below shell_header_lines while good and i + 2 < shell_header_lines {
+    good = shell_digits(fields[i + 2], false, false)
+  }
+  if not good {
+    return raw
+  }
+  let source: bytes<shell_body_bytes_max> = bytes_of(rest)
+  let out_head = shell_number(fields[3])
+  let out_end = shell_number(fields[4])
+  let err_head = out_end + shell_number(fields[6])
+  let err_end = out_end + shell_number(fields[7])
+  if out_head > out_end or err_head > err_end or err_end != len(source) {
+    return raw
+  }
+  var shown = ""
+  if fields[0] != "0" {
+    shown = "Exit code " ++ fields[0]
+  }
+  let stdout = shell_stream(source, 0, out_head, out_end, shell_number(fields[2]), "stdout")
+  let stderr = shell_stream(source, out_end, err_head, err_end, shell_number(fields[5]), "stderr")
+  var timed_out = ""
+  if len(fields[1]) > 0 {
+    timed_out = "Command timed out after " ++ shell_timed_out(shell_number(fields[1]))
+  }
+  shown = shell_joined(shell_joined(shell_joined(shown, stdout), stderr), timed_out)
+  if fields[0] == "0" {
+    if len(shown) == 0 {
+      return "(Bash completed with no output)"
+    }
+    return shown
+  }
+  return shell_error_cut(shown)
+}
+
+fn bash_shown(name: text, raw: text) -> text {
+  if name == "Bash" {
+    return shell_shown(raw)
+  }
+  return raw
+}
+
+fn job_shown(notice: text) -> text {
+  if not contains(notice, "\n") or before(notice, "\n") != "@@hl-job@@" {
+    return notice
+  }
+  let rest = after(notice, "\n")
+  let key = before(rest, "\n")
+  let after_key = after(rest, "\n")
+  let status = before(after_key, "\n")
+  let after_code = after(after_key, "\n")
+  let size = before(after_code, "\n")
+  if not shell_digits(status, false, true) or not shell_digits(size, false, false) {
+    return notice
+  }
+  let source: bytes<shell_body_bytes_max> = bytes_of(after(after_code, "\n"))
+  let command_end = shell_number(size)
+  if command_end > len(source) {
+    return notice
+  }
+  let command = text_of(slice(source, 0, command_end))
+  let output = shell_shown(text_of(slice(source, command_end, len(source))))
+  if status == "0" {
+    return "<task-notification>\n<task-id>" ++ key ++ "</task-id>\n<status>completed</status>\n<summary>Background command \"" ++ command ++ "\" completed</summary>\n</task-notification>\n" ++ output
+  }
+  return "<task-notification>\n<task-id>" ++ key ++ "</task-id>\n<status>failed</status>\n<summary>Background command \"" ++ command ++ "\" failed with exit code " ++ status ++ "</summary>\n</task-notification>\n" ++ output
+}
+
 fn login_answered() {
   login_refreshed = false
   if mpp_paying {
@@ -144,8 +487,8 @@ fn mpp_pay(error: text) {
   mpp_paying = true
   mpp_payments = mpp_payments + 1
   match Bash("c='" ++ challenge ++ "'; x=50000\np=${HL_MPP_PAYER:-}; [ -n \"$p\" ] || { printf '@@hl-refused@@HL_MPP_PAYER is not set@@hl-end@@'; exit 0; }\nprintf '%s' \"$c\" | \"$p\" \"$x\" 2>&1 | tail -c 4000", probe_timeout_ms, "Refresh the Claude login", false, false) {
-    ok(out) => { mpp_paid(out) }
-    failed(why) => { return failed("the MPP payment failed: " ++ why) }
+    ok(out) => { mpp_paid(shell_shown(out)) }
+    failed(why) => { return failed("the MPP payment failed: " ++ shell_shown(why)) }
     unknown => { return failed("the MPP payment was cut by a restart and its outcome is unknown; it is not paid again") }
   }
 }
@@ -175,8 +518,8 @@ fn login_rejected(error: text) {
 fn refresh_login() {
   login_refreshed = true
   match Bash("f='" ++ env_loginfile ++ "'; m='" ++ env_login ++ "'\numask 077\nv() { sed -n \"s/.*\\\"$1\\\": *\\\"\\([^\\\"]*\\)\\\".*/\\1/p\" | head -n 1; }\nsay() { printf '@@hl-refresh@@%s@@hl-end@@' \"$1\"; exit 0; }\nsafe() { case $1 in '' | *[!A-Za-z0-9._-]*) say 'the token server answered an unexpected token';; esac; }\npost() { curl -sS --max-time 20 -X POST -H 'content-type: application/json' --data-binary @- -w '\\n@@hl-status@@%{http_code}' \"$1\" 2>/dev/null; }\nwhy() { e=$(printf '%s' \"$b\" | v error); [ -n \"$e\" ] || e=$(printf '%s' \"$b\" | v code); [ -n \"$e\" ] || e=$(printf '%s' \"$b\" | v type); printf 'HTTP %s %s' \"$c\" \"$(printf '%s' \"$e\" | tr -cd 'A-Za-z0-9_ .-')\"; }\nw() { t=$(mktemp \"$f.XXXXXX\") || say 'no temporary file beside the login file'; if awk '{ s = $0; h = \"\"; if (!on) { p = index(s, \"\\\"\" ENVIRON[\"HL_SCOPE\"] \"\\\"\"); if (p == 0) { print s; next } on = 1; h = substr(s, 1, p - 1); s = substr(s, p) } n = split(ENVIRON[\"HL_TEXTS\"], t, \" \"); for (j = 1; j <= n; j++) if (!d[t[j]] && match(s, \"\\\"\" t[j] \"\\\": *\\\"[^\\\"]*\\\"\")) { s = substr(s, 1, RSTART - 1) \"\\\"\" t[j] \"\\\": \\\"\" ENVIRON[\"HL_\" t[j]] \"\\\"\" substr(s, RSTART + RLENGTH); d[t[j]] = 1 } n = split(ENVIRON[\"HL_NUMBERS\"], t, \" \"); for (j = 1; j <= n; j++) if (!d[t[j]] && match(s, \"\\\"\" t[j] \"\\\": *[0-9]+\")) { s = substr(s, 1, RSTART - 1) \"\\\"\" t[j] \"\\\": \" ENVIRON[\"HL_\" t[j]] substr(s, RSTART + RLENGTH); d[t[j]] = 1 } print h s } END { n = split(ENVIRON[\"HL_TEXTS\"] \" \" ENVIRON[\"HL_NUMBERS\"], t, \" \"); for (j = 1; j <= n; j++) if (!d[t[j]]) exit 1 }' \"$f\" > \"$t\" && HL_HELD=$1 awk 'index($0, ENVIRON[\"HL_HELD\"]) { f = 1 } END { exit !f }' \"$t\"; then mv -f \"$t\" \"$f\"; else rm -f \"$t\"; say 'the login file did not take the new token'; fi; }\no() { sed -n 's/.*\"claudeAiOauth\": *{\\([^}]*\\)}.*/\\1/p' \"$f\" | head -n 1; }\nif [ \"$m\" = keychain ]; then k=$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null) && [ -n \"$k\" ] && printf '%s' \"$k\" > \"$f.new\" && mv -f \"$f.new\" \"$f\" || say 'the keychain holds no Claude login'; x=$(o | sed -n 's/.*\"expiresAt\": *\\([0-9]*\\).*/\\1/p'); if [ -n \"$x\" ] && [ \"$x\" -gt \"$(date +%s)000\" ]; then say ok; fi; say 'the keychain login has expired; run claude once to renew it'; fi\nr=$(o | v refreshToken); [ -n \"$r\" ] || say 'the login has no refresh token'; safe \"$r\"\nb=$(printf '{\"grant_type\":\"refresh_token\",\"refresh_token\":\"%s\",\"client_id\":\"9d1c250a-e61b-44d9-88ed-5944d1962f5e\"}' \"$r\" | post \"${HL_CLAUDE_TOKEN_URL:-https://console.anthropic.com/v1/oauth/token}\")\nc=${b##*@@hl-status@@}; b=${b%@@hl-status@@*}\na=$(printf '%s' \"$b\" | v access_token); n=$(printf '%s' \"$b\" | v refresh_token); x=$(printf '%s' \"$b\" | sed -n 's/.*\"expires_in\": *\\([0-9]*\\).*/\\1/p' | head -n 1)\nif [ \"$c\" != 200 ] || [ -z \"$a\" ] || [ -z \"$x\" ]; then [ \"$(o | v refreshToken)\" = \"$r\" ] || say ok; say \"$(why)\"; fi\n[ -n \"$n\" ] || n=$r; safe \"$a\"; safe \"$n\"\nHL_SCOPE=claudeAiOauth HL_TEXTS='accessToken refreshToken' HL_NUMBERS=expiresAt HL_accessToken=$a HL_refreshToken=$n HL_expiresAt=$(( ($(date +%s) + x) * 1000 )) w \"$a\"\nsay ok", probe_timeout_ms, "Refresh the Claude login", false, false) {
-    ok(out) => { login_refresh_done(out) }
-    failed(error) => { return failed("the Claude login refresh failed: " ++ error) }
+    ok(out) => { login_refresh_done(shell_shown(out)) }
+    failed(error) => { return failed("the Claude login refresh failed: " ++ shell_shown(error)) }
     unknown => {}
   }
 }
@@ -292,7 +635,7 @@ fn probe(cwd: text) {
     if agents_more {
       agents_more = false
       match Bash("c='" ++ cwd ++ "'; s='" ++ agents_skip ++ "'\ncd -- \"$c\" || exit 1\ne() { LC_ALL=C od -An -tu1 -v | LC_ALL=C awk 'BEGIN { n = 0 } { for (i = 1; i <= NF; i++) { b[n] = $i + 0; n++ } } END { while (n > 0 && (b[n-1] == 32 || b[n-1] == 9 || b[n-1] == 10 || b[n-1] == 13 || b[n-1] == 12 || b[n-1] == 11)) n--; i = 0; while (i < n) { c = b[i]; if (c == 34) { printf \"%s\", \"\\\\\\\"\"; i++ } else if (c == 92) { printf \"%s\", \"\\\\\\\\\"; i++ } else if (c == 10) { printf \"%s\", \"\\\\n\"; i++ } else if (c == 9) { printf \"%s\", \"\\\\t\"; i++ } else if (c == 13) { printf \"%s\", \"\\\\r\"; i++ } else if (c < 32 || c == 127) { printf \"\\\\u%04x\", c; i++ } else if (c < 128) { printf \"%c\", c; i++ } else if (c >= 240 && c < 248 && i + 3 < n) { p = (c - 240) * 262144 + (b[i+1] - 128) * 4096 + (b[i+2] - 128) * 64 + (b[i+3] - 128) - 65536; printf \"\\\\u%04x\\\\u%04x\", 55296 + int(p / 1024), 56320 + p % 1024; i += 4 } else if (c >= 224 && c < 240 && i + 2 < n) { printf \"\\\\u%04x\", (c - 224) * 4096 + (b[i+1] - 128) * 64 + (b[i+2] - 128); i += 3 } else if (c >= 192 && c < 224 && i + 1 < n) { printf \"\\\\u%04x\", (c - 192) * 64 + (b[i+1] - 128); i += 2 } else { printf \"%s\", \"\\\\ufffd\"; i++ } } }'; }\nk=24000\nif [ -z \"$s\" ]; then\nprintf '@@hl-cwd@@'; printf '%s' \"$c\" | e\nprintf '@@hl-git@@'; d=$c; g=false; while :; do if [ -e \"$d/.git\" ]; then g=true; break; fi; if [ \"$d\" = / ] || [ -z \"$d\" ]; then break; fi; d=$(dirname -- \"$d\"); done; printf '%s' \"$g\"\nprintf '@@hl-platform@@'; uname -s 2>/dev/null | tr 'A-Z' 'a-z' | e\nprintf '@@hl-shell@@'; if [ -n \"${SHELL:-}\" ]; then printf '%s' \"${SHELL##*/}\" | e; fi\nprintf '@@hl-os@@'; uname -sr 2>/dev/null | e\nprintf '@@hl-date@@'; date +%Y-%m-%d 2>/dev/null | e\nprintf '@@hl-login@@'; h=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json; m=file; o=$(sed -n 's/.*\"claudeAiOauth\": *{\\([^}]*\\)}.*/\\1/p' \"$h\" 2>/dev/null | head -n 1); if ! printf '%s' \"$o\" | grep -q '\"accessToken\": *\"[^\"]'; then if [ \"$(uname -s)\" = Darwin ] && k=$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null) && [ -n \"$k\" ]; then h=$HOME/.hl/claude-credentials.json; m=keychain; mkdir -p \"$HOME/.hl\" && (umask 077 && printf '%s' \"$k\" > \"$h.new\" && mv -f \"$h.new\" \"$h\"); o=$(sed -n 's/.*\"claudeAiOauth\": *{\\([^}]*\\)}.*/\\1/p' \"$h\" | head -n 1); fi; fi; if printf '%s' \"$o\" | grep -q '\"accessToken\": *\"[^\"]'; then printf '%s' \"$m\"; printf '@@hl-loginfile@@'; printf '%s' \"$h\" | e; printf '@@hl-stale@@'; x=$(printf '%s' \"$o\" | sed -n 's/.*\"expiresAt\": *\\([0-9]*\\).*/\\1/p'); if [ -n \"$x\" ] && [ \"$x\" -le \"$(date +%s)000\" ]; then printf yes; else printf no; fi; else printf none; fi\nprintf '@@hl-haskey@@'; if [ -n \"${ANTHROPIC_API_KEY:-}\" ]; then printf yes; else printf no; fi\nprintf '@@hl-hasbase@@'; if [ -n \"${ANTHROPIC_BASE_URL:-}\" ]; then printf yes; else printf no; fi\nprintf '@@hl-hasoauth@@'; if [ -n \"${CLAUDE_CODE_OAUTH_TOKEN:-}\" ]; then printf yes; else printf no; fi\nprintf '@@hl-mpp@@'; if [ -n \"${HL_MPP_BASE_URL:-}\" ] && [ -n \"${HL_MPP_PAYER:-}\" ]; then printf yes; else printf no; fi\nfi\nprintf '@@hl-agents@@'\nif [ -f AGENTS.md ] && [ -r AGENTS.md ]; then printf 'present@@hl-text@@'; e < AGENTS.md | tail -c +$((${#s} * k + 1)) | head -c \"$k\"; t=$(e < AGENTS.md | wc -c); if [ \"$t\" -gt $(((${#s} + 1) * k)) ]; then printf '@@hl-more@@'; fi; fi\nprintf '@@hl-end@@'", probe_timeout_ms, "Read the environment for the system prompt", false, false) {
-        ok(out) => { probed_output(out, chunk) }
+        ok(out) => { probed_output(shell_shown(out), chunk) }
         failed(_) => { probe_lost() }
         unknown => { probe_lost() }
       }
@@ -522,7 +865,8 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
   pending_units = 0
   for call in requested parallel {
     match dispatch(call) {
-      ok(output) => {
+      ok(raw) => {
+        let output = bash_shown(call.tool, raw)
         if call.tool == "submit_result" {
           submit_accepted = true
           submitted_output = output
@@ -537,8 +881,8 @@ fn run_calls(requested: list<call, calls_per_round_max>) {
           push context result(call, cut)
         }
       }
-      failed(error) => {
-        let cut = truncate_middle(error, direct_result_tokens_max)
+      failed(raw) => {
+        let cut = truncate_middle(bash_shown(call.tool, raw), direct_result_tokens_max)
         pending_units = pending_units + len(cut)
         push context error(call, cut)
       }

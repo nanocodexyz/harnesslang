@@ -170,6 +170,14 @@ MPP_PAY = r"""p=${HL_MPP_PAYER:-}; [ -n "$p" ] || { printf '@@hl-refused@@HL_MPP
 printf '%s' "$c" | "$p" "$x" 2>&1 | tail -c 4000"""
 
 
+def shown_of(codex):
+    return "exec_shown" if codex else "shell_shown"
+
+
+def shared_fns(name):
+    return read(ROOT + "/scripts/fixtures/" + name).rstrip(NL).split(NL)
+
+
 def mpp_fns(call_of, codex):
     if codex:
         rest = J([['content-type', 'application/json'], ['accept', 'text/event-stream']])[1:-1] + ',[' + J('session-id') + ',' + Q
@@ -196,8 +204,8 @@ def mpp_fns(call_of, codex):
         "  mpp_paying = true",
         "  mpp_payments = mpp_payments + 1",
         f"  match {call_of(command)} {{",
-        "    ok(out) => { mpp_paid(out) }",
-        f"    failed(why) => {{ return failed({L('the MPP payment failed: ')} ++ why) }}",
+        f"    ok(out) => {{ mpp_paid({shown_of(codex)}(out)) }}",
+        f"    failed(why) => {{ return failed({L('the MPP payment failed: ')} ++ {shown_of(codex)}(why)) }}",
         f"    unknown => {{ return failed({L('the MPP payment was cut by a restart and its outcome is unknown; it is not paid again')}) }}",
         "  }",
         "}",
@@ -266,8 +274,8 @@ def login_fns(call_of, codex, otherwise):
         "fn refresh_login() {",
         "  login_refreshed = true",
         f"  match {call_of(command)} {{",
-        "    ok(out) => { login_refresh_done(out) }",
-        f"    failed(error) => {{ return failed({L('the ' + words['who'] + ' login refresh failed: ')} ++ error) }}",
+        f"    ok(out) => {{ login_refresh_done({shown_of(codex)}(out)) }}",
+        f"    failed(error) => {{ return failed({L('the ' + words['who'] + ' login refresh failed: ')} ++ {shown_of(codex)}(error)) }}",
         "    unknown => {}",
         "  }",
         "}",
@@ -306,7 +314,7 @@ def probe_fns(call_of, recoverable, codex):
         "    if agents_more {",
         "      agents_more = false",
         f"      match {call_of(command)} {{",
-        "        ok(out) => { probed_output(out, chunk) }",
+        f"        ok(out) => {{ probed_output({shown_of(codex)}(out), chunk) }}",
         "        failed(_) => { probe_lost() }",
     ]
     if recoverable:
@@ -395,6 +403,7 @@ def claude_generated(side, levels):
         out.append("    }")
     out += ["  }", "}", ""]
     description = L("Read the environment for the system prompt")
+    out += shared_fns("shell.hl") + [""]
     out += probe_fns(lambda command: f"Bash({command}, probe_timeout_ms, {description}, false, false)", True, False)
     otherwise = "repair_history(error)" if side == "parent" else 'return failed("provider rejected the request: " ++ error)'
     out += [""] + login_fns(lambda command: f"Bash({command}, probe_timeout_ms, {L('Refresh the Claude login')}, false, false)", False, otherwise)
@@ -574,6 +583,8 @@ def splice(path, fns):
         lines = file.read().split(NL)
     blocks = []
     current = []
+    anchor = None
+    fn_anchor = None
     for line in fns:
         if line == "":
             if current:
@@ -593,11 +604,23 @@ def splice(path, fns):
             else:
                 lines[at] = block[0]
             continue
-        name = re.match(r"fn ([a-z_]+)\(", block[0]).group(1)
+        if block[0].startswith("const "):
+            for line in block:
+                prefix = line[:line.index(":") + 1]
+                at = next((i for i, held in enumerate(lines) if held.startswith(prefix)), None)
+                if at is None:
+                    at = anchor if anchor is not None else next(i for i, held in enumerate(lines) if held.startswith("const "))
+                    lines[at:at] = [line]
+                    anchor = at + 1
+                else:
+                    lines[at] = line
+            continue
+        name = re.match(r"fn ([a-z_0-9]+)\(", block[0]).group(1)
         start = next((i for i, line in enumerate(lines) if line.startswith("fn " + name + "(")), None)
         if start is None:
-            at = next(i for i, line in enumerate(lines) if line.startswith("fn "))
+            at = fn_anchor if fn_anchor is not None else next(i for i, line in enumerate(lines) if line.startswith("fn "))
             lines[at:at] = block + [""]
+            fn_anchor = at + len(block) + 1
         else:
             end = next(i for i in range(start, len(lines)) if lines[i] == "}")
             lines[start:end + 1] = block

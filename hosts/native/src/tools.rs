@@ -9,10 +9,10 @@ use crate::texts::Texts;
 pub const COMMAND_BYTES_MAX: usize = 1024 * 1024;
 pub const DESCRIPTION_BYTES_MAX: usize = 1024;
 pub const STREAM_BYTES_MAX: usize = 30_000;
+pub const SHELL_MARK: &str = "@@hl-bash@@";
+pub const JOB_MARK: &str = "@@hl-job@@";
 pub const TIMEOUT_MAX_MS: u64 = 600_000;
 pub const TIMEOUT_DEFAULT_MS: u64 = 120_000;
-pub const ERROR_CHARS: usize = 10_000;
-pub const ERROR_CHARS_SLACK: usize = 1_024;
 pub const SHELL_SIGNAL_STATUS: i32 = 128;
 pub const TIMED_OUT_STATUS: i32 = SHELL_SIGNAL_STATUS + 15;
 pub const READ_BYTES_MAX: u64 = 262_144;
@@ -21,8 +21,6 @@ pub const READ_TOKENS_MAX: usize = 25_000;
 pub const BYTES_PER_TOKEN: usize = 4;
 pub const SELECTED_BYTES_PER_TOKEN: u64 = 128;
 static SHELL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub const MILLISECONDS_PER_MINUTE: u128 = 60_000;
-pub const MILLISECONDS_PER_SECOND: u128 = 1_000;
 pub const PAGE_FILL: f64 = 0.85;
 pub const PAGE_SHRINK: f64 = 0.7;
 pub const PAGE_SHRINKS_MAX: usize = 6;
@@ -457,7 +455,7 @@ impl Workspace {
             .execute(command, timeout, room)
             .map_err(|error| format!("command executor: {error}"))?;
         Ok(match waited {
-            Waited::Done(shell) => Bashed::Ran(rendered(&self.texts, &shell)),
+            Waited::Done(shell) => Bashed::Ran(rendered(&shell)),
             Waited::Moved(started) => {
                 let seconds = timeout.as_secs().max(1).to_string();
                 let message = self.texts.fill("bash_moved", &[("seconds", &seconds)]);
@@ -525,14 +523,13 @@ impl Workspace {
                 }
                 kill_group(&mut started.child)?;
                 let status = started.child.wait().map_err(|error| error.to_string())?;
-                let mut shell = settled(&self.texts, started, status, true)?;
-                let after = timed_out_after(timeout);
-                shell.message = Some(self.texts.fill("bash_timed_out", &[("after", &after)]));
+                let mut shell = settled(started, status, true)?;
+                shell.timeout = Some(timeout.as_millis());
                 return Ok(Waited::Done(shell));
             }
             std::thread::sleep(TIMEOUT_POLL);
         };
-        Ok(Waited::Done(settled(&self.texts, started, status, false)?))
+        Ok(Waited::Done(settled(started, status, false)?))
     }
 }
 
@@ -592,13 +589,12 @@ pub fn kill_group(child: &mut std::process::Child) -> Result<(), String> {
 }
 
 pub fn settled(
-    texts: &Texts,
     started: Started,
     status: std::process::ExitStatus,
     timed_out: bool,
 ) -> Result<Shell, String> {
-    let stdout = captured(texts, &started.stdout, "stdout")?;
-    let stderr = captured(texts, &started.stderr, "stderr")?;
+    let stdout = captured(&started.stdout)?;
+    let stderr = captured(&started.stderr)?;
     let _ = std::fs::remove_file(&started.stdout);
     let _ = std::fs::remove_file(&started.stderr);
     let code = match (timed_out, status.code()) {
@@ -613,15 +609,19 @@ pub fn settled(
         stdout,
         stderr,
         code,
-        message: None,
+        timeout: None,
     })
 }
 
-pub fn shown(texts: &Texts, shell: &Shell) -> String {
-    match rendered(texts, shell) {
-        Ran::Ok(text) | Ran::Failed(text) | Ran::Job(text) => text,
-        Ran::Image(_) => String::new(),
-    }
+pub fn shown(shell: &Shell) -> String {
+    let timeout = shell.timeout.map(|ms| ms.to_string()).unwrap_or_default();
+    let (out, err) = (&shell.stdout, &shell.stderr);
+    let out_end = out.head.len() + out.tail.len();
+    let err_end = err.head.len() + err.tail.len();
+    format!(
+        "{SHELL_MARK}\n{}\n{timeout}\n{}\n{}\n{out_end}\n{}\n{}\n{err_end}\n{}{}{}{}",
+        shell.code, out.total, out.head.len(), err.total, err.head.len(), out.head, out.tail, err.head, err.tail
+    )
 }
 
 pub fn exit_code(shell: &Shell) -> i32 {
@@ -631,20 +631,27 @@ pub fn exit_code(shell: &Shell) -> i32 {
 use std::os::unix::process::CommandExt as _;
 
 pub struct Shell {
-    stdout: String,
-    stderr: String,
+    stdout: Captured,
+    stderr: Captured,
     code: i32,
-    message: Option<String>,
+    timeout: Option<u128>,
 }
 
-fn captured(texts: &Texts, path: &Path, stream: &str) -> Result<String, String> {
+struct Captured {
+    total: u64,
+    head: String,
+    tail: String,
+}
+
+fn captured(path: &Path) -> Result<Captured, String> {
     let failed = |error: std::io::Error| format!("{}: {error}", path.display());
     let mut file = std::fs::File::open(path).map_err(failed)?;
     let total = file.metadata().map_err(failed)?.len();
     if total <= STREAM_BYTES_MAX as u64 {
         let mut kept = Vec::with_capacity(total as usize);
         file.read_to_end(&mut kept).map_err(failed)?;
-        return Ok(String::from_utf8_lossy(&kept).into_owned());
+        let head = String::from_utf8_lossy(&kept).into_owned();
+        return Ok(Captured { total, head, tail: String::new() });
     }
     let side = STREAM_BYTES_MAX / 2;
     let mut head = vec![0; side];
@@ -653,91 +660,18 @@ fn captured(texts: &Texts, path: &Path, stream: &str) -> Result<String, String> 
         .map_err(failed)?;
     let mut tail = vec![0; side];
     file.read_exact(&mut tail).map_err(failed)?;
-    let elided = total - head.len() as u64 - tail.len() as u64;
-    assert!(elided > 0);
-    let head = String::from_utf8_lossy(&head);
-    let tail = String::from_utf8_lossy(&tail);
-    let line = if head.is_empty() || head.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    let elided = elided.to_string();
-    let total = total.to_string();
-    let marker = texts.fill(
-        "bash_elided",
-        &[("stream", stream), ("elided", &elided), ("total", &total)],
-    );
-    Ok(format!("{head}{line}{marker}\n{tail}"))
+    Ok(Captured {
+        total,
+        head: String::from_utf8_lossy(&head).into_owned(),
+        tail: String::from_utf8_lossy(&tail).into_owned(),
+    })
 }
 
-fn timed_out_after(timeout: Duration) -> String {
-    let milliseconds = timeout.as_millis();
-    if milliseconds < MILLISECONDS_PER_MINUTE {
-        return format!("{}s", milliseconds / MILLISECONDS_PER_SECOND);
+fn rendered(shell: &Shell) -> Ran {
+    match shell.code {
+        0 => Ran::Ok(shown(shell)),
+        _ => Ran::Failed(shown(shell)),
     }
-    let minutes = milliseconds / MILLISECONDS_PER_MINUTE;
-    let seconds = (milliseconds % MILLISECONDS_PER_MINUTE + MILLISECONDS_PER_SECOND / 2)
-        / MILLISECONDS_PER_SECOND;
-    if seconds * MILLISECONDS_PER_SECOND == MILLISECONDS_PER_MINUTE {
-        format!("{}m 0s", minutes + 1)
-    } else {
-        format!("{minutes}m {seconds}s")
-    }
-}
-
-fn without_empty_lines(text: &str) -> String {
-    let lines = text.split('\n').collect::<Vec<_>>();
-    let start = lines
-        .iter()
-        .position(|line| !line.trim().is_empty())
-        .unwrap_or(lines.len());
-    lines[start..].join("\n").trim_end().to_owned()
-}
-
-fn rendered(texts: &Texts, shell: &Shell) -> Ran {
-    let code = shell.code.to_string();
-    let parts = [
-        (shell.code != 0).then(|| texts.fill("bash_exit", &[("code", &code)])),
-        Some(without_empty_lines(&shell.stdout)),
-        Some(without_empty_lines(&shell.stderr)),
-        shell.message.clone(),
-    ];
-    let text = parts
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    match (shell.code, text.is_empty()) {
-        (0, true) => Ran::Ok(texts.fill("bash_no_output", &[])),
-        (0, false) => Ran::Ok(text),
-        _ => Ran::Failed(truncated_error(texts, text)),
-    }
-}
-
-fn truncated_error(texts: &Texts, text: String) -> String {
-    let units = text.encode_utf16().count();
-    if units <= ERROR_CHARS + ERROR_CHARS_SLACK {
-        return text;
-    }
-    let mut head = (0, 0);
-    for (at, c) in text.char_indices() {
-        if head.1 + c.len_utf16() > ERROR_CHARS / 2 {
-            break;
-        }
-        head = (at + c.len_utf8(), head.1 + c.len_utf16());
-    }
-    let mut tail = (text.len(), 0);
-    for (at, c) in text.char_indices().rev() {
-        if tail.1 + c.len_utf16() > ERROR_CHARS - ERROR_CHARS / 2 || at < head.0 {
-            break;
-        }
-        tail = (at, tail.1 + c.len_utf16());
-    }
-    let count = (units - head.1 - tail.1).to_string();
-    let cut = texts.fill("bash_error_cut", &[("count", &count)]);
-    format!("{}{cut}{}", &text[..head.0], &text[tail.0..])
 }
 
 fn binary(texts: &Texts, file_path: &str) -> Option<String> {

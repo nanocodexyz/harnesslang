@@ -3,4 +3,4 @@ host_lines_beyond_fixed 0
 programs_not_on_wasm 0
 host_policy_lines 0
 rust_compiler_lines 27814
-host_lines_total 7673
+host_lines_total 7558

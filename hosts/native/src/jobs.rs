@@ -162,25 +162,15 @@ impl Jobs {
             let job = self.running.remove(&key).expect("finished job missing");
             let mut started = job.started;
             let status = started.child.wait().expect("job wait");
-            let notice = match tools::settled(&self.texts, started, status, false) {
-                Ok(shell) => {
-                    let code = tools::exit_code(&shell);
-                    let output = tools::shown(&self.texts, &shell);
-                    let name = if code == 0 {
-                        "job_completed"
-                    } else {
-                        "job_failed"
-                    };
-                    self.texts.fill(
-                        name,
-                        &[
-                            ("key", &key),
-                            ("command", &job.command),
-                            ("code", &code.to_string()),
-                            ("output", &output),
-                        ],
-                    )
-                }
+            let notice = match tools::settled(started, status, false) {
+                Ok(shell) => format!(
+                    "{}\n{key}\n{}\n{}\n{}{}",
+                    tools::JOB_MARK,
+                    tools::exit_code(&shell),
+                    job.command.len(),
+                    job.command,
+                    tools::shown(&shell)
+                ),
                 Err(error) => self.texts.fill(
                     "job_lost",
                     &[("key", &key), ("command", &job.command), ("error", &error)],

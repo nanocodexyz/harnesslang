@@ -1,0 +1,343 @@
+const shell_header_lines: u64 = 8
+const shell_line_bytes_max: u64 = 80
+const shell_digits_max: u64 = 20
+const shell_number_digits_max: u64 = 19
+const shell_body_bytes_max: u64 = 1048576
+const shell_stream_bytes_max: u64 = 30000
+const shell_error_units: u64 = 10000
+const shell_error_units_slack: u64 = 1024
+const shell_ms_per_second: u64 = 1000
+const shell_ms_per_minute: u64 = 60000
+const shell_utf8_tail_max: u64 = 4
+
+fn shell_digits(line: text, empty_ok: bool, signed: bool) -> bool {
+  if len(line) == 0 {
+    return empty_ok
+  }
+  if len(line) > shell_number_digits_max {
+    return false
+  }
+  let source: bytes<shell_line_bytes_max> = bytes_of(line)
+  var good = true
+  loop i below shell_line_bytes_max while good and i < len(source) {
+    if source[i] < '0' or source[i] > '9' {
+      good = signed and i == 0 and source[i] == '-' and len(source) > 1
+    }
+  }
+  return good
+}
+
+fn shell_number(line: text) -> u64 {
+  let source: bytes<shell_line_bytes_max> = bytes_of(line)
+  var value: u64 = 0
+  loop i below shell_number_digits_max while i < len(source) {
+    value = value * 10 + source[i] - '0'
+  }
+  return value
+}
+
+fn shell_decimal(n: u64) -> text {
+  var reversed: bytes<shell_digits_max> = []
+  var rest = n
+  push reversed '0' + rest % 10
+  rest = rest / 10
+  loop step below shell_digits_max while rest > 0 {
+    push reversed '0' + rest % 10
+    rest = rest / 10
+  }
+  var out: bytes<shell_digits_max> = []
+  loop i below shell_digits_max while i < len(reversed) {
+    push out reversed[len(reversed) - 1 - i]
+  }
+  return text_of(out)
+}
+
+fn shell_space_at(source: bytes<shell_body_bytes_max>, at: u64, stop: u64) -> u64 {
+  let b = source[at]
+  if b == ' ' or (b >= 0x09 and b <= 0x0d) {
+    return 1
+  }
+  if at + 1 >= stop {
+    return 0
+  }
+  if b == 0xc2 {
+    if source[at + 1] == 0x85 or source[at + 1] == 0xa0 {
+      return 2
+    }
+    return 0
+  }
+  if at + 2 >= stop {
+    return 0
+  }
+  let b1 = source[at + 1]
+  let b2 = source[at + 2]
+  if b == 0xe1 and b1 == 0x9a and b2 == 0x80 {
+    return 3
+  }
+  if b == 0xe3 and b1 == 0x80 and b2 == 0x80 {
+    return 3
+  }
+  if b == 0xe2 and b1 == 0x80 and (b2 <= 0x8a or b2 == 0xa8 or b2 == 0xa9 or b2 == 0xaf) {
+    return 3
+  }
+  if b == 0xe2 and b1 == 0x81 and b2 == 0x9f {
+    return 3
+  }
+  return 0
+}
+
+fn shell_space_before(source: bytes<shell_body_bytes_max>, start: u64, end: u64) -> u64 {
+  if end <= start {
+    return 0
+  }
+  if source[end - 1] < 0x80 {
+    return shell_space_at(source, end - 1, end)
+  }
+  if end < start + 2 {
+    return 0
+  }
+  if source[end - 2] == 0xc2 {
+    return shell_space_at(source, end - 2, end)
+  }
+  if end < start + 3 {
+    return 0
+  }
+  if shell_space_at(source, end - 3, end) == 3 {
+    return 3
+  }
+  return 0
+}
+
+fn shell_line_start(source: bytes<shell_body_bytes_max>, start: u64, at: u64) -> u64 {
+  var line = at
+  var going = line > start
+  loop step below shell_body_bytes_max while going {
+    if source[line - 1] == '\n' {
+      going = false
+    } else {
+      line = line - 1
+      going = line > start
+    }
+  }
+  return line
+}
+
+fn shell_unpadded(source: bytes<shell_body_bytes_max>, start: u64, end: u64) -> text {
+  var first = start
+  var found = false
+  loop step below shell_body_bytes_max while not found and first < end {
+    let width = shell_space_at(source, first, end)
+    if width == 0 {
+      found = true
+    } else {
+      first = first + width
+    }
+  }
+  if not found {
+    return ""
+  }
+  let line = shell_line_start(source, start, first)
+  var last = end
+  var trimming = true
+  loop step below shell_body_bytes_max while trimming and last > first {
+    let width = shell_space_before(source, first, last)
+    if width == 0 {
+      trimming = false
+    } else {
+      last = last - width
+    }
+  }
+  return text_of(slice(source, line, last))
+}
+
+fn shell_stream(source: bytes<shell_body_bytes_max>, start: u64, middle: u64, end: u64, total: u64, name: text) -> text {
+  if total <= shell_stream_bytes_max {
+    return shell_unpadded(source, start, end)
+  }
+  var line = "\n"
+  if middle == start {
+    line = ""
+  } else {
+    if source[middle - 1] == '\n' {
+      line = ""
+    }
+  }
+  let marker = "[" ++ name ++ ": " ++ shell_decimal(total - shell_stream_bytes_max) ++ " of " ++ shell_decimal(total) ++ " bytes elided from the middle. To see them, rerun the command with its output sent to a file and read parts of it with grep -n, sed -n 'START,ENDp' or tail]"
+  let whole = text_of(slice(source, start, middle)) ++ line ++ marker ++ "\n" ++ text_of(slice(source, middle, end))
+  let joined: bytes<shell_body_bytes_max> = bytes_of(whole)
+  return shell_unpadded(joined, 0, len(joined))
+}
+
+fn shell_timed_out(ms: u64) -> text {
+  if ms < shell_ms_per_minute {
+    return shell_decimal(ms / shell_ms_per_second) ++ "s"
+  }
+  let minutes = ms / shell_ms_per_minute
+  let seconds = (ms % shell_ms_per_minute + shell_ms_per_second / 2) / shell_ms_per_second
+  if seconds * shell_ms_per_second == shell_ms_per_minute {
+    return shell_decimal(minutes + 1) ++ "m 0s"
+  }
+  return shell_decimal(minutes) ++ "m " ++ shell_decimal(seconds) ++ "s"
+}
+
+fn shell_continuation(source: bytes<shell_body_bytes_max>, at: u64) -> bool {
+  if at == 0 {
+    return false
+  }
+  return source[at] >= 0x80 and source[at] < 0xc0
+}
+
+fn shell_units(lead: u64) -> u64 {
+  if lead >= 0xf0 {
+    return 2
+  }
+  return 1
+}
+
+fn shell_width(lead: u64) -> u64 {
+  if lead < 0x80 {
+    return 1
+  }
+  if lead < 0xe0 {
+    return 2
+  }
+  if lead < 0xf0 {
+    return 3
+  }
+  return 4
+}
+
+fn shell_error_cut(error: text) -> text {
+  let units = len(error)
+  if units <= shell_error_units + shell_error_units_slack {
+    return error
+  }
+  let source: bytes<shell_body_bytes_max> = bytes_of(error)
+  var front = 0
+  var front_units = 0
+  var going = true
+  loop step below shell_body_bytes_max while going and front < len(source) {
+    let more = shell_units(source[front])
+    if front_units + more > shell_error_units / 2 {
+      going = false
+    } else {
+      front_units = front_units + more
+      front = front + shell_width(source[front])
+    }
+  }
+  var back = len(source)
+  var back_units = 0
+  going = true
+  loop step below shell_body_bytes_max while going and back > front {
+    var at = back - 1
+    loop hop below shell_utf8_tail_max while shell_continuation(source, at) {
+      at = at - 1
+    }
+    let more = shell_units(source[at])
+    if back_units + more > shell_error_units - shell_error_units / 2 or at < front {
+      going = false
+    } else {
+      back_units = back_units + more
+      back = at
+    }
+  }
+  return text_of(slice(source, 0, front)) ++ "\n\n... [" ++ shell_decimal(units - front_units - back_units) ++ " characters truncated] ...\n\n" ++ text_of(slice(source, back, len(source)))
+}
+
+fn shell_joined(shown: text, part: text) -> text {
+  if len(part) == 0 {
+    return shown
+  }
+  if len(shown) == 0 {
+    return part
+  }
+  return shown ++ "\n" ++ part
+}
+
+fn shell_shown(raw: text) -> text {
+  if not contains(raw, "\n") or before(raw, "\n") != "@@hl-bash@@" {
+    return raw
+  }
+  var rest = after(raw, "\n")
+  var fields: list<text, shell_header_lines> = []
+  var good = true
+  loop i below shell_header_lines while good {
+    if contains(rest, "\n") {
+      push fields before(rest, "\n")
+      rest = after(rest, "\n")
+    } else {
+      good = false
+    }
+  }
+  if not good {
+    return raw
+  }
+  if not shell_digits(fields[0], false, true) or not shell_digits(fields[1], true, false) {
+    return raw
+  }
+  loop i below shell_header_lines while good and i + 2 < shell_header_lines {
+    good = shell_digits(fields[i + 2], false, false)
+  }
+  if not good {
+    return raw
+  }
+  let source: bytes<shell_body_bytes_max> = bytes_of(rest)
+  let out_head = shell_number(fields[3])
+  let out_end = shell_number(fields[4])
+  let err_head = out_end + shell_number(fields[6])
+  let err_end = out_end + shell_number(fields[7])
+  if out_head > out_end or err_head > err_end or err_end != len(source) {
+    return raw
+  }
+  var shown = ""
+  if fields[0] != "0" {
+    shown = "Exit code " ++ fields[0]
+  }
+  let stdout = shell_stream(source, 0, out_head, out_end, shell_number(fields[2]), "stdout")
+  let stderr = shell_stream(source, out_end, err_head, err_end, shell_number(fields[5]), "stderr")
+  var timed_out = ""
+  if len(fields[1]) > 0 {
+    timed_out = "Command timed out after " ++ shell_timed_out(shell_number(fields[1]))
+  }
+  shown = shell_joined(shell_joined(shell_joined(shown, stdout), stderr), timed_out)
+  if fields[0] == "0" {
+    if len(shown) == 0 {
+      return "(Bash completed with no output)"
+    }
+    return shown
+  }
+  return shell_error_cut(shown)
+}
+
+fn bash_shown(name: text, raw: text) -> text {
+  if name == "Bash" {
+    return shell_shown(raw)
+  }
+  return raw
+}
+
+fn job_shown(notice: text) -> text {
+  if not contains(notice, "\n") or before(notice, "\n") != "@@hl-job@@" {
+    return notice
+  }
+  let rest = after(notice, "\n")
+  let key = before(rest, "\n")
+  let after_key = after(rest, "\n")
+  let status = before(after_key, "\n")
+  let after_code = after(after_key, "\n")
+  let size = before(after_code, "\n")
+  if not shell_digits(status, false, true) or not shell_digits(size, false, false) {
+    return notice
+  }
+  let source: bytes<shell_body_bytes_max> = bytes_of(after(after_code, "\n"))
+  let command_end = shell_number(size)
+  if command_end > len(source) {
+    return notice
+  }
+  let command = text_of(slice(source, 0, command_end))
+  let output = shell_shown(text_of(slice(source, command_end, len(source))))
+  if status == "0" {
+    return "<task-notification>\n<task-id>" ++ key ++ "</task-id>\n<status>completed</status>\n<summary>Background command \"" ++ command ++ "\" completed</summary>\n</task-notification>\n" ++ output
+  }
+  return "<task-notification>\n<task-id>" ++ key ++ "</task-id>\n<status>failed</status>\n<summary>Background command \"" ++ command ++ "\" failed with exit code " ++ status ++ "</summary>\n</task-notification>\n" ++ output
+}
