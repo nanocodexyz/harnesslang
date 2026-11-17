@@ -8,7 +8,7 @@ scratch=output/gate
 targets="native-jsonl native-sqlite server-postgres cloudflare vercel"
 programs=$(echo examples/*.hl examples/inlined/*.hl examples/sound/*.hl)
 per_program_hosts="agent"
-counts="emitted_source_lines host_lines_beyond_fixed programs_not_on_wasm host_policy_lines"
+counts="emitted_source_lines host_lines_beyond_fixed programs_not_on_wasm host_policy_lines rust_compiler_lines"
 prose='"([^"\\]|\\.)*[A-Za-z]+ [A-Za-z]+ [A-Za-z]+ [A-Za-z]+([^"\\]|\\.)*"'
 
 fail() {
@@ -111,6 +111,10 @@ prove_all() {
     tail -n 1 "$scratch/prove.log"
   done
   echo "gate: hl prove passes on all $(echo $programs | wc -w) programs on every target"
+}
+
+rust_compiler_lines() {
+  git ls-files -- 'src/syntax/*.rs' 'src/check/*.rs' 'src/ir/*.rs' 'src/emit/*.rs' 'src/prove/*.rs' | xargs cat | wc -l
 }
 
 measure() {
