@@ -1,6 +1,6 @@
 use super::compile::{Binary, Code, Load, Store, Unary};
 use super::decode::{MEMORY_PAGES_MAX, Module};
-use super::specialize::{Crc, Hex, Inst, Scan, Test, Unhex};
+use super::specialize::{Crc, Hex, Inst, Scan, Test, Unhex, Words};
 use super::{Error, Host, Trap, Value};
 use crate::emit::wasm::encode::PAGE_BYTES;
 
@@ -1017,6 +1017,12 @@ impl<'a> Instance<'a> {
                     executed += ops - 1;
                     pc = target as usize;
                 }
+                Inst::Words { words } => {
+                    let words = code.loops.words[words as usize];
+                    let (target, ops) = check!(self.words(words, stack, base));
+                    executed += ops - 1;
+                    pc = target as usize;
+                }
                 Inst::JumpIf { condition, target } => {
                     if slot!(condition) as u32 != 0 {
                         pc = target as usize;
@@ -1491,6 +1497,94 @@ impl<'a> Instance<'a> {
             bytes += 1;
         }
         Ok((hex.done, Hex::ops(bytes)))
+    }
+
+    fn words(&self, words: Words, stack: &mut [u64], base: usize) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(words.end)] as u32;
+        let left = stack[slot(words.left)] as u32;
+        let right = stack[slot(words.right)] as u32;
+        let at = stack[slot(words.at)] as u32;
+        if at > end || end > u32::MAX - Words::BYTES {
+            return self.words_bytewise(words, stack, base);
+        }
+        let count = (end - at) / Words::BYTES;
+        let last = at + count * Words::BYTES;
+        let (Some(lefts), Some(rights)) = (
+            self.memory.span(left, at, last),
+            self.memory.span(right, at, last),
+        ) else {
+            return self.words_bytewise(words, stack, base);
+        };
+        let memory = &self.memory.bytes;
+        let differ = if memory[lefts.clone()] == memory[rights.clone()] {
+            None
+        } else {
+            let (lefts, _) = memory[lefts].as_chunks::<{ Words::BYTES as usize }>();
+            let (rights, _) = memory[rights].as_chunks::<{ Words::BYTES as usize }>();
+            lefts
+                .iter()
+                .zip(rights)
+                .position(|(left, right)| left != right)
+        };
+        let equal = differ.map_or(count, |index| index as u32);
+        let word = |base: u32, at: u32| {
+            let start = (base + at) as usize;
+            u64::from_le_bytes(
+                memory[start..start + Words::BYTES as usize]
+                    .try_into()
+                    .expect("a word is eight bytes"),
+            )
+        };
+        if equal > 0 {
+            let previous = at + (equal - 1) * Words::BYTES;
+            stack[slot(words.next)] = u64::from(previous + Words::BYTES);
+            stack[slot(words.left_word)] = word(left, previous);
+            stack[slot(words.right_word)] = word(right, previous);
+            stack[slot(words.differ)] = 0;
+        }
+        let current = at + equal * Words::BYTES;
+        stack[slot(words.at)] = u64::from(current);
+        stack[slot(words.next)] = u64::from(current + Words::BYTES);
+        if differ.is_some() {
+            stack[slot(words.left_word)] = word(left, current);
+            stack[slot(words.right_word)] = word(right, current);
+            stack[slot(words.differ)] = 1;
+        }
+        Ok((words.done, Words::ops(u64::from(equal), differ.is_some())))
+    }
+
+    fn words_bytewise(
+        &self,
+        words: Words,
+        stack: &mut [u64],
+        base: usize,
+    ) -> Result<(u32, u64), Trap> {
+        let slot = |index: u32| base + index as usize;
+        let end = stack[slot(words.end)] as u32;
+        let left = stack[slot(words.left)] as u32;
+        let right = stack[slot(words.right)] as u32;
+        let mut at = stack[slot(words.at)] as u32;
+        let mut equal: u64 = 0;
+        loop {
+            let next = at.wrapping_add(Words::BYTES);
+            stack[slot(words.next)] = u64::from(next);
+            if next > end {
+                return Ok((words.done, Words::ops(equal, false)));
+            }
+            let left_word = self.load(Load::I64, u64::from(left.wrapping_add(at)))?;
+            stack[slot(words.left_word)] = left_word;
+            let right_word = self.load(Load::I64, u64::from(right.wrapping_add(at)))?;
+            stack[slot(words.right_word)] = right_word;
+            let differ = left_word != right_word;
+            stack[slot(words.differ)] = u64::from(differ);
+            if differ {
+                return Ok((words.done, Words::ops(equal, true)));
+            }
+            at = at.wrapping_add(Words::BYTES);
+            stack[slot(words.at)] = u64::from(at);
+            equal += 1;
+        }
     }
 
     fn other(&mut self, inst: Inst, stack: &mut [u64], base: usize) -> Result<(), Trap> {

@@ -230,7 +230,9 @@ $ compiler/bench/target/release/selfhost-bench examples/claude_code.hl encode.wa
 | | encode.hl handler | over encode.rs (0.054 ms) | hl-host wall |
 | --- | --- | --- | --- |
 | before (061d508) | 300 ms | 5,578x | 440 ms |
-| after | 13.8 ms | 251x | 47 ms |
+| after hex builtins (ed9db7d) | 13.8 ms | 251x | 47 ms |
+| same, remeasured on a quiet Hand | 11.7 ms | 201x | 38 ms |
+| after Inst::Words | 9.6 ms | 165x | 36 ms |
 
 Startup is outside those: decoding and compiling the encoder's wasm takes
 1.4 ms in process, and an hl-host run of an empty handler takes 9 ms wall,
@@ -243,7 +245,9 @@ What it took, in the order the profile showed it:
   that the engine fuses into one instruction each (Inst::Unhex, Inst::Hex),
   as it already fused byte scans and crc.
 - The engine. Scan, crc and the hex loops run over a slice when every access
-  is in bounds, and `write_string` copies runs of plain bytes at once.
+  is in bounds, and `write_string` copies runs of plain bytes at once. The
+  word compare loop in `$bytes_equal` is fused into one memcmp
+  (Inst::Words).
 - Checks a pure fn proves away (see Pure fns in LANGUAGE.md): unchecked add,
   multiply, divide and remainder where the operands' largest values allow, a
   push without the byte-width check, and no halt check after an expression

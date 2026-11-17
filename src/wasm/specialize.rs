@@ -14,6 +14,9 @@ pub enum Inst {
     Hex {
         hex: u32,
     },
+    Words {
+        words: u32,
+    },
     Unreachable,
     Jump(u32),
     JumpIf {
@@ -1266,6 +1269,10 @@ const CRC_OPS: u64 = 10;
 const UNHEX_OPS: u64 = 15;
 const UNHEX_INVALID_OPS: u64 = 8;
 const HEX_OPS: u64 = 14;
+const WORDS_OPS: u64 = 8;
+const WORDS_SHORT_OPS: u64 = 2;
+const WORDS_DIFFER_OPS: u64 = 6;
+const WORD_BYTES: u32 = 8;
 const HEX_NIBBLE_MAX: u32 = 15;
 const HEX_NIBBLE_BITS: u32 = 4;
 const LOOP_EXIT_OPS: u64 = 1;
@@ -1376,12 +1383,39 @@ impl Hex {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Words {
+    pub at: u32,
+    pub end: u32,
+    pub left: u32,
+    pub right: u32,
+    pub next: u32,
+    pub left_word: u32,
+    pub right_word: u32,
+    pub differ: u32,
+    pub done: u32,
+}
+
+impl Words {
+    pub const BYTES: u32 = WORD_BYTES;
+
+    pub const fn ops(equal: u64, differ: bool) -> u64 {
+        equal * WORDS_OPS
+            + if differ {
+                WORDS_DIFFER_OPS
+            } else {
+                WORDS_SHORT_OPS
+            }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Loops {
     pub scans: Vec<Scan>,
     pub crcs: Vec<Crc>,
     pub unhexes: Vec<Unhex>,
     pub hexes: Vec<Hex>,
+    pub words: Vec<Words>,
 }
 
 fn distinct(slots: &[u32]) -> bool {
@@ -1414,9 +1448,86 @@ pub fn fuse_loops(insts: &mut [Inst]) -> Loops {
                 hex: loops.hexes.len() as u32,
             };
             loops.hexes.push(hex);
+        } else if let Some(words) = words_at(insts, head) {
+            insts[head] = Inst::Words {
+                words: loops.words.len() as u32,
+            };
+            loops.words.push(words);
         }
     }
     loops
+}
+
+fn words_at(insts: &[Inst], head: usize) -> Option<Words> {
+    let window = insts.get(head..head + WORDS_OPS as usize)?;
+    let [
+        Inst::I32AddImmediate {
+            result: next,
+            left: next_from,
+            right: WORD_BYTES,
+        },
+        Inst::JumpGtU {
+            left: bound,
+            right: end,
+            target: done,
+        },
+        Inst::LoadIndexed {
+            load: Load::I64,
+            result: left_word,
+            base: left,
+            index: left_at,
+        },
+        Inst::LoadIndexed {
+            load: Load::I64,
+            result: right_word,
+            base: right,
+            index: right_at,
+        },
+        Inst::I64Ne {
+            result: differ,
+            left: differ_left,
+            right: differ_right,
+        },
+        Inst::JumpIf {
+            condition,
+            target: differ_done,
+        },
+        Inst::I32AddImmediate {
+            result: stepped,
+            left: step_from,
+            right: WORD_BYTES,
+        },
+        Inst::Jump(back),
+    ] = *window
+    else {
+        return None;
+    };
+    let at = next_from;
+    let chained = bound == next
+        && left_at == at
+        && right_at == at
+        && differ_left == left_word
+        && differ_right == right_word
+        && right_word != left_word
+        && condition == differ
+        && differ_done == done
+        && stepped == at
+        && step_from == at
+        && back as usize == head;
+    let written = [next, left_word, right_word, differ];
+    let fixed = [at, end, left, right];
+    let apart = distinct(&fixed) && fixed.iter().all(|slot| !written.contains(slot));
+    (chained && apart).then_some(Words {
+        at,
+        end,
+        left,
+        right,
+        next,
+        left_word,
+        right_word,
+        differ,
+        done,
+    })
 }
 
 fn scan_at(insts: &[Inst], head: usize) -> Option<Scan> {

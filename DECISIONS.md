@@ -609,3 +609,11 @@ Losses, read from each row's verifier log and meter records:
 - gate.txt records rust_compiler_lines 28,094 (from 27,814): the two builtins and the bounds proofs are language features the port needs, as the 2026-11-17 SELFHOST entry allows.
 - docs/SELFHOST.md gains "How fast compiled .hl runs" and "Beyond the compiler: what else moves to .hl", an inventory ordered by value with measured line counts.
 - The inventory names what each of the three host pieces that stay waits on: an integer-exact rounding decision for Read paging, an unjournaled host-to-pure-fn call for stall-line detection, and a computed-edit-list tool protocol for apply_patch.
+
+## 2026-11-17: the engine fuses the runtime's word compare loop (Inst::Words)
+
+- `$bytes_equal` compares eight bytes a step in a loop of eight instructions: step, bound check, two i64 loads, compare, exit, step, jump. The engine now fuses that loop into Inst::Words, a memcmp over both spans, the way it fuses scans, crc and the hex loops: one instruction that leaves the same locals and charges the same op count as the loop it replaces, a slice fast path when both spans are in bounds, and a word-at-a-time path that traps exactly where the loop would otherwise.
+- The matcher in src/wasm/specialize.rs takes only that exact shape with its slots distinct, so no other loop changes meaning. `$text_eq`, the record-survives assert in `$append` and every pure `==` on text use it.
+- Result, best of 3 bench runs in process on a quiet hosted Hand (compiler/bench, bytes checked against encode.rs): the compile handler goes from 11.7 ms to 9.6 ms (201x to 165x encode.rs). hl-host wall, best of 20: 38.1 ms to 36.2 ms. Lane 22's 13.8 ms baseline was taken on a busier machine; both numbers here come from the same machine minutes apart.
+- Most of the remaining `$bytes_equal` ops are 74,000 short compares from the pure encoder (names and keys), where call overhead, not the loop, is the cost.
+
