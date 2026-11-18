@@ -1,0 +1,490 @@
+harness catalog
+
+const catalog_bytes_max: u64 = 4194304
+const catalog_word_bytes: u64 = 4
+const catalog_version: u64 = 1
+const catalog_missing: u64 = 4294967296
+const catalog_i32: u64 = 127
+const catalog_i64: u64 = 126
+const catalog_sections: u64 = 4
+const catalog_sections_before_names: u64 = 3
+const catalog_passes: u64 = 2
+
+fn catalog_word(value: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  return value[at] + value[at + 1] * 256 + value[at + 2] * 65536 + value[at + 3] * 16777216
+}
+
+fn catalog_out(value: u64) -> bytes<catalog_word_bytes> {
+  var out: bytes<catalog_word_bytes> = []
+  var rest = value
+  loop byte below catalog_word_bytes {
+    push out rest % byte_radix
+    rest = rest / byte_radix
+  }
+  return out
+}
+
+fn catalog_equal(left: bytes<tokens_bytes_max>, right: bytes<tokens_bytes_max>) -> bool {
+  if len(left) != len(right) { return false }
+  var equal = true
+  loop byte below tokens_bytes_max while byte < len(left) and equal {
+    if left[byte] != right[byte] { equal = false }
+  }
+  return equal
+}
+
+fn catalog_is(value: bytes<tokens_bytes_max>, expected: text) -> bool {
+  let raw: bytes<tokens_bytes_max> = bytes_of(expected)
+  return catalog_equal(value, raw)
+}
+
+fn catalog_next(tokens: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  return at + header_bytes + catalog_word(tokens, at + 1 + word_bytes)
+}
+
+fn catalog_payload(tokens: bytes<tokens_bytes_max>, at: u64) -> bytes<tokens_bytes_max> {
+  return slice(tokens, at + header_bytes, catalog_next(tokens, at))
+}
+
+fn catalog_validate(tokens: bytes<tokens_bytes_max>) -> text {
+  var at = 0
+  var depth = 0
+  var lines: bytes<tokens_bytes_max> = []
+  loop record below tokens_bytes_max while at < len(tokens) {
+    if len(tokens) - at < header_bytes { return "catalog invalid: truncated token header" }
+    let kind = tokens[at]
+    let line = catalog_word(tokens, at + 1)
+    let size = catalog_word(tokens, at + 1 + word_bytes)
+    if kind < token_open or kind > token_text { return "catalog invalid: token kind" }
+    if line == 0 { return "catalog invalid: token line" }
+    if kind == token_atom and size == 0 { return "catalog invalid: empty atom" }
+    if size > source_bytes_max or size > len(tokens) - at - header_bytes { return "catalog invalid: token payload" }
+    if kind == token_open or kind == token_close {
+      if size != 0 { return "catalog invalid: delimiter payload" }
+      if kind == token_open {
+        if depth == nesting_max { return "catalog bound: nesting_max" }
+        push lines catalog_out(line)
+        depth = depth + 1
+      } else {
+        if depth == 0 { return "catalog invalid: unmatched close" }
+        depth = depth - 1
+        if catalog_word(lines, depth * word_bytes) != line { return "catalog invalid: close line" }
+        lines = slice(lines, 0, depth * word_bytes)
+      }
+    }
+    at = at + header_bytes + size
+  }
+  if depth != 0 { return "catalog invalid: unclosed form" }
+  return ""
+}
+
+fn catalog_end(tokens: bytes<tokens_bytes_max>, start: u64) -> u64 {
+  var at = start
+  var depth = 0
+  var end = start
+  var done = false
+  loop record below tokens_bytes_max while at < len(tokens) and not done {
+    if tokens[at] == token_open { depth = depth + 1 }
+    if tokens[at] == token_close {
+      depth = depth - 1
+      if depth == 0 {
+        end = at
+        done = true
+      }
+    }
+    at = catalog_next(tokens, at)
+  }
+  return end
+}
+
+fn catalog_ascii(value: bytes<tokens_bytes_max>) -> bool {
+  var valid = true
+  loop byte below tokens_bytes_max while byte < len(value) and valid {
+    if value[byte] >= 128 { valid = false }
+  }
+  return valid
+}
+
+fn catalog_named(value: bytes<tokens_bytes_max>) -> bool {
+  if len(value) == 0 { return false }
+  return value[0] == '$'
+}
+
+fn catalog_type(value: bytes<tokens_bytes_max>) -> u64 {
+  if catalog_is(value, "i32") { return catalog_i32 }
+  if catalog_is(value, "i64") { return catalog_i64 }
+  return 0
+}
+
+fn catalog_blob(value: bytes<tokens_bytes_max>) -> bytes<tokens_bytes_max> {
+  var out: bytes<tokens_bytes_max> = []
+  push out catalog_out(len(value))
+  push out value
+  return out
+}
+
+fn catalog_skip(value: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  return at + word_bytes + catalog_word(value, at)
+}
+
+fn catalog_map(names: bytes<tokens_bytes_max>, symbol_name: bytes<tokens_bytes_max>) -> u64 {
+  var at = 0
+  var found = catalog_missing
+  loop entry below items_max while at < len(names) {
+    let next = catalog_skip(names, at)
+    if catalog_equal(slice(names, at + word_bytes, next), symbol_name) { found = catalog_word(names, next) }
+    at = next + word_bytes
+  }
+  return found
+}
+
+fn catalog_typed(tokens: bytes<tokens_bytes_max>, start: u64, end: u64) -> text {
+  var at = catalog_next(tokens, catalog_next(tokens, start))
+  var symbol_name: bytes<tokens_bytes_max> = []
+  var type_codes: bytes<tokens_bytes_max> = []
+  if at < end and tokens[at] == token_atom {
+    let first = catalog_payload(tokens, at)
+    if catalog_named(first) {
+      symbol_name = first
+      at = catalog_next(tokens, at)
+    }
+  }
+  loop field below locals_max while at < end {
+    if tokens[at] != token_atom { return "catalog invalid: nested typed field" }
+    let type_code = catalog_type(catalog_payload(tokens, at))
+    if type_code == 0 { return "catalog invalid: unknown type" }
+    if len(type_codes) == locals_max { return "catalog bound: locals_max" }
+    push type_codes type_code
+    at = catalog_next(tokens, at)
+  }
+  if at != end { return "catalog bound: locals_max" }
+  if len(symbol_name) > 0 and len(type_codes) != 1 { return "catalog invalid: named field needs one type" }
+  if len(symbol_name) > catalog_bytes_max - 2 * word_bytes - len(type_codes) { return "catalog bound: typed bytes" }
+  var out: bytes<tokens_bytes_max> = []
+  push out catalog_blob(symbol_name)
+  push out catalog_blob(type_codes)
+  return "ok " ++ hex_of(out)
+}
+
+fn catalog_header_out(start: u64, end: u64, symbol_name: bytes<tokens_bytes_max>, params: bytes<tokens_bytes_max>, results: bytes<tokens_bytes_max>, locals: bytes<tokens_bytes_max>, param_names: bytes<tokens_bytes_max>, local_names: bytes<tokens_bytes_max>, param_count: u64, local_count: u64, exported: bool, export_name: bytes<tokens_bytes_max>) -> text {
+  let overhead = 10 * word_bytes
+  let payload = len(symbol_name) + len(params) + len(results) + len(locals) + len(param_names) + len(local_names) + len(export_name)
+  if payload > catalog_bytes_max - overhead { return "catalog bound: header bytes" }
+  var out: bytes<tokens_bytes_max> = []
+  push out catalog_out(start)
+  push out catalog_out(end)
+  push out catalog_blob(symbol_name)
+  push out catalog_blob(params)
+  push out catalog_blob(results)
+  push out catalog_blob(locals)
+  push out catalog_out(param_count)
+  push out param_names
+  push out catalog_out(local_count)
+  push out local_names
+  if exported { push out catalog_out(1) } else { push out catalog_out(0) }
+  push out catalog_blob(export_name)
+  return "ok " ++ hex_of(out)
+}
+
+
+fn catalog_header(tokens: bytes<tokens_bytes_max>, start: u64, end: u64) -> text {
+  let name_at = catalog_next(tokens, catalog_next(tokens, start))
+  if name_at >= end { return "catalog invalid: function needs name" }
+  let symbol_name = catalog_payload(tokens, name_at)
+  if tokens[name_at] != token_atom or not catalog_named(symbol_name) { return "catalog invalid: function needs name" }
+  var at = catalog_next(tokens, name_at)
+  var params: bytes<tokens_bytes_max> = []
+  var results: bytes<tokens_bytes_max> = []
+  var locals: bytes<tokens_bytes_max> = []
+  var param_names: bytes<tokens_bytes_max> = []
+  var local_names: bytes<tokens_bytes_max> = []
+  var param_count = 0
+  var local_count = 0
+  var exported = false
+  var export_name: bytes<tokens_bytes_max> = []
+  var body = false
+  loop field below tokens_bytes_max while at < end and not body {
+    if tokens[at] != token_open { body = true } else {
+      let field_end = catalog_end(tokens, at)
+      let head_at = catalog_next(tokens, at)
+      let head = catalog_payload(tokens, head_at)
+      if tokens[head_at] != token_atom { body = true } else {
+        if catalog_is(head, "export") {
+          let text_at = catalog_next(tokens, head_at)
+          if text_at >= field_end { return "catalog invalid: export name" }
+          if tokens[text_at] != token_text { return "catalog invalid: export text" }
+          export_name = catalog_payload(tokens, text_at)
+          exported = true
+        } else {
+          if catalog_is(head, "param") or catalog_is(head, "local") or catalog_is(head, "result") {
+            let parsed = catalog_typed(tokens, at, field_end)
+            if before(parsed, " ") != "ok" { return parsed }
+            let value: bytes<tokens_bytes_max> = bytes_of_hex(after(parsed, " "))
+            let codes_at = catalog_skip(value, 0)
+            let typed_name = slice(value, word_bytes, codes_at)
+            let type_codes = slice(value, codes_at + word_bytes, len(value))
+            if catalog_is(head, "param") {
+              if len(type_codes) > locals_max - len(params) { return "catalog bound: params locals_max" }
+              if len(typed_name) > 0 {
+                if len(typed_name) + 2 * word_bytes > catalog_bytes_max - len(param_names) { return "catalog bound: param names" }
+                push param_names catalog_blob(typed_name)
+                push param_names catalog_out(len(params))
+                param_count = param_count + 1
+              }
+              push params type_codes
+            }
+            if catalog_is(head, "local") {
+              if len(type_codes) > locals_max - len(locals) { return "catalog bound: locals_max" }
+              if len(typed_name) > 0 {
+                if len(typed_name) + 2 * word_bytes > catalog_bytes_max - len(local_names) { return "catalog bound: local names" }
+                push local_names catalog_blob(typed_name)
+                push local_names catalog_out(len(locals))
+                local_count = local_count + 1
+              }
+              push locals type_codes
+            }
+            if catalog_is(head, "result") {
+              if len(type_codes) > locals_max - len(results) { return "catalog bound: results locals_max" }
+              push results type_codes
+            }
+          } else { body = true }
+        }
+      }
+      if not body { at = catalog_next(tokens, field_end) }
+    }
+  }
+  if exported and not catalog_ascii(export_name) { return "catalog unsupported: nonascii export" }
+  if len(params) > locals_max - len(locals) { return "catalog bound: combined locals_max" }
+  return catalog_header_out(at, end, symbol_name, params, results, locals, param_names, local_names, param_count, local_count, exported, export_name)
+}
+
+
+fn catalog_type_index(signature_entries: bytes<tokens_bytes_max>, signature: bytes<tokens_bytes_max>) -> u64 {
+  var at = 0
+  var index = 0
+  var found = catalog_missing
+  loop entry below items_max while at < len(signature_entries) and found == catalog_missing {
+    let next = catalog_skip(signature_entries, catalog_skip(signature_entries, at))
+    if catalog_equal(slice(signature_entries, at, next), signature) { found = index }
+    index = index + 1
+    at = next
+  }
+  return found
+}
+
+fn catalog_function_record(parsed: bytes<tokens_bytes_max>, index: u64, type_id: u64) -> text {
+  let params_at = catalog_skip(parsed, 2 * word_bytes)
+  let results_at = catalog_skip(parsed, params_at)
+  let locals_at = catalog_skip(parsed, results_at)
+  let names_at = catalog_skip(parsed, locals_at)
+  let params_count = catalog_word(parsed, params_at)
+  let param_names_count = catalog_word(parsed, names_at)
+  var at = names_at + word_bytes
+  var names: bytes<tokens_bytes_max> = []
+  loop entry below locals_max while entry < param_names_count {
+    let next = catalog_skip(parsed, at) + word_bytes
+    push names slice(parsed, at, next)
+    at = next
+  }
+  let local_names_count = catalog_word(parsed, at)
+  at = at + word_bytes
+  loop entry below locals_max while entry < local_names_count {
+    let next = catalog_skip(parsed, at)
+    push names slice(parsed, at, next)
+    push names catalog_out(catalog_word(parsed, next) + params_count)
+    at = next + word_bytes
+  }
+  let export_at = at
+  let payload = params_at - 2 * word_bytes + results_at - params_at + names_at - locals_at + len(names) + len(parsed) - export_at
+  if payload > catalog_bytes_max - 5 * word_bytes { return "catalog bound: function record" }
+  var out: bytes<tokens_bytes_max> = []
+  push out slice(parsed, 2 * word_bytes, params_at)
+  push out catalog_out(index)
+  push out catalog_out(type_id)
+  push out slice(parsed, 0, 2 * word_bytes)
+  push out slice(parsed, params_at, results_at)
+  push out slice(parsed, locals_at, names_at)
+  push out catalog_out(param_names_count + local_names_count)
+  push out names
+  push out slice(parsed, export_at, len(parsed))
+  return "ok " ++ hex_of(out)
+}
+
+fn catalog_finish(signature_entries: bytes<tokens_bytes_max>, import_entries: bytes<tokens_bytes_max>, function_entries: bytes<tokens_bytes_max>, names: bytes<tokens_bytes_max>, type_count: u64, import_count: u64, function_count: u64) -> text {
+  let payload = len(signature_entries) + len(import_entries) + len(function_entries) + len(names)
+  let overhead = (1 + 2 * catalog_sections) * word_bytes
+  if payload > catalog_bytes_max - overhead { return "catalog bound: catalog_bytes_max" }
+  var out: bytes<tokens_bytes_max> = []
+  push out catalog_out(catalog_version)
+  push out catalog_out(word_bytes + len(signature_entries))
+  push out catalog_out(type_count)
+  push out signature_entries
+  push out catalog_out(word_bytes + len(import_entries))
+  push out catalog_out(import_count)
+  push out import_entries
+  push out catalog_out(word_bytes + len(function_entries))
+  push out catalog_out(function_count)
+  push out function_entries
+  push out catalog_out(word_bytes + len(names))
+  push out catalog_out(import_count + function_count)
+  push out names
+  return "ok " ++ hex_of(out)
+}
+
+
+fn catalog_tokens(tokens: bytes<tokens_bytes_max>) -> text {
+  let error = catalog_validate(tokens)
+  if error != "" { return error }
+  var signature_entries: bytes<tokens_bytes_max> = []
+  var import_entries: bytes<tokens_bytes_max> = []
+  var function_entries: bytes<tokens_bytes_max> = []
+  var names: bytes<tokens_bytes_max> = []
+  var type_count = 0
+  var import_count = 0
+  var function_count = 0
+  loop pass below catalog_passes {
+    var at = 0
+    loop form below items_max while at < len(tokens) {
+      if tokens[at] != token_open { return "catalog invalid: top level list" }
+      let end = catalog_end(tokens, at)
+      let head_at = catalog_next(tokens, at)
+      if head_at >= end { return "catalog invalid: empty top level" }
+      if tokens[head_at] != token_atom { return "catalog invalid: top level head" }
+      let head = catalog_payload(tokens, head_at)
+      let imported = catalog_is(head, "import")
+      let defined = catalog_is(head, "func")
+      if not imported and not defined and not catalog_is(head, "memory") and not catalog_is(head, "global") and not catalog_is(head, "data") and not catalog_is(head, "text") and not catalog_is(head, "words") { return "catalog unsupported: top level" }
+      if (pass == 0 and imported) or (pass == 1 and defined) {
+        var start = at
+        var signature_end = end
+        var import_prefix: bytes<tokens_bytes_max> = []
+        if imported {
+          let module_at = catalog_next(tokens, head_at)
+          if module_at >= end { return "catalog invalid: import module" }
+          let import_at = catalog_next(tokens, module_at)
+          if import_at >= end { return "catalog invalid: import name" }
+          start = catalog_next(tokens, import_at)
+          if start >= end { return "catalog invalid: import signature" }
+          if tokens[module_at] != token_text or tokens[import_at] != token_text or tokens[start] != token_open { return "catalog invalid: import fields" }
+          let module_name = catalog_payload(tokens, module_at)
+          let import_name = catalog_payload(tokens, import_at)
+          if not catalog_ascii(module_name) or not catalog_ascii(import_name) { return "catalog unsupported: nonascii import" }
+          if len(module_name) + len(import_name) > catalog_bytes_max - 2 * word_bytes { return "catalog bound: import text" }
+          push import_prefix catalog_blob(module_name)
+          push import_prefix catalog_blob(import_name)
+          signature_end = catalog_end(tokens, start)
+          let inner_head = catalog_next(tokens, start)
+          if inner_head >= signature_end or tokens[inner_head] != token_atom or not catalog_is(catalog_payload(tokens, inner_head), "func") { return "catalog invalid: import func" }
+        }
+        let parsed_result = catalog_header(tokens, start, signature_end)
+        if before(parsed_result, " ") != "ok" { return parsed_result }
+        let parsed: bytes<tokens_bytes_max> = bytes_of_hex(after(parsed_result, " "))
+        let params_at = catalog_skip(parsed, 2 * word_bytes)
+        let results_at = catalog_skip(parsed, params_at)
+        let locals_at = catalog_skip(parsed, results_at)
+        let signature = slice(parsed, params_at, locals_at)
+        var type_id = catalog_type_index(signature_entries, signature)
+        if type_id == catalog_missing {
+          if type_count == items_max { return "catalog bound: items_max types" }
+          if len(signature) > catalog_bytes_max - len(signature_entries) { return "catalog bound: type bytes" }
+          push signature_entries signature
+          type_id = type_count
+          type_count = type_count + 1
+        }
+        let symbol_name = slice(parsed, 3 * word_bytes, params_at)
+        let index = import_count + function_count
+        if index == items_max { return "catalog bound: items_max names" }
+        if not imported and catalog_map(names, symbol_name) != catalog_missing { return "catalog invalid: function named twice" }
+        if len(symbol_name) + 2 * word_bytes > catalog_bytes_max - len(names) { return "catalog bound: name bytes" }
+        push names catalog_blob(symbol_name)
+        push names catalog_out(index)
+        if imported {
+          if import_count == items_max { return "catalog bound: items_max imports" }
+          if len(import_prefix) + word_bytes > catalog_bytes_max - len(import_entries) { return "catalog bound: import bytes" }
+          push import_entries import_prefix
+          push import_entries catalog_out(type_id)
+          import_count = import_count + 1
+        } else {
+          if function_count == items_max { return "catalog bound: items_max functions" }
+          let record_result = catalog_function_record(parsed, index, type_id)
+          if before(record_result, " ") != "ok" { return record_result }
+          let record: bytes<tokens_bytes_max> = bytes_of_hex(after(record_result, " "))
+          if len(record) > catalog_bytes_max - len(function_entries) { return "catalog bound: function bytes" }
+          push function_entries record
+          function_count = function_count + 1
+        }
+      }
+      at = catalog_next(tokens, end)
+    }
+    if at != len(tokens) { return "catalog bound: items_max forms" }
+  }
+  return catalog_finish(signature_entries, import_entries, function_entries, names, type_count, import_count, function_count)
+}
+
+
+fn catalog_index(value: bytes<tokens_bytes_max>, symbol_name: bytes<tokens_bytes_max>) -> u64 {
+  var at = word_bytes
+  loop section_entry below catalog_sections_before_names { at = catalog_skip(value, at) }
+  return catalog_map(slice(value, at + 2 * word_bytes, catalog_skip(value, at)), symbol_name)
+}
+
+fn catalog_local_index(record: bytes<tokens_bytes_max>, symbol_name: bytes<tokens_bytes_max>) -> u64 {
+  let params_at = catalog_skip(record, 0) + 4 * word_bytes
+  let locals_at = catalog_skip(record, params_at)
+  let names_at = catalog_skip(record, locals_at)
+  let count = catalog_word(record, names_at)
+  var at = names_at + word_bytes
+  var found = catalog_missing
+  loop entry below locals_max while entry < count {
+    let next = catalog_skip(record, at)
+    if catalog_equal(slice(record, at + word_bytes, next), symbol_name) { found = catalog_word(record, next) }
+    at = next + word_bytes
+  }
+  return found
+}
+
+fn catalog_source(source: text) -> text {
+  let result = tokenize(source)
+  if before(result, " ") != "ok" { return result }
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(after(result, " "))
+  return catalog_tokens(tokens)
+}
+
+fn catalog_token_source(input: text) -> text {
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(input)
+  return catalog_tokens(tokens)
+}
+
+on catalog(input: text) -> text {
+  return catalog_source(input)
+}
+
+on catalog_compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = catalog_source(source)
+      match write_bytes(output_path, hex_result(result)) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}
+
+on catalog_token_input(input: text) -> text {
+  return catalog_token_source(input)
+}
+
+on catalog_token_compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = catalog_token_source(source)
+      match write_bytes(output_path, hex_result(result)) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}

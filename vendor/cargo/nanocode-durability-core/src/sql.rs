@@ -1,0 +1,1515 @@
+use std::{collections::HashSet, sync::Arc};
+
+use nanocode_platform::{MaybeSend, MaybeSync};
+
+use serde::ser::SerializeSeq;
+
+use crate::{
+    Committed, EncodedPayload, OwnedCommit, OwnedState, OwnerId, OwnerToken, Settle, StateCommit,
+    StateStore, StoreError, StoreFuture, StoreRecord, StoredState,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlStatement<'a> {
+    pub sql: &'static str,
+    pub params: Vec<&'a str>,
+}
+
+impl serde::Serialize for SqlStatement<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.params.len() + 1))?;
+        sequence.serialize_element(self.sql)?;
+        for param in &self.params {
+            sequence.serialize_element(param)?;
+        }
+        sequence.end()
+    }
+}
+
+pub type SqlRow = Vec<Option<String>>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SqlAccess {
+    Read,
+    Write,
+    Schema,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum SqlDialect {
+    #[default]
+    Sqlite,
+    Postgres,
+}
+
+impl SqlDialect {
+    #[must_use]
+    pub const fn pick(self, statements: &[&'static str; 2]) -> &'static str {
+        statements[self as usize]
+    }
+}
+
+pub trait Sql: MaybeSend + MaybeSync {
+    fn transaction<'a>(
+        &'a self,
+        operation: &'static str,
+        statements: &'a [SqlStatement<'a>],
+    ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>>;
+
+    fn run<'a>(
+        &'a self,
+        access: SqlAccess,
+        operation: &'static str,
+        statements: &'a [SqlStatement<'a>],
+    ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>> {
+        let _ = access;
+        self.transaction(operation, statements)
+    }
+
+    fn write<'a>(
+        &'a self,
+        settle: Settle,
+        operation: &'static str,
+        statements: &'a [SqlStatement<'a>],
+    ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>> {
+        let _ = settle;
+        self.run(SqlAccess::Write, operation, statements)
+    }
+
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Sqlite
+    }
+
+    fn concurrent(self: Arc<Self>) -> Option<Arc<dyn Sql>> {
+        None
+    }
+
+    fn writers(&self) -> usize {
+        1
+    }
+
+    fn readers(&self) -> usize {
+        1
+    }
+}
+
+type Dialects = [&'static str; 2];
+
+const READ_PART_KEYS: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MissingColumn {
+    pub probe: Dialects,
+    pub add: Dialects,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Migration {
+    pub statements: [&'static [&'static str]; 2],
+    pub adopt: Option<MissingColumn>,
+}
+
+const CREATE_FORMATS: Dialects = [
+    "CREATE TABLE IF NOT EXISTS nanocode_formats (component TEXT PRIMARY KEY, version INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS nanocode_formats (component TEXT PRIMARY KEY, version BIGINT NOT NULL)",
+];
+const READ_FORMAT: Dialects = [
+    "SELECT CAST(version AS TEXT) FROM nanocode_formats WHERE component = ?1",
+    "SELECT CAST(version AS TEXT) FROM nanocode_formats WHERE component = $1::text",
+];
+const WRITE_FORMAT: Dialects = [
+    "INSERT INTO nanocode_formats (component, version) VALUES (?1, CAST(?2 AS INTEGER)) ON CONFLICT (component) DO UPDATE SET version = excluded.version",
+    "INSERT INTO nanocode_formats (component, version) VALUES ($1::text, CAST($2::text AS BIGINT)) ON CONFLICT (component) DO UPDATE SET version = excluded.version",
+];
+
+pub(crate) async fn run_checked<H: Sql + ?Sized>(
+    host: &H,
+    access: SqlAccess,
+    operation: &'static str,
+    statements: &[SqlStatement<'_>],
+) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+    answered(host.run(access, operation, statements).await?, statements)
+}
+
+pub(crate) async fn written<H: Sql + ?Sized>(
+    host: &H,
+    settle: Settle,
+    operation: &'static str,
+    statements: &[SqlStatement<'_>],
+) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+    answered(host.write(settle, operation, statements).await?, statements)
+}
+
+fn answered(
+    results: Vec<Vec<SqlRow>>,
+    statements: &[SqlStatement<'_>],
+) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+    if results.len() != statements.len() {
+        return Err(StoreError::Backend(format!(
+            "SQL host answered {} of {} statements",
+            results.len(),
+            statements.len()
+        )));
+    }
+    Ok(results)
+}
+
+pub async fn migrate_format<H: Sql + ?Sized>(
+    host: &H,
+    component: &'static str,
+    migrations: &[Migration],
+) -> Result<(), StoreError> {
+    migrate_format_then(host, component, migrations, &[])
+        .await
+        .map(drop)
+}
+
+pub async fn migrate_format_then<H: Sql + ?Sized>(
+    host: &H,
+    component: &'static str,
+    migrations: &[Migration],
+    then: &[SqlStatement<'_>],
+) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+    let dialect = host.dialect();
+    let check = [
+        statement(dialect, &CREATE_FORMATS, Vec::new()),
+        statement(dialect, &READ_FORMAT, vec![component]),
+    ];
+    let known = u32::try_from(migrations.len()).unwrap_or(u32::MAX);
+    let current = |results: &[Vec<SqlRow>]| -> Result<u64, StoreError> {
+        Ok(match single(&results[1])? {
+            Some(row) => counter(row, 0)?,
+            None => 0,
+        })
+    };
+    let stored = current(&run_checked(host, SqlAccess::Schema, "format", &check).await?)?;
+    if stored > u64::from(known) {
+        return Err(StoreError::UnsupportedFormat {
+            component,
+            stored,
+            known,
+        });
+    }
+    if stored == u64::from(known) {
+        return if then.is_empty() {
+            Ok(Vec::new())
+        } else {
+            run_checked(host, SqlAccess::Schema, "format", then).await
+        };
+    }
+    let last = migrations.len() - 1;
+    for (index, migration) in migrations.iter().enumerate().skip(stored as usize) {
+        let version = (index + 1).to_string();
+        let write = statement(dialect, &WRITE_FORMAT, vec![component, &version]);
+        let trailing: &[SqlStatement<'_>] = if index == last { then } else { &[] };
+        let schema = migration.statements[dialect as usize]
+            .iter()
+            .map(|sql| SqlStatement {
+                sql,
+                params: Vec::new(),
+            });
+        let Some(adopt) = migration.adopt else {
+            let statements: Vec<_> = schema
+                .chain([write])
+                .chain(trailing.iter().cloned())
+                .collect();
+            let mut results = run_checked(host, SqlAccess::Schema, "format", &statements).await?;
+            if index == last {
+                return Ok(results.split_off(statements.len() - trailing.len()));
+            }
+            continue;
+        };
+        let probe = || statement(dialect, &adopt.probe, Vec::new());
+        let statements: Vec<_> = schema.chain([probe()]).collect();
+        let results = run_checked(host, SqlAccess::Schema, "format", &statements).await?;
+        if !column_present(&results[statements.len() - 1])? {
+            let add = [statement(dialect, &adopt.add, Vec::new())];
+            if let Err(error) = run_checked(host, SqlAccess::Schema, "format", &add).await
+                && !column_present(
+                    &run_checked(host, SqlAccess::Schema, "format", &[probe()]).await?[0],
+                )?
+            {
+                return Err(error);
+            }
+        }
+        let statements: Vec<_> = [write]
+            .into_iter()
+            .chain(trailing.iter().cloned())
+            .collect();
+        let mut results = run_checked(host, SqlAccess::Schema, "format", &statements).await?;
+        if index == last {
+            return Ok(results.split_off(1));
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn column_present(rows: &[SqlRow]) -> Result<bool, StoreError> {
+    match single(rows)? {
+        Some(row) => Ok(counter(row, 0)? > 0),
+        None => Ok(false),
+    }
+}
+
+const SCHEMA: [&[&str]; 2] = [
+    &[
+        "CREATE TABLE IF NOT EXISTS states (id TEXT PRIMARY KEY, revision TEXT NOT NULL, payload TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, owner TEXT NOT NULL, fence TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS records (state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (state_id, key)) WITHOUT ROWID",
+        "CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY, state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL)",
+    ],
+    &[
+        "CREATE TABLE IF NOT EXISTS states (id TEXT PRIMARY KEY, revision TEXT NOT NULL, payload TEXT NOT NULL, ord BIGINT GENERATED BY DEFAULT AS IDENTITY)",
+        "CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, owner TEXT NOT NULL, fence TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS blobs (id BIGINT PRIMARY KEY, state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL)",
+    ],
+];
+const SHARED: [&[&str]; 2] = [
+    &[
+        "ALTER TABLE records RENAME TO legacy_records",
+        "CREATE TABLE records (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL)",
+        "CREATE TABLE state_records (record INTEGER NOT NULL, state_id TEXT NOT NULL, PRIMARY KEY (record, state_id)) WITHOUT ROWID",
+        "CREATE INDEX state_records_state ON state_records (state_id)",
+        "INSERT INTO records (key, value) SELECT key, value FROM blobs WHERE true ON CONFLICT (key) DO NOTHING",
+        "INSERT INTO records (key, value) SELECT key, value FROM legacy_records WHERE true ON CONFLICT (key) DO NOTHING",
+        "INSERT INTO state_records (state_id, record) SELECT blobs.state_id, records.id FROM blobs JOIN records ON records.key = blobs.key WHERE true ON CONFLICT DO NOTHING",
+        "INSERT INTO state_records (state_id, record) SELECT legacy_records.state_id, records.id FROM legacy_records JOIN records ON records.key = legacy_records.key WHERE true ON CONFLICT DO NOTHING",
+        "DROP TABLE legacy_records",
+        "DROP TABLE blobs",
+    ],
+    &[
+        "CREATE TABLE IF NOT EXISTS records (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS state_records (record BIGINT NOT NULL, state_id TEXT NOT NULL, PRIMARY KEY (record, state_id))",
+        "CREATE INDEX IF NOT EXISTS state_records_state ON state_records (state_id)",
+        "INSERT INTO records (key, value) SELECT DISTINCT ON (key) key, value FROM blobs ORDER BY key ON CONFLICT (key) DO NOTHING",
+        "INSERT INTO state_records (state_id, record) SELECT DISTINCT blobs.state_id, records.id FROM blobs JOIN records ON records.key = blobs.key ON CONFLICT DO NOTHING",
+        "DROP TABLE blobs",
+    ],
+];
+const HOLDERS: [&[&str]; 2] = [
+    &[
+        "ALTER TABLE records ADD COLUMN holder TEXT",
+        "CREATE INDEX records_holder ON records (holder) WHERE holder IS NOT NULL",
+    ],
+    &[
+        "ALTER TABLE records ADD COLUMN IF NOT EXISTS holder TEXT",
+        "CREATE INDEX IF NOT EXISTS records_holder ON records (holder) WHERE holder IS NOT NULL",
+    ],
+];
+const PEEK: Dialects = [
+    "SELECT revision, payload FROM states WHERE id = ?1",
+    "SELECT revision, payload FROM states WHERE id = $1::text",
+];
+const OWNER: Dialects = [
+    "SELECT owner, fence FROM owners WHERE id = ?1",
+    "SELECT owner, fence FROM owners WHERE id = $1::text",
+];
+const HEAD: Dialects = [
+    "SELECT owners.owner, owners.fence, COALESCE(states.revision, '0') FROM owners LEFT JOIN states ON states.id = owners.id WHERE owners.id = ?1",
+    "SELECT owners.owner, owners.fence, COALESCE(states.revision, '0') FROM owners LEFT JOIN states ON states.id = owners.id WHERE owners.id = $1::text",
+];
+const RECORDS: Dialects = [
+    "SELECT records.value FROM json_each(?1) AS keys LEFT JOIN records ON records.key = keys.value ORDER BY keys.key",
+    "SELECT records.value FROM jsonb_array_elements_text($1::text::jsonb) WITH ORDINALITY AS keys (key, ord) LEFT JOIN records ON records.key = keys.key ORDER BY keys.ord",
+];
+const STATES: Dialects = [
+    "SELECT id FROM states ORDER BY rowid DESC LIMIT CAST(?1 AS INTEGER)",
+    "SELECT id FROM states ORDER BY ord DESC LIMIT CAST($1::text AS BIGINT)",
+];
+const RECORD_KEYS: Dialects = [
+    "SELECT key FROM records WHERE holder = ?1 UNION SELECT records.key FROM state_records JOIN records ON records.id = state_records.record WHERE state_records.state_id = ?1",
+    "SELECT key FROM records WHERE holder = $1::text UNION SELECT records.key FROM state_records JOIN records ON records.id = state_records.record WHERE state_records.state_id = $1::text",
+];
+const ACQUIRE: Dialects = [
+    "INSERT INTO owners VALUES (?1, ?2, '1') ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, fence = CAST(CAST(fence AS INTEGER) + 1 AS TEXT) WHERE CAST(fence AS INTEGER) < 9223372036854775807 RETURNING fence",
+    "INSERT INTO owners (id, owner, fence) VALUES ($1::text, $2::text, '1') ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, fence = CAST(CAST(owners.fence AS BIGINT) + 1 AS TEXT) WHERE CAST(owners.fence AS BIGINT) < 9223372036854775807 RETURNING fence",
+];
+const ACQUIRE_MANY: Dialects = [
+    "INSERT INTO owners (id, owner, fence) SELECT value ->> 0, value ->> 1, '1' FROM json_each(?1) WHERE true ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, fence = CAST(CAST(fence AS INTEGER) + 1 AS TEXT) WHERE CAST(fence AS INTEGER) < 9223372036854775807 RETURNING id, fence",
+    "INSERT INTO owners (id, owner, fence) SELECT wanted.value ->> 0, wanted.value ->> 1, '1' FROM json_array_elements($1::text::json) AS wanted (value) ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, fence = CAST(CAST(owners.fence AS BIGINT) + 1 AS TEXT) WHERE CAST(owners.fence AS BIGINT) < 9223372036854775807 RETURNING id, fence",
+];
+const PEEK_MANY: Dialects = [
+    "SELECT states.id, states.revision, states.payload FROM json_each(?1) AS wanted JOIN states ON states.id = wanted.value",
+    "SELECT states.id, states.revision, states.payload FROM json_array_elements_text($1::text::json) AS wanted (id) JOIN states ON states.id = wanted.id",
+];
+const INSERT_RECORD: &str = "INSERT INTO records (key, value, holder) SELECT ?2, ?3, ?1 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT (key) DO NOTHING";
+const INSERT_RECORDS: &str = "WITH stored AS (INSERT INTO records (key, value, holder) SELECT staged.key, staged.value, $1::text FROM json_to_recordset($5::text::json) AS staged (key text, value text) WHERE EXISTS (SELECT 1 FROM owners WHERE id = $1::text AND owner = $2::text AND fence = $3::text FOR SHARE) AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $4::text ORDER BY 1 ON CONFLICT (key) DO UPDATE SET key = excluded.key RETURNING id, holder) INSERT INTO state_records (record, state_id) SELECT id, $1::text FROM stored WHERE holder IS DISTINCT FROM $1::text ON CONFLICT DO NOTHING";
+const HOLD: Dialects = [
+    "INSERT INTO state_records (record, state_id) SELECT records.id, ?1 FROM json_each(?5) AS staged JOIN records ON records.key = staged.value WHERE records.holder IS NOT ?1 AND EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?2 AND fence = ?3) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?4 ON CONFLICT DO NOTHING",
+    "INSERT INTO state_records (record, state_id) SELECT records.id, $1::text FROM jsonb_array_elements_text($5::text::jsonb) AS staged (key) JOIN records ON records.key = staged.key WHERE records.holder IS DISTINCT FROM $1::text AND EXISTS (SELECT 1 FROM owners WHERE id = $1::text AND owner = $2::text AND fence = $3::text FOR SHARE) AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $4::text ON CONFLICT DO NOTHING",
+];
+const GROUP_REPLACE_ONE: &str = "INSERT INTO states (id, revision, payload) SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload RETURNING id, revision";
+const GROUP_LOCK_RECORDS_PG: &str = "SELECT CAST(count(*) AS TEXT) FROM (SELECT 1 FROM records WHERE records.key IN (SELECT staged.key FROM json_array_elements_text($1::text::json) AS staged (key)) ORDER BY records.key FOR KEY SHARE) AS locked";
+const GROUP_RECORDS_PG: &str = "INSERT INTO records (key, value, holder) SELECT staged.key, staged.value, staged.holder FROM json_to_recordset($1::text::json) AS staged (key text, value text, holder text) ON CONFLICT (key) DO NOTHING";
+const GROUP_HOLDS_PG: &str = "INSERT INTO state_records (record, state_id) SELECT records.id, commits.state FROM json_to_recordset($1::text::json) AS commits (state text, owner text, fence text, expected text, keys json) CROSS JOIN LATERAL json_array_elements_text(commits.keys) AS staged (key) JOIN records ON records.key = staged.key WHERE records.holder IS DISTINCT FROM commits.state AND EXISTS (SELECT 1 FROM owners WHERE owners.id = commits.state AND owners.owner = commits.owner AND owners.fence = commits.fence FOR SHARE) AND COALESCE((SELECT revision FROM states WHERE states.id = commits.state), '0') = commits.expected ON CONFLICT DO NOTHING";
+const GROUP_REPLACE_PG: &str = "INSERT INTO states (id, revision, payload) SELECT commits.state, commits.revision, commits.payload FROM json_to_recordset($1::text::json) AS commits (state text, owner text, fence text, expected text, revision text, payload text) WHERE EXISTS (SELECT 1 FROM owners WHERE owners.id = commits.state AND owners.owner = commits.owner AND owners.fence = commits.fence FOR SHARE) AND COALESCE((SELECT revision FROM states WHERE states.id = commits.state), '0') = commits.expected ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload WHERE CAST(states.revision AS BIGINT) + 1 = CAST(excluded.revision AS BIGINT) RETURNING id, revision";
+const PUT_RECORD: &str =
+    "INSERT INTO records (key, value, holder) VALUES (?1, ?2, ?3) ON CONFLICT (key) DO NOTHING";
+const PUT_RECORDS: &str = "WITH stored AS (INSERT INTO records (key, value, holder) SELECT staged.key, staged.value, $1::text FROM json_to_recordset($2::text::json) AS staged (key text, value text) ORDER BY 1 ON CONFLICT (key) DO UPDATE SET key = excluded.key RETURNING id, holder) INSERT INTO state_records (record, state_id) SELECT id, $1::text FROM stored WHERE holder IS DISTINCT FROM $1::text ON CONFLICT DO NOTHING";
+const PUT_HOLDS: &str = "INSERT INTO state_records (record, state_id) SELECT records.id, ?1 FROM json_each(?2) AS staged JOIN records ON records.key = staged.value WHERE records.holder IS NOT ?1 ON CONFLICT DO NOTHING";
+const REPLACE: Dialects = [
+    "INSERT INTO states SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 AND NOT EXISTS (SELECT 1 FROM json_each(?7) AS staged LEFT JOIN records ON records.key = staged.value WHERE records.holder IS NOT ?1 AND NOT EXISTS (SELECT 1 FROM state_records WHERE state_records.state_id = ?1 AND state_records.record = records.id)) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload RETURNING revision",
+    "INSERT INTO states (id, revision, payload) SELECT $1::text, $2::text, $3::text WHERE EXISTS (SELECT 1 FROM owners WHERE id = $1::text AND owner = $4::text AND fence = $5::text FOR SHARE) AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $6::text AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text($7::text::jsonb) AS staged (key) LEFT JOIN records ON records.key = staged.key WHERE records.holder IS DISTINCT FROM $1::text AND NOT EXISTS (SELECT 1 FROM state_records WHERE state_records.state_id = $1::text AND state_records.record = records.id)) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload WHERE states.revision = $6::text RETURNING revision",
+];
+const HOLD_OWNER: Dialects = [
+    "INSERT INTO owners (id, owner, fence) VALUES (?1, '', '0') ON CONFLICT (id) DO UPDATE SET fence = owners.fence",
+    "INSERT INTO owners (id, owner, fence) VALUES ($1::text, '', '0') ON CONFLICT (id) DO UPDATE SET fence = owners.fence",
+];
+const LOCK_RECORDS: &str = "SELECT CAST(COUNT(*) AS TEXT) FROM (SELECT 1 FROM jsonb_array_elements_text($1::text::jsonb) AS dead (key) JOIN records ON records.key = dead.key ORDER BY records.key FOR UPDATE OF records) AS locked";
+const RELEASE: Dialects = [
+    "DELETE FROM state_records WHERE state_id = ?1 AND record IN (SELECT records.id FROM json_each(?3) AS dead JOIN records ON records.key = dead.value) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?2 AND (SELECT CAST(fence AS INTEGER) FROM owners WHERE id = ?1) < 9223372036854775807 RETURNING record",
+    "DELETE FROM state_records USING jsonb_array_elements_text($3::text::jsonb) AS dead (key), records WHERE records.key = dead.key AND state_records.state_id = $1::text AND state_records.record = records.id AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $2::text AND (SELECT CAST(fence AS BIGINT) FROM owners WHERE id = $1::text) < 9223372036854775807 RETURNING CAST(state_records.record AS TEXT)",
+];
+const UNHOLD: Dialects = [
+    "UPDATE records SET holder = NULL WHERE holder = ?1 AND key IN (SELECT value FROM json_each(?3)) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?2 AND (SELECT CAST(fence AS INTEGER) FROM owners WHERE id = ?1) < 9223372036854775807 RETURNING id",
+    "UPDATE records SET holder = NULL FROM jsonb_array_elements_text($3::text::jsonb) AS dead (key) WHERE records.key = dead.key AND records.holder = $1::text AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $2::text AND (SELECT CAST(fence AS BIGINT) FROM owners WHERE id = $1::text) < 9223372036854775807 RETURNING CAST(records.id AS TEXT)",
+];
+const FENCE: Dialects = [
+    "UPDATE owners SET fence = CAST(CAST(fence AS INTEGER) + 1 AS TEXT) WHERE id = ?1 AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?2 AND CAST(fence AS INTEGER) < 9223372036854775807 RETURNING fence",
+    "UPDATE owners SET fence = CAST(CAST(fence AS BIGINT) + 1 AS TEXT) WHERE id = $1::text AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $2::text AND CAST(fence AS BIGINT) < 9223372036854775807 RETURNING fence",
+];
+const RELEASE_OWNER: Dialects = [
+    "DELETE FROM owners WHERE id = ?1 AND owner = '' AND fence = '0'",
+    "DELETE FROM owners WHERE id = $1::text AND owner = '' AND fence = '0'",
+];
+const DROP_RECORDS: Dialects = [
+    "DELETE FROM records WHERE key IN (SELECT value FROM json_each(?3)) AND (holder IS NULL OR (holder = ?1 AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?2 AND (SELECT CAST(fence AS INTEGER) FROM owners WHERE id = ?1) < 9223372036854775807)) AND NOT EXISTS (SELECT 1 FROM state_records WHERE state_records.record = records.id) RETURNING holder",
+    "DELETE FROM records USING jsonb_array_elements_text($3::text::jsonb) AS dead (key) WHERE records.key = dead.key AND (records.holder IS NULL OR (records.holder = $1::text AND COALESCE((SELECT revision FROM states WHERE id = $1::text), '0') = $2::text AND (SELECT CAST(fence AS BIGINT) FROM owners WHERE id = $1::text) < 9223372036854775807)) AND NOT EXISTS (SELECT 1 FROM state_records WHERE state_records.record = records.id) RETURNING records.holder",
+];
+
+struct Text<T>(T);
+
+impl<T: AsRef<str>> serde::Serialize for Text<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_ref())
+    }
+}
+
+struct Each<I>(std::cell::Cell<Option<I>>);
+
+impl<I: Iterator<Item = T>, T: serde::Serialize> serde::Serialize for Each<I> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.take().into_iter().flatten())
+    }
+}
+
+pub(crate) fn keys_json(keys: impl Iterator<Item = impl AsRef<str>>) -> Result<String, StoreError> {
+    serde_json::to_string(&Each(std::cell::Cell::new(Some(keys.map(Text)))))
+        .map_err(|error| StoreError::NotCommitted(format!("record keys: {error}")))
+}
+
+#[derive(serde::Serialize)]
+struct GroupRecord<'a> {
+    key: &'a str,
+    value: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holder: Option<&'a str>,
+}
+
+fn records_json<'a>(
+    records: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+) -> Result<String, StoreError> {
+    serde_json::to_string(&Each(std::cell::Cell::new(Some(
+        records.map(|(key, value, holder)| GroupRecord { key, value, holder }),
+    ))))
+    .map_err(|error| StoreError::NotCommitted(format!("records: {error}")))
+}
+
+fn values_json(records: &[StoreRecord]) -> Result<String, StoreError> {
+    records_json(
+        records
+            .iter()
+            .map(|record| (record.key.as_str(), record.value.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(key, value)| (key, value, None)),
+    )
+}
+
+pub(crate) const fn statement<'a>(
+    dialect: SqlDialect,
+    sql: &Dialects,
+    params: Vec<&'a str>,
+) -> SqlStatement<'a> {
+    SqlStatement {
+        sql: dialect.pick(sql),
+        params,
+    }
+}
+
+pub(crate) fn invalid(detail: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend(format!("SQL host answered an invalid row: {detail}"))
+}
+
+pub(crate) fn text(row: &SqlRow, column: usize) -> Result<&str, StoreError> {
+    row.get(column)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| invalid(format!("column {column} is missing")))
+}
+
+pub(crate) fn counter(row: &SqlRow, column: usize) -> Result<u64, StoreError> {
+    let value = text(row, column)?;
+    value
+        .parse()
+        .map_err(|error| invalid(format!("counter `{value}`: {error}")))
+}
+
+pub(crate) fn limit_param(limit: usize) -> String {
+    u64::try_from(limit)
+        .unwrap_or(u64::MAX)
+        .min(i64::MAX as u64)
+        .to_string()
+}
+
+pub(crate) fn names(rows: &[SqlRow]) -> Result<Vec<String>, StoreError> {
+    rows.iter()
+        .map(|row| text(row, 0).map(str::to_owned))
+        .collect()
+}
+
+pub(crate) fn owner_token(rows: &[SqlRow]) -> Result<Option<OwnerToken>, StoreError> {
+    single(rows)?
+        .map(|row| {
+            Ok(OwnerToken::new(
+                OwnerId::from(text(row, 0)?.to_owned()),
+                counter(row, 1)?,
+            ))
+        })
+        .transpose()
+}
+
+pub(crate) fn single(rows: &[SqlRow]) -> Result<Option<&SqlRow>, StoreError> {
+    match rows {
+        [] => Ok(None),
+        [row] => Ok(Some(row)),
+        _ => Err(invalid(format!(
+            "{} rows for a single-row query",
+            rows.len()
+        ))),
+    }
+}
+
+fn stored(rows: &[SqlRow]) -> Result<StoredState, StoreError> {
+    match single(rows)? {
+        None => Ok(StoredState::default()),
+        Some(row) => Ok(StoredState {
+            revision: counter(row, 0)?,
+            payload: Some(text(row, 1)?.to_owned()),
+        }),
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Unreachable {
+    pub revision: u64,
+    pub keys: Vec<String>,
+    pub reachable: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Collected {
+    pub released: u64,
+    pub deleted: u64,
+}
+
+pub(crate) async fn unreachable_in(
+    store: &mut dyn StateStore,
+    state_id: &str,
+) -> Result<Unreachable, StoreError> {
+    let head = store.peek(state_id).await?;
+    let held = store.list_records(state_id).await?;
+    let mut unreachable = Unreachable {
+        revision: head.revision,
+        keys: Vec::new(),
+        reachable: held.len(),
+    };
+    if !held.iter().all(|key| EncodedPayload::is_layout_key(key)) {
+        return Ok(unreachable);
+    }
+    let holds: HashSet<&str> = held.iter().map(String::as_str).collect();
+    let mut reached = HashSet::new();
+    let mut level = Vec::new();
+    let follow = |json: &str, reached: &mut HashSet<String>, level: &mut Vec<_>| {
+        for key in EncodedPayload::references(json) {
+            if holds.contains(key) && reached.insert(key.to_owned()) {
+                level.push(EncodedPayload::by_key(key));
+            }
+        }
+    };
+    follow(
+        head.payload.as_deref().unwrap_or_default(),
+        &mut reached,
+        &mut level,
+    );
+    while !level.is_empty() {
+        let loaded = EncodedPayload::load_many_noting(&level, &mut *store, state_id, &mut reached)
+            .await
+            .map_err(|error| {
+                StoreError::Backend(format!("state {state_id} is not whole: {error}"))
+            })?;
+        level.clear();
+        for payload in &loaded {
+            let json = payload
+                .json()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            follow(json, &mut reached, &mut level);
+        }
+    }
+    unreachable.keys = held
+        .iter()
+        .filter(|key| !reached.contains(*key))
+        .cloned()
+        .collect();
+    unreachable.reachable = held.len() - unreachable.keys.len();
+    Ok(unreachable)
+}
+
+struct Replacement<'a> {
+    dialect: SqlDialect,
+    state_id: &'a str,
+    owner: &'a OwnerToken,
+    expected_revision: u64,
+    revision: u64,
+    payload: &'a str,
+    records: &'a [StoreRecord],
+}
+
+#[derive(serde::Serialize)]
+struct GroupHold<'a> {
+    state: &'a str,
+    owner: &'a str,
+    fence: &'a str,
+    expected: &'a str,
+    keys: Vec<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct GroupHead<'a> {
+    state: &'a str,
+    owner: &'a str,
+    fence: &'a str,
+    expected: &'a str,
+    revision: &'a str,
+    payload: &'a str,
+}
+
+struct Counters {
+    fence: String,
+    expected: String,
+    revision: String,
+    staged: String,
+    values: Option<String>,
+}
+
+impl Replacement<'_> {
+    fn counters(&self) -> Result<Counters, StoreError> {
+        self.counters_with(self.dialect == SqlDialect::Postgres)
+    }
+
+    fn counters_with(&self, values: bool) -> Result<Counters, StoreError> {
+        if self.revision <= self.expected_revision {
+            return Err(StoreError::NotCommitted(format!(
+                "a replacement of revision {} must advance it, not set {}",
+                self.expected_revision, self.revision
+            )));
+        }
+        let values = (values && !self.records.is_empty())
+            .then(|| values_json(self.records))
+            .transpose()?;
+        Ok(Counters {
+            fence: self.owner.fence().to_string(),
+            expected: self.expected_revision.to_string(),
+            revision: self.revision.to_string(),
+            staged: keys_json(self.records.iter().map(|record| &record.key))?,
+            values,
+        })
+    }
+
+    fn statements<'a>(&'a self, counters: &'a Counters, statements: &mut Vec<SqlStatement<'a>>) {
+        let owner = self.owner.owner_id().as_str();
+        if let Some(values) = &counters.values {
+            statements.push(SqlStatement {
+                sql: INSERT_RECORDS,
+                params: vec![
+                    self.state_id,
+                    owner,
+                    &counters.fence,
+                    &counters.expected,
+                    values,
+                ],
+            });
+        } else {
+            statements.extend(self.records.iter().map(|record| SqlStatement {
+                sql: INSERT_RECORD,
+                params: vec![
+                    self.state_id,
+                    &record.key,
+                    &record.value,
+                    owner,
+                    &counters.fence,
+                    &counters.expected,
+                ],
+            }));
+            self.hold(counters, statements);
+        }
+        self.replacement(counters, statements);
+    }
+
+    fn hold<'a>(&'a self, counters: &'a Counters, statements: &mut Vec<SqlStatement<'a>>) {
+        if !self.records.is_empty() {
+            statements.push(statement(
+                self.dialect,
+                &HOLD,
+                vec![
+                    self.state_id,
+                    self.owner.owner_id().as_str(),
+                    &counters.fence,
+                    &counters.expected,
+                    &counters.staged,
+                ],
+            ));
+        }
+    }
+
+    fn replacement<'a>(&'a self, counters: &'a Counters, statements: &mut Vec<SqlStatement<'a>>) {
+        let owner = self.owner.owner_id().as_str();
+        statements.push(statement(
+            self.dialect,
+            &REPLACE,
+            vec![
+                self.state_id,
+                &counters.revision,
+                self.payload,
+                owner,
+                &counters.fence,
+                &counters.expected,
+                &counters.staged,
+            ],
+        ));
+    }
+
+    fn replaced(results: &[Vec<SqlRow>]) -> Result<Option<u64>, StoreError> {
+        let [.., replaced] = results else {
+            return Err(StoreError::Backend(
+                "SQL host answered too few statements for a replacement".to_owned(),
+            ));
+        };
+        single(replaced)?.map(|row| counter(row, 0)).transpose()
+    }
+
+    fn refusal(&self, head: &[SqlRow]) -> StoreError {
+        self.diagnose(head).unwrap_or_else(|error| error)
+    }
+
+    fn diagnose(&self, head: &[SqlRow]) -> Result<StoreError, StoreError> {
+        let Some(head) = single(head)? else {
+            return Ok(StoreError::Fenced);
+        };
+        if text(head, 0)? != self.owner.owner_id().as_str()
+            || counter(head, 1)? != self.owner.fence()
+        {
+            return Ok(StoreError::Fenced);
+        }
+        let actual = counter(head, 2)?;
+        if actual != self.expected_revision {
+            return Ok(StoreError::Conflict {
+                expected: self.expected_revision,
+                actual,
+            });
+        }
+        Ok(StoreError::Backend(format!(
+            "SQL host refused to replace revision {actual} of state {} while reporting it as current",
+            self.state_id
+        )))
+    }
+}
+
+const MIGRATIONS: [Migration; 3] = [
+    Migration {
+        statements: SCHEMA,
+        adopt: None,
+    },
+    Migration {
+        statements: SHARED,
+        adopt: None,
+    },
+    Migration {
+        statements: HOLDERS,
+        adopt: None,
+    },
+];
+
+pub struct SqlStore<H: ?Sized> {
+    host: Arc<H>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<H: Sql + ?Sized> SqlStore<H> {
+    pub fn new(host: H) -> Self
+    where
+        H: Sized,
+    {
+        Self::shared(Arc::new(host))
+    }
+
+    pub fn shared(host: Arc<H>) -> Self {
+        Self {
+            host,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub const FORMAT: u32 = MIGRATIONS.len() as u32;
+
+    #[must_use]
+    pub fn migrated(self) -> Self {
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    pub async fn migrate(&mut self) -> Result<(), StoreError> {
+        migrate_format(&*self.host, "records", &MIGRATIONS).await?;
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub fn host(&self) -> &H {
+        &self.host
+    }
+
+    async fn transaction(
+        &mut self,
+        operation: &'static str,
+        statements: Vec<SqlStatement<'_>>,
+    ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+        self.run(SqlAccess::Write, operation, statements).await
+    }
+
+    async fn run(
+        &mut self,
+        access: SqlAccess,
+        operation: &'static str,
+        statements: Vec<SqlStatement<'_>>,
+    ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            self.migrate().await?;
+        }
+        run_checked(&*self.host, access, operation, &statements).await
+    }
+
+    async fn settled(
+        &mut self,
+        settle: Settle,
+        operation: &'static str,
+        statements: Vec<SqlStatement<'_>>,
+    ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            self.migrate().await?;
+        }
+        written(&*self.host, settle, operation, &statements).await
+    }
+
+    async fn query(
+        &mut self,
+        operation: &'static str,
+        sql: &Dialects,
+        params: Vec<&str>,
+    ) -> Result<Vec<SqlRow>, StoreError> {
+        let dialect = self.host.dialect();
+        let mut results = self
+            .run(
+                SqlAccess::Read,
+                operation,
+                vec![statement(dialect, sql, params)],
+            )
+            .await?;
+        Ok(results.pop().unwrap_or_default())
+    }
+
+    async fn record(&mut self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .records(std::slice::from_ref(&key.to_owned()))
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    async fn records(&mut self, keys: &[String]) -> Result<Vec<Option<String>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let parts = self
+            .host
+            .readers()
+            .clamp(1, keys.len().div_ceil(READ_PART_KEYS).max(1));
+        let rows = if parts == 1 {
+            let encoded = keys_json(keys.iter())?;
+            self.query("read_records", &RECORDS, vec![&encoded]).await?
+        } else {
+            if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+                self.migrate().await?;
+            }
+            let dialect = self.host.dialect();
+            let encoded = keys
+                .chunks(keys.len().div_ceil(parts))
+                .map(|chunk| keys_json(chunk.iter()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let statements = encoded
+                .iter()
+                .map(|encoded| [statement(dialect, &RECORDS, vec![encoded])])
+                .collect::<Vec<_>>();
+            let host = &*self.host;
+            nanocode_sync::try_join_in_order(
+                statements
+                    .iter()
+                    .map(|statement| run_checked(host, SqlAccess::Read, "read_records", statement)),
+            )
+            .await?
+            .into_iter()
+            .flat_map(|mut results| results.pop().unwrap_or_default())
+            .collect()
+        };
+        if rows.len() != keys.len() {
+            return Err(StoreError::Backend(format!(
+                "SQL host answered {} of {} record reads",
+                rows.len(),
+                keys.len()
+            )));
+        }
+        rows.into_iter()
+            .map(|row| match <[Option<String>; 1]>::try_from(row) {
+                Ok([value]) => Ok(value),
+                Err(row) => Err(invalid(format!("{} columns for a record read", row.len()))),
+            })
+            .collect()
+    }
+
+    async fn state(&mut self, state_id: &str) -> Result<StoredState, StoreError> {
+        stored(&self.query("peek", &PEEK, vec![state_id]).await?)
+    }
+
+    async fn state_ids(&mut self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let limit = limit_param(limit);
+        names(&self.query("list_states", &STATES, vec![&limit]).await?)
+    }
+
+    async fn record_keys(&mut self, state_id: &str) -> Result<Vec<String>, StoreError> {
+        names(
+            &self
+                .query("list_records", &RECORD_KEYS, vec![state_id])
+                .await?,
+        )
+    }
+
+    async fn current_owner(&mut self, state_id: &str) -> Result<Option<OwnerToken>, StoreError> {
+        owner_token(&self.query("owner", &OWNER, vec![state_id]).await?)
+    }
+
+    async fn acquire_owner(
+        &mut self,
+        state_id: &str,
+        owner_id: OwnerId,
+    ) -> Result<OwnedState, StoreError> {
+        let dialect = self.host.dialect();
+        let results = self
+            .transaction(
+                "acquire",
+                vec![
+                    statement(dialect, &ACQUIRE, vec![state_id, owner_id.as_str()]),
+                    statement(dialect, &PEEK, vec![state_id]),
+                ],
+            )
+            .await?;
+        let Some(acquired) = single(&results[0])? else {
+            return Err(StoreError::NotCommitted(
+                "SQL durability owner fence overflow".to_owned(),
+            ));
+        };
+        let fence = counter(acquired, 0)?;
+        Ok(OwnedState {
+            owner: OwnerToken::new(owner_id, fence),
+            state: stored(&results[1])?,
+        })
+    }
+
+    async fn acquire_owners(
+        &mut self,
+        acquisitions: Vec<(String, OwnerId)>,
+    ) -> Vec<Result<OwnedState, StoreError>> {
+        let mut order = acquisitions.iter().collect::<Vec<_>>();
+        order.sort_unstable_by_key(|(state_id, _)| state_id.as_str());
+        order.dedup_by_key(|(state_id, _)| state_id.as_str());
+        if order.len() != acquisitions.len() || acquisitions.len() == 1 {
+            let mut results = Vec::with_capacity(acquisitions.len());
+            for (state_id, owner_id) in acquisitions {
+                results.push(self.acquire_owner(&state_id, owner_id).await);
+            }
+            return results;
+        }
+        let dialect = self.host.dialect();
+        let documents = serde_json::to_string(
+            &order
+                .iter()
+                .map(|(state_id, owner_id)| [state_id.as_str(), owner_id.as_str()])
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| StoreError::NotCommitted(format!("owners: {error}")))
+        .and_then(|owners| {
+            Ok((
+                owners,
+                keys_json(order.iter().map(|(state_id, _)| state_id))?,
+            ))
+        });
+        let acquired = match documents {
+            Ok((owners, ids)) => {
+                self.transaction(
+                    "acquire_many",
+                    vec![
+                        statement(dialect, &ACQUIRE_MANY, vec![&owners]),
+                        statement(dialect, &PEEK_MANY, vec![&ids]),
+                    ],
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+        .and_then(|results| {
+            let fences = results[0]
+                .iter()
+                .map(|row| Ok((text(row, 0)?.to_owned(), counter(row, 1)?)))
+                .collect::<Result<std::collections::HashMap<_, _>, StoreError>>()?;
+            let heads = results[1]
+                .iter()
+                .map(|row| {
+                    Ok((
+                        text(row, 0)?.to_owned(),
+                        StoredState {
+                            revision: counter(row, 1)?,
+                            payload: Some(text(row, 2)?.to_owned()),
+                        },
+                    ))
+                })
+                .collect::<Result<std::collections::HashMap<_, _>, StoreError>>()?;
+            Ok((fences, heads))
+        });
+        let (fences, mut heads) = match acquired {
+            Ok(acquired) => acquired,
+            Err(error) => return acquisitions.iter().map(|_| Err(error.clone())).collect(),
+        };
+        acquisitions
+            .into_iter()
+            .map(|(state_id, owner_id)| match fences.get(&state_id) {
+                Some(fence) => Ok(OwnedState {
+                    owner: OwnerToken::new(owner_id, *fence),
+                    state: heads.remove(&state_id).unwrap_or_default(),
+                }),
+                None => Err(StoreError::NotCommitted(
+                    "SQL durability owner fence overflow".to_owned(),
+                )),
+            })
+            .collect()
+    }
+
+    async fn replace_state(
+        &mut self,
+        replacement: Replacement<'_>,
+        settle: Settle,
+    ) -> Result<u64, StoreError> {
+        let counters = replacement.counters()?;
+        let mut statements = Vec::with_capacity(replacement.records.len() + 2);
+        replacement.statements(&counters, &mut statements);
+        let results = self.settled(settle, "replace", statements).await?;
+        match Replacement::replaced(&results)? {
+            Some(revision) => Ok(revision),
+            None => Err(self.refusal(&replacement).await),
+        }
+    }
+
+    async fn put(&mut self, state_id: &str, records: &[StoreRecord]) -> Result<bool, StoreError> {
+        if records.is_empty() {
+            return Ok(true);
+        }
+        let dialect = self.host.dialect();
+        let keys = keys_json(records.iter().map(|record| &record.key))?;
+        let values = (dialect == SqlDialect::Postgres)
+            .then(|| values_json(records))
+            .transpose()?;
+        let statements = match &values {
+            Some(values) => vec![SqlStatement {
+                sql: PUT_RECORDS,
+                params: vec![state_id, values],
+            }],
+            None => records
+                .iter()
+                .map(|record| SqlStatement {
+                    sql: PUT_RECORD,
+                    params: vec![&record.key, &record.value, state_id],
+                })
+                .chain([SqlStatement {
+                    sql: PUT_HOLDS,
+                    params: vec![state_id, &keys],
+                }])
+                .collect(),
+        };
+        self.transaction("put_records", statements).await?;
+        Ok(true)
+    }
+
+    pub async fn unreachable(&mut self, state_id: &str) -> Result<Unreachable, StoreError> {
+        unreachable_in(self, state_id).await
+    }
+
+    pub async fn collect(
+        &mut self,
+        state_id: &str,
+        revision: u64,
+        keys: &[String],
+    ) -> Result<Option<Collected>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Some(Collected::default()));
+        }
+        let dialect = self.host.dialect();
+        let revision = revision.to_string();
+        let dead = keys_json(keys.iter())?;
+        let mut statements = vec![statement(dialect, &HOLD_OWNER, vec![state_id])];
+        if dialect == SqlDialect::Postgres {
+            statements.push(SqlStatement {
+                sql: LOCK_RECORDS,
+                params: vec![&dead],
+            });
+        }
+        statements.extend([
+            statement(dialect, &RELEASE, vec![state_id, &revision, &dead]),
+            statement(dialect, &DROP_RECORDS, vec![state_id, &revision, &dead]),
+            statement(dialect, &UNHOLD, vec![state_id, &revision, &dead]),
+            statement(dialect, &FENCE, vec![state_id, &revision]),
+            statement(dialect, &RELEASE_OWNER, vec![state_id]),
+        ]);
+        let released = statements.len() - 5;
+        let results = self.transaction("collect", statements).await?;
+        if results[released + 3].is_empty() {
+            return Ok(None);
+        }
+        let dropped = &results[released + 1];
+        let unheld = dropped
+            .iter()
+            .filter(|row| row.first().is_some_and(Option::is_some));
+        Ok(Some(Collected {
+            released: (results[released].len() + unheld.count() + results[released + 2].len())
+                as u64,
+            deleted: dropped.len() as u64,
+        }))
+    }
+
+    pub async fn sweep(
+        &mut self,
+        state_id: &str,
+        batch: usize,
+    ) -> Result<Option<Collected>, StoreError> {
+        let unreachable = self.unreachable(state_id).await?;
+        let mut collected = Collected::default();
+        for keys in unreachable.keys.chunks(batch.max(1)) {
+            let Some(swept) = self.collect(state_id, unreachable.revision, keys).await? else {
+                return Ok(None);
+            };
+            collected.released += swept.released;
+            collected.deleted += swept.deleted;
+        }
+        Ok(Some(collected))
+    }
+
+    async fn refusal(&mut self, replacement: &Replacement<'_>) -> StoreError {
+        match self.query("head", &HEAD, vec![replacement.state_id]).await {
+            Ok(head) => replacement.refusal(&head),
+            Err(error) => error,
+        }
+    }
+
+    async fn commit_all(
+        &mut self,
+        commits: Vec<OwnedCommit>,
+    ) -> Vec<Result<Committed, StoreError>> {
+        let dialect = self.host.dialect();
+        let prepared: Vec<_> = commits
+            .iter()
+            .map(|commit| {
+                if !commit.events.is_empty() {
+                    return Err(StoreError::NotCommitted(
+                        "this store does not record state events".to_owned(),
+                    ));
+                }
+                let replacement = Replacement {
+                    dialect,
+                    state_id: &commit.state_id,
+                    owner: &commit.owner,
+                    expected_revision: commit.expected_revision,
+                    revision: commit.expected_revision.checked_add(1).ok_or_else(|| {
+                        StoreError::NotCommitted("SQL durability revision overflow".to_owned())
+                    })?,
+                    payload: &commit.payload,
+                    records: &commit.records,
+                };
+                let counters = replacement.counters_with(false)?;
+                Ok((replacement, counters))
+            })
+            .collect();
+        let mut unique = std::collections::BTreeMap::new();
+        for (replacement, _) in prepared.iter().flatten() {
+            for record in replacement.records {
+                unique
+                    .entry(record.key.as_str())
+                    .or_insert((record.value.as_str(), replacement.state_id));
+            }
+        }
+        let settle = if commits
+            .iter()
+            .all(|commit| commit.settle == Settle::Ordered)
+        {
+            Settle::Ordered
+        } else {
+            Settle::Durable
+        };
+        self.commit_grouped(dialect, &prepared, &unique, settle)
+            .await
+    }
+
+    async fn commit_grouped(
+        &mut self,
+        dialect: SqlDialect,
+        prepared: &[Result<(Replacement<'_>, Counters), StoreError>],
+        unique: &std::collections::BTreeMap<&str, (&str, &str)>,
+        settle: Settle,
+    ) -> Vec<Result<Committed, StoreError>> {
+        let mut committing = prepared.iter().flatten().collect::<Vec<_>>();
+        committing.sort_unstable_by_key(|(replacement, _)| replacement.state_id);
+        let encoded = match dialect {
+            SqlDialect::Sqlite => Ok(None),
+            SqlDialect::Postgres => Self::group_documents(&committing, unique).map(Some),
+        };
+        let documents = match encoded {
+            Ok(documents) => documents,
+            Err(error) => return prepared.iter().map(|_| Err(error.clone())).collect(),
+        };
+        let mut statements = Vec::new();
+        match &documents {
+            Some((keys, values, holds, heads)) => {
+                if !unique.is_empty() {
+                    statements.push(SqlStatement {
+                        sql: GROUP_LOCK_RECORDS_PG,
+                        params: vec![keys],
+                    });
+                    statements.push(SqlStatement {
+                        sql: GROUP_RECORDS_PG,
+                        params: vec![values],
+                    });
+                    statements.push(SqlStatement {
+                        sql: GROUP_HOLDS_PG,
+                        params: vec![holds],
+                    });
+                }
+                if !committing.is_empty() {
+                    statements.push(SqlStatement {
+                        sql: GROUP_REPLACE_PG,
+                        params: vec![heads],
+                    });
+                }
+            }
+            None => {
+                statements.extend(unique.iter().map(|(key, (value, holder))| SqlStatement {
+                    sql: PUT_RECORD,
+                    params: vec![*key, *value, *holder],
+                }));
+                for (replacement, counters) in &committing {
+                    replacement.hold(counters, &mut statements);
+                    statements.push(SqlStatement {
+                        sql: GROUP_REPLACE_ONE,
+                        params: vec![
+                            replacement.state_id,
+                            &counters.revision,
+                            replacement.payload,
+                            replacement.owner.owner_id().as_str(),
+                            &counters.fence,
+                            &counters.expected,
+                        ],
+                    });
+                }
+            }
+        }
+        let results = if statements.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.settled(settle, "commit_many", statements).await
+        };
+        let replaced = match &results {
+            Ok(results) => {
+                let rows: Box<dyn Iterator<Item = &SqlRow>> = match &documents {
+                    Some(_) => Box::new(results.last().into_iter().flatten()),
+                    None => Box::new(results.iter().flatten()),
+                };
+                rows.filter(|row| row.len() == 2)
+                    .map(|row| Ok((text(row, 0)?.to_owned(), counter(row, 1)?)))
+                    .collect::<Result<std::collections::HashMap<_, _>, StoreError>>()
+            }
+            Err(error) => Err(error.clone()),
+        };
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        for entry in prepared {
+            let outcome = match (entry, &replaced) {
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error.clone()),
+                (Ok((replacement, _)), Ok(replaced)) => match replaced.get(replacement.state_id) {
+                    Some(revision) => Ok(Committed {
+                        revision: *revision,
+                        first_event: None,
+                    }),
+                    None => Err(self.refusal(replacement).await),
+                },
+            };
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    fn group_documents(
+        committing: &[&(Replacement<'_>, Counters)],
+        unique: &std::collections::BTreeMap<&str, (&str, &str)>,
+    ) -> Result<(String, String, String, String), StoreError> {
+        let holds = committing
+            .iter()
+            .filter(|(replacement, _)| !replacement.records.is_empty())
+            .map(|(replacement, counters)| GroupHold {
+                state: replacement.state_id,
+                owner: replacement.owner.owner_id().as_str(),
+                fence: &counters.fence,
+                expected: &counters.expected,
+                keys: replacement
+                    .records
+                    .iter()
+                    .map(|record| record.key.as_str())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let heads = committing
+            .iter()
+            .map(|(replacement, counters)| GroupHead {
+                state: replacement.state_id,
+                owner: replacement.owner.owner_id().as_str(),
+                fence: &counters.fence,
+                expected: &counters.expected,
+                revision: &counters.revision,
+                payload: replacement.payload,
+            })
+            .collect::<Vec<_>>();
+        let encode =
+            |error: serde_json::Error| StoreError::NotCommitted(format!("records: {error}"));
+        Ok((
+            keys_json(unique.keys())?,
+            records_json(
+                unique
+                    .iter()
+                    .map(|(key, (value, holder))| (*key, *value, Some(*holder))),
+            )?,
+            serde_json::to_string(&holds).map_err(encode)?,
+            serde_json::to_string(&heads).map_err(encode)?,
+        ))
+    }
+}
+
+impl<H: Sql + ?Sized> StateStore for SqlStore<H> {
+    fn read_record<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+        key: &'a str,
+    ) -> StoreFuture<'a, Result<Option<String>, StoreError>> {
+        Box::pin(self.record(key))
+    }
+
+    fn read_records<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+        keys: &'a [String],
+    ) -> StoreFuture<'a, Result<Vec<Option<String>>, StoreError>> {
+        Box::pin(self.records(keys))
+    }
+
+    fn peek<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
+        Box::pin(self.state(state_id))
+    }
+
+    fn list_states<'a>(
+        &'a mut self,
+        limit: usize,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(self.state_ids(limit))
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(self.record_keys(state_id))
+    }
+
+    fn owner<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        Box::pin(self.current_owner(state_id))
+    }
+
+    fn acquire<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        Box::pin(self.acquire_owner(state_id, owner_id))
+    }
+
+    fn acquire_many(
+        &mut self,
+        acquisitions: Vec<(String, OwnerId)>,
+    ) -> StoreFuture<'_, Vec<Result<OwnedState, StoreError>>> {
+        Box::pin(self.acquire_owners(acquisitions))
+    }
+
+    fn replace<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner: &'a OwnerToken,
+        expected_revision: u64,
+        payload: &'a str,
+        records: &'a [StoreRecord],
+    ) -> StoreFuture<'a, Result<u64, StoreError>> {
+        let dialect = self.host.dialect();
+        Box::pin(async move {
+            self.replace_state(
+                Replacement {
+                    dialect,
+                    state_id,
+                    owner,
+                    expected_revision,
+                    revision: expected_revision.checked_add(1).ok_or_else(|| {
+                        StoreError::NotCommitted("SQL durability revision overflow".to_owned())
+                    })?,
+                    payload,
+                    records,
+                },
+                Settle::Durable,
+            )
+            .await
+        })
+    }
+
+    fn commit<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner: &'a OwnerToken,
+        expected_revision: u64,
+        commit: StateCommit<'a>,
+    ) -> StoreFuture<'a, Result<Committed, StoreError>> {
+        let dialect = self.host.dialect();
+        Box::pin(async move {
+            if !commit.events.is_empty() {
+                return Err(StoreError::NotCommitted(
+                    "this store does not record state events".to_owned(),
+                ));
+            }
+            let revision = self
+                .replace_state(
+                    Replacement {
+                        dialect,
+                        state_id,
+                        owner,
+                        expected_revision,
+                        revision: expected_revision.checked_add(1).ok_or_else(|| {
+                            StoreError::NotCommitted("SQL durability revision overflow".to_owned())
+                        })?,
+                        payload: commit.payload,
+                        records: commit.records,
+                    },
+                    commit.settle,
+                )
+                .await?;
+            Ok(Committed {
+                revision,
+                first_event: None,
+            })
+        })
+    }
+
+    fn put_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        records: &'a [StoreRecord],
+    ) -> StoreFuture<'a, Result<bool, StoreError>> {
+        Box::pin(self.put(state_id, records))
+    }
+
+    fn replace_to<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner: &'a OwnerToken,
+        expected_revision: u64,
+        revision: u64,
+        payload: &'a str,
+        records: &'a [StoreRecord],
+    ) -> StoreFuture<'a, Result<Option<u64>, StoreError>> {
+        let dialect = self.host.dialect();
+        Box::pin(async move {
+            self.replace_state(
+                Replacement {
+                    dialect,
+                    state_id,
+                    owner,
+                    expected_revision,
+                    revision,
+                    payload,
+                    records,
+                },
+                Settle::Durable,
+            )
+            .await
+            .map(Some)
+        })
+    }
+
+    fn commit_many(
+        &mut self,
+        commits: Vec<OwnedCommit>,
+    ) -> StoreFuture<'_, Vec<Result<Committed, StoreError>>> {
+        Box::pin(self.commit_all(commits))
+    }
+
+    fn group_writers(&self) -> usize {
+        self.host.writers()
+    }
+
+    fn pipeline_handle(&self) -> Option<Box<dyn StateStore>> {
+        let host = Arc::clone(&self.host).concurrent()?;
+        Some(Box::new(SqlStore {
+            host,
+            ready: Arc::clone(&self.ready),
+        }))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn handles(&self) -> Option<Arc<dyn crate::StoreHandles>> {
+        let host = Arc::clone(&self.host).concurrent()?;
+        Some(Arc::new(SqlStore {
+            host,
+            ready: Arc::clone(&self.ready),
+        }))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl<H: Sql + ?Sized + 'static> crate::StoreHandles for SqlStore<H> {
+    fn handle(&self) -> Box<dyn StateStore> {
+        Box::new(Self {
+            host: Arc::clone(&self.host),
+            ready: Arc::clone(&self.ready),
+        })
+    }
+}

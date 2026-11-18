@@ -1,0 +1,56 @@
+[
+  {
+    "package": "@cloudflare/workerd-darwin-64",
+    "file": "workerd-darwin-64-1.20261107.1.tgz",
+    "bytes": 42367029,
+    "sha256": "c6ae42f85ed73fa6936640fff6ddeaf9800c2d289635bb9d2050d0dbf3df48b4",
+    "integrity": "sha512-IfkbxJ88EHLkVlFD/udlMYNtC6KFSEzSRuQk9Bu2ambK+EkPu56Lj09JuksjkNnRGESoJwMAEj3aLMfWmoc9EQ==",
+    "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-64/-/workerd-darwin-64-1.20261107.1.tgz",
+    "license": "Apache-2.0"
+  },
+  {
+    "package": "@cloudflare/workerd-darwin-arm64",
+    "file": "workerd-darwin-arm64-1.20261107.1.tgz",
+    "bytes": 40771731,
+    "sha256": "7e1612dd36cab2f210b64526194d42c63ec291f4aa83c2d0b350ddd024271a40",
+    "integrity": "sha512-wk4Mc/Dae3pTiuLOqXOq6xk2Q1iVJlcbf4WEN0t0/3A9Gw7rgOKFX7bpV+kTVFMEtQc/eiymPeh88hRt9c+3bQ==",
+    "url": "https://registry.npmjs.org/@cloudflare/workerd-darwin-arm64/-/workerd-darwin-arm64-1.20261107.1.tgz",
+    "license": "Apache-2.0"
+  },
+  {
+    "package": "@cloudflare/workerd-linux-64",
+    "file": "workerd-linux-64-1.20261107.1.tgz",
+    "bytes": 45621642,
+    "sha256": "4de6a3f7d3f2f892ff366188ca787ca576d5ebb62ea1c38fdc953d2490a4c14c",
+    "integrity": "sha512-tbEu/oR67uK10O9wrS3V/NyN90RZROcCrjVVDjqlkz/+RfZE8O5iK7HM0lC/5MzfXD2W46Z80yrjrR170RgYrA==",
+    "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20261107.1.tgz",
+    "license": "Apache-2.0"
+  },
+  {
+    "package": "@cloudflare/workerd-linux-arm64",
+    "file": "workerd-linux-arm64-1.20261107.1.tgz",
+    "bytes": 45711343,
+    "sha256": "fa21a57dc2a568782ec5aaf2def1061d501a1d3de975c7ecb0547191066b68fa",
+    "integrity": "sha512-gSSIQDl1CpFg/CkCRXxJRSTKbQXWkMpw65H433fRf2sxohb6+bMWEy61vyaijMYWbjHR7yq/HOTNSiawttRf1Q==",
+    "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20261107.1.tgz",
+    "license": "Apache-2.0"
+  },
+  {
+    "package": "@cloudflare/workerd-windows-64",
+    "file": "workerd-windows-64-1.20261107.1.tgz",
+    "bytes": 38646750,
+    "sha256": "034dd46c5bea522593448b813e2de04f53586e6b3fff3024551762ca40980042",
+    "integrity": "sha512-ApQhe89ZbCmKNv6qurqUdhhKbsxNqVOHIL63ReXqsIbxgCm4BpDBZrBu0rn3WEwYCg624ry9BtmaothHoT+DrA==",
+    "url": "https://registry.npmjs.org/@cloudflare/workerd-windows-64/-/workerd-windows-64-1.20261107.1.tgz",
+    "license": "Apache-2.0"
+  },
+  {
+    "package": "workerd",
+    "file": "workerd-1.20261107.1.tgz",
+    "bytes": 1292937,
+    "sha256": "1200b8b84a17ca23648bb0667a3fe6c002cfd903f6b1ed8145f2c251124ea72f",
+    "integrity": "sha512-b9V3Wes/Nf6+gWt2HpbYRKZGlQt8fnvxgYLa1zJq5ZFn71RmOgPfvwP4TM1HRNzVtMXjv0lMx3UzpZNR3lJLoQ==",
+    "url": "https://registry.npmjs.org/workerd/-/workerd-1.20261107.1.tgz",
+    "license": "Apache-2.0"
+  }
+]

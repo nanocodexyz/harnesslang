@@ -1,0 +1,255 @@
+harness expr
+
+const expr_local_set: u64 = 33
+const expr_frame_words: u64 = 6
+const expr_phase_children: u64 = 1
+const expr_frame_bytes: u64 = 24
+const expr_instruction_bytes_max: u64 = 11
+
+fn expr_i32_opcode(payload: bytes<tokens_bytes_max>) -> u64 {
+  if assembly_matches(payload, "i32.eqz") { return 69 }
+  if assembly_matches(payload, "i32.eq") { return 70 }
+  if assembly_matches(payload, "i32.ne") { return 71 }
+  if assembly_matches(payload, "i32.lt_s") { return 72 }
+  if assembly_matches(payload, "i32.lt_u") { return 73 }
+  if assembly_matches(payload, "i32.gt_s") { return 74 }
+  if assembly_matches(payload, "i32.gt_u") { return 75 }
+  if assembly_matches(payload, "i32.le_s") { return 76 }
+  if assembly_matches(payload, "i32.le_u") { return 77 }
+  if assembly_matches(payload, "i32.ge_s") { return 78 }
+  if assembly_matches(payload, "i32.ge_u") { return 79 }
+  if assembly_matches(payload, "i32.clz") { return 103 }
+  if assembly_matches(payload, "i32.ctz") { return 104 }
+  if assembly_matches(payload, "i32.popcnt") { return 105 }
+  if assembly_matches(payload, "i32.rem_s") { return 111 }
+  if assembly_matches(payload, "i32.rem_u") { return 112 }
+  if assembly_matches(payload, "i32.and") { return 113 }
+  if assembly_matches(payload, "i32.or") { return 114 }
+  if assembly_matches(payload, "i32.xor") { return 115 }
+  if assembly_matches(payload, "i32.shl") { return 116 }
+  if assembly_matches(payload, "i32.shr_s") { return 117 }
+  if assembly_matches(payload, "i32.shr_u") { return 118 }
+  if assembly_matches(payload, "i32.rotl") { return 119 }
+  if assembly_matches(payload, "i32.rotr") { return 120 }
+  return assembly_opcode_invalid
+}
+
+fn expr_i64_opcode(payload: bytes<tokens_bytes_max>) -> u64 {
+  if assembly_matches(payload, "i64.eqz") { return 80 }
+  if assembly_matches(payload, "i64.eq") { return 81 }
+  if assembly_matches(payload, "i64.ne") { return 82 }
+  if assembly_matches(payload, "i64.lt_s") { return 83 }
+  if assembly_matches(payload, "i64.lt_u") { return 84 }
+  if assembly_matches(payload, "i64.gt_s") { return 85 }
+  if assembly_matches(payload, "i64.gt_u") { return 86 }
+  if assembly_matches(payload, "i64.le_s") { return 87 }
+  if assembly_matches(payload, "i64.le_u") { return 88 }
+  if assembly_matches(payload, "i64.ge_s") { return 89 }
+  if assembly_matches(payload, "i64.ge_u") { return 90 }
+  if assembly_matches(payload, "i64.clz") { return 121 }
+  if assembly_matches(payload, "i64.ctz") { return 122 }
+  if assembly_matches(payload, "i64.popcnt") { return 123 }
+  if assembly_matches(payload, "i64.rem_s") { return 129 }
+  if assembly_matches(payload, "i64.rem_u") { return 130 }
+  if assembly_matches(payload, "i64.and") { return 131 }
+  if assembly_matches(payload, "i64.or") { return 132 }
+  if assembly_matches(payload, "i64.xor") { return 133 }
+  if assembly_matches(payload, "i64.shl") { return 134 }
+  if assembly_matches(payload, "i64.shr_s") { return 135 }
+  if assembly_matches(payload, "i64.shr_u") { return 136 }
+  if assembly_matches(payload, "i64.rotl") { return 137 }
+  if assembly_matches(payload, "i64.rotr") { return 138 }
+  return assembly_opcode_invalid
+}
+
+fn expr_opcode(payload: bytes<tokens_bytes_max>) -> u64 {
+  if assembly_matches(payload, "local.set") { return expr_local_set }
+  if assembly_matches(payload, "i32.wrap_i64") { return 167 }
+  if assembly_matches(payload, "i64.extend_i32_s") { return 172 }
+  if assembly_matches(payload, "i64.extend_i32_u") { return 173 }
+  let base = assembly_opcode(payload)
+  if base != assembly_opcode_invalid { return base }
+  let i32_opcode = expr_i32_opcode(payload)
+  if i32_opcode != assembly_opcode_invalid { return i32_opcode }
+  return expr_i64_opcode(payload)
+}
+
+fn expr_has_immediate(opcode: u64) -> bool {
+  return opcode == assembly_i32_constant or opcode == assembly_i64_constant or opcode == assembly_local_get or opcode == expr_local_set
+}
+
+fn expr_frame(opcode: u64, immediate: u64, line: u64, children: u64, next: u64) -> bytes<tokens_bytes_max> {
+  var out: bytes<tokens_bytes_max> = []
+  push out catalog_out(expr_phase_children)
+  push out catalog_out(opcode)
+  push out catalog_out(immediate)
+  push out catalog_out(line)
+  push out catalog_out(children)
+  push out catalog_out(next)
+  return out
+}
+
+fn expr_head(tokens: bytes<tokens_bytes_max>, at: u64, end: u64) -> text {
+  if at >= end { return "expr invalid: missing instruction head" }
+  let line = catalog_word(tokens, at + 1)
+  if tokens[at] != token_atom { return failure(line, "expr invalid: instruction head must be atom") }
+  let opcode = expr_opcode(catalog_payload(tokens, at))
+  if opcode == assembly_opcode_invalid { return failure(line, "expr unsupported: opcode (control/calls/globals/memory/float excluded)") }
+  var next = catalog_next(tokens, at)
+  let immediate = next
+  if expr_has_immediate(opcode) {
+    if next >= end { return failure(line, "expr invalid: missing immediate") }
+    if tokens[next] != token_atom { return failure(line, "expr invalid: immediate must be atom") }
+    next = catalog_next(tokens, next)
+  }
+  return "ok " ++ hex_of(expr_frame(opcode, immediate, line, 0, next))
+}
+
+fn expr_immediate(payload: bytes<tokens_bytes_max>, opcode: u64, record: bytes<tokens_bytes_max>) -> text {
+  if opcode == assembly_local_get or opcode == expr_local_set {
+    let params_at = catalog_skip(record, 0) + 4 * word_bytes
+    let locals_at = catalog_skip(record, params_at)
+    let count = catalog_word(record, params_at) + catalog_word(record, locals_at)
+    var index = catalog_missing
+    if catalog_named(payload) {
+      index = catalog_local_index(record, payload)
+    } else {
+      index = assembly_pages(payload)
+    }
+    if index == catalog_missing or index >= count { return "expr invalid: unknown local name or index" }
+    return "ok " ++ hex_of(unsigned(index))
+  }
+  return assembly_immediate(payload, opcode, 0)
+}
+
+fn expr_instruction(tokens: bytes<tokens_bytes_max>, frame: bytes<tokens_bytes_max>, record: bytes<tokens_bytes_max>) -> text {
+  if len(frame) != expr_frame_bytes { return "expr invariant: frame width" }
+  if catalog_word(frame, 0) != expr_phase_children { return "expr invariant: frame phase" }
+  let opcode = catalog_word(frame, word_bytes)
+  var instruction: bytes<tokens_bytes_max> = []
+  push instruction opcode
+  if expr_has_immediate(opcode) {
+    let operand = catalog_word(frame, 2 * word_bytes)
+    let result = expr_immediate(catalog_payload(tokens, operand), opcode, record)
+    if before(result, " ") != "ok" { return failure(catalog_word(frame, 3 * word_bytes), result) }
+    let immediate: bytes<tokens_bytes_max> = bytes_of_hex(after(result, " "))
+    if len(immediate) > leb_bytes_max { return "expr invariant: immediate width" }
+    push instruction immediate
+  }
+  if len(instruction) > expr_instruction_bytes_max { return "expr invariant: instruction width" }
+  return "ok " ++ hex_of(instruction)
+}
+
+fn expr_body(tokens: bytes<tokens_bytes_max>, record: bytes<tokens_bytes_max>) -> text {
+  let fields = catalog_skip(record, 0)
+  var at = catalog_word(record, fields + 2 * word_bytes)
+  let end = catalog_word(record, fields + 3 * word_bytes)
+  var frames: bytes<tokens_bytes_max> = []
+  var body: bytes<tokens_bytes_max> = []
+  loop visit below tokens_bytes_max while at < end {
+    let kind = tokens[at]
+    let line = catalog_word(tokens, at + 1)
+    var frame: bytes<tokens_bytes_max> = []
+    var emit = false
+    if kind == token_close {
+      if len(frames) == 0 { return failure(line, "expr invalid: unexpected close") }
+      frame = slice(frames, len(frames) - expr_frame_bytes, len(frames))
+      frames = slice(frames, 0, len(frames) - expr_frame_bytes)
+      if catalog_word(frame, 3 * word_bytes) != line { return "expr invalid: close line" }
+      emit = true
+      at = catalog_next(tokens, at)
+    } else {
+      let folded = kind == token_open
+      if not folded and len(frames) > 0 { return failure(line, "expr invalid: child must be folded") }
+      var head = at
+      if folded { head = catalog_next(tokens, at) }
+      let parsed = expr_head(tokens, head, end)
+      if before(parsed, " ") != "ok" { return parsed }
+      frame = bytes_of_hex(after(parsed, " "))
+      at = catalog_word(frame, 5 * word_bytes)
+      if folded {
+        if len(frames) / expr_frame_bytes == nesting_max { return "expr bound: nesting_max" }
+        if len(frames) > 0 {
+          let parent_at = len(frames) - expr_frame_bytes
+          let children = catalog_word(frames, parent_at + 4 * word_bytes) + 1
+          if children > tokens_bytes_max / header_bytes { return "expr invariant: child visits" }
+          let parent = expr_frame(catalog_word(frames, parent_at + word_bytes), catalog_word(frames, parent_at + 2 * word_bytes), catalog_word(frames, parent_at + 3 * word_bytes), children, catalog_word(frames, parent_at + 5 * word_bytes))
+          frames = slice(frames, 0, parent_at)
+          push frames parent
+        }
+        frame = expr_frame(catalog_word(frame, word_bytes), catalog_word(frame, 2 * word_bytes), line, 0, at)
+        push frames frame
+      } else { emit = true }
+    }
+    if emit {
+      let result = expr_instruction(tokens, frame, record)
+      if before(result, " ") != "ok" { return result }
+      let instruction: bytes<tokens_bytes_max> = bytes_of_hex(after(result, " "))
+      if len(instruction) > flat_bytes_max - len(body) { return "expr bound: flat_bytes_max instruction bytes" }
+      push body instruction
+    }
+  }
+  if at != end { return "expr bound: token visits" }
+  if len(frames) != 0 { return "expr invalid: unclosed folded instruction" }
+  return "ok " ++ hex_of(body)
+}
+
+fn expr_record_end(value: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  let params_at = catalog_skip(value, at) + 4 * word_bytes
+  let locals_at = catalog_skip(value, params_at)
+  let names_at = catalog_skip(value, locals_at)
+  let count = catalog_word(value, names_at)
+  var next = names_at + word_bytes
+  loop local_name below locals_max while local_name < count { next = catalog_skip(value, next) + word_bytes }
+  return catalog_skip(value, next + word_bytes)
+}
+
+fn expr_selected(tokens: bytes<tokens_bytes_max>, value: bytes<tokens_bytes_max>, selected_name: bytes<tokens_bytes_max>) -> text {
+  if catalog_word(value, 0) != catalog_version { return "expr invariant: catalog version" }
+  let imports_at = catalog_skip(value, word_bytes)
+  let functions_at = catalog_skip(value, imports_at)
+  let count = catalog_word(value, functions_at + word_bytes)
+  var at = functions_at + 2 * word_bytes
+  loop function below items_max while function < count {
+    let next = expr_record_end(value, at)
+    let symbol_end = catalog_skip(value, at)
+    if catalog_equal(slice(value, at + word_bytes, symbol_end), selected_name) {
+      return expr_body(tokens, slice(value, at, next))
+    }
+    at = next
+  }
+  return "expr invalid: selected function not found"
+}
+
+fn expr_named_source(source: text, symbol: text) -> text {
+  let lexed = tokenize(source)
+  if before(lexed, " ") != "ok" { return lexed }
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(after(lexed, " "))
+  let parsed = catalog_tokens(tokens)
+  if before(parsed, " ") != "ok" { return parsed }
+  let value: bytes<tokens_bytes_max> = bytes_of_hex(after(parsed, " "))
+  let selected_name: bytes<tokens_bytes_max> = bytes_of(symbol)
+  return expr_selected(tokens, value, selected_name)
+}
+
+fn expr_source(source: text) -> text {
+  return expr_named_source(source, "$f")
+}
+
+on expr_parse(input: text) -> text {
+  return expr_source(input)
+}
+
+on expr_compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = expr_source(source)
+      if before(result, " ") != "ok" { return result }
+      match write_bytes(output_path, after(result, " ")) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}

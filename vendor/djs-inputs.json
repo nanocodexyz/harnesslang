@@ -1,0 +1,41 @@
+{
+  "source": "git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293#395967ffd227ef2158ea824df6ee4c6054d30293",
+  "license": "MIT OR Apache-2.0",
+  "files": [
+    {
+      "path": "builtins/gen/prelude.js",
+      "upstream_path": "crates/patches/djs/builtins/gen/prelude.js",
+      "git_blob": "ee5a3b5573d5d325b5dd0a39f058d6625579abb1",
+      "bytes": 459284,
+      "sha256": "c127f5130c8999b17dd0630f21289c04cf8cf0db32bd24c0bfe9264a655d5b75"
+    },
+    {
+      "path": "builtins/gen/prelude-slim.js",
+      "upstream_path": "crates/patches/djs/builtins/gen/prelude-slim.js",
+      "git_blob": "c9831ce3603125cdeddb094735479649eca524b6",
+      "bytes": 299262,
+      "sha256": "7981bdb5bfb165c20c111d34a88301490e44bc61444c46455d21803f7d3aa87d"
+    },
+    {
+      "path": "builtins/gen/prelude-noembed.js",
+      "upstream_path": "crates/patches/djs/builtins/gen/prelude-noembed.js",
+      "git_blob": "f42e6072270dae97d667c14e2bc58e2237e68552",
+      "bytes": 441733,
+      "sha256": "f951bb2188e3e6d6ed6ec7d9218895643188bf7da4c9fcd0b8389284ebcdacdc"
+    },
+    {
+      "path": "licenses/djs/LICENSE-APACHE",
+      "upstream_path": "crates/patches/djs/LICENSE-APACHE",
+      "git_blob": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "licenses/djs/LICENSE-MIT",
+      "upstream_path": "crates/patches/djs/LICENSE-MIT",
+      "git_blob": "e1089e76e4d4b959e4ac7fd3e76f914cab6fae44",
+      "bytes": 1070,
+      "sha256": "0567286d50b2c4b4afae9b98caa0824e38e68ea3bb9382782232e0af372cd1ef"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+#![deny(rustdoc::broken_intra_doc_links)]
+#![cfg_attr(target_family = "wasm", allow(clippy::module_name_repetitions))]
+
+#[cfg(any(not(target_family = "wasm"), feature = "local-cells"))]
+pub mod code_mode;
+
+#[path = "code_mode/description.rs"]
+pub mod code_mode_description;
+
+pub mod code_mode_order;
+
+#[path = "code_mode/spec.rs"]
+pub mod code_mode_spec;
+
+pub mod embedded;
+pub mod remote;
+mod toolset;
+
+pub use nanocode_image as image;
+pub use nanocode_tools::tool;
+pub use toolset::{CodeModeToolObservation, CodeModeToolset};
+
+pub mod contract {
+    pub use nanocode_tool_contracts::{
+        DEFAULT_TOOL_OUTPUT_TOKENS, HistorySource, SharedHistory, Tool, ToolContext,
+        ToolDefinition, ToolError, ToolInput, ToolInputError, ToolOutput, ToolOutputBody,
+        ToolOutputContent, ToolOutputWire, ToolProcessTraceWire, ToolResult,
+    };
+}
+
+pub use contract::{
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent,
+    ToolResult,
+};
+
+#[cfg(all(target_family = "wasm", not(feature = "local-cells")))]
+pub mod code_mode {
+    pub use crate::code_mode_description::ExecLayout;
+    pub use crate::code_mode_spec::{
+        exec_spec, exec_spec_with, exec_spec_yielding, source_with_options, source_yielding,
+        wait_spec, wait_spec_yielding, wait_yielding,
+    };
+    pub use crate::embedded::{
+        CodeModeCell, CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate,
+        NestedToolCall,
+    };
+    pub use crate::{CodeModeToolObservation, CodeModeToolset};
+}
+
+#[doc(hidden)]
+pub mod __private {
+    pub use nanocode_tools::__private::*;
+}

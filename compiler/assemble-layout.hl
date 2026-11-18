@@ -1,0 +1,499 @@
+harness static_layout
+
+const static_layout_u32_max: u64 = 4294967295
+const static_layout_invalid: u64 = 4294967296
+const static_layout_u64_max: u64 = 18446744073709551615
+const static_layout_i32_negative_max: u64 = 2147483648
+const static_layout_i64_negative_max: u64 = 9223372036854775808
+const static_layout_base_bytes: u64 = 1024
+const static_layout_end_align_bytes: u64 = 8
+const static_layout_global_bytes: u64 = 10
+const static_layout_long_bytes: u64 = 8
+const static_layout_flat_overhead: u64 = 40
+const static_layout_symbol_header_bytes: u64 = 8
+
+fn static_layout_expect(condition: bool, value: u64) -> u64 {
+  var divisor = 0
+  if condition { divisor = 1 }
+  return value / divisor
+}
+
+fn static_layout_word(input: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  var value = 0
+  var scale = 1
+  loop byte below word_bytes {
+    value = value + input[at + byte] * scale
+    scale = scale * byte_radix
+  }
+  return value
+}
+
+fn static_layout_out(value: u64) -> bytes<word_bytes> {
+  var out: bytes<word_bytes> = []
+  var rest = value
+  loop byte below word_bytes {
+    push out rest % byte_radix
+    rest = rest / byte_radix
+  }
+  return out
+}
+
+fn static_layout_matches(value: bytes<tokens_bytes_max>, expected: text) -> bool {
+  let other: bytes<source_bytes_max> = bytes_of(expected)
+  if len(value) != len(other) { return false }
+  var same = true
+  loop byte below source_bytes_max while byte < len(value) and same {
+    same = value[byte] == other[byte]
+  }
+  return same
+}
+
+fn static_layout_next(tokens: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  return at + header_bytes + static_layout_word(tokens, at + 1 + word_bytes)
+}
+
+fn static_layout_payload(tokens: bytes<tokens_bytes_max>, at: u64) -> bytes<tokens_bytes_max> {
+  return slice(tokens, at + header_bytes, static_layout_next(tokens, at))
+}
+
+fn static_layout_record(tokens: bytes<tokens_bytes_max>, at: u64) -> text {
+  if len(tokens) - at < header_bytes { return "static layout invalid: truncated token header" }
+  let kind = tokens[at]
+  let size = static_layout_word(tokens, at + 1 + word_bytes)
+  if kind < token_open or kind > token_text { return "static layout invalid: token kind" }
+  if kind == token_atom and size == 0 { return "static layout invalid: empty atom" }
+  if static_layout_word(tokens, at + 1) == 0 { return "static layout invalid: zero line" }
+  if size > source_bytes_max or size > len(tokens) - at - header_bytes { return "static layout invalid: token length" }
+  if kind == token_open or kind == token_close {
+    if size != 0 { return "static layout invalid: delimiter payload" }
+  }
+  return ""
+}
+
+fn static_layout_forms(tokens: bytes<tokens_bytes_max>) -> text {
+  var spans: bytes<tokens_bytes_max> = []
+  var opened: list<u64, nesting_max> = []
+  var depth = 0
+  var count = 0
+  var start = 0
+  var at = 0
+  loop token below tokens_bytes_max while at < len(tokens) {
+    let error = static_layout_record(tokens, at)
+    if error != "" { return error }
+    let kind = tokens[at]
+    if depth == 0 {
+      if kind != token_open { return "static layout invalid: top-level list required" }
+      if count == items_max { return "static layout bound: items_max forms" }
+      count = count + 1
+      start = at
+    }
+    if kind == token_open {
+      if depth == nesting_max { return "static layout bound: nesting_max" }
+      if depth == len(opened) { push opened static_layout_word(tokens, at + 1) } else { set opened[depth] = static_layout_word(tokens, at + 1) }
+      depth = depth + 1
+    }
+    if kind == token_close {
+      if depth == 0 { return "static layout invalid: unexpected close" }
+      depth = depth - 1
+      if opened[depth] != static_layout_word(tokens, at + 1) { return "static layout invalid: close line" }
+    }
+    let next = static_layout_next(tokens, at)
+    if depth == 0 {
+      if len(spans) > tokens_bytes_max - word_bytes * 2 { return "static layout bound: token spans" }
+      push spans static_layout_out(start)
+      push spans static_layout_out(next)
+    }
+    at = next
+  }
+  if depth != 0 { return "static layout invalid: incomplete form" }
+  return "ok " ++ hex_of(spans)
+}
+
+fn static_layout_find(symbols: bytes<tokens_bytes_max>, symbol_name: bytes<tokens_bytes_max>) -> u64 {
+  var found = static_layout_invalid
+  var at = static_layout_symbol_header_bytes
+  let count = static_layout_word(symbols, word_bytes)
+  loop entry below items_max while entry < count {
+    let size = static_layout_word(symbols, at)
+    let stored = slice(symbols, at + word_bytes, at + word_bytes + size)
+    var same = len(stored) == len(symbol_name)
+    loop byte below source_bytes_max while byte < len(symbol_name) and same {
+      same = stored[byte] == symbol_name[byte]
+    }
+    if same { found = static_layout_word(symbols, at + word_bytes + size) }
+    at = at + word_bytes * 2 + size
+  }
+  return static_layout_expect(at == len(symbols), found)
+}
+
+fn static_layout_size(tokens: bytes<tokens_bytes_max>, start: u64, end: u64, is_text: bool) -> u64 {
+  let head = start + header_bytes
+  if head >= end - header_bytes or tokens[head] != token_atom { return static_layout_invalid }
+  let name_at = static_layout_next(tokens, head)
+  if name_at >= end - header_bytes or tokens[name_at] != token_atom { return static_layout_invalid }
+  let symbol_name = static_layout_payload(tokens, name_at)
+  if len(symbol_name) == 0 { return static_layout_invalid }
+  if symbol_name[0] != '$' { return static_layout_invalid }
+  var size = 0
+  if is_text { size = word_bytes }
+  var at = static_layout_next(tokens, name_at)
+  loop token below tokens_bytes_max while at < end - header_bytes {
+    if is_text {
+      if tokens[at] != token_text { return static_layout_invalid }
+      let amount = static_layout_word(tokens, at + 1 + word_bytes)
+      if amount > static_layout_u32_max - size { return static_layout_invalid }
+      size = size + amount
+    } else {
+      if tokens[at] != token_atom { return static_layout_invalid }
+      if size > static_layout_u32_max - word_bytes { return static_layout_invalid }
+      size = size + word_bytes
+    }
+    at = static_layout_next(tokens, at)
+  }
+  if at != end - header_bytes { return static_layout_invalid }
+  return size
+}
+
+fn static_layout_align(address: u64, size: u64, alignment: u64) -> u64 {
+  if alignment != word_bytes and alignment != static_layout_end_align_bytes { return static_layout_invalid }
+  if address > static_layout_u32_max { return static_layout_invalid }
+  if size > static_layout_u32_max - address { return static_layout_invalid }
+  let end = address + size
+  let padding = (alignment - end % alignment) % alignment
+  if padding > static_layout_u32_max - end { return static_layout_invalid }
+  return end + padding
+}
+
+fn static_layout_symbols(tokens: bytes<tokens_bytes_max>) -> text {
+  let checked = static_layout_forms(tokens)
+  if before(checked, " ") != "ok" { return checked }
+  let spans: bytes<tokens_bytes_max> = bytes_of_hex(after(checked, " "))
+  var symbols: bytes<tokens_bytes_max> = []
+  push symbols static_layout_out(0)
+  push symbols static_layout_out(0)
+  var count = 0
+  var address = static_layout_base_bytes
+  loop form below items_max while form * word_bytes * 2 < len(spans) {
+    let start = static_layout_word(spans, form * word_bytes * 2)
+    let end = static_layout_word(spans, form * word_bytes * 2 + word_bytes)
+    let head_at = start + header_bytes
+    if head_at >= end - header_bytes or tokens[head_at] != token_atom { return "static layout invalid: form head" }
+    let head = static_layout_payload(tokens, head_at)
+    let is_text = static_layout_matches(head, "text")
+    let is_words = static_layout_matches(head, "words")
+    if not is_text and not is_words and not static_layout_matches(head, "global") { return "static layout unsupported: top-level form" }
+    if is_text or is_words {
+      let size = static_layout_size(tokens, start, end, is_text)
+      if size == static_layout_invalid { return "static layout invalid: text/words fields or u32 size" }
+      let symbol_name = static_layout_payload(tokens, static_layout_next(tokens, head_at))
+      if static_layout_find(symbols, symbol_name) != static_layout_invalid { return "static layout invalid: duplicate placed name" }
+      if count + 1 == items_max { return "static layout bound: items_max symbols including static_end" }
+      if len(symbol_name) + word_bytes * 2 > tokens_bytes_max - len(symbols) { return "static layout bound: tokens_bytes_max symbols" }
+      push symbols static_layout_out(len(symbol_name))
+      push symbols symbol_name
+      push symbols static_layout_out(address)
+      count = count + 1
+      set symbols[word_bytes] = count % byte_radix
+      set symbols[word_bytes + 1] = count / byte_radix % byte_radix
+      set symbols[word_bytes + 2] = count / byte_radix / byte_radix % byte_radix
+      set symbols[word_bytes + 3] = count / byte_radix / byte_radix / byte_radix
+      address = static_layout_align(address, size, word_bytes)
+      if address == static_layout_invalid { return "static layout invalid: u32 address/alignment overflow" }
+    }
+  }
+  address = static_layout_align(address, 0, static_layout_end_align_bytes)
+  if address == static_layout_invalid { return "static layout invalid: u32 final alignment overflow" }
+  if address - static_layout_base_bytes > flat_bytes_max - static_layout_flat_overhead { return "static layout bound: flat_bytes_max static data" }
+  var out: bytes<tokens_bytes_max> = []
+  push out static_layout_out(address)
+  push out static_layout_out(count + 1)
+  push out slice(symbols, static_layout_symbol_header_bytes, len(symbols))
+  let reserved: bytes<source_bytes_max> = bytes_of("$static_end")
+  if len(reserved) + word_bytes * 2 > tokens_bytes_max - len(out) { return "static layout bound: tokens_bytes_max static_end" }
+  push out static_layout_out(len(reserved))
+  push out reserved
+  push out static_layout_out(address)
+  return "ok " ++ hex_of(out)
+}
+
+fn static_layout_number(payload: bytes<tokens_bytes_max>, narrow: bool) -> text {
+  if len(payload) == 0 { return "static layout invalid: empty number" }
+  var negative = payload[0] == '-'
+  var at = 0
+  if negative { at = 1 }
+  var cleaned: bytes<source_bytes_max> = []
+  loop byte below source_bytes_max while at < len(payload) {
+    if payload[at] != '_' { push cleaned payload[at] }
+    at = at + 1
+  }
+  if len(cleaned) == 0 { return "static layout invalid: number digits" }
+  at = 0
+  var radix = decimal_radix
+  if len(cleaned) > 1 {
+    if cleaned[0] == '0' and cleaned[1] == 'x' {
+      radix = hex_radix
+      at = 2
+    }
+  }
+  if at < len(cleaned) {
+    if cleaned[at] == '+' or cleaned[at] == '-' {
+      if cleaned[at] == '-' { negative = not negative }
+      at = at + 1
+    }
+  }
+  if at == len(cleaned) { return "static layout invalid: number digits" }
+  var limit = static_layout_u64_max
+  if narrow { limit = static_layout_u32_max }
+  if negative {
+    limit = static_layout_i64_negative_max
+    if narrow { limit = static_layout_i32_negative_max }
+  }
+  var value = 0
+  loop byte below source_bytes_max while at < len(cleaned) {
+    let digit = hex_digit(cleaned[at])
+    if digit >= radix { return "static layout invalid: numeric digit" }
+    if value > (limit - digit) / radix { return "static layout invalid: numeric range" }
+    value = value * radix + digit
+    at = at + 1
+  }
+  if negative and value != 0 { value = static_layout_u64_max - value + 1 }
+  if narrow { value = value % static_layout_invalid }
+  var out: bytes<static_layout_long_bytes> = []
+  push out static_layout_out(value)
+  push out static_layout_out(value / static_layout_invalid)
+  return "ok " ++ hex_of(out)
+}
+
+fn static_layout_value(payload: bytes<tokens_bytes_max>, symbols: bytes<tokens_bytes_max>, narrow: bool) -> text {
+  let address = static_layout_find(symbols, payload)
+  if address == static_layout_invalid { return static_layout_number(payload, narrow) }
+  var out: bytes<static_layout_long_bytes> = []
+  push out static_layout_out(address)
+  push out static_layout_out(0)
+  return "ok " ++ hex_of(out)
+}
+
+fn static_layout_global(tokens: bytes<tokens_bytes_max>, start: u64, end: u64, symbols: bytes<tokens_bytes_max>) -> text {
+  let head = start + header_bytes
+  let name_at = static_layout_next(tokens, head)
+  if name_at >= end - header_bytes or tokens[name_at] != token_atom { return "static layout invalid: global name" }
+  var at = static_layout_next(tokens, name_at)
+  if at >= end - header_bytes { return "static layout invalid: global type missing" }
+  let mutable = tokens[at] == token_open
+  if mutable {
+    at = at + header_bytes
+    if at >= end - header_bytes or tokens[at] != token_atom { return "static layout invalid: mut head" }
+    if not static_layout_matches(static_layout_payload(tokens, at), "mut") { return "static layout unsupported: global type form" }
+    at = static_layout_next(tokens, at)
+  }
+  if at >= end - header_bytes or tokens[at] != token_atom { return "static layout invalid: global type" }
+  let ty = static_layout_payload(tokens, at)
+  var type_code = 0
+  if static_layout_matches(ty, "i32") { type_code = 127 }
+  if static_layout_matches(ty, "i64") { type_code = 126 }
+  if type_code == 0 { return "static layout unsupported: global value type" }
+  at = static_layout_next(tokens, at)
+  if mutable {
+    if at >= end - header_bytes { return "static layout invalid: mut close" }
+    if tokens[at] != token_close { return "static layout unsupported: extra mut fields" }
+    at = static_layout_next(tokens, at)
+  }
+  if at >= end - header_bytes or tokens[at] != token_open { return "static layout invalid: initializer list" }
+  at = at + header_bytes
+  if at >= end - header_bytes or tokens[at] != token_atom { return "static layout invalid: initializer head" }
+  let optype_code = static_layout_payload(tokens, at)
+  if not static_layout_matches(optype_code, "i32.const") and not static_layout_matches(optype_code, "i64.const") { return "static layout unsupported: initializer optype_code" }
+  at = static_layout_next(tokens, at)
+  if at >= end - header_bytes or tokens[at] != token_atom { return "static layout invalid: initializer operand" }
+  let resolved = static_layout_value(static_layout_payload(tokens, at), symbols, false)
+  if before(resolved, " ") != "ok" { return resolved }
+  at = static_layout_next(tokens, at)
+  if at >= end - header_bytes or tokens[at] != token_close { return "static layout invalid: initializer close" }
+  at = static_layout_next(tokens, at)
+  if at != end - header_bytes { return "static layout unsupported: extra global fields" }
+  let value: bytes<static_layout_long_bytes> = bytes_of_hex(after(resolved, " "))
+  var out: bytes<static_layout_global_bytes> = []
+  push out type_code
+  if mutable { push out 1 } else { push out 0 }
+  push out slice(value, 0, static_layout_expect(len(value) == static_layout_long_bytes, len(value)))
+  return "ok " ++ hex_of(out)
+}
+
+fn static_layout_globals(tokens: bytes<tokens_bytes_max>, spans: bytes<tokens_bytes_max>, symbols: bytes<tokens_bytes_max>) -> text {
+  var out: bytes<flat_bytes_max> = []
+  var names: bytes<tokens_bytes_max> = []
+  push names static_layout_out(0)
+  push names static_layout_out(0)
+  var count = 0
+  loop form below items_max while form * static_layout_long_bytes < len(spans) {
+    let start = static_layout_word(spans, form * static_layout_long_bytes)
+    let end = static_layout_word(spans, form * static_layout_long_bytes + word_bytes)
+    let head = start + header_bytes
+    if static_layout_matches(static_layout_payload(tokens, head), "global") {
+      let record = static_layout_global(tokens, start, end, symbols)
+      if before(record, " ") != "ok" { return record }
+      let symbol_name = static_layout_payload(tokens, static_layout_next(tokens, head))
+      if static_layout_find(names, symbol_name) != static_layout_invalid { return "static layout invalid: duplicate global name" }
+      if len(symbol_name) + static_layout_long_bytes > tokens_bytes_max - len(names) { return "static layout bound: global names" }
+      if len(out) > flat_bytes_max - static_layout_global_bytes { return "static layout bound: global records" }
+      push names static_layout_out(len(symbol_name))
+      push names symbol_name
+      push names static_layout_out(count)
+      count = count + 1
+      set names[word_bytes] = count % byte_radix
+      set names[word_bytes + 1] = count / byte_radix % byte_radix
+      set names[word_bytes + 2] = count / byte_radix / byte_radix % byte_radix
+      set names[word_bytes + 3] = count / byte_radix / byte_radix / byte_radix
+      let value: bytes<static_layout_global_bytes> = bytes_of_hex(after(record, " "))
+      push out value
+    }
+  }
+  if len(out) > flat_bytes_max - word_bytes { return "static layout bound: global count" }
+  var result: bytes<flat_bytes_max> = []
+  push result static_layout_out(count)
+  push result out
+  return "ok " ++ hex_of(result)
+}
+
+fn static_layout_data(tokens: bytes<tokens_bytes_max>, spans: bytes<tokens_bytes_max>, symbols: bytes<tokens_bytes_max>) -> text {
+  var out: bytes<flat_bytes_max> = []
+  loop form below items_max while form * static_layout_long_bytes < len(spans) {
+    let start = static_layout_word(spans, form * static_layout_long_bytes)
+    let end = static_layout_word(spans, form * static_layout_long_bytes + word_bytes)
+    let head = start + header_bytes
+    let is_text = static_layout_matches(static_layout_payload(tokens, head), "text")
+    let is_words = static_layout_matches(static_layout_payload(tokens, head), "words")
+    if is_text or is_words {
+      let measured = static_layout_size(tokens, start, end, is_text)
+      let size = static_layout_expect(measured != static_layout_invalid, measured)
+      var at = static_layout_next(tokens, static_layout_next(tokens, head))
+      if is_text { push out static_layout_out(size - word_bytes) }
+      loop token below tokens_bytes_max while at < end - header_bytes {
+        let payload = static_layout_payload(tokens, at)
+        if is_text { push out payload } else {
+          let resolved = static_layout_value(payload, symbols, true)
+          if before(resolved, " ") != "ok" { return resolved }
+          let value: bytes<static_layout_long_bytes> = bytes_of_hex(after(resolved, " "))
+          push out slice(value, 0, word_bytes)
+        }
+        at = static_layout_next(tokens, at)
+      }
+      let padding = (word_bytes - len(out) % word_bytes) % word_bytes
+      loop byte below word_bytes while byte < padding { push out 0 }
+    }
+  }
+  let expected = static_layout_word(symbols, 0) - static_layout_base_bytes
+  let remaining = static_layout_expect(len(out) <= expected, expected - len(out))
+  loop byte below flat_bytes_max while byte < remaining { push out 0 }
+  return "ok " ++ hex_of(slice(out, 0, static_layout_expect(len(out) == expected, len(out))))
+}
+
+fn static_layout_tokens(tokens: bytes<tokens_bytes_max>) -> text {
+  let placed = static_layout_symbols(tokens)
+  if before(placed, " ") != "ok" { return placed }
+  let symbols: bytes<tokens_bytes_max> = bytes_of_hex(after(placed, " "))
+  let indexed = static_layout_forms(tokens)
+  let spans_raw: bytes<tokens_bytes_max> = bytes_of_hex(after(indexed, " "))
+  let spans = slice(spans_raw, 0, static_layout_expect(before(indexed, " ") == "ok", len(spans_raw)))
+  let initialized = static_layout_globals(tokens, spans, symbols)
+  if before(initialized, " ") != "ok" { return initialized }
+  let globals_flat: bytes<flat_bytes_max> = bytes_of_hex(after(initialized, " "))
+  let data_size = static_layout_word(symbols, 0) - static_layout_base_bytes
+  if len(globals_flat) - word_bytes > flat_bytes_max - static_layout_flat_overhead - data_size { return "static layout bound: flat_bytes_max global and data records" }
+  let packed = static_layout_data(tokens, spans, symbols)
+  if before(packed, " ") != "ok" { return packed }
+  let data_flat: bytes<flat_bytes_max> = bytes_of_hex(after(packed, " "))
+  var flat: bytes<flat_bytes_max> = []
+  push flat static_layout_out(0)
+  push flat static_layout_out(0)
+  push flat static_layout_out(0)
+  push flat static_layout_out(0)
+  push flat static_layout_out(0)
+  push flat globals_flat
+  push flat static_layout_out(0)
+  push flat static_layout_out(1)
+  push flat static_layout_out(static_layout_base_bytes)
+  push flat static_layout_out(len(data_flat))
+  push flat data_flat
+  let expected = static_layout_flat_overhead + len(globals_flat) - word_bytes + data_size
+  return "ok " ++ hex_of(slice(flat, 0, static_layout_expect(len(flat) == expected, len(flat))))
+}
+
+fn static_layout_flat(input: text) -> text {
+  let lexed = tokenize(input)
+  if before(lexed, " ") != "ok" { return lexed }
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(after(lexed, " "))
+  return static_layout_tokens(tokens)
+}
+
+fn static_layout_token_hex(input: text) -> text {
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(input)
+  return static_layout_tokens(tokens)
+}
+
+fn static_layout_symbol_source(input: text) -> text {
+  let lexed = tokenize(input)
+  if before(lexed, " ") != "ok" { return lexed }
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(after(lexed, " "))
+  return static_layout_symbols(tokens)
+}
+
+on static_layout(input: text) -> text {
+  return static_layout_flat(input)
+}
+
+on static_layout_encode(input: text) -> text {
+  let result = static_layout_flat(input)
+  if before(result, " ") != "ok" { return result }
+  return "ok " ++ encode_hex(after(result, " "))
+}
+
+on static_layout_tokens(input: text) -> text {
+  return static_layout_token_hex(input)
+}
+
+on static_layout_symbols(input: text) -> text {
+  return static_layout_symbol_source(input)
+}
+
+on static_layout_flatten(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = static_layout_flat(source)
+      if before(result, " ") != "ok" { return result }
+      match write_bytes(output_path, after(result, " ")) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}
+
+on static_layout_compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = static_layout_flat(source)
+      if before(result, " ") != "ok" { return result }
+      match write_bytes(output_path, encode_hex(after(result, " "))) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}
+
+on static_layout_token_compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = static_layout_token_hex(source)
+      if before(result, " ") != "ok" { return result }
+      match write_bytes(output_path, after(result, " ")) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}

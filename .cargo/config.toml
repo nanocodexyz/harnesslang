@@ -1,0 +1,13 @@
+[net]
+offline = true
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/nanocodexyz/nanocode?rev=395967ffd227ef2158ea824df6ee4c6054d30293"]
+git = "https://github.com/nanocodexyz/nanocode"
+rev = "395967ffd227ef2158ea824df6ee4c6054d30293"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor/cargo"

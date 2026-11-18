@@ -1,0 +1,605 @@
+harness assemble
+
+const assembly_u32_max: u64 = 4294967295
+const assembly_u32_invalid: u64 = 4294967296
+const assembly_root: u64 = 0
+const assembly_memory_head: u64 = 1
+const assembly_memory_field: u64 = 2
+const assembly_export_head: u64 = 3
+const assembly_export_name: u64 = 4
+const assembly_export_close: u64 = 5
+const assembly_done: u64 = 6
+const assembly_memory_kind: u64 = 2
+const assembly_ascii_limit: u64 = 128
+const assembly_static_base_bytes: u64 = 1024
+const assembly_export_flat_overhead: u64 = 49
+
+fn assembly_word(tokens: bytes<tokens_bytes_max>, at: u64) -> u64 {
+  var value = 0
+  var scale = 1
+  loop byte below word_bytes {
+    value = value + tokens[at + byte] * scale
+    scale = scale * byte_radix
+  }
+  return value
+}
+
+fn assembly_word_out(value: u64) -> bytes<word_bytes> {
+  var out: bytes<word_bytes> = []
+  var rest = value
+  loop byte below word_bytes {
+    push out rest % byte_radix
+    rest = rest / byte_radix
+  }
+  return out
+}
+
+fn assembly_matches(payload: bytes<tokens_bytes_max>, expected: text) -> bool {
+  let expected_bytes: bytes<source_bytes_max> = bytes_of(expected)
+  if len(payload) != len(expected_bytes) { return false }
+  var same = true
+  loop byte below source_bytes_max while byte < len(payload) and same {
+    if payload[byte] != expected_bytes[byte] { same = false }
+  }
+  return same
+}
+
+fn assembly_pages(payload: bytes<tokens_bytes_max>) -> u64 {
+  var value = 0
+  var valid = len(payload) > 0 and len(payload) <= source_bytes_max
+  loop byte below source_bytes_max while byte < len(payload) and valid {
+    let digit = payload[byte]
+    if digit < '0' or digit > '9' {
+      valid = false
+    } else {
+      let decoded = digit - '0'
+      if value > (assembly_u32_max - decoded) / decimal_radix {
+        valid = false
+      } else {
+        value = value * decimal_radix + decoded
+      }
+    }
+  }
+  if not valid { value = assembly_u32_invalid }
+  return value
+}
+
+fn assembly_ascii(payload: bytes<tokens_bytes_max>) -> bool {
+  var valid = len(payload) <= source_bytes_max
+  loop byte below source_bytes_max while byte < len(payload) and valid {
+    if payload[byte] >= assembly_ascii_limit { valid = false }
+  }
+  return valid
+}
+
+fn assembly_layout(present: bool, pages: u64, exported: bool, export_name: bytes<tokens_bytes_max>) -> text {
+  if exported and len(export_name) > flat_bytes_max - assembly_export_flat_overhead {
+    return "assembler subset: export exceeds flat_bytes_max"
+  }
+  var flat: bytes<flat_bytes_max> = []
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(0)
+  if present { push flat assembly_word_out(1) } else { push flat assembly_word_out(0) }
+  push flat assembly_word_out(pages)
+  push flat assembly_word_out(0)
+  if exported { push flat assembly_word_out(1) } else { push flat assembly_word_out(0) }
+  if exported {
+    push flat assembly_word_out(len(export_name))
+    push flat export_name
+    push flat assembly_memory_kind
+    push flat assembly_word_out(0)
+  }
+  push flat assembly_word_out(1)
+  push flat assembly_word_out(assembly_static_base_bytes)
+  push flat assembly_word_out(0)
+  return "ok " ++ hex_of(flat)
+}
+
+fn assembly_record(tokens: bytes<tokens_bytes_max>, at: u64) -> text {
+  var error = ""
+  if len(tokens) - at < header_bytes {
+    error = "assembler subset: truncated token header"
+  } else {
+    let kind = tokens[at]
+    let size = assembly_word(tokens, at + 1 + word_bytes)
+    if kind < token_open or kind > token_text { error = "assembler subset: unknown token kind" }
+    if assembly_word(tokens, at + 1) == 0 { error = "assembler subset: zero token line" }
+    if size > source_bytes_max or size > len(tokens) - at - header_bytes { error = "assembler subset: invalid token payload length" }
+    if kind == token_open or kind == token_close {
+      if size != 0 { error = "assembler subset: delimiter has payload" }
+    }
+  }
+  return error
+}
+
+fn assembly_memory_tokens(tokens: bytes<tokens_bytes_max>) -> text {
+  var phase = assembly_root
+  var at = 0
+  var pages = 0
+  var has_pages = false
+  var exported = false
+  var export_name: bytes<tokens_bytes_max> = []
+  var opened = 0
+  var export_opened = 0
+  var error = ""
+  loop token below tokens_bytes_max while at < len(tokens) and error == "" {
+    error = assembly_record(tokens, at)
+    if error == "" {
+      let kind = tokens[at]
+      let line = assembly_word(tokens, at + 1)
+      let size = assembly_word(tokens, at + 1 + word_bytes)
+      let payload = slice(tokens, at + header_bytes, at + header_bytes + size)
+      let previous = phase
+      var accepted = false
+      if previous == assembly_root and kind == token_open {
+        opened = line
+        phase = assembly_memory_head
+        accepted = true
+      }
+      if previous == assembly_memory_head and kind == token_atom {
+        if assembly_matches(payload, "memory") {
+          phase = assembly_memory_field
+          accepted = true
+        }
+      }
+      if previous == assembly_memory_field {
+        if kind == token_atom and not has_pages {
+          pages = assembly_pages(payload)
+          if pages != assembly_u32_invalid {
+            has_pages = true
+            accepted = true
+          }
+        }
+        if kind == token_open and not exported {
+          export_opened = line
+          phase = assembly_export_head
+          accepted = true
+        }
+        if kind == token_close and has_pages and line == opened {
+          phase = assembly_done
+          accepted = true
+        }
+      }
+      if previous == assembly_export_head and kind == token_atom {
+        if assembly_matches(payload, "export") {
+          phase = assembly_export_name
+          accepted = true
+        }
+      }
+      if previous == assembly_export_name and kind == token_text {
+        if assembly_ascii(payload) {
+          export_name = payload
+          phase = assembly_export_close
+          accepted = true
+        }
+      }
+      if previous == assembly_export_close and kind == token_close and line == export_opened {
+        exported = true
+        phase = assembly_memory_field
+        accepted = true
+      }
+      if not accepted { error = failure(line, "unsupported assembler subset form or field") }
+      at = at + header_bytes + size
+    }
+  }
+  if error == "" and phase != assembly_root and phase != assembly_done { error = "assembler subset: incomplete memory declaration" }
+  if error != "" { return error }
+  return assembly_layout(phase == assembly_done, pages, exported, export_name)
+}
+
+const assembly_function_kind: u64 = 0
+const assembly_i32_type: u64 = 127
+const assembly_i64_type: u64 = 126
+const assembly_opcode_invalid: u64 = 256
+const assembly_i32_constant: u64 = 65
+const assembly_i64_constant: u64 = 66
+const assembly_local_get: u64 = 32
+const assembly_function_end: u64 = 11
+const assembly_u64_max: u64 = 18446744073709551615
+const assembly_i32_negative_max: u64 = 2147483648
+const assembly_i64_negative_max: u64 = 9223372036854775808
+const assembly_function_flat_overhead: u64 = 69
+const assembly_form_depth_max: u64 = 2
+const assembly_form_head: u64 = 10
+const assembly_function_name: u64 = 11
+const assembly_function_header: u64 = 12
+const assembly_field_head: u64 = 13
+const assembly_param_types: u64 = 14
+const assembly_result_type: u64 = 15
+const assembly_field_close: u64 = 16
+const assembly_function_export: u64 = 17
+const assembly_function_body: u64 = 18
+const assembly_function_operand: u64 = 19
+
+fn assembly_type(payload: bytes<tokens_bytes_max>) -> u64 {
+  if assembly_matches(payload, "i32") { return assembly_i32_type }
+  if assembly_matches(payload, "i64") { return assembly_i64_type }
+  return 0
+}
+
+fn assembly_function_named(payload: bytes<tokens_bytes_max>) -> bool {
+  if len(payload) < 2 { return false }
+  var valid = payload[0] == '$'
+  loop byte below source_bytes_max while byte + 1 < len(payload) and valid {
+    let value = payload[byte + 1]
+    valid = (value >= 'a' and value <= 'z') or (value >= 'A' and value <= 'Z') or (value >= '0' and value <= '9') or value == '_'
+  }
+  return valid
+}
+
+fn assembly_opcode(payload: bytes<tokens_bytes_max>) -> u64 {
+  if assembly_matches(payload, "i32.const") { return assembly_i32_constant }
+  if assembly_matches(payload, "i64.const") { return assembly_i64_constant }
+  if assembly_matches(payload, "local.get") { return assembly_local_get }
+  if assembly_matches(payload, "nop") { return 1 }
+  if assembly_matches(payload, "drop") { return 26 }
+  if assembly_matches(payload, "i32.add") { return 106 }
+  if assembly_matches(payload, "i32.sub") { return 107 }
+  if assembly_matches(payload, "i32.mul") { return 108 }
+  if assembly_matches(payload, "i32.div_s") { return 109 }
+  if assembly_matches(payload, "i32.div_u") { return 110 }
+  if assembly_matches(payload, "i64.add") { return 124 }
+  if assembly_matches(payload, "i64.sub") { return 125 }
+  if assembly_matches(payload, "i64.mul") { return 126 }
+  if assembly_matches(payload, "i64.div_s") { return 127 }
+  if assembly_matches(payload, "i64.div_u") { return 128 }
+  return assembly_opcode_invalid
+}
+
+fn assembly_immediate(payload: bytes<tokens_bytes_max>, opcode: u64, params: u64) -> text {
+  if len(payload) == 0 { return "assembler subset: missing immediate" }
+  var at = 0
+  let negative = payload[0] == '-'
+  if negative { at = 1 }
+  var limit = assembly_u64_max
+  if opcode == assembly_i32_constant { limit = assembly_u32_max }
+  if negative {
+    limit = assembly_i64_negative_max
+    if opcode == assembly_i32_constant { limit = assembly_i32_negative_max }
+  }
+  if opcode == assembly_local_get {
+    if negative or params == 0 { return "assembler subset: local index outside params" }
+    limit = params - 1
+  }
+  var valid = at < len(payload)
+  var value = 0
+  loop byte below source_bytes_max while at < len(payload) and valid {
+    let digit = payload[at]
+    if digit < '0' or digit > '9' {
+      valid = false
+    } else {
+      let decoded = digit - '0'
+      if decoded > limit {
+        valid = false
+      } else {
+        if value > (limit - decoded) / decimal_radix {
+          valid = false
+        } else {
+          value = value * decimal_radix + decoded
+        }
+      }
+    }
+    at = at + 1
+  }
+  if not valid { return "assembler subset: invalid decimal immediate or range" }
+  if negative and value > 0 { value = assembly_u64_max - value + 1 }
+  if opcode == assembly_i32_constant { value = widened(value) }
+  var out: bytes<leb_bytes_max> = []
+  if opcode == assembly_local_get { out = unsigned(value) } else { out = signed(value) }
+  return "ok " ++ hex_of(out)
+}
+
+fn assembly_function_layout(params: bytes<flat_bytes_max>, results: bytes<flat_bytes_max>, body: bytes<flat_bytes_max>, exported: bool, export_name: bytes<tokens_bytes_max>) -> text {
+  if not exported { return assembly_layout(false, 0, false, export_name) }
+  var available = flat_bytes_max - assembly_function_flat_overhead
+  if len(params) > available { return "assembler subset: params exceed flat_bytes_max" }
+  available = available - len(params)
+  if len(results) > available { return "assembler subset: results exceed flat_bytes_max" }
+  available = available - len(results)
+  if len(body) > available { return "assembler subset: body exceeds flat_bytes_max" }
+  available = available - len(body)
+  if len(export_name) > available { return "assembler subset: export exceeds flat_bytes_max" }
+  var flat: bytes<flat_bytes_max> = []
+  push flat assembly_word_out(1)
+  push flat assembly_word_out(len(params))
+  push flat params
+  push flat assembly_word_out(len(results))
+  push flat results
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(1)
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(len(body))
+  push flat body
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(1)
+  push flat assembly_word_out(len(export_name))
+  push flat export_name
+  push flat assembly_function_kind
+  push flat assembly_word_out(0)
+  push flat assembly_word_out(1)
+  push flat assembly_word_out(assembly_static_base_bytes)
+  push flat assembly_word_out(0)
+  return "ok " ++ hex_of(flat)
+}
+
+fn assembly_function_tokens(tokens: bytes<tokens_bytes_max>) -> text {
+  var phase = assembly_root
+  var at = 0
+  var opened = 0
+  var field_opened = 0
+  var has_params = false
+  var has_result = false
+  var exported = false
+  var export_name: bytes<tokens_bytes_max> = []
+  var params: bytes<flat_bytes_max> = []
+  var results: bytes<flat_bytes_max> = []
+  var body: bytes<flat_bytes_max> = []
+  var opcode = assembly_opcode_invalid
+  var error = ""
+  loop token below tokens_bytes_max while at < len(tokens) and error == "" {
+    error = assembly_record(tokens, at)
+    if error == "" {
+      let kind = tokens[at]
+      let line = assembly_word(tokens, at + 1)
+      let size = assembly_word(tokens, at + 1 + word_bytes)
+      let payload = slice(tokens, at + header_bytes, at + header_bytes + size)
+      let previous = phase
+      var accepted = false
+      if previous == assembly_root and kind == token_open {
+        opened = line
+        phase = assembly_form_head
+        accepted = true
+      }
+      if previous == assembly_form_head and kind == token_atom and assembly_matches(payload, "func") {
+        phase = assembly_function_name
+        accepted = true
+      }
+      if previous == assembly_function_name and kind == token_atom and assembly_function_named(payload) {
+        phase = assembly_function_header
+        accepted = true
+      }
+      if previous == assembly_function_header and kind == token_open {
+        field_opened = line
+        phase = assembly_field_head
+        accepted = true
+      }
+      if previous == assembly_field_head and kind == token_atom {
+        if assembly_matches(payload, "param") and not has_params {
+          has_params = true
+          phase = assembly_param_types
+          accepted = true
+        }
+        if assembly_matches(payload, "result") and not has_result {
+          has_result = true
+          phase = assembly_result_type
+          accepted = true
+        }
+        if assembly_matches(payload, "export") and not exported {
+          phase = assembly_function_export
+          accepted = true
+        }
+      }
+      if previous == assembly_param_types {
+        if kind == token_atom and assembly_type(payload) != 0 {
+          if len(params) == locals_max { return "assembler subset: params exceed locals_max" }
+          push params assembly_type(payload)
+          accepted = true
+        }
+        if kind == token_close and line == field_opened and len(params) > 0 {
+          phase = assembly_function_header
+          accepted = true
+        }
+      }
+      if previous == assembly_result_type and kind == token_atom and assembly_type(payload) != 0 {
+        push results assembly_type(payload)
+        phase = assembly_field_close
+        accepted = true
+      }
+      if previous == assembly_function_export and kind == token_text and assembly_ascii(payload) {
+        export_name = payload
+        exported = true
+        phase = assembly_field_close
+        accepted = true
+      }
+      if previous == assembly_field_close and kind == token_close and line == field_opened {
+        phase = assembly_function_header
+        accepted = true
+      }
+      if previous == assembly_function_header or previous == assembly_function_body {
+        if kind == token_atom {
+          opcode = assembly_opcode(payload)
+          if opcode != assembly_opcode_invalid {
+            if len(body) == flat_bytes_max { return "assembler subset: body exceeds flat_bytes_max" }
+            push body opcode
+            phase = assembly_function_body
+            if opcode == assembly_i32_constant or opcode == assembly_i64_constant or opcode == assembly_local_get { phase = assembly_function_operand }
+            accepted = true
+          }
+        }
+        if kind == token_close and line == opened {
+          if len(body) == flat_bytes_max { return "assembler subset: body exceeds flat_bytes_max" }
+          push body assembly_function_end
+          phase = assembly_done
+          accepted = true
+        }
+      }
+      if previous == assembly_function_operand and kind == token_atom {
+        let immediate = assembly_immediate(payload, opcode, len(params))
+        if before(immediate, " ") != "ok" { return failure(line, immediate) }
+        let encoded: bytes<leb_bytes_max> = bytes_of_hex(after(immediate, " "))
+        if len(encoded) > flat_bytes_max - len(body) { return "assembler subset: body exceeds flat_bytes_max" }
+        push body encoded
+        phase = assembly_function_body
+        accepted = true
+      }
+      if not accepted { error = failure(line, "unsupported function subset form or field") }
+      at = at + header_bytes + size
+    }
+  }
+  if error == "" and phase != assembly_done { error = "assembler subset: incomplete function declaration or immediate" }
+  if error != "" { return error }
+  return assembly_function_layout(params, results, body, exported, export_name)
+}
+
+fn assembly_join(memory_flat: bytes<flat_bytes_max>, function_flat: bytes<flat_bytes_max>, memory_first: bool) -> text {
+  let function_memory = functions_end(function_flat, imports_end(function_flat, types_end(function_flat, 0)))
+  let function_exports = function_memory + 3 * word_bytes
+  let memory_exports = 6 * word_bytes
+  let function_data = exports_end(function_flat, function_exports)
+  let memory_data = exports_end(memory_flat, memory_exports)
+  let function_exports_bytes = slice(function_flat, function_exports + word_bytes, function_data)
+  let memory_exports_bytes = slice(memory_flat, memory_exports + word_bytes, memory_data)
+  let suffix = slice(memory_flat, memory_data, len(memory_flat))
+  let overhead = function_memory + 4 * word_bytes + len(suffix)
+  if len(function_exports_bytes) > flat_bytes_max - overhead { return "assembler subset: exports exceed flat_bytes_max" }
+  if len(memory_exports_bytes) > flat_bytes_max - overhead - len(function_exports_bytes) { return "assembler subset: exports exceed flat_bytes_max" }
+  var flat: bytes<flat_bytes_max> = []
+  push flat slice(function_flat, 0, function_memory)
+  push flat slice(memory_flat, 3 * word_bytes, memory_exports)
+  push flat assembly_word_out(word(function_flat, function_exports) + word(memory_flat, memory_exports))
+  if memory_first {
+    push flat memory_exports_bytes
+    push flat function_exports_bytes
+  } else {
+    push flat function_exports_bytes
+    push flat memory_exports_bytes
+  }
+  push flat suffix
+  return "ok " ++ hex_of(flat)
+}
+
+fn assembly_tokens(tokens: bytes<tokens_bytes_max>) -> text {
+  var at = 0
+  var start = 0
+  var depth = 0
+  var memory_seen = false
+  var function_seen = false
+  var memory_first = false
+  var form_memory = false
+  var form_kind_known = false
+  let empty_name: bytes<tokens_bytes_max> = []
+  let empty = assembly_layout(false, 0, false, empty_name)
+  var memory_flat: bytes<flat_bytes_max> = bytes_of_hex(after(empty, " "))
+  var function_flat = memory_flat
+  var error = ""
+  loop token below tokens_bytes_max while at < len(tokens) and error == "" {
+    error = assembly_record(tokens, at)
+    if error == "" {
+      let kind = tokens[at]
+      let size = assembly_word(tokens, at + 1 + word_bytes)
+      let next = at + header_bytes + size
+      if depth == 0 {
+        if kind != token_open { return "assembler subset: expected top-level form" }
+        start = at
+        form_kind_known = false
+      } else {
+        if not form_kind_known {
+          if kind != token_atom { return "assembler subset: expected form head" }
+          let payload = slice(tokens, at + header_bytes, next)
+          form_memory = assembly_matches(payload, "memory")
+          if not form_memory and not assembly_matches(payload, "func") { return "assembler subset: unsupported top-level form" }
+          if form_memory and memory_seen { return "assembler subset: duplicate memory" }
+          if not form_memory and function_seen { return "assembler subset: duplicate function" }
+          form_kind_known = true
+        }
+      }
+      if kind == token_open { depth = depth + 1 }
+      if depth > assembly_form_depth_max { return "assembler subset: nested instructions unsupported" }
+      if kind == token_close { depth = depth - 1 }
+      if depth == 0 {
+        let form = slice(tokens, start, next)
+        var result = ""
+        if form_memory { result = assembly_memory_tokens(form) } else { result = assembly_function_tokens(form) }
+        if before(result, " ") != "ok" { return result }
+        let flat: bytes<flat_bytes_max> = bytes_of_hex(after(result, " "))
+        if form_memory {
+          memory_first = not function_seen
+          memory_seen = true
+          memory_flat = flat
+        } else {
+          function_seen = true
+          function_flat = flat
+        }
+      }
+      at = next
+    }
+  }
+  if error != "" { return error }
+  if depth != 0 { return "assembler subset: incomplete top-level form" }
+  return assembly_join(memory_flat, function_flat, memory_first)
+}
+
+fn assembly_flat(input: text) -> text {
+  let result = tokenize(input)
+  if before(result, " ") != "ok" { return result }
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(after(result, " "))
+  return assembly_tokens(tokens)
+}
+
+fn assembly_module(input: text) -> text {
+  let result = assembly_flat(input)
+  if before(result, " ") != "ok" { return result }
+  return "ok " ++ encode_hex(after(result, " "))
+}
+
+fn assembly_token_hex(input: text) -> text {
+  let tokens: bytes<tokens_bytes_max> = bytes_of_hex(input)
+  return assembly_tokens(tokens)
+}
+
+on assemble(input: text) -> text {
+  return assembly_flat(input)
+}
+
+on assemble_tokens(input: text) -> text {
+  return assembly_token_hex(input)
+}
+
+on encode_assembly(input: text) -> text {
+  return assembly_module(input)
+}
+
+on compile_tokens(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = assembly_token_hex(source)
+      match write_bytes(output_path, hex_result(result)) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}
+
+on flatten(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = assembly_flat(source)
+      if before(result, " ") != "ok" { return result }
+      match write_bytes(output_path, after(result, " ")) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}
+
+on compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = assembly_module(source)
+      if before(result, " ") != "ok" { return result }
+      match write_bytes(output_path, after(result, " ")) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}

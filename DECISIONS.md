@@ -630,3 +630,19 @@ Losses, read from each row's verifier log and meter records:
 
 - Since be04d48 hl-host returns a Bash result as the raw `@@hl-bash@@` frame, and programs render it with the shared pure fns in scripts/fixtures/shell.hl. The host-probe fixtures (scripts/fixtures/programs/syscalls.hl and syscalls_child.hl) still compared the host's answer with rendered text, so scripts/fixtures/host-probe.sh failed at e2ee589 and at master. Reproduced on a fresh worktree of each.
 - The fixtures now pass their Bash results through `shell_shown`, and host-probe.sh builds them with shell.hl appended, the way program-literals.py inlines it into the agents. One renderer, no copy. The probe's expected answers are unchanged.
+
+
+## Offline reference builds and bounded assembly components
+
+Harnesslang is a language for agent harnesses. Its existing compiler is written in Rust and still uses only Rust's standard library. Separate reference checks now resolve their third-party Rust libraries, npm archives and API specifications from checked-in inputs, including generated JavaScript initialization files that the DJS library reads from outside its crate directory. DJS is a dependency of the separate reference-check program. Existing compiler, fixed-host, example and evaluator sources are unchanged.
+
+New assembly components written in Harnesslang convert selected WebAssembly text into tokens, memory and function declarations, static data layout, function signatures and integer function bodies. Their checks compare results with the Rust implementation through the Harnesslang interpreter and compiled WebAssembly. These are partial assembly components, not a complete self-hosted compiler or a bootstrap fixed point.
+
+Local verification passed on November 17, 2026 PST:
+
+```sh
+SHIPPY_REMOTE_BUILD=0 CARGO_BUILD_JOBS=2 unshare -Urn scripts/offline-check.sh --build
+SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh
+```
+
+The first command builds the reference workspaces with fresh caches and networking disabled. The second runs the full local suite: repeated component comparisons, seeded simulations, compiled-host comparisons, checks that deliberately broken programs are rejected, bounded-program proofs and checks against the source-size limits in `gate.txt`. Both commands disable remote builds; the job variables select build and check concurrency.

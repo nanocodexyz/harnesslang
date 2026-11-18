@@ -15,14 +15,10 @@ oracle=oracle/cloudflare
 scratch=output/cloudflare-drill
 mkdir -p "$scratch"
 
-cargo build --release --locked -j1 > /dev/null 2>&1 || cargo build --release --locked -j1
+cargo build --release --frozen --offline -j1
 npm_prefix=output/cloudflare-npm
+node scripts/offline-npm.mjs "$npm_prefix"
 workerd="$npm_prefix/node_modules/.bin/workerd"
-if [ ! -x "$workerd" ] || ! cmp -s "$oracle/package-lock.json" "$npm_prefix/package-lock.json"; then
-  mkdir -p "$npm_prefix"
-  cp "$oracle/package.json" "$oracle/package-lock.json" "$npm_prefix/"
-  (cd "$npm_prefix" && npm ci --no-audit --no-fund > /dev/null)
-fi
 echo "cloudflare drill: $("$workerd" --version)"
 loader_log="$scratch/loader.log"
 if ! node "$oracle/loader.mjs" --dir "$scratch/loader" > "$loader_log" 2>&1; then

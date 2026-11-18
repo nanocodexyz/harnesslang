@@ -1,0 +1,18 @@
+[
+  {
+    "name": "cloudflare",
+    "url": "https://raw.githubusercontent.com/cloudflare/api-schemas/8b1a451819bc546d410e41cca71a86bcc2779808/openapi.json",
+    "sha256": "214602bc44128f3b441db94e5a77a1da8c47d6c5d9da9c26230dfff2650cdebf",
+    "bytes": 28011450,
+    "gzip_bytes": 1848146,
+    "gzip_sha256": "43f9588422d867f94ca806305bbb9479cddabb1627671c9218978e0278e8ffc1"
+  },
+  {
+    "name": "vercel",
+    "url": "https://raw.githubusercontent.com/vercel/sdk/fe01b47433aa130b15c68a738a8773d9dd38b190/vercel-spec.json",
+    "sha256": "f96d1077e4152c4b51b1c821a7525f9bbb0ceea45ddd3a6141138041a26893cd",
+    "bytes": 12302658,
+    "gzip_bytes": 744808,
+    "gzip_sha256": "8bb8e15b67262f53e6dc08a413651f8fff88df16b5ae58381d5d8cf839647a11"
+  }
+]

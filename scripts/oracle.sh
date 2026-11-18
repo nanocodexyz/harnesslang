@@ -14,8 +14,8 @@ if grep -rnE '^\s*//|#\[test\]|#\[cfg\(test\)\]' oracle/src; then
   echo "oracle/src has comments or test functions" >&2
   exit 1
 fi
-cargo build --release --locked
-cargo build --release --locked --manifest-path oracle/Cargo.toml
+cargo build --release --frozen --offline
+cargo build --release --frozen --offline --manifest-path oracle/Cargo.toml
 rm -rf "$scratch"
 mkdir -p "$journals"
 

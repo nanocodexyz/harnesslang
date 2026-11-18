@@ -2,6 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+export SHIPPY_REMOTE_BUILD=0
+export CARGO_NET_OFFLINE=true
 export CHECK_JOBS=${CHECK_JOBS:-4}
 export SEEDS=${SEEDS:-0..300}
 export TWICE_SEEDS=${TWICE_SEEDS:-0..60}

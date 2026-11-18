@@ -1,0 +1,40 @@
+Vendored build and reference-check inputs
+
+Cargo dependency sources are the exact packages in oracle/Cargo.lock, copied by
+cargo vendor --locked. Their source identities, package checksums and declared
+licenses are in cargo-manifest.json; each crate retains its upstream files and
+.cargo-checksum.json. Nanocode git packages inherit the MIT OR Apache-2.0 license
+from the pinned repository root, reproduced in licenses/nanocode/. Other license
+texts and copyright notices remain in their individual crate directories.
+
+builtins/gen/ contains the three unchanged generated JavaScript preludes read
+outside the djs-core crate directory by its build script and include_str! calls.
+These committed inputs are copied from crates/patches/djs/builtins/gen/ at the
+same nanocode revision locked by oracle/Cargo.lock, not regenerated or fetched
+during builds. djs-inputs.json records their source identity, Git blob IDs,
+SHA256 checksums and sizes. DJS's own MIT/Apache licenses from that revision
+are reproduced in licenses/djs/. scripts/offline-vendor.py verifies these
+auxiliary inputs as well as the Cargo-vendored crate sources. No upstream
+build script, source hash computation or image assertion is modified.
+
+npm/ contains the six unchanged registry archives from
+oracle/cloudflare/package-lock.json: workerd and all five optional platform
+packages, not node_modules. npm/manifest.json records the lockfile integrity,
+source URL, package license and archive SHA256. The npm packages declare
+Apache-2.0; the workerd source license is reproduced in licenses/workerd/LICENSE
+from https://github.com/cloudflare/workerd/tree/v1.20261107.1. Archive contents,
+including upstream notices and package metadata, are unmodified.
+
+specs/ contains deterministic gzip copies of the pinned Cloudflare and Vercel
+OpenAPI specifications, not fetched during checks. Its manifest records source
+URLs and compressed/uncompressed SHA256 checksums. The corresponding repository
+licenses are specs/cloudflare.LICENSE (BSD-3-Clause) and specs/vercel.LICENSE
+(Apache-2.0), retrieved at the same commits as their specifications.
+
+No toolchain is bundled. Rust 1.99.0 (including cargo, rustfmt and clippy), Node.js
+24 with npm, Python 3.11 or newer, Git, a C toolchain, gzip, curl, sha256sum and
+PostgreSQL are local prerequisites. External providers and generated deployment
+applications are not offline build inputs. scripts/offline-check.sh validates
+vendored checksums, fresh-cache Cargo metadata for all five workspaces, and a
+fresh-cache offline npm install. Add --build to compile all five workspaces.
+Run from the repository root. No install-script or network fallback is used.

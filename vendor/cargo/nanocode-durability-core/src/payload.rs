@@ -1,0 +1,1145 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, OnceLock},
+};
+
+use serde::{Serialize, de::DeserializeOwned};
+
+use crate::{Error, Result};
+
+const INLINE_BYTES: usize = 16 * 1024;
+
+const STEP_INLINE_BYTES: usize = 1024;
+
+const CHUNK_MIN: usize = 2 * 1024;
+const CHUNK_AVG: usize = 8 * 1024;
+const CHUNK_MAX: usize = 32 * 1024;
+
+const CHUNK_MASK_SMALL: u64 = !(u64::MAX >> 15);
+const CHUNK_MASK_LARGE: u64 = !(u64::MAX >> 11);
+
+const MANIFEST_PREFIX: char = '%';
+
+const SHA256_MANIFEST_PREFIX: char = '#';
+
+const TREE_PREFIX: char = '^';
+
+const KEY_PREFIX: &str = "b3:";
+
+const GEAR: [u64; 256] = gear_table();
+
+const fn gear_table() -> [u64; 256] {
+    let mut table = [0_u64; 256];
+    let mut state: u64 = 0x6e61_6e6f_636f_6465;
+    let mut index = 0;
+    while index < 256 {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        table[index] = value ^ (value >> 31);
+        index += 1;
+    }
+    table
+}
+
+fn chunk_end(content: &str) -> usize {
+    let bytes = content.as_bytes();
+    let length = bytes.len();
+
+    if length <= CHUNK_MIN * 2 {
+        return length;
+    }
+    let limit = length.min(CHUNK_MAX);
+    let normal = limit.min(CHUNK_AVG);
+    let mut hash = 0_u64;
+    let mut index = CHUNK_MIN;
+    let mut cut = limit;
+    while index < limit {
+        hash = (hash << 1).wrapping_add(GEAR[bytes[index] as usize]);
+        let mask = if index < normal {
+            CHUNK_MASK_SMALL
+        } else {
+            CHUNK_MASK_LARGE
+        };
+        if hash & mask == 0 {
+            cut = index + 1;
+            break;
+        }
+        index += 1;
+    }
+    content.ceil_char_boundary(cut)
+}
+
+fn chunk_key(hash: &str) -> String {
+    format!("c:{hash}")
+}
+
+#[derive(Clone, Debug)]
+pub struct EncodedPayload {
+    body: Body,
+    pending: Arc<[crate::StoreRecord]>,
+    children: Arc<[Self]>,
+}
+
+#[derive(Clone, Debug)]
+enum Body {
+    Reference(Arc<str>),
+    Content {
+        json: Arc<str>,
+        keyed: Arc<OnceLock<Keyed>>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct Keyed {
+    key: Arc<str>,
+    layout: Option<Arc<Layout>>,
+}
+
+impl serde::Serialize for EncodedPayload {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.key())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EncodedPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let key = <std::borrow::Cow<'_, str> as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::by_key(&key))
+    }
+}
+
+#[derive(Debug)]
+struct Layout {
+    hashes: String,
+    ends: Vec<usize>,
+    nodes: Vec<(String, String)>,
+    root: String,
+}
+
+impl Layout {
+    fn of(content: &str) -> Self {
+        let mut hashes = String::with_capacity(content.len() / CHUNK_MIN * HASH_HEX);
+        let mut ends = Vec::with_capacity(content.len() / CHUNK_AVG + 1);
+        let mut offset = 0;
+        while offset < content.len() {
+            let end = offset + chunk_end(&content[offset..]);
+            assert!(end > offset, "a payload chunk is never empty");
+            assert!(
+                content.is_char_boundary(end),
+                "a payload chunk ends on a character boundary"
+            );
+            hashes.push_str(&content_hash(&content[offset..end]));
+            ends.push(end);
+            offset = end;
+        }
+        assert_eq!(
+            offset,
+            content.len(),
+            "payload chunks cover the content exactly"
+        );
+        assert_eq!(
+            hashes.len(),
+            ends.len() * HASH_HEX,
+            "a payload layout names one hash per chunk"
+        );
+        let mut nodes = Vec::new();
+        let root = manifest_tree(MANIFEST_PREFIX, &hashes, &mut nodes);
+        Self {
+            hashes,
+            ends,
+            nodes,
+            root,
+        }
+    }
+
+    fn hash(&self, index: usize) -> &str {
+        &self.hashes[index * HASH_HEX..(index + 1) * HASH_HEX]
+    }
+}
+
+const HASH_HEX: usize = 64;
+
+fn manifest_tree(prefix: char, hashes: &str, nodes: &mut Vec<(String, String)>) -> String {
+    if 1 + hashes.len() < INLINE_BYTES {
+        return format!("{prefix}{hashes}");
+    }
+    let mut parents = String::new();
+    let mut group = String::from(prefix);
+    let mut count = 0;
+    assert!(
+        hashes.len().is_multiple_of(HASH_HEX),
+        "a payload manifest holds whole hashes"
+    );
+    for hash in hashes.as_bytes().chunks(HASH_HEX) {
+        let hash = std::str::from_utf8(hash).expect("a payload manifest hash is hex");
+        group.push_str(hash);
+        count += 1;
+        if count >= CHUNK_MAX / HASH_HEX || (count >= CHUNK_MIN / HASH_HEX && node_cut(hash)) {
+            close_group(&mut group, &mut parents, nodes, prefix);
+            count = 0;
+        }
+    }
+    if count > 0 {
+        close_group(&mut group, &mut parents, nodes, prefix);
+    }
+    manifest_tree(TREE_PREFIX, &parents, nodes)
+}
+
+fn node_cut(hash: &str) -> bool {
+    u32::from_str_radix(&hash[..8], 16)
+        .is_ok_and(|value| value % (CHUNK_AVG / HASH_HEX) as u32 == 0)
+}
+
+fn close_group(
+    group: &mut String,
+    parents: &mut String,
+    nodes: &mut Vec<(String, String)>,
+    prefix: char,
+) {
+    let text = std::mem::replace(group, String::from(prefix));
+    let hash = content_hash(&text);
+    parents.push_str(&hash);
+    nodes.push((hash, text));
+}
+
+fn keyed(json: &str) -> Keyed {
+    if json.len() < INLINE_BYTES {
+        return Keyed {
+            key: record_key(json).into(),
+            layout: None,
+        };
+    }
+    let layout = Layout::of(json);
+    Keyed {
+        key: record_key(&layout.root).into(),
+        layout: Some(Arc::new(layout)),
+    }
+}
+
+impl EncodedPayload {
+    pub fn key(&self) -> &str {
+        self.shared_key()
+    }
+
+    fn shared_key(&self) -> &Arc<str> {
+        match &self.body {
+            Body::Reference(key) => key,
+            Body::Content { json, keyed } => &keyed.get_or_init(|| self::keyed(json)).key,
+        }
+    }
+
+    const fn content(&self) -> Option<&Arc<str>> {
+        match &self.body {
+            Body::Reference(_) => None,
+            Body::Content { json, .. } => Some(json),
+        }
+    }
+
+    fn of(body: Body) -> Self {
+        Self {
+            body,
+            pending: Arc::default(),
+            children: Arc::default(),
+        }
+    }
+
+    pub fn matches_key(&self, key: &str) -> bool {
+        self.key() == key
+            || self
+                .content()
+                .is_some_and(|content| key_matches(key, content))
+    }
+
+    pub fn is_key(value: &str) -> bool {
+        let hash = value.strip_prefix(KEY_PREFIX).unwrap_or(value);
+        hash.len() == HASH_HEX
+            && hash
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    pub fn references(json: &str) -> impl Iterator<Item = &str> {
+        json.match_indices(KEY_PREFIX).filter_map(|(at, _)| {
+            json.get(at..at + KEY_PREFIX.len() + HASH_HEX)
+                .filter(|key| Self::is_key(key))
+        })
+    }
+
+    pub fn is_layout_key(key: &str) -> bool {
+        key.strip_prefix(KEY_PREFIX)
+            .or_else(|| key.strip_prefix("c:"))
+            .is_some_and(Self::is_key)
+    }
+
+    pub fn verify_record(key: &str, value: &str) -> Result<()> {
+        let invalid = |detail: &str| Err(Error::InvalidState(format!("record {key} {detail}")));
+        if let Some(hash) = key.strip_prefix(KEY_PREFIX) {
+            let (content, limit) = match value.strip_prefix('=') {
+                Some(content) => (content, INLINE_BYTES),
+                None if value.starts_with(MANIFEST_PREFIX) || value.starts_with(TREE_PREFIX) => {
+                    check_hashes(&value[1..])?;
+                    (value, INLINE_BYTES)
+                }
+                None => return invalid("is neither an inline payload nor a chunk manifest"),
+            };
+            if content.len() >= limit {
+                return invalid("is larger than an inline payload or manifest can be");
+            }
+            if content_hash(content) != hash {
+                return invalid("does not hold the content its key names");
+            }
+            return Ok(());
+        }
+        if let Some(hash) = key.strip_prefix("c:") {
+            if value.len() > CHUNK_MAX + char::MAX_LEN_UTF8 - 1 {
+                return invalid("is larger than a payload chunk can be");
+            }
+            if content_hash(value) != hash {
+                return invalid("does not hold the content its key names");
+            }
+            return Ok(());
+        }
+        if !Self::is_key(key) {
+            return invalid("is not a content-addressed record");
+        }
+        match value.strip_prefix('=') {
+            Some(content) if sha256_key(content) == key => Ok(()),
+            Some(_) => invalid("does not hold the content its key names"),
+            None => invalid(
+                "is a chunked payload of an earlier build, whose parts cannot be verified on their own",
+            ),
+        }
+    }
+
+    pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Self> {
+        let json = serde_json::to_string(value).map_err(Error::InvalidPayload)?;
+        Ok(Self::from_json(json.into()))
+    }
+
+    pub fn from_json(json: Arc<str>) -> Self {
+        Self::of(Body::Content {
+            json,
+            keyed: Arc::default(),
+        })
+    }
+
+    pub fn keyed(key: Arc<str>, json: Arc<str>) -> Self {
+        Self::of(Body::Content {
+            json,
+            keyed: Arc::new(OnceLock::from(Keyed { key, layout: None })),
+        })
+    }
+
+    pub fn by_key(key: &str) -> Self {
+        Self::of(Body::Reference(key.into()))
+    }
+
+    pub fn decode<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_str(self.json()?).map_err(Error::InvalidPayload)
+    }
+
+    pub fn json(&self) -> Result<&str> {
+        self.content().map(|content| &**content).ok_or_else(|| {
+            Error::InvalidState(
+                "resolve the payload through its durable session before reading it".into(),
+            )
+        })
+    }
+
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    pub fn from_key(key: &str) -> Self {
+        Self::by_key(key)
+    }
+
+    pub fn reference(&self) -> Self {
+        Self::of(Body::Reference(Arc::clone(self.shared_key())))
+    }
+
+    pub fn with_records(mut self, records: Vec<crate::StoreRecord>) -> Self {
+        self.pending = records.into();
+        self
+    }
+
+    pub fn with_payloads(mut self, payloads: Vec<Self>) -> Self {
+        self.children = payloads.into();
+        self
+    }
+
+    pub fn stage(&mut self, records: &mut Vec<crate::StoreRecord>) {
+        self.stage_unless(records, &|_| false);
+    }
+
+    pub fn stage_unless(
+        &mut self,
+        records: &mut Vec<crate::StoreRecord>,
+        known: &dyn Fn(&str) -> bool,
+    ) {
+        self.stage_tree(records, known);
+        self.release();
+    }
+
+    fn release(&mut self) {
+        self.body = Body::Reference(Arc::clone(self.shared_key()));
+        self.pending = Arc::default();
+        self.children = Arc::default();
+    }
+
+    fn stage_tree(&self, records: &mut Vec<crate::StoreRecord>, known: &dyn Fn(&str) -> bool) {
+        if known(self.key()) {
+            return;
+        }
+        self.stage_closure(records, known);
+        let Body::Content {
+            json: content,
+            keyed,
+        } = &self.body
+        else {
+            return;
+        };
+        let layout = match keyed.get().and_then(|keyed| keyed.layout.as_ref()) {
+            Some(layout) => Arc::clone(layout),
+            None if content.len() >= INLINE_BYTES && self.key().starts_with(KEY_PREFIX) => {
+                Arc::new(Layout::of(content))
+            }
+            None => {
+                let mut value = String::with_capacity(1 + content.len());
+                value.push('=');
+                value.push_str(content);
+                records.push(crate::StoreRecord {
+                    key: self.key().to_owned(),
+                    value,
+                });
+                return;
+            }
+        };
+        let mut offset = 0;
+        for (index, &end) in layout.ends.iter().enumerate() {
+            let key = chunk_key(layout.hash(index));
+            if !known(&key) {
+                records.push(crate::StoreRecord {
+                    key,
+                    value: content[offset..end].to_owned(),
+                });
+            }
+            offset = end;
+        }
+        for (hash, text) in &layout.nodes {
+            let key = chunk_key(hash);
+            if !known(&key) {
+                records.push(crate::StoreRecord {
+                    key,
+                    value: text.clone(),
+                });
+            }
+        }
+        records.push(crate::StoreRecord {
+            key: self.key().to_owned(),
+            value: layout.root.clone(),
+        });
+    }
+
+    fn inline_within(&self, limit: usize) -> Option<&str> {
+        let Body::Content { json, keyed } = &self.body else {
+            return None;
+        };
+        (json.len() < limit
+            && keyed
+                .get()
+                .is_none_or(|keyed| keyed.layout.is_none() && keyed.key.starts_with(KEY_PREFIX)))
+        .then_some(&**json)
+    }
+
+    pub(crate) fn is_step_inline(&self) -> bool {
+        self.inline_within(STEP_INLINE_BYTES).is_some()
+    }
+
+    pub(crate) fn is_head_inline(&self) -> bool {
+        self.inline_within(INLINE_BYTES).is_some()
+    }
+
+    pub(crate) fn stage_step_unless(
+        &mut self,
+        records: &mut Vec<crate::StoreRecord>,
+        known: &dyn Fn(&str) -> bool,
+    ) {
+        self.stage_inline_unless(STEP_INLINE_BYTES, records, known);
+    }
+
+    pub(crate) fn stage_head_unless(
+        &mut self,
+        records: &mut Vec<crate::StoreRecord>,
+        known: &dyn Fn(&str) -> bool,
+    ) {
+        self.stage_inline_unless(INLINE_BYTES, records, known);
+    }
+
+    fn stage_inline_unless(
+        &mut self,
+        limit: usize,
+        records: &mut Vec<crate::StoreRecord>,
+        known: &dyn Fn(&str) -> bool,
+    ) {
+        if self.inline_within(limit).is_none() {
+            self.stage_unless(records, known);
+            return;
+        }
+        self.stage_closure(records, known);
+        self.pending = Arc::default();
+        self.children = Arc::default();
+    }
+
+    fn stage_closure(&self, records: &mut Vec<crate::StoreRecord>, known: &dyn Fn(&str) -> bool) {
+        records.extend(
+            self.pending
+                .iter()
+                .filter(|record| !known(&record.key))
+                .cloned(),
+        );
+        for child in self.children.iter() {
+            child.stage_tree(records, known);
+        }
+    }
+
+    pub async fn load(&self, store: &mut dyn crate::StateStore, state_id: &str) -> Result<Self> {
+        self.load_noting(store, state_id, &mut HashSet::new()).await
+    }
+
+    pub async fn load_noting(
+        &self,
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+        read: &mut HashSet<String>,
+    ) -> Result<Self> {
+        if self.content().is_some() {
+            return Ok(self.clone());
+        }
+        let record = store
+            .read_record(state_id, self.key())
+            .await?
+            .ok_or_else(|| Error::InvalidState(format!("missing payload record {}", self.key())))?;
+        read.insert(self.key().to_owned());
+        self.load_record(&mut Noting { store, read }, state_id, record)
+            .await
+    }
+
+    pub async fn read(&self, reader: &mut dyn crate::StateReader, state_id: &str) -> Result<Self> {
+        if self.content().is_some() {
+            return Ok(self.clone());
+        }
+        let record = reader
+            .read_records(state_id, std::slice::from_ref(&self.key().to_owned()))
+            .await?
+            .pop()
+            .flatten()
+            .ok_or_else(|| Error::InvalidState(format!("missing payload record {}", self.key())))?;
+        self.load_record(reader, state_id, record).await
+    }
+
+    pub async fn read_many(
+        values: &[Self],
+        reader: &mut dyn crate::StateReader,
+        state_id: &str,
+    ) -> Result<Vec<Self>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if values.iter().any(|value| value.content().is_some()) {
+            let missing: Vec<Self> = values
+                .iter()
+                .filter(|value| value.content().is_none())
+                .cloned()
+                .collect();
+            let mut loaded = Box::pin(Self::read_many(&missing, reader, state_id))
+                .await?
+                .into_iter();
+            return values
+                .iter()
+                .map(|value| match value.content() {
+                    Some(_) => Ok(value.clone()),
+                    None => loaded
+                        .next()
+                        .ok_or_else(|| Error::InvalidState("record batch length mismatch".into())),
+                })
+                .collect();
+        }
+        let keys: Vec<_> = values.iter().map(|value| value.key().to_owned()).collect();
+        let records = reader.read_records(state_id, &keys).await?;
+        if records.len() != values.len() {
+            return Err(Error::InvalidState("record batch length mismatch".into()));
+        }
+        let records = values
+            .iter()
+            .zip(records)
+            .map(|(value, record)| {
+                record.ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload record {}", value.key()))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::load_records(values, reader, state_id, records).await
+    }
+
+    pub async fn load_many(
+        values: &[Self],
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+    ) -> Result<Vec<Self>> {
+        Self::load_many_noting(values, store, state_id, &mut HashSet::new()).await
+    }
+
+    pub async fn load_many_noting(
+        values: &[Self],
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+        read: &mut HashSet<String>,
+    ) -> Result<Vec<Self>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if values.iter().any(|value| value.content().is_some()) {
+            let missing: Vec<Self> = values
+                .iter()
+                .filter(|value| value.content().is_none())
+                .cloned()
+                .collect();
+            let mut loaded = Box::pin(Self::load_many_noting(&missing, store, state_id, read))
+                .await?
+                .into_iter();
+            return values
+                .iter()
+                .map(|value| match value.content() {
+                    Some(_) => Ok(value.clone()),
+                    None => loaded
+                        .next()
+                        .ok_or_else(|| Error::InvalidState("record batch length mismatch".into())),
+                })
+                .collect();
+        }
+        let keys: Vec<_> = values.iter().map(|value| value.key().to_owned()).collect();
+        let mut source = Noting { store, read };
+        let records = source.records(state_id, &keys).await?;
+        if records.len() != values.len() {
+            return Err(Error::InvalidState("record batch length mismatch".into()));
+        }
+        let records = values
+            .iter()
+            .zip(records)
+            .map(|(value, record)| {
+                record.ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload record {}", value.key()))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::load_records(values, &mut source, state_id, records).await
+    }
+
+    pub async fn manifests_by_content(
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut manifests = HashMap::new();
+        for key in store.list_records(state_id).await? {
+            if !key.starts_with(KEY_PREFIX) {
+                continue;
+            }
+            let Some(record) = store.read_record(state_id, &key).await? else {
+                continue;
+            };
+            if !record.starts_with(MANIFEST_PREFIX) && !record.starts_with(TREE_PREFIX) {
+                continue;
+            }
+            let read = &mut HashSet::new();
+            let payload = Self::by_key(&key)
+                .load_record(
+                    &mut Noting {
+                        store: &mut *store,
+                        read,
+                    },
+                    state_id,
+                    record,
+                )
+                .await?;
+            manifests.insert(record_key(payload.json()?), key);
+        }
+        Ok(manifests)
+    }
+
+    pub(crate) async fn reachable<S: crate::StateStore + ?Sized>(
+        head: &str,
+        staged: &nanocode_sync::OrdMap<String, Arc<str>>,
+        store: &mut S,
+        state_id: &str,
+    ) -> Result<HashSet<String>> {
+        let mut reached = HashSet::new();
+        let mut queued = HashSet::new();
+        let follow = |json: &str, queued: &mut HashSet<String>, level: &mut Vec<Self>| {
+            for key in Self::references(json) {
+                if staged.contains_key(key) && queued.insert(key.to_owned()) {
+                    level.push(Self::by_key(key));
+                }
+            }
+        };
+        let mut level = Vec::new();
+        follow(head, &mut queued, &mut level);
+        while !level.is_empty() {
+            let mut source = Overlay {
+                staged,
+                store: &mut *store,
+                reached: &mut reached,
+            };
+            let keys: Vec<_> = level.iter().map(|value| value.key().to_owned()).collect();
+            let records = source
+                .records(state_id, &keys)
+                .await?
+                .into_iter()
+                .zip(&keys)
+                .map(|(record, key)| {
+                    record
+                        .ok_or_else(|| Error::InvalidState(format!("missing payload record {key}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let loaded = Self::load_records(&level, &mut source, state_id, records).await?;
+            level.clear();
+            for payload in &loaded {
+                follow(payload.json()?, &mut queued, &mut level);
+            }
+        }
+        Ok(reached)
+    }
+
+    async fn load_record<S: RecordSource + ?Sized>(
+        &self,
+        store: &mut S,
+        state_id: &str,
+        record: String,
+    ) -> Result<Self> {
+        Self::load_records(std::slice::from_ref(self), store, state_id, vec![record])
+            .await?
+            .pop()
+            .ok_or_else(|| Error::InvalidState("record batch length mismatch".into()))
+    }
+
+    async fn load_records<S: RecordSource + ?Sized>(
+        values: &[Self],
+        store: &mut S,
+        state_id: &str,
+        records: Vec<String>,
+    ) -> Result<Vec<Self>> {
+        let mut pending = Vec::with_capacity(values.len());
+        for (value, record) in values.iter().zip(&records) {
+            pending.push(if record.starts_with('=') {
+                Assembly::Inline
+            } else if record.starts_with(MANIFEST_PREFIX) || record.starts_with(TREE_PREFIX) {
+                if record_key(record) != value.key() {
+                    return Err(Error::InvalidState(format!(
+                        "payload manifest checksum mismatch {}",
+                        value.key()
+                    )));
+                }
+                Assembly::Tree(vec![record.clone()])
+            } else if let Some(hashes) = record.strip_prefix(SHA256_MANIFEST_PREFIX) {
+                Assembly::Leaves(hashes.to_owned(), false)
+            } else {
+                Assembly::Assembled(value.numbered_chunks(store, state_id, record).await?)
+            });
+        }
+        Self::resolve_trees(values, store, state_id, &mut pending).await?;
+        Self::assemble(values, store, state_id, &mut pending).await?;
+        let mut loaded = Vec::with_capacity(values.len());
+        for ((value, record), assembly) in values.iter().zip(&records).zip(pending) {
+            let (content, verified) = match &assembly {
+                Assembly::Inline => (&record[1..], false),
+                Assembly::Assembled(content) => (content.as_str(), false),
+                Assembly::Verified(content) => (content.as_str(), true),
+                Assembly::Tree(_) | Assembly::Leaves(..) => {
+                    return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+                }
+            };
+            if !verified && !key_matches(value.key(), content) {
+                return Err(Error::InvalidState(format!(
+                    "payload record checksum mismatch {}",
+                    value.key()
+                )));
+            }
+            loaded.push(Self::of(Body::Content {
+                json: content.into(),
+                keyed: Arc::new(OnceLock::from(Keyed {
+                    key: Arc::clone(value.shared_key()),
+                    layout: None,
+                })),
+            }));
+        }
+        Ok(loaded)
+    }
+
+    async fn numbered_chunks<S: RecordSource + ?Sized>(
+        &self,
+        store: &mut S,
+        state_id: &str,
+        record: &str,
+    ) -> Result<String> {
+        let count: usize = record
+            .strip_prefix('+')
+            .ok_or_else(|| Error::InvalidState("invalid payload record".into()))?
+            .parse()
+            .map_err(|_| Error::InvalidState("invalid payload record count".into()))?;
+        let mut content = String::new();
+        for index in 0..count {
+            let chunk = store
+                .records(state_id, &[format!("{}/{index}", self.key())])
+                .await?
+                .pop()
+                .flatten()
+                .ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload chunk {}/{index}", self.key()))
+                })?;
+            content.push_str(&chunk);
+        }
+        Ok(content)
+    }
+
+    async fn resolve_trees<S: RecordSource + ?Sized>(
+        values: &[Self],
+        store: &mut S,
+        state_id: &str,
+        pending: &mut [Assembly],
+    ) -> Result<()> {
+        loop {
+            let mut keys = Vec::new();
+            let mut owners = Vec::new();
+            for (index, assembly) in pending.iter_mut().enumerate() {
+                let Assembly::Tree(level) = assembly else {
+                    continue;
+                };
+                let leaves = level.iter().all(|text| text.starts_with(MANIFEST_PREFIX));
+                if !leaves && !level.iter().all(|text| text.starts_with(TREE_PREFIX)) {
+                    return Err(Error::InvalidState(format!(
+                        "payload manifest tree mixes levels {}",
+                        values[index].key()
+                    )));
+                }
+                let hashes: String = level.iter().map(|text| &text[1..]).collect();
+                check_hashes(&hashes)?;
+                if leaves {
+                    *assembly = Assembly::Leaves(hashes, true);
+                    continue;
+                }
+                level.clear();
+                for hash in hashes.as_bytes().chunks(HASH_HEX) {
+                    let hash = std::str::from_utf8(hash).unwrap_or_default();
+                    keys.push(chunk_key(hash));
+                    owners.push((index, hash.to_owned()));
+                }
+            }
+            if keys.is_empty() {
+                return Ok(());
+            }
+            let children = store.records(state_id, &keys).await?;
+            if children.len() != keys.len() {
+                return Err(Error::InvalidState("record batch length mismatch".into()));
+            }
+            for ((key, child), (index, hash)) in keys.iter().zip(children).zip(owners) {
+                let child = child.ok_or_else(|| {
+                    Error::InvalidState(format!(
+                        "missing payload manifest {key} of {}",
+                        values[index].key()
+                    ))
+                })?;
+                if content_hash(&child) != hash {
+                    return Err(Error::InvalidState(format!(
+                        "payload manifest checksum mismatch {key} of {}",
+                        values[index].key()
+                    )));
+                }
+                if let Assembly::Tree(level) = &mut pending[index] {
+                    level.push(child);
+                }
+            }
+        }
+    }
+
+    async fn assemble<S: RecordSource + ?Sized>(
+        values: &[Self],
+        store: &mut S,
+        state_id: &str,
+        pending: &mut [Assembly],
+    ) -> Result<()> {
+        let mut keys = Vec::new();
+        let mut owners = Vec::new();
+        for (index, assembly) in pending.iter().enumerate() {
+            let Assembly::Leaves(hashes, _) = assembly else {
+                continue;
+            };
+            check_hashes(hashes)?;
+            for chunk in 0..hashes.len() / HASH_HEX {
+                keys.push(chunk_key(&hashes[chunk * HASH_HEX..(chunk + 1) * HASH_HEX]));
+                owners.push((index, chunk));
+            }
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let chunks = store.records(state_id, &keys).await?;
+        if chunks.len() != keys.len() {
+            return Err(Error::InvalidState("record batch length mismatch".into()));
+        }
+        let mut contents: Vec<String> = vec![String::new(); pending.len()];
+        for ((key, chunk), (index, position)) in keys.iter().zip(chunks).zip(owners) {
+            let chunk = chunk.ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "missing payload chunk {key} of {}",
+                    values[index].key()
+                ))
+            })?;
+            if let Assembly::Leaves(hashes, true) = &pending[index]
+                && content_hash(&chunk) != hashes[position * HASH_HEX..(position + 1) * HASH_HEX]
+            {
+                return Err(Error::InvalidState(format!(
+                    "payload chunk checksum mismatch {key} of {}",
+                    values[index].key()
+                )));
+            }
+            contents[index].push_str(&chunk);
+        }
+        for (assembly, content) in pending.iter_mut().zip(contents) {
+            if let Assembly::Leaves(_, verified) = assembly {
+                *assembly = if *verified {
+                    Assembly::Verified(content)
+                } else {
+                    Assembly::Assembled(content)
+                };
+            }
+        }
+        Ok(())
+    }
+}
+
+enum Assembly {
+    Inline,
+    Tree(Vec<String>),
+    Leaves(String, bool),
+    Assembled(String),
+    Verified(String),
+}
+
+fn check_hashes(hashes: &str) -> Result<()> {
+    if hashes.is_empty()
+        || !hashes.len().is_multiple_of(HASH_HEX)
+        || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+    }
+    Ok(())
+}
+
+trait RecordSource {
+    fn records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>>;
+}
+
+struct Noting<'a, 'store> {
+    store: &'a mut (dyn crate::StateStore + 'store),
+    read: &'a mut HashSet<String>,
+}
+
+impl RecordSource for Noting<'_, '_> {
+    fn records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>> {
+        Box::pin(async move {
+            let records = self.store.read_records(state_id, keys).await?;
+            for (key, record) in keys.iter().zip(&records) {
+                if record.is_some() {
+                    self.read.insert(key.clone());
+                }
+            }
+            Ok(records)
+        })
+    }
+}
+
+struct Overlay<'a, S: ?Sized> {
+    staged: &'a nanocode_sync::OrdMap<String, Arc<str>>,
+    store: &'a mut S,
+    reached: &'a mut HashSet<String>,
+}
+
+impl<S: crate::StateStore + ?Sized> RecordSource for Overlay<'_, S> {
+    fn records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>> {
+        Box::pin(async move {
+            let missing: Vec<_> = keys
+                .iter()
+                .filter(|key| !self.staged.contains_key(*key))
+                .cloned()
+                .collect();
+            let read = if missing.is_empty() {
+                Vec::new()
+            } else {
+                self.store.read_records(state_id, &missing).await?
+            };
+            if read.len() != missing.len() {
+                return Err(crate::StoreError::Backend(format!(
+                    "store answered {} of {} record reads",
+                    read.len(),
+                    missing.len()
+                )));
+            }
+            let mut read = read.into_iter();
+            Ok(keys
+                .iter()
+                .map(|key| match self.staged.get(key) {
+                    Some(value) => {
+                        self.reached.insert(key.clone());
+                        Some(value.to_string())
+                    }
+                    None => read.next().flatten(),
+                })
+                .collect())
+        })
+    }
+}
+
+impl RecordSource for dyn crate::StateReader + '_ {
+    fn records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>> {
+        self.read_records(state_id, keys)
+    }
+}
+
+fn content_hash(value: &str) -> String {
+    nanocode_digest::blake3(value.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn record_key(value: &str) -> String {
+    format!("{KEY_PREFIX}{}", content_hash(value))
+}
+
+fn key_matches(key: &str, content: &str) -> bool {
+    match key.strip_prefix(KEY_PREFIX) {
+        Some(hash) => content_hash(content) == hash,
+        None => sha256_key(content) == key,
+    }
+}
+
+fn sha256_key(value: &str) -> String {
+    use nanocode_digest::Sha256;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(value.as_bytes()) {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 15) as usize] as char);
+    }
+    encoded
+}
+
+impl PartialEq for EncodedPayload {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.body, &other.body) {
+            (
+                Body::Content { json, keyed },
+                Body::Content {
+                    json: other_json,
+                    keyed: other_keyed,
+                },
+            ) if keyed.get().is_none() && other_keyed.get().is_none() => json == other_json,
+            _ => self.key() == other.key(),
+        }
+    }
+}
+impl Eq for EncodedPayload {}
+
+fn serialize_within<S: serde::Serializer>(
+    payload: &EncodedPayload,
+    limit: usize,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match payload.inline_within(limit) {
+        Some(content) => serializer.collect_str(&format_args!("={content}")),
+        None => serializer.serialize_str(payload.key()),
+    }
+}
+
+fn deserialize_within<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    limit: usize,
+) -> std::result::Result<EncodedPayload, D::Error> {
+    let value = <std::borrow::Cow<'_, str> as serde::Deserialize>::deserialize(deserializer)?;
+    let Some(content) = value.strip_prefix('=') else {
+        return Ok(EncodedPayload::by_key(&value));
+    };
+    if content.len() >= limit {
+        return Err(serde::de::Error::custom(
+            "an inline payload exceeds its size limit",
+        ));
+    }
+    Ok(EncodedPayload::from_json(content.into()))
+}
+
+pub(crate) mod step {
+    use serde::{Deserializer, Serializer};
+
+    use super::{EncodedPayload, STEP_INLINE_BYTES};
+
+    pub fn serialize<S: Serializer>(
+        payload: &EncodedPayload,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        super::serialize_within(payload, STEP_INLINE_BYTES, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<EncodedPayload, D::Error> {
+        super::deserialize_within(deserializer, STEP_INLINE_BYTES)
+    }
+}
+
+pub(crate) mod head {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{EncodedPayload, INLINE_BYTES};
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(
+        payload: &Option<EncodedPayload>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match payload {
+            Some(payload) => super::serialize_within(payload, INLINE_BYTES, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<EncodedPayload>, D::Error> {
+        struct Within(EncodedPayload);
+        impl<'de> Deserialize<'de> for Within {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                super::deserialize_within(deserializer, INLINE_BYTES).map(Self)
+            }
+        }
+        Ok(Option::<Within>::deserialize(deserializer)?.map(|within| within.0))
+    }
+}

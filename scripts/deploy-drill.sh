@@ -8,9 +8,7 @@ plant="${DEPLOY_DRILL_PLANT:-none}"
 targets="${DEPLOY_DRILL_TARGETS:-cloudflare vercel native-jsonl}"
 scratch="${DEPLOY_DRILL_SCRATCH:-output/deploy-drill/$plant}"
 specs=output/deploy/specs
-cloudflare_spec_url=https://raw.githubusercontent.com/cloudflare/api-schemas/8b1a451819bc546d410e41cca71a86bcc2779808/openapi.json
 cloudflare_spec_sha256=214602bc44128f3b441db94e5a77a1da8c47d6c5d9da9c26230dfff2650cdebf
-vercel_spec_url=https://raw.githubusercontent.com/vercel/sdk/fe01b47433aa130b15c68a738a8773d9dd38b190/vercel-spec.json
 vercel_spec_sha256=f96d1077e4152c4b51b1c821a7525f9bbb0ceea45ddd3a6141138041a26893cd
 token=drill-token
 first_file=examples/minimal.hl
@@ -21,22 +19,17 @@ fail() {
   exit 1
 }
 
-[ -x "$hl" ] || cargo build --release --locked
+[ -x "$hl" ] || cargo build --release --frozen --offline
 rm -rf "$scratch"
 mkdir -p "$scratch" "$specs"
 
-fetch_spec() {
-  local file=$1 url=$2 sha=$3
-  if [ -f "$file" ] && [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$sha" ]; then
-    return
-  fi
-  local download="$file.download.$$"
-  curl -sSfL --retry 3 -o "$download" "$url" || fail "cannot fetch $url"
-  [ "$(sha256sum "$download" | cut -d' ' -f1)" = "$sha" ] || fail "$url does not hash to $sha"
-  mv "$download" "$file"
+read_spec() {
+  local name=$1 sha=$2 file="$specs/$1.json"
+  gzip -dc "vendor/specs/$name.json.gz" > "$file" || fail "cannot unpack vendored $name spec"
+  [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$sha" ] || fail "vendored $name spec does not hash to $sha"
 }
-fetch_spec "$specs/cloudflare.json" "$cloudflare_spec_url" "$cloudflare_spec_sha256"
-fetch_spec "$specs/vercel.json" "$vercel_spec_url" "$vercel_spec_sha256"
+read_spec cloudflare "$cloudflare_spec_sha256"
+read_spec vercel "$vercel_spec_sha256"
 
 fake_pid=
 stop_fake() {

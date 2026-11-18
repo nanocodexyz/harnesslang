@@ -422,6 +422,11 @@ queue invalid invalid_fail
 queue fn fn_equal
 queue docs scripts/docs-check.sh
 queue strict scripts/strict.sh
+queue selfhost-lex scripts/selfhost-lex.sh --mutations --bounds --jobs "$jobs"
+queue selfhost-assemble python3 scripts/selfhost-lex-assemble.py --runs 3 --mutations
+queue selfhost-functions python3 scripts/selfhost-func.py --allocated --runs 3 --out "$(mktemp -d "$PWD/output/selfhost-func.XXXXXXXX")"
+queue selfhost-components scripts/selfhost-components.sh
+queue offline scripts/offline-check.sh
 for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl docs/snippets/in_flight.hl docs/snippets/fork.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"

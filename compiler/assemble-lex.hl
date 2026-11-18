@@ -1,0 +1,222 @@
+harness assemble_lex
+
+const source_bytes_max: u64 = 4194304
+const tokens_bytes_max: u64 = 41943040
+const result_bytes_max: u64 = 83886083
+const nesting_max: u64 = 4096
+const header_bytes: u64 = 9
+const word_bytes: u64 = 4
+const byte_radix: u64 = 256
+const tab_byte: u64 = 9
+const carriage_return_byte: u64 = 13
+const hex_radix: u64 = 16
+const hex_invalid: u64 = 16
+const decimal_radix: u64 = 10
+const decimal_digits_max: u64 = 20
+const string_unterminated: u64 = 4194305
+const string_bad_escape: u64 = 4194306
+const token_open: u64 = 1
+const token_close: u64 = 2
+const token_atom: u64 = 3
+const token_text: u64 = 4
+
+tool read_file(file_path: text) -> text effect none
+tool write_bytes(file_path: text, hex: text) -> text effect idempotent
+
+fn decimal(value: u64) -> text {
+  var reversed: bytes<decimal_digits_max> = []
+  var rest = value
+  push reversed '0' + rest % decimal_radix
+  rest = rest / decimal_radix
+  loop digit below decimal_digits_max while rest > 0 {
+    push reversed '0' + rest % decimal_radix
+    rest = rest / decimal_radix
+  }
+  var out: bytes<decimal_digits_max> = []
+  loop digit below decimal_digits_max while digit < len(reversed) {
+    push out reversed[len(reversed) - 1 - digit]
+  }
+  return text_of(out)
+}
+
+fn failure(line: u64, message: text) -> text {
+  return "wat line " ++ decimal(line) ++ ": " ++ message
+}
+
+fn delimiter(byte: u64) -> bool {
+  return byte == ' ' or byte == tab_byte or byte == carriage_return_byte or byte == '\n' or byte == '(' or byte == ')' or byte == '"'
+}
+
+fn hex_digit(byte: u64) -> u64 {
+  var digit = hex_invalid
+  if byte >= '0' and byte <= '9' { digit = byte - '0' }
+  if byte >= 'a' and byte <= 'f' { digit = byte - 'a' + decimal_radix }
+  if byte >= 'A' and byte <= 'F' { digit = byte - 'A' + decimal_radix }
+  return digit
+}
+
+fn escape_width(source: bytes<source_bytes_max>, at: u64) -> u64 {
+  var width = 0
+  if at + 1 < len(source) {
+    let byte = source[at + 1]
+    if byte == 'n' or byte == 't' or byte == '\\' or byte == '"' or byte == '\'' {
+      width = 2
+    } else {
+      if at + 2 < len(source) {
+        let first = hex_digit(byte)
+        let second = hex_digit(source[at + 2])
+        if (first < hex_radix or byte == '+') and second < hex_radix { width = 3 }
+      }
+    }
+  }
+  return width
+}
+
+fn string_end(source: bytes<source_bytes_max>, start: u64) -> u64 {
+  var at = start
+  var next = string_unterminated
+  loop byte below source_bytes_max while at < len(source) and next == string_unterminated {
+    if source[at] == '"' {
+      next = at + 1
+    } else {
+      if source[at] == '\\' {
+        let width = escape_width(source, at)
+        if width == 0 { next = string_bad_escape } else { at = at + width }
+      } else {
+        at = at + 1
+      }
+    }
+  }
+  return next
+}
+
+fn string_bytes(source: bytes<source_bytes_max>, start: u64, end: u64) -> bytes<source_bytes_max> {
+  var out: bytes<source_bytes_max> = []
+  var at = start
+  loop byte below source_bytes_max while at + 1 < end {
+    var decoded = source[at]
+    var width = 1
+    if decoded == '\\' {
+      width = escape_width(source, at)
+      let escape = source[at + 1]
+      if width == 2 {
+        decoded = escape
+        if escape == 'n' { decoded = '\n' }
+        if escape == 't' { decoded = tab_byte }
+      } else {
+        var first = 0
+        if escape != '+' { first = hex_digit(escape) }
+        decoded = first * hex_radix + hex_digit(source[at + 2])
+      }
+    }
+    push out decoded
+    at = at + width
+  }
+  return out
+}
+
+fn atom_end(source: bytes<source_bytes_max>, start: u64) -> u64 {
+  var at = start
+  var done = false
+  loop byte below source_bytes_max while at < len(source) and not done {
+    if delimiter(source[at]) { done = true } else { at = at + 1 }
+  }
+  return at
+}
+
+fn header(kind: u64, line: u64, size: u64) -> bytes<header_bytes> {
+  var out: bytes<header_bytes> = []
+  push out kind
+  var rest = line
+  loop byte below word_bytes {
+    push out rest % byte_radix
+    rest = rest / byte_radix
+  }
+  rest = size
+  loop byte below word_bytes {
+    push out rest % byte_radix
+    rest = rest / byte_radix
+  }
+  return out
+}
+
+fn tokenize(input: text) -> text {
+  let source: bytes<source_bytes_max> = bytes_of(input)
+  var out: bytes<tokens_bytes_max> = []
+  var opened: list<u64, nesting_max> = []
+  var depth = 0
+  var at = 0
+  var line = 1
+  var error = ""
+  loop token below source_bytes_max while at < len(source) and error == "" {
+    let byte = source[at]
+    if byte == '\n' { line = line + 1 }
+    if byte == ' ' or byte == tab_byte or byte == carriage_return_byte or byte == '\n' {
+      at = at + 1
+    } else {
+      if byte == '(' {
+        if depth == nesting_max {
+          error = failure(line, "nesting deeper than nesting_max (" ++ decimal(nesting_max) ++ ")")
+        } else {
+          if depth == len(opened) { push opened line } else { set opened[depth] = line }
+          depth = depth + 1
+          push out header(token_open, line, 0)
+          at = at + 1
+        }
+      } else {
+        if byte == ')' {
+          if depth == 0 {
+            error = failure(line, "unbalanced ')'")
+          } else {
+            depth = depth - 1
+            push out header(token_close, opened[depth], 0)
+            at = at + 1
+          }
+        } else {
+          if byte == '"' {
+            let next = string_end(source, at + 1)
+            if next == string_unterminated { error = failure(line, "unterminated string") } else {
+              if next == string_bad_escape { error = failure(line, "bad string escape") } else {
+                let value = string_bytes(source, at + 1, next)
+                push out header(token_text, line, len(value))
+                push out value
+                at = next
+              }
+            }
+          } else {
+            let next = atom_end(source, at)
+            push out header(token_atom, line, next - at)
+            push out slice(source, at, next)
+            at = next
+          }
+        }
+      }
+    }
+  }
+  if error == "" and depth != 0 { error = failure(line, "unbalanced '('") }
+  var result = error
+  if error == "" { result = "ok " ++ hex_of(out) }
+  return result
+}
+
+fn hex_result(result: text) -> text {
+  let encoded: bytes<result_bytes_max> = bytes_of(result)
+  return hex_of(encoded)
+}
+
+on tokenize(input: text) -> text {
+  return tokenize(input)
+}
+
+on compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(source) => {
+      let result = tokenize(source)
+      match write_bytes(output_path, hex_result(result)) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}
