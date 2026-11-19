@@ -198,11 +198,35 @@ def checkpoint_fixture(args):
                   result_sha256=report.checkpoint_digest(row)))
 
 
+def change_checkpoint_identity(arm, action):
+    wrapper = report.read_json(arm / "campaign.json")
+    action(wrapper["identity"])
+    write(arm / "campaign.json", wrapper)
+    for directory in (arm / "rows").iterdir():
+        path = directory / "checkpoint.json"
+        state = report.read_json(path)
+        state["identity"]["campaign"] = report.checkpoint_digest(wrapper["identity"])
+        write(path, state)
+
+
 def check_checkpoint(root):
     args = fixture(root)
     checkpoint_fixture(args)
+    fails(report.build_report(args))
+    args.allow_source_change = ["src/agent.rs"]
     result = report.build_report(args)
     assert result["status"] == "PASS", report.readable(result)
+    assert result["treatment"]["observed_changes"]["source"] == ["src/agent.rs"]
+    change_checkpoint_identity(args.candidate, lambda identity: identity["agent_tree"].update({"bin/hl-agent": "e" * 64}))
+    fails(report.build_report(args))
+    args.allow_agent_change = ["bin/hl-agent"]
+    assert report.build_report(args)["status"] == "PASS"
+    change_checkpoint_identity(args.candidate, lambda identity: identity["source_files"].update({"Cargo.lock": "f" * 64}))
+    args.allow_source_change.append("Cargo.lock")
+    fails(report.build_report(args))
+    args.allow_source_change.remove("Cargo.lock")
+    change_checkpoint_identity(args.candidate, lambda identity: identity["source_files"].pop("Cargo.lock"))
+    assert report.build_report(args)["status"] == "PASS"
     directory = first_row(args.candidate)
     path = directory / "checkpoint.json"
     state = report.read_json(path)
@@ -269,6 +293,20 @@ def main():
         assert result["baseline"]["cost_total_usd"] is None
         assert result["baseline"]["cost_mean_usd"] is None
         assert len(result["baseline"]["unknown_external_streams"]) == 2
+        assert result["paired"]["cost_difference_usd"] is None
+        assert result["status"] == "FAIL"
+        drops = root / "dropped-baseline"
+        drops.mkdir()
+        args = fixture(drops)
+        for directory in sorted((args.baseline / "rows").iterdir())[:2]:
+            path = directory / "requests.jsonl"
+            records = report.read_lines(path)
+            records[0]["status"] = 0
+            path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        result = report.build_report(args)
+        assert len(result["baseline"]["unknown_cost_rows"]) == 2
+        assert result["baseline"]["cost_total_usd"] is None
+        assert result["baseline"]["cost_mean_usd"] is None
         assert result["paired"]["cost_difference_usd"] is None
         assert result["status"] == "FAIL"
         suite60 = report.read_suite(ROOT / "suite-60.txt")

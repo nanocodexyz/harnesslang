@@ -128,20 +128,20 @@ def price_row(directory, row):
         responses = None
     for index, record in enumerate(records):
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
-            result["unknown"].append("record %d: missing request path" % index)
+            result["unknown"].append("record %d: missing request path" % (index + 1))
             continue
         endpoint = record["path"].split("?")[0]
         if not endpoint.endswith(MODEL_ENDPOINTS):
             result["non_model_records"] += 1
             if not endpoint.endswith("/models"):
-                result["unknown"].append("record %d: unrecognized endpoint %s" % (index, endpoint))
+                result["unknown"].append("record %d: unrecognized endpoint %s" % (index + 1, endpoint))
             continue
         result["requests"] += 1
         try:
             response = responses[index] if responses is not None else None
             amount, model = request_cost(record, response, row.get("id"))
         except (ValueError, TypeError, AttributeError) as error:
-            result["unknown"].append("request %d: %s" % (index, error))
+            result["unknown"].append("request %d: %s" % (index + 1, error))
             continue
         result["lower_bound_usd"] += amount
         result["by_model_usd"][model] = result["by_model_usd"].get(model, 0.0) + amount
@@ -232,6 +232,8 @@ def checkpoint_manifest(wrapper):
                 "agent_root_sha256": checkpoint_digest(identity["agent_tree"]) if identity.get("agent_tree") else None,
                 "campaign_suite_sha256": identity.get("suite_sha256"), "config": parameters,
                 "tasks": tasks, "runtime": identity.get("runtime"), "transport_sha256": identity.get("transport_sha256")}
+    manifest["source"]["files"] = identity.get("source_files")
+    manifest["agent_tree_files"] = identity.get("agent_tree")
     manifest["measurement_source_files"] = {key: value for key, value in identity.get("source_files", {}).items()
                                             if key.startswith("evals/") and not key.endswith("report.py")}
     for field in sorted(set(identity) - {"source_commit", "source_files", "agent_tree", "parameters", "tasks", "task_trees", "suite_sha256", "ca_sha256", "runtime", "transport_sha256"}):
@@ -332,10 +334,41 @@ def compare_optional(base, candidate, label, issues):
         issues.append("mismatched " + label)
 
 
-def compare_arms(base, candidate, tasks, attempts):
+def measurement_path(path):
+    return path.startswith(("evals/", "scripts/", "rust-toolchain")) or path in ("Cargo.toml", "Cargo.lock")
+
+
+def compare_treatment(first, second, allowed_source, allowed_agent, issues):
+    observed = {}
+    for label, trees, digests, allowed in (
+            ("source", [arm.get("source", {}).get("files") for arm in (first, second)],
+             [arm.get("source", {}).get("tracked_sha256") for arm in (first, second)], allowed_source),
+            ("agent", [arm.get("agent_tree_files") for arm in (first, second)],
+             [arm.get("agent_root_sha256") for arm in (first, second)], allowed_agent)):
+        if all(isinstance(tree, dict) for tree in trees):
+            changes = sorted(key for key in set(trees[0]) | set(trees[1]) if trees[0].get(key) != trees[1].get(key))
+            observed[label] = changes
+            if any(not valid_digest(value) for tree in trees for value in tree.values()):
+                issues.append("invalid granular " + label + " file digest")
+            if label == "source" and any(measurement_path(path) for path in changes):
+                issues.append("measurement harness/toolchain source changed; not a quality treatment")
+            undeclared = sorted(set(changes) - set(allowed))
+            if undeclared:
+                issues.append("undeclared %s treatment changes: %s" % (label, ", ".join(undeclared)))
+        elif digests[0] != digests[1]:
+            issues.append("missing granular %s pins; cannot establish intended-only treatment delta" % label)
+            observed[label] = None
+        else:
+            observed[label] = []
+    return {"declared_source_changes": allowed_source, "declared_agent_changes": allowed_agent,
+            "observed_changes": observed}
+
+
+def compare_arms(base, candidate, tasks, attempts, allowed_source, allowed_agent):
     issues = []
     first, second = base["manifest"], candidate["manifest"]
-    for field in sorted((set(first) | set(second)) - {"source", "agent_root_sha256", "config", "tasks"}):
+    treatment = compare_treatment(first, second, allowed_source, allowed_agent, issues)
+    for field in sorted((set(first) | set(second)) - {"source", "agent_root_sha256", "agent_tree_files", "config", "tasks"}):
         compare_optional(first.get(field), second.get(field), "manifest " + field, issues)
     configs = [{key: value for key, value in arm.get("config", {}).items() if key not in BINDING_FIELDS} for arm in (first, second)]
     compare_optional(*configs, "config", issues)
@@ -351,7 +384,7 @@ def compare_arms(base, candidate, tasks, attempts):
                 compare_optional(rows[0].get(field), rows[1].get(field), "%s %s" % (key, field), issues)
             if any(not row.get("image") for row in rows):
                 issues.append("missing image pin: " + str(key))
-    return issues
+    return issues, treatment
 
 
 def accounting_evidence(arm, path):
@@ -439,7 +472,8 @@ def build_report(args):
     candidate = load_arm(args.candidate, tasks, args.attempts, args.agent)
     accounting_evidence(base, getattr(args, "baseline_accounting", None))
     accounting_evidence(candidate, getattr(args, "candidate_accounting", None))
-    issues = compare_arms(base, candidate, tasks, args.attempts)
+    issues, treatment = compare_arms(base, candidate, tasks, args.attempts,
+                                    getattr(args, "allow_source_change", []), getattr(args, "allow_agent_change", []))
     if args.baseline.resolve() == args.candidate.resolve():
         issues.append("baseline and candidate must be distinct arms")
     matched = not (issues or base["issues"] or candidate["issues"])
@@ -457,9 +491,9 @@ def build_report(args):
     profile = "MATCHED180" if tasks == canonical and args.attempts == 3 else "CUSTOM_%d_TASKS_%d_ATTEMPTS_NOT_MATCHED180" % (len(tasks), expected)
     return {"schema_version": 1, "profile": profile, "matched": matched, "status": "PASS" if all(gates.values()) else "FAIL",
             "policy": {"gates_apply_to": "candidate; both arms require complete matched matrices", "min_success": args.min_success, "max_cost_usd_per_attempt": args.max_cost, "min_improvement_pp": args.min_improvement_pp},
-            "gates": gates, "issues": issues, "baseline": baseline_summary, "candidate": candidate_summary,
+            "gates": gates, "issues": issues, "treatment": treatment, "baseline": baseline_summary, "candidate": candidate_summary,
             "paired": paired, "prices_per_million_tokens": PRICES_PER_MTOK, "prices_source": PRICES_SOURCE,
-            "interpretation": "Errors count as nonpasses in the full planned denominator. Cost is list-price equivalent, not invoiced spend. Unknown costs are not zero. Candidate source and agent-root pins are the treatment and may differ; measurement config, task, image and cache variants must match."}
+            "interpretation": "Errors count as nonpasses in the full planned denominator. Cost is list-price equivalent, not invoiced spend. Unknown costs are not zero. Candidate source and agent-root pins may differ only at declared treatment paths with granular pins; measurement config, task, image and cache variants must match."}
 
 
 def readable(report):
@@ -492,6 +526,8 @@ def arguments():
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--baseline-accounting", type=Path, help="preserved stream accounting JSON (including aborted streams)")
     parser.add_argument("--candidate-accounting", type=Path, help="preserved stream accounting JSON (including aborted streams)")
+    parser.add_argument("--allow-source-change", action="append", default=[], help="declare one exact intended treatment source path; repeat per changed file")
+    parser.add_argument("--allow-agent-change", action="append", default=[], help="declare one exact intended treatment agent-tree path, such as bin/hl-agent")
     parser.add_argument("--suite", type=Path, default=Path(__file__).with_name("suite-60.txt"))
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--expected-tasks", type=int, default=60)
@@ -504,6 +540,11 @@ def arguments():
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--summary", action="store_true", help="print readable summary instead of JSON")
     args = parser.parse_args()
+    for path in args.allow_source_change + args.allow_agent_change:
+        if not path or Path(path).is_absolute() or ".." in Path(path).parts or any(char in path for char in "*?["):
+            parser.error("treatment declarations must be exact safe relative paths")
+    if any(measurement_path(path) for path in args.allow_source_change):
+        parser.error("measurement harness and toolchain changes cannot be treatment exceptions")
     if min(args.attempts, args.expected_tasks, args.bootstrap_reps) < 1:
         parser.error("attempts, expected-tasks and bootstrap-reps must be positive")
     if not 0 <= args.min_success <= 1 or not math.isfinite(args.max_cost) or args.max_cost < 0 or not 0 <= args.min_improvement_pp <= 100:
