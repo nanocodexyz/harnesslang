@@ -24,9 +24,11 @@ rm -rf "$scratch"
 mkdir -p "$scratch" "$specs"
 
 read_spec() {
-  local name=$1 sha=$2 file="$specs/$1.json"
-  gzip -dc "vendor/specs/$name.json.gz" > "$file" || fail "cannot unpack vendored $name spec"
-  [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$sha" ] || fail "vendored $name spec does not hash to $sha"
+  local name=$1 sha=$2 file="$specs/$1.json" temporary
+  temporary=$(mktemp "$file.XXXXXX") || fail "cannot stage vendored $name spec"
+  gzip -dc "vendor/specs/$name.json.gz" > "$temporary" || { rm -f "$temporary"; fail "cannot unpack vendored $name spec"; }
+  [ "$(sha256sum "$temporary" | cut -d' ' -f1)" = "$sha" ] || { rm -f "$temporary"; fail "vendored $name spec does not hash to $sha"; }
+  mv -f "$temporary" "$file" || { rm -f "$temporary"; fail "cannot publish vendored $name spec"; }
 }
 read_spec cloudflare "$cloudflare_spec_sha256"
 read_spec vercel "$vercel_spec_sha256"
