@@ -6,6 +6,8 @@ from pathlib import Path
 import random
 import sys
 
+import checkpoint_meter
+
 WILSON_Z_95 = 1.959964
 PRICES_PER_MTOK = {
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write_5m": 3.75, "cache_write_1h": 6.0, "cache_read": 0.30},
@@ -173,6 +175,8 @@ def meter_ledger(directory, records, required):
             issues.append("durable meter incarnation mismatch: " + key)
         elif done["record"].get("request_id") != key or checkpoint_digest(done["record"]) != done.get("record_sha256") or (key in by_id and by_id[key] != done["record_sha256"]):
             issues.append("durable meter completion/request digest mismatch: " + key)
+        elif not checkpoint_meter.bound_record(intent, done["record"]):
+            issues.append("durable meter terminal binding mismatch: " + key)
         else:
             status["completed"] += 1
             if key not in by_id:

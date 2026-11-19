@@ -666,3 +666,31 @@ Baseline and candidate campaigns are the two comparison arms. Verifier dependenc
 A matched report compares baseline and candidate agent campaigns. It requires every planned task and repetition, known request-level usage and identical measurement settings. Intended differences in the Harnesslang agent program and its compiled executable package must be listed separately. The acceptance gate requires a 95% task-paired pass-rate improvement interval above zero as well as at least 92% passing attempts, at most $0.010 per attempt and at least five percentage points of pass-rate improvement over baseline. Cache, checkpoint and reporting drills now run in the default local suite.
 
 These changes add evaluator support code. They do not remove handwritten compiler or host code, show that the compiler can build an identical successor, or demonstrate a higher benchmark pass rate.
+
+
+## Durable terminal usage receipts
+
+The model meter proxies requests between an evaluation attempt and a model provider. It now saves a terminal usage receipt before forwarding the response's final event or a nonstream response body to the client. The pre-dispatch intent records the provider, endpoint, requested model, request-body digest and attempt-identity digest. The completion binds that intent to the received response identifier, model and usage. These receipts omit credentials, request query strings and response content. The existing completion file remains authoritative; an auxiliary receipt alone cannot establish usage.
+
+A client disconnect does not stop collection of the provider's terminal usage. Truncated, malformed, failed, incomplete or identity-mismatched responses remain unknown. Report recovery applies the same intent/completion binding check as the live meter. Existing receipts without the new schema remain readable. This reduces one forward-before-durable-completion loss window; it does not recover historical unknown usage, guarantee provider billing, or establish a current cost improvement.
+
+Offline verification passed on November 19, 2026. The checkpoint accounting fixture now checks that terminal delivery waits for persistence, rather than expecting delivery before persistence. Its other accounting and unknown-state checks remain in place. The focused terminal drill exercises the production forwarding, persistence, reconciliation and report paths with synthetic upstream/downstream objects: 23 cases repeated three times, 69 real process kills, and ten rejected binding mutations, including schema downgrade attempts. The existing matched-report drill still rejects all 35 mutants. The terminal drill is included in the default local check queue.
+
+```sh
+SHIPPY_REMOTE_BUILD=0 PYTHONDONTWRITEBYTECODE=1 python3 evals/checkpoint_drill.py --out output/followup46-final/checkpoints
+SHIPPY_REMOTE_BUILD=0 PYTHONDONTWRITEBYTECODE=1 python3 evals/meter_terminal_drill.py --out output/followup46-final/meter-terminal
+SHIPPY_REMOTE_BUILD=0 PYTHONDONTWRITEBYTECODE=1 python3 evals/matched_report_drill.py
+```
+
+These checks used no model requests, Docker or external network; existing checkpoint fixtures used loopback HTTP. The full local suite passed on November 19, 2026, at 14:58 PST with the same executable source files. No campaign, completed row, staged agent package or historical report was changed. This is evaluator support code, not a reduction in compiler or fixed-host source.
+
+
+## Atomic reference-spec cache publication
+
+The deployment drill now unpacks a vendored reference specification into a same-directory temporary file, checks its pinned digest, then renames the complete file into the cache. A concurrent reader therefore cannot see a partly unpacked replacement. A failed unpack or digest check leaves the prior cache file unchanged. Three isolated protocol trials passed, including concurrent reads, wrong digests and truncated gzip streams; the old direct-write behavior was rejected by the mutation.
+
+The combined terminal-receipt and reference-cache changes passed the complete local suite on November 19, 2026, at 14:58 PST, including all default seeded simulations, compiled-host differential and mutation checks, bounds proofs and the existing source-line ratchets. This is one complete deterministic suite run, not a performance sample or a model-acceptance result. The compiler and host ratchets remain 28,094 and 7,573 lines. No benchmark campaign or agent package was changed by this check.
+
+```sh
+SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh
+```

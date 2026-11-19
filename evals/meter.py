@@ -1,8 +1,10 @@
+import hashlib
 import http.client
 import ipaddress
 import http.server
 import json
 import os
+import re
 import socketserver
 import ssl
 import sys
@@ -34,6 +36,8 @@ TOOL_USE_TYPES = ("tool_use", "function_call", "custom_tool_call", "local_shell_
 WEBSOCKET_REFUSED = 426
 UPSTREAM_TIMEOUT_SEC = 900
 READ_CHUNK = 65536
+IDENTITY_CHARS_MAX = 256
+SSE_SEPARATORS = (b"\n\n", b"\r\n\r\n")
 DROPPED_REQUEST_HEADERS = {"host", "x-api-key", "authorization", "chatgpt-account-id", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 DROPPED_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "content-encoding"}
 
@@ -141,26 +145,56 @@ def summarize_request(body):
     }
 
 
+def identity(value):
+    if isinstance(value, str) and len(value) <= IDENTITY_CHARS_MAX and re.fullmatch(r'[A-Za-z0-9._:/-]+', value):
+        return value
+    return None
+
+
+def intent_metadata(directory, run, provider, path, body, started):
+    state = os.path.join(directory, 'checkpoint.json')
+    attempt = checkpoint.read(state)['identity'] if os.path.isfile(state) else {'run': run}
+    return {'schema': 2, 'provider': provider, 'path': path.split('?')[0],
+        'model': identity(summarize_request(body).get('model')), 'started': started,
+        'body_sha256': hashlib.sha256(body).hexdigest(), 'attempt_identity_sha256': checkpoint.digest(attempt)}
+
+
 class Assembler:
     def __init__(self):
         self.message = {"content": [], "usage": {}}
         self.buffer = b""
         self.complete = False
+        self.identities = {"id": set(), "model": set()}
 
     def feed_stream(self, data):
         self.buffer += data
-        while b"\n\n" in self.buffer:
-            event, self.buffer = self.buffer.split(b"\n\n", 1)
-            for line in event.split(b"\n"):
-                if line.startswith(b"data:"):
-                    self.event(json.loads(line[5:]))
+        while any(separator in self.buffer for separator in SSE_SEPARATORS):
+            _, separator = min((self.buffer.index(separator), separator) for separator in SSE_SEPARATORS if separator in self.buffer)
+            frame, self.buffer = self.buffer.split(separator, 1)
+            payload = b"\n".join(line[5:].lstrip(b" ") for line in frame.splitlines() if line.startswith(b"data:"))
+            if payload and payload != b"[DONE]":
+                self.event(json.loads(payload))
+            yield frame + separator
+            if self.complete:
+                return
+
+    def observe(self, message):
+        for key, values in self.identities.items():
+            value = message.get(key)
+            if value is not None:
+                values.add(identity(value) or '<invalid>')
 
     def event(self, event):
         kind = event.get("type")
+        if isinstance(event.get("response"), dict):
+            self.observe(event["response"])
+        if event.get("response_id") is not None:
+            self.observe({"id": event["response_id"]})
         if kind == "message_stop":
             self.complete = True
         elif kind == "message_start":
             message = event["message"]
+            self.observe(message)
             self.message.update({key: value for key, value in message.items() if key != "content"})
             self.message["usage"] = dict(message.get("usage") or {})
         elif kind == "content_block_start":
@@ -188,6 +222,8 @@ class Assembler:
             self.complete = True
             response = event["response"]
             self.message.update({key: value for key, value in response.items() if key != "output"})
+            if kind != "response.completed":
+                self.message["status"] = kind.removeprefix("response.")
             self.message["stop_reason"] = response.get("status")
             if response.get("error"):
                 self.message["error"] = response["error"]
@@ -260,13 +296,15 @@ class Meter(http.server.BaseHTTPRequestHandler):
             self.send_error(503, "the meter stopped the ChatGPT route after status " + str(Meter.halted))
             return
         request_id = None
+        started = time.time()
+        metadata = None
         if path.split("?")[0].endswith(checkpoint_meter.MODEL_ENDPOINTS):
+            metadata = intent_metadata(directory, run, provider, path, body, started)
             try:
-                request_id = checkpoint_meter.begin(directory, self.incarnation)
+                request_id = checkpoint_meter.begin(directory, self.incarnation, metadata)
             except checkpoint.ResumeError as error:
                 self.send_error(503, str(error))
                 return
-        started = time.time()
         headers = {name: value for name, value in self.headers.items() if name.lower() not in DROPPED_REQUEST_HEADERS}
         if provider == "chatgpt" and not lite_context(body):
             headers = {name: value for name, value in headers.items() if name.lower() != CHATGPT_LITE_HEADER}
@@ -274,12 +312,20 @@ class Meter(http.server.BaseHTTPRequestHandler):
         headers["accept-encoding"] = "identity"
         headers["content-length"] = str(len(body))
         connection = upstream(os.environ.get(PROVIDERS[provider]["origin_env"]) or PROVIDERS[provider]["origin"])
-        record = {"run": run, "provider": provider, "path": path, "started": started, "request": summarize_request(body)}
+        record = {"run": run, "provider": provider, "path": path.split("?")[0], "started": started, "request": summarize_request(body)}
         if request_id:
-            record.update(request_id=request_id, meter_incarnation=self.incarnation)
+            record['request']['model'] = metadata['model']
+            intent = dict(metadata, request_id=request_id, incarnation=self.incarnation)
+            record.update(request_id=request_id, meter_incarnation=self.incarnation, intent_sha256=checkpoint.digest(intent))
         assembler = Assembler()
         raw = b""
         streaming = False
+        persisted = False
+        persisting = False
+        buffered_response = True
+        self.downstream_failed = False
+        received = hashlib.sha256()
+        record["status"] = 0
         try:
             connection.request(self.command, path, body=body, headers=headers)
             response = connection.getresponse()
@@ -288,24 +334,34 @@ class Meter(http.server.BaseHTTPRequestHandler):
                 self.relay_translated(response)
                 record["status"] = response.status
                 return
+            record["status"] = response.status
             streaming = "text/event-stream" in (response.getheader("content-type") or "")
-            self.send_response(response.status)
-            for name, value in response.getheaders():
-                if name.lower() not in DROPPED_RESPONSE_HEADERS:
-                    self.send_header(name, value)
-            self.send_header("transfer-encoding", "chunked")
-            self.end_headers()
+            buffered_response = not streaming
+            try:
+                self.send_response(response.status)
+                for name, value in response.getheaders():
+                    if name.lower() not in DROPPED_RESPONSE_HEADERS:
+                        self.send_header(name, value)
+                self.send_header("transfer-encoding", "chunked")
+                self.end_headers()
+            except OSError:
+                self.downstream_failed = True
             while True:
                 data = response.read1(READ_CHUNK)
                 if not data:
                     break
+                received.update(data)
                 if streaming:
-                    assembler.feed_stream(data)
+                    for frame in assembler.feed_stream(data):
+                        if assembler.complete:
+                            persisting = True
+                            self.persist(directory, request_id, record, assembler, received.hexdigest(), True)
+                            persisted = True
+                        self.write_chunk(frame)
+                    if assembler.complete:
+                        break
                 else:
                     raw += data
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
-                self.wfile.flush()
-            record["status"] = response.status
             if provider == "chatgpt" and response.status in CHATGPT_HALT_STATUSES:
                 self.halt(response.status, run)
             if not streaming:
@@ -313,41 +369,76 @@ class Meter(http.server.BaseHTTPRequestHandler):
                     parsed = json.loads(raw)
                     if isinstance(parsed, dict) and parsed.get("type") == "message":
                         assembler.message = parsed
+                        assembler.complete = True
                     elif isinstance(parsed, dict) and parsed.get("object") == "response":
                         assembler.message = dict(parsed, content=parsed.get("output") or [])
+                        assembler.complete = True
                     else:
                         assembler.message["error"] = parsed
                 except ValueError:
                     if raw.lstrip().startswith(SSE_PREFIXES):
                         streaming = True
-                        assembler.feed_stream(raw + b"\n\n")
+                        list(assembler.feed_stream(raw))
                     else:
                         assembler.message["error"] = raw[:2000].decode(errors="replace")
-        except (OSError, http.client.HTTPException) as error:
+        except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError, IndexError) as error:
+            if persisting:
+                raise
             record["status"] = 0
             assembler.message["error"] = repr(error)
         finally:
             connection.close()
-        message = assembler.message
-        record["ended"] = time.time()
-        record["usage_known"] = record.get("status") == 200 and (not streaming or assembler.complete) and all(type((message.get("usage") or {}).get(key)) is int and message["usage"][key] >= 0 for key in ("input_tokens", "output_tokens"))
-        record["usage"] = usage_of(message)
-        record["stop_reason"] = message.get("stop_reason")
-        record["tool_uses"] = [block.get("name") or block.get("type") for block in message.get("content") or [] if block.get("type") in TOOL_USE_TYPES]
-        if message.get("error"):
-            record["error"] = message["error"]
-        if request_id:
-            checkpoint_meter.finish(directory, request_id, record)
+        if not persisted:
+            self.persist(directory, request_id, record, assembler, received.hexdigest(), assembler.complete)
+        if buffered_response:
+            self.write_chunk(raw)
+        elif not assembler.complete and assembler.buffer:
+            self.write_chunk(assembler.buffer)
         with self.lock:
             with open(os.path.join(directory, "requests.jsonl"), "a") as handle:
                 handle.write(json.dumps(record) + "\n")
             with open(os.path.join(directory, "responses.jsonl"), "a") as handle:
-                handle.write(json.dumps(message) + "\n")
+                handle.write(json.dumps(assembler.message) + "\n")
             if body:
                 with open(os.path.join(directory, "last-request.json"), "wb") as handle:
                     handle.write(body)
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
+            self.downstream_failed = True
+            self.close_connection = True
+
+    def write_chunk(self, data):
+        if not data or self.downstream_failed:
+            return
+        try:
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+            self.wfile.flush()
+        except OSError:
+            self.downstream_failed = True
+            self.close_connection = True
+
+    def persist(self, directory, request_id, record, assembler, response_sha256, complete):
+        message = assembler.message
+        assembler.observe(message)
+        models, ids = assembler.identities['model'], assembler.identities['id']
+        model = next(iter(models)) if len(models) == 1 else None
+        matches = len(models) == 1 and len(ids) == 1 and '<invalid>' not in ids and '<invalid>' not in models
+        matches = matches and (not models or model == record['request'].get('model'))
+        record['ended'] = time.time()
+        record['usage_known'] = record.get('status') == 200 and complete and matches and not message.get('error') and message.get('status') in (None, 'completed') and all(type((message.get('usage') or {}).get(key)) is int and message['usage'][key] >= 0 for key in ('input_tokens', 'output_tokens'))
+        record['usage'] = usage_of(message)
+        record['stop_reason'] = message.get('stop_reason')
+        record['tool_uses'] = [block.get('name') or block.get('type') for block in message.get('content') or [] if block.get('type') in TOOL_USE_TYPES]
+        record['terminal'] = {'complete': complete, 'identity_matches': matches, 'model': model,
+            'provider_response_id': next(iter(ids)) if len(ids) == 1 else None,
+            'response_sha256': response_sha256, 'envelope_sha256': checkpoint.digest(message),
+            'usage_sha256': checkpoint.digest(record['usage'])}
+        if message.get('error'):
+            record['error'] = message['error']
+        if request_id:
+            checkpoint_meter.finish(directory, request_id, record)
 
 
     def relay_translated(self, response):

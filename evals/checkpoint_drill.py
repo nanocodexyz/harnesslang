@@ -388,7 +388,7 @@ def accounting_drill(base, sse=False):
                 if self.sent:
                     return b''
                 self.sent = True
-                response = {'object': 'response', 'usage': {'input_tokens': 3, 'output_tokens': 2}}
+                response = {'object': 'response', 'id': 'resp_fixture', 'model': 'fixture-model', 'status': 'completed', 'usage': {'input_tokens': 3, 'output_tokens': 2}}
                 if sse:
                     return b'data: ' + json.dumps({'type': 'response.completed', 'response': response}).encode() + b'\n\n'
                 return json.dumps(response).encode()
@@ -414,7 +414,7 @@ def accounting_drill(base, sse=False):
         def client():
             try:
                 connection = http.client.HTTPConnection(*server.server_address, timeout=TIMEOUT_SECONDS)
-                connection.request('POST', '/run/' + run_id + '/openai/v1/responses', body=b'{}')
+                connection.request('POST', '/run/' + run_id + '/openai/v1/responses', body=b'{"model":"fixture-model"}')
                 response = connection.getresponse()
                 if sse:
                     assert b'response.completed' in response.readline()
@@ -428,10 +428,7 @@ def accounting_drill(base, sse=False):
         reader = threading.Thread(target=client)
         reader.start()
         assert entered.wait(TIMEOUT_SECONDS)
-        if sse:
-            assert consumed.wait(TIMEOUT_SECONDS)
-        else:
-            assert not consumed.wait(POLL_SECONDS)
+        assert not consumed.wait(POLL_SECONDS)
         assert checkpoint_meter.snapshot(directory, 'live')[0]['active'] == 1
         drained = []
         barrier = threading.Thread(target=lambda: drained.append(checkpoint_meter.reconcile(directory, 'live', TIMEOUT_SECONDS)))
@@ -456,7 +453,7 @@ def accounting_drill(base, sse=False):
         server.shutdown()
         server.server_close()
         worker.join(TIMEOUT_SECONDS)
-        results.append({'intent_before_upstream': True, 'eof_after_receipt': True, 'barrier_waited': True, 'receipt_without_log_counted': True, 'terminal_sse_consumed_before_receipt': sse})
+        results.append({'intent_before_upstream': True, 'eof_after_receipt': True, 'barrier_waited': True, 'receipt_without_log_counted': True, 'terminal_sse_consumed_before_receipt': False, 'terminal_sse_after_receipt': sse})
     return results
 
 

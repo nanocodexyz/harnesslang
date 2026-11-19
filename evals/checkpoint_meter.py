@@ -19,7 +19,7 @@ def lock(directory):
     return handle
 
 
-def begin(directory, incarnation):
+def begin(directory, incarnation, metadata=None):
     intents = os.path.join(directory, 'meter-intents')
     with lock(directory):
         if os.path.exists(os.path.join(directory, 'meter-closed.json')):
@@ -27,13 +27,37 @@ def begin(directory, incarnation):
         checkpoint.durable_directory(intents)
         request_id = uuid.uuid4().hex
         checkpoint.atomic(os.path.join(intents, request_id + '.intent.json'),
-            {'request_id': request_id, 'incarnation': incarnation}, True)
+            dict(metadata or {}, request_id=request_id, incarnation=incarnation), True)
     return request_id
 
 
+def bound_record(intent, record):
+    if intent.get('schema') != 2:
+        return 'schema' not in intent and 'intent_sha256' not in record
+    terminal = record.get('terminal') or {}
+    return (record.get('intent_sha256') == checkpoint.digest(intent)
+        and all(record.get(key) == intent.get(key) for key in ('provider', 'path', 'started'))
+        and (record.get('request') or {}).get('model') == intent.get('model')
+        and terminal.get('usage_sha256') == checkpoint.digest(record.get('usage'))
+        and (not record.get('usage_known') or (terminal.get('complete') is True
+            and terminal.get('identity_matches') is True
+            and isinstance(terminal.get('response_sha256'), str)
+            and isinstance(terminal.get('provider_response_id'), str)
+            and terminal.get('model') is not None and terminal.get('model') == intent.get('model'))))
+
+
 def finish(directory, request_id, record):
-    checkpoint.atomic(os.path.join(directory, 'meter-intents', request_id + '.done.json'),
-        {'request_id': request_id, 'record': record, 'record_sha256': checkpoint.digest(record)}, True)
+    root = os.path.join(directory, 'meter-intents')
+    intent = checkpoint.read(os.path.join(root, request_id + '.intent.json'))
+    if not bound_record(intent, record):
+        raise checkpoint.ResumeError('terminal receipt does not match durable intent')
+    receipt = {'request_id': request_id, 'record': record, 'record_sha256': checkpoint.digest(record)}
+    if intent.get('schema') == 2:
+        receipts = os.path.join(directory, 'meter-receipts')
+        checkpoint.durable_directory(receipts)
+        checkpoint.atomic(os.path.join(receipts, request_id + '.terminal.json'),
+            dict(receipt, intent_sha256=checkpoint.digest(intent), terminal=record['terminal']), True)
+    checkpoint.atomic(os.path.join(root, request_id + '.done.json'), receipt, True)
 
 
 def snapshot(directory, incarnation):
@@ -53,7 +77,7 @@ def snapshot(directory, incarnation):
             continue
         receipt = checkpoint.read(done)
         record = receipt.get('record')
-        if not isinstance(record, dict) or receipt.get('request_id') != key or record.get('request_id') != key or record.get('meter_incarnation') != intent['incarnation'] or checkpoint.digest(record) != receipt.get('record_sha256'):
+        if not isinstance(record, dict) or receipt.get('request_id') != key or record.get('request_id') != key or record.get('meter_incarnation') != intent['incarnation'] or checkpoint.digest(record) != receipt.get('record_sha256') or not bound_record(intent, record):
             status['unknown'] += 1
             continue
         status['completed'] += 1
