@@ -1,7 +1,9 @@
-import glob
+import argparse
+import hashlib
 import json
 import math
-import os
+from pathlib import Path
+import random
 import sys
 
 WILSON_Z_95 = 1.959964
@@ -14,239 +16,514 @@ PRICES_PER_MTOK = {
     "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.05},
 }
 PRICES_SOURCE = "https://docs.anthropic.com/en/docs/about-claude/pricing, read 2026-11-14; https://developers.openai.com/api/docs/models/gpt-5.5 (prompts under 272K tokens), read 2026-11-15; gpt-5.6-sol at https://openrouter.ai/openai/gpt-5.6-sol, read 2026-11-16 (a notional list price: the ChatGPT plan bills none); gpt-6-luna and gpt-6.1-terra at the standard-context list rates agent/src/openai.rs carries"
-CODEX_TOOL_ITEMS = ("command_execution", "file_change", "mcp_tool_call", "web_search")
 TOKENS_PER_MTOK = 1_000_000
-INNER_TOOL_MARK = "\u00b7 "
-CODE_MODE_TOOLS = ("exec", "wait")
+MODEL_ENDPOINTS = ("/messages", "/responses", "/responses/compact", "/chat/completions")
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+OUTCOMES = ("passed", "failed", "errored")
+BINDING_FIELDS = ("meter_port", "relay_port", "meter_host")
+REQUIRED_CONFIG = ("agents", "attempts", "model", "parallel", "limits", "agent_memory_mb", "max_turns", "openai_route", "hl_agent_arg", "ca_sha256")
 
 
 def wilson(passed, total):
-    if total == 0:
-        return (float("nan"), float("nan"))
-    p = passed / total
+    if not total:
+        return None
+    probability = passed / total
     denominator = 1 + WILSON_Z_95 ** 2 / total
-    centre = (p + WILSON_Z_95 ** 2 / (2 * total)) / denominator
-    half = WILSON_Z_95 * math.sqrt(p * (1 - p) / total + WILSON_Z_95 ** 2 / (4 * total * total)) / denominator
-    return (centre - half, centre + half)
+    centre = (probability + WILSON_Z_95 ** 2 / (2 * total)) / denominator
+    half = WILSON_Z_95 * math.sqrt(probability * (1 - probability) / total + WILSON_Z_95 ** 2 / (4 * total * total)) / denominator
+    return [centre - half, centre + half]
 
 
-def cost(model, meter):
+def token_count(value):
+    return type(value) is int and value >= 0
+
+
+def cost(model, usage):
+    if model not in PRICES_PER_MTOK:
+        raise ValueError("unknown request model: " + str(model))
+    if not isinstance(usage, dict) or any(not token_count(usage.get(key)) for key in TOKEN_FIELDS):
+        raise ValueError("missing or invalid usage")
+    hour = usage.get("cache_write_1h_tokens", 0)
+    if not token_count(hour) or hour > usage["cache_write_tokens"]:
+        raise ValueError("invalid cache write split")
     price = PRICES_PER_MTOK[model]
-    five_minute = meter["cache_write_tokens"] - meter.get("cache_write_1h_tokens", 0)
-    return (
-        meter["input_tokens"] * price["input"]
-        + meter["output_tokens"] * price["output"]
-        + five_minute * price["cache_write_5m"]
-        + meter.get("cache_write_1h_tokens", 0) * price["cache_write_1h"]
-        + meter["cache_read_tokens"] * price["cache_read"]
-    ) / TOKENS_PER_MTOK
+    return (usage["input_tokens"] * price["input"] + usage["output_tokens"] * price["output"]
+            + (usage["cache_write_tokens"] - hour) * price["cache_write_5m"]
+            + hour * price["cache_write_1h"] + usage["cache_read_tokens"] * price["cache_read"]) / TOKENS_PER_MTOK
 
 
-def codex_tool_calls(path):
-    if not os.path.isfile(path):
-        return None
-    count = 0
-    for line in open(path, errors="replace"):
+def read_json(path):
+    with path.open() as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(str(path) + ": expected object")
+    return value
+
+
+def read_lines(path):
+    with path.open() as handle:
+        return [json.loads(line) for line in handle]
+
+
+def read_suite(path):
+    tasks = []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            raise ValueError("suite line %d must be source task" % number)
+        tasks.append(tuple(parts))
+    if not tasks or len(tasks) != len(set(tasks)):
+        raise ValueError("empty or duplicate suite")
+    return sorted(tasks)
+
+
+def raw_usage(message):
+    usage = message.get("usage")
+    if not isinstance(usage, dict) or any(not token_count(usage.get(key)) for key in ("input_tokens", "output_tokens")):
+        raise ValueError("response has absent/invalid usage")
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+    anthropic = "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    return {"input_tokens": usage["input_tokens"] if anthropic else usage["input_tokens"] - cached,
+            "output_tokens": usage["output_tokens"],
+            "cache_read_tokens": usage.get("cache_read_input_tokens", 0) if anthropic else cached,
+            "cache_write_tokens": usage.get("cache_creation_input_tokens", 0),
+            "cache_write_1h_tokens": (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0)}
+
+
+def request_cost(record, response, row_id):
+    if not isinstance(record, dict):
+        raise ValueError("invalid request record")
+    if record.get("status") != 200 or record.get("error"):
+        raise ValueError("request status/error: " + str(record.get("status")))
+    if record.get("run", row_id) != row_id:
+        raise ValueError("request run differs from row")
+    model = (record.get("request") or {}).get("model")
+    usage = record.get("usage")
+    amount = cost(model, usage)
+    if response is None and not any(usage.get(field, 0) for field in TOKEN_FIELDS):
+        raise ValueError("zero normalized usage without response evidence")
+    if response is not None and response.get("model", model) != model:
+        raise ValueError("request/response model mismatch")
+    if response is not None:
+        observed = raw_usage(response)
+        if any(observed[key] != usage.get(key, 0) for key in observed):
+            raise ValueError("request/response usage mismatch")
+    return amount, model
+
+
+def price_row(directory, row):
+    path = directory / "requests.jsonl"
+    result = {"total_usd": None, "lower_bound_usd": 0.0, "unknown": [], "requests": 0, "non_model_records": 0, "by_model_usd": {}}
+    if not path.is_file():
+        result["unknown"].append("missing request log")
+        return result
+    records = read_lines(path)
+    responses_path = directory / "responses.jsonl"
+    responses = read_lines(responses_path) if responses_path.is_file() else None
+    if responses is not None and len(responses) != len(records):
+        result["unknown"].append("request/response log lengths differ")
+        responses = None
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            result["unknown"].append("record %d: missing request path" % index)
+            continue
+        endpoint = record["path"].split("?")[0]
+        if not endpoint.endswith(MODEL_ENDPOINTS):
+            result["non_model_records"] += 1
+            if not endpoint.endswith("/models"):
+                result["unknown"].append("record %d: unrecognized endpoint %s" % (index, endpoint))
+            continue
+        result["requests"] += 1
         try:
-            event = json.loads(line)
-        except ValueError:
+            response = responses[index] if responses is not None else None
+            amount, model = request_cost(record, response, row.get("id"))
+        except (ValueError, TypeError, AttributeError) as error:
+            result["unknown"].append("request %d: %s" % (index, error))
             continue
-        if event.get("type") == "item.completed" and (event.get("item") or {}).get("type") in CODEX_TOOL_ITEMS:
-            count += 1
-    return count
+        result["lower_bound_usd"] += amount
+        result["by_model_usd"][model] = result["by_model_usd"].get(model, 0.0) + amount
+    meter = row.get("meter") or {}
+    accounting = row.get("accounting_status", meter.get("accounting_status", "observed"))
+    if accounting != "observed" or meter.get("unknown_requests", 0) != 0:
+        result["unknown"].append("incomplete request accounting: " + str(accounting))
+    if meter.get("requests") != result["requests"]:
+        result["unknown"].append("meter/request count mismatch or absent meter")
+    if not result["requests"]:
+        result["unknown"].append("no model requests; zero cost not established")
+    if not result["unknown"]:
+        result["total_usd"] = result["lower_bound_usd"]
+    return result
 
 
-def inner_tool_calls(row_dir, result):
-    if result["agent"].startswith("hl-agent"):
-        return (result.get("self_reported_usage") or {}).get("tool_calls")
-    if result["agent"] == "codex":
-        return codex_tool_calls(os.path.join(row_dir, "journal", "agent.stdout"))
-    path = os.path.join(row_dir, "journal", "agent.stderr")
-    if not os.path.isfile(path):
-        return None
-    count = 0
-    for line in open(path, errors="replace"):
-        if line.startswith(INNER_TOOL_MARK) and line[len(INNER_TOOL_MARK):].strip() not in CODE_MODE_TOOLS:
-            count += 1
-    return count
+def manifest_identity(manifest):
+    encoded = json.dumps(manifest, sort_keys=True, indent=1) + "\n"
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def load(argument):
-    out, _, label = argument.partition("=")
-    rows = []
-    for path in sorted(glob.glob(os.path.join(out, "rows", "*", "result.json"))):
-        result = json.load(open(path))
-        meter = result.get("meter") or {}
-        result["cost"] = cost(result["model"], meter) if meter else 0.0
-        result["inner_tools"] = inner_tool_calls(os.path.dirname(path), result)
-        if label and result["agent"] != "nanocode":
-            result["agent"] = label
-        rows.append(result)
-    return rows
+def valid_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
-def mean(values):
-    values = [value for value in values if value is not None]
-    return sum(values) / len(values) if values else float("nan")
+def validate_manifest(manifest, tasks, attempts, agent):
+    issues = []
+    if manifest.get("version") not in (1, "checkpoint-1"):
+        issues.append("unsupported or missing manifest version")
+    source = manifest.get("source") or {}
+    commit = source.get("commit")
+    if not isinstance(commit, str) or len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit) or not valid_digest(source.get("tracked_sha256")):
+        issues.append("missing source pins; cannot establish match")
+    for field in ("agent_root_sha256", "campaign_suite_sha256", "transport_sha256"):
+        if not valid_digest(manifest.get(field)):
+            issues.append("missing provenance pin: " + field)
+    config = manifest.get("config") or {}
+    for field in REQUIRED_CONFIG:
+        if field not in config:
+            issues.append("missing config pin: " + field)
+    if config.get("agents") != [agent] or config.get("attempts") != attempts:
+        issues.append("manifest agents/attempts differ from requested matrix")
+    pinned = {}
+    for task in manifest.get("tasks") or []:
+        key = (task.get("source"), task.get("task"))
+        if key in pinned:
+            issues.append("duplicate manifest task: " + str(key))
+        pinned[key] = task
+        for field in ("package_sha256", "tree_sha256"):
+            if not valid_digest(task.get(field)):
+                issues.append("missing task pin: %s %s" % (key, field))
+    if set(pinned) != set(tasks):
+        issues.append("manifest task matrix differs from requested suite; no subsetting")
+    if not manifest.get("runtime"):
+        issues.append("missing runtime provenance")
+    expected_ids = {"%s.%s.%s.%d" % (source, task, agent, attempt)
+                    for source, task in tasks for attempt in range(1, attempts + 1)}
+    if "matrix" in manifest:
+        matrix = manifest["matrix"]
+        if len(matrix) != len(expected_ids) or set(matrix) != expected_ids:
+            issues.append("manifest row matrix differs from requested matrix")
+    if "images" in manifest and set(manifest["images"]) != expected_ids:
+        issues.append("manifest image matrix differs from requested matrix")
+    return issues
 
 
-def summary(rows, agents):
-    lines = ["| Agent | Attempts | Passed | Failed | Errored | Pass rate (95% Wilson) | Cost | Cost/attempt | Wall/attempt | Requests/attempt | Model tool calls/attempt | Inner tool calls/attempt | Input+cache tokens/attempt | Output tokens/attempt |", "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
-    for agent in agents:
-        mine = [row for row in rows if row["agent"] == agent]
-        passed = sum(row["outcome"] == "passed" for row in mine)
-        failed = sum(row["outcome"] == "failed" for row in mine)
-        errored = sum(row["outcome"] == "errored" for row in mine)
-        scored = passed + failed
-        low, high = wilson(passed, scored)
-        rate = passed / scored if scored else float("nan")
-        meters = [row.get("meter") or {} for row in mine]
-        prompt = [m.get("input_tokens", 0) + m.get("cache_read_tokens", 0) + m.get("cache_write_tokens", 0) for m in meters]
-        lines.append(
-            "| %s | %d | %d | %d | %d | %.1f%% (%.1f-%.1f%%) | $%.2f | $%.3f | %.0f s | %.1f | %.1f | %.1f | %.0f | %.0f |"
-            % (
-                agent, len(mine), passed, failed, errored, 100 * rate, 100 * low, 100 * high,
-                sum(row["cost"] for row in mine), mean([row["cost"] for row in mine]),
-                mean([(row.get("agent_result") or {}).get("wall_ms", 0) / 1000 for row in mine]),
-                mean([m.get("requests") for m in meters]), mean([m.get("tool_calls") for m in meters]),
-                mean([row["inner_tools"] for row in mine]), mean(prompt), mean([m.get("output_tokens") for m in meters]),
-            )
-        )
-    return lines
+def checkpoint_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def per_task(rows, agents):
-    tasks = sorted({(row["source"], row["task"]) for row in rows})
-    header = "| Task | " + " | ".join(agent + " pass | " + agent + " $ | " + agent + " s | " + agent + " req | " + agent + " tools" for agent in agents) + " |"
-    lines = [header, "| --- |" + " ---: |" * (5 * len(agents))]
-    for source, task in tasks:
-        cells = []
-        for agent in agents:
-            mine = [row for row in rows if row["agent"] == agent and row["task"] == task and row["source"] == source]
-            passed = sum(row["outcome"] == "passed" for row in mine)
-            errored = sum(row["outcome"] == "errored" for row in mine)
-            mark = "%d/%d" % (passed, len(mine) - errored) + (" (%d err)" % errored if errored else "")
-            cells += [
-                mark,
-                "%.3f" % mean([row["cost"] for row in mine]),
-                "%.0f" % mean([(row.get("agent_result") or {}).get("wall_ms", 0) / 1000 for row in mine]),
-                "%.1f" % mean([(row.get("meter") or {}).get("requests") for row in mine]),
-                "%.1f" % mean([row["inner_tools"] for row in mine]),
-            ]
-        lines.append("| " + task + " | " + " | ".join(cells) + " |")
-    return lines
+def checkpoint_manifest(wrapper):
+    if wrapper.get("schema") != 1:
+        raise ValueError("unsupported checkpoint campaign schema")
+    identity = wrapper["identity"]
+    parameters = dict(identity.get("parameters") or {})
+    parameters["agents"] = parameters.get("agents", "").split(",")
+    parameters["ca_sha256"] = identity.get("ca_sha256")
+    parameters.pop("only", None)
+    tasks = []
+    for key, package in sorted((identity.get("tasks") or {}).items()):
+        source, separator, task = key.partition("/")
+        if not separator:
+            raise ValueError("checkpoint task key has no source: " + key)
+        tree = (identity.get("task_trees") or {}).get(key)
+        tasks.append(dict(source=source, task=task, package_sha256=package, tree_sha256=tree))
+    manifest = {"version": "checkpoint-1", "source": {"commit": identity.get("source_commit"),
+                "tracked_sha256": checkpoint_digest(identity["source_files"]) if identity.get("source_files") else None},
+                "agent_root_sha256": checkpoint_digest(identity["agent_tree"]) if identity.get("agent_tree") else None,
+                "campaign_suite_sha256": identity.get("suite_sha256"), "config": parameters,
+                "tasks": tasks, "runtime": identity.get("runtime"), "transport_sha256": identity.get("transport_sha256")}
+    manifest["measurement_source_files"] = {key: value for key, value in identity.get("source_files", {}).items()
+                                            if key.startswith("evals/") and not key.endswith("report.py")}
+    for field in sorted(set(identity) - {"source_commit", "source_files", "agent_tree", "parameters", "tasks", "task_trees", "suite_sha256", "ca_sha256", "runtime", "transport_sha256"}):
+        manifest[field] = identity[field]
+    return manifest, checkpoint_digest(identity)
 
 
-def paired(rows, agents):
-    if len(agents) != 2:
-        return []
-    first, second = agents
-    wins = {first: [], second: []}
-    for task in sorted({row["task"] for row in rows}):
-        rate = {}
-        for agent in agents:
-            scored = [row for row in rows if row["task"] == task and row["agent"] == agent and row["outcome"] in ("passed", "failed")]
-            rate[agent] = sum(row["outcome"] == "passed" for row in scored) / len(scored) if scored else None
-        if rate[first] is None or rate[second] is None:
-            continue
-        if rate[first] > rate[second]:
-            wins[first].append(task)
-        elif rate[second] > rate[first]:
-            wins[second].append(task)
-    return [
-        "Tasks where %s passes more often: %s" % (first, ", ".join(wins[first]) or "none"),
-        "Tasks where %s passes more often: %s" % (second, ", ".join(wins[second]) or "none"),
-    ]
+def validate_checkpoint(directory, row, identity):
+    path = directory / "checkpoint.json"
+    if not path.is_file():
+        return ["missing attempt checkpoint: " + directory.name]
+    state = read_json(path)
+    issues = []
+    if state.get("identity") != {"campaign": identity, "row": row.get("id")}:
+        issues.append("attempt checkpoint identity mismatch: " + directory.name)
+    if state.get("stage") != "completed" or state.get("result_sha256") != checkpoint_digest(row):
+        issues.append("attempt checkpoint result mismatch or incomplete: " + directory.name)
+    return issues
 
 
-def interval(values):
-    count = len(values)
-    centre = sum(values) / count
-    if count < 2:
-        return centre, float("nan"), float("nan")
-    spread = math.sqrt(sum((value - centre) ** 2 for value in values) / (count - 1) / count)
-    return centre, centre - WILSON_Z_95 * spread, centre + WILSON_Z_95 * spread
+def row_key(row):
+    return (row.get("source"), row.get("task"), row.get("attempt"))
 
 
-def differences(rows, agents):
-    if len(agents) != 2:
-        return []
-    first, second = agents
-    by_key = {(row["source"], row["task"], row["attempt"], row["agent"]): row for row in rows}
-    pairs = [(by_key[key[:3] + (first,)], row) for key, row in by_key.items() if key[3] == second and key[:3] + (first,) in by_key]
-    if not pairs:
-        return []
-    measures = (
-        ("cost ($)", lambda row: row["cost"], "%.4f"),
-        ("wall (s)", lambda row: (row.get("agent_result") or {}).get("wall_ms", 0) / 1000, "%.1f"),
-        ("requests", lambda row: (row.get("meter") or {}).get("requests", 0), "%.2f"),
-        ("prompt tokens", lambda row: sum((row.get("meter") or {}).get(key, 0) for key in ("input_tokens", "cache_read_tokens", "cache_write_tokens")), "%.0f"),
-    )
-    lines = ["Paired by task and attempt (%d pairs), %s minus %s, mean with its 95%% normal interval:" % (len(pairs), second, first)]
-    for name, measure, form in measures:
-        centre, low, high = interval([measure(other) - measure(base) for base, other in pairs])
-        lines.append(("- %s: " + form + " (" + form + " to " + form + ")") % (name, centre, low, high))
-    return lines
+def validate_row(row, directory, manifest, identity, agent):
+    issues = []
+    if row.get("agent") != agent:
+        issues.append("unknown agent: " + str(row.get("agent")))
+    if row.get("outcome") not in OUTCOMES:
+        issues.append("unknown outcome: " + str(row.get("outcome")))
+    if type(row.get("attempt")) is not int:
+        issues.append("attempt must be an integer")
+    identifier = "%s.%s.%s.%s" % (row.get("source"), row.get("task"), agent, row.get("attempt"))
+    if row.get("id") != identifier or directory.name != identifier:
+        issues.append("row id/directory mismatch: " + directory.name)
+    if manifest.get("version") == "checkpoint-1":
+        issues.extend(validate_checkpoint(directory, row, identity))
+    elif row.get("campaign_sha256") != identity:
+        issues.append("row campaign provenance mismatch: " + directory.name)
+    if row.get("model") != (manifest.get("config") or {}).get("model"):
+        issues.append("row starting model/config mismatch: " + directory.name)
+    if "images" in manifest and row.get("image") != manifest["images"].get(row.get("id")):
+        issues.append("row image/manifest mismatch: " + directory.name)
+    return issues
 
 
-def sign_test(wins, losses):
-    count = wins + losses
-    if count == 0:
-        return 1.0
-    tail = sum(math.comb(count, k) for k in range(min(wins, losses) + 1)) / 2 ** count
-    return min(1.0, 2 * tail)
+def load_arm(path, tasks, attempts, agent):
+    manifest_path = path / "campaign.json"
+    manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+    checkpoint_schema = "identity" in manifest
+    if checkpoint_schema:
+        manifest, identity = checkpoint_manifest(manifest)
+    else:
+        identity = manifest_identity(manifest) if manifest else None
+    issues = validate_manifest(manifest, tasks, attempts, agent)
+    rows, by_key = [], {}
+    nonfinal = 0
+    expected = {(source, task, attempt) for source, task in tasks for attempt in range(1, attempts + 1)}
+    directories = sorted((path / "rows").iterdir()) if (path / "rows").is_dir() else []
+    for directory in directories:
+        result_path = directory / "result.json"
+        if not result_path.is_file():
+            issues.append("row entry without final result: " + directory.name)
+            nonfinal += 1
+            infrastructure = directory / "infrastructure.json"
+            if not infrastructure.is_file():
+                continue
+            evidence = read_json(infrastructure)
+            known = {(source + "." + task + "." + agent + "." + str(attempt)): (source, task, attempt)
+                     for source, task, attempt in expected}
+            if directory.name not in known:
+                issues.append("unknown infrastructure row: " + directory.name)
+                continue
+            source, task, attempt = known[directory.name]
+            row = dict(evidence, id=directory.name, source=source, task=task, agent=agent,
+                       attempt=attempt, outcome="errored")
+        else:
+            row = read_json(result_path)
+            issues.extend(validate_row(row, directory, manifest, identity, agent))
+        row["pricing"] = price_row(directory, row)
+        key = row_key(row)
+        if key in by_key:
+            issues.append("duplicate row: " + str(key))
+        by_key[key] = row
+        rows.append(row)
+        if key not in expected:
+            issues.append("unknown row outside matrix: " + str(key))
+    missing = sorted(expected - set(by_key))
+    if missing:
+        issues.append("%d missing rows" % len(missing))
+    complete = not nonfinal and not missing and len(rows) == len(expected) and set(by_key) == expected
+    return {"path": str(path), "manifest": manifest, "identity": identity, "issues": issues, "rows": rows,
+            "by_key": by_key, "complete": complete, "missing": [list(key) for key in missing]}
 
 
-def paired_outcomes(rows, agents):
-    if len(agents) != 2:
-        return []
-    first, second = agents
-    by_key = {(row["source"], row["task"], row["attempt"], row["agent"]): row for row in rows}
-    scored = ("passed", "failed")
-    pairs = [
-        (by_key[key[:3] + (first,)], row)
-        for key, row in sorted(by_key.items())
-        if key[3] == second and key[:3] + (first,) in by_key and row["outcome"] in scored and by_key[key[:3] + (first,)]["outcome"] in scored
-    ]
-    both = sum(base["outcome"] == "passed" and other["outcome"] == "passed" for base, other in pairs)
-    neither = sum(base["outcome"] == "failed" and other["outcome"] == "failed" for base, other in pairs)
-    only_second = sum(base["outcome"] == "failed" and other["outcome"] == "passed" for base, other in pairs)
-    only_first = sum(base["outcome"] == "passed" and other["outcome"] == "failed" for base, other in pairs)
-    return [
-        "Paired outcomes (%d pairs both scored): both passed %d, both failed %d, only %s passed %d, only %s passed %d; exact two-sided sign test on the discordant pairs p = %.3f"
-        % (len(pairs), both, neither, second, only_second, first, only_first, sign_test(only_second, only_first)),
-        "Only %s passed: %s" % (first, ", ".join("%s.%d" % (base["task"], base["attempt"]) for base, other in pairs if base["outcome"] == "passed" and other["outcome"] == "failed") or "none"),
-        "Only %s passed: %s" % (second, ", ".join("%s.%d" % (base["task"], base["attempt"]) for base, other in pairs if base["outcome"] == "failed" and other["outcome"] == "passed") or "none"),
-    ]
+def compare_optional(base, candidate, label, issues):
+    if base != candidate:
+        issues.append("mismatched " + label)
+
+
+def compare_arms(base, candidate, tasks, attempts):
+    issues = []
+    first, second = base["manifest"], candidate["manifest"]
+    for field in sorted((set(first) | set(second)) - {"source", "agent_root_sha256", "config", "tasks"}):
+        compare_optional(first.get(field), second.get(field), "manifest " + field, issues)
+    configs = [{key: value for key, value in arm.get("config", {}).items() if key not in BINDING_FIELDS} for arm in (first, second)]
+    compare_optional(*configs, "config", issues)
+    compare_optional(first.get("tasks"), second.get("tasks"), "task pins/config source", issues)
+    for task in tasks:
+        for attempt in range(1, attempts + 1):
+            key = task + (attempt,)
+            rows = [arm["by_key"].get(key) for arm in (base, candidate)]
+            if any(row is None for row in rows):
+                continue
+            fields = {field for row in rows for field in row if any(word in field for word in ("image", "cache", "provenance", "task_sha", "package_sha", "tree_sha"))}
+            for field in sorted(fields):
+                compare_optional(rows[0].get(field), rows[1].get(field), "%s %s" % (key, field), issues)
+            if any(not row.get("image") for row in rows):
+                issues.append("missing image pin: " + str(key))
+    return issues
+
+
+def accounting_evidence(arm, path):
+    arm["accounting_evidence"] = None
+    if path is None:
+        automatic = Path(arm["path"]) / "accounting.json"
+        path = automatic if automatic.is_file() else None
+    if path is None:
+        return
+    value = json.loads(path.read_text())
+    records = value if isinstance(value, list) else value.get("streams", [])
+    unknown = [record for record in records if record.get("aborted_cost_unknown") or record.get("unknown_requests")]
+    arm["accounting_evidence"] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                  "unknown_streams": unknown}
+
+
+def arm_summary(arm, expected):
+    rows = arm["rows"]
+    counts = {outcome: sum(row.get("outcome") == outcome for row in rows) for outcome in OUTCOMES}
+    counts["invalid"] = len(rows) - sum(counts.values())
+    passed = counts["passed"]
+    unknown = [row.get("id") for row in rows if row["pricing"]["total_usd"] is None]
+    evidence = arm.get("accounting_evidence")
+    external_unknown = evidence["unknown_streams"] if evidence else []
+    full_cost = arm["complete"] and not unknown and not external_unknown
+    lower_bound = sum(row["pricing"]["lower_bound_usd"] for row in rows)
+    provenance = {field: arm["manifest"].get(field) for field in
+                  ("source", "agent_root_sha256", "config", "tasks", "runtime", "transport_sha256", "cache")}
+    provenance["campaign_sha256"] = arm["identity"]
+    return {"path": arm["path"], "provenance": provenance, "complete": arm["complete"], "expected_attempts": expected,
+            "observed_rows": len(rows), "counts": counts, "missing": arm["missing"],
+            "pass_rate": passed / expected, "pass_wilson_95": wilson(passed, expected) if arm["complete"] else None,
+            "cost_total_usd": lower_bound if full_cost else None, "cost_lower_bound_usd": lower_bound,
+            "cost_mean_usd": lower_bound / expected if full_cost else None,
+            "cost_mean_lower_bound_usd": lower_bound / expected if arm["complete"] else None,
+            "unknown_cost_rows": unknown, "unknown_external_streams": external_unknown,
+            "accounting_evidence": evidence, "issues": arm["issues"],
+            "rows": [{"id": row.get("id"), "outcome": row.get("outcome"), "pricing": row["pricing"]} for row in rows]}
+
+
+def percentile(values, probability):
+    position = (len(values) - 1) * probability
+    lower = math.floor(position)
+    fraction = position - lower
+    return values[lower] * (1 - fraction) + values[math.ceil(position)] * fraction
+
+
+def clustered_bootstrap(base, candidate, tasks, attempts, repetitions, seed):
+    pass_clusters, cost_clusters = [], []
+    cost_known = True
+    for task in tasks:
+        pass_delta, cost_delta = 0.0, 0.0
+        for attempt in range(1, attempts + 1):
+            key = task + (attempt,)
+            first, second = base["by_key"][key], candidate["by_key"][key]
+            pass_delta += int(second["outcome"] == "passed") - int(first["outcome"] == "passed")
+            costs = [row["pricing"]["total_usd"] for row in (first, second)]
+            if None in costs:
+                cost_known = False
+            else:
+                cost_delta += costs[1] - costs[0]
+        pass_clusters.append(pass_delta / attempts)
+        cost_clusters.append(cost_delta / attempts)
+    randomizer = random.Random(seed)
+    pass_samples, cost_samples = [], []
+    count = len(tasks)
+    for _ in range(repetitions):
+        selected = [randomizer.randrange(count) for _ in range(count)]
+        pass_samples.append(sum(pass_clusters[index] for index in selected) / count)
+        if cost_known:
+            cost_samples.append(sum(cost_clusters[index] for index in selected) / count)
+    def estimate(values, samples):
+        return {"mean": sum(values) / count, "ci_95": [percentile(sorted(samples), 0.025), percentile(sorted(samples), 0.975)]}
+    return {"method": "paired task-cluster percentile bootstrap; candidate minus baseline",
+            "clusters": count, "attempts_per_cluster": attempts, "repetitions": repetitions, "seed": seed,
+            "pass_difference": estimate(pass_clusters, pass_samples),
+            "cost_difference_usd": estimate(cost_clusters, cost_samples) if cost_known else None}
+
+
+def build_report(args):
+    tasks = read_suite(args.suite)
+    if len(tasks) != args.expected_tasks:
+        raise ValueError("suite has %d tasks; expected %d" % (len(tasks), args.expected_tasks))
+    base = load_arm(args.baseline, tasks, args.attempts, args.agent)
+    candidate = load_arm(args.candidate, tasks, args.attempts, args.agent)
+    accounting_evidence(base, getattr(args, "baseline_accounting", None))
+    accounting_evidence(candidate, getattr(args, "candidate_accounting", None))
+    issues = compare_arms(base, candidate, tasks, args.attempts)
+    if args.baseline.resolve() == args.candidate.resolve():
+        issues.append("baseline and candidate must be distinct arms")
+    matched = not (issues or base["issues"] or candidate["issues"])
+    expected = len(tasks) * args.attempts
+    baseline_summary, candidate_summary = [arm_summary(arm, expected) for arm in (base, candidate)]
+    paired = clustered_bootstrap(base, candidate, tasks, args.attempts, args.bootstrap_reps, args.seed) if matched else None
+    if paired and (baseline_summary["cost_total_usd"] is None or candidate_summary["cost_total_usd"] is None):
+        paired["cost_difference_usd"] = None
+    gates = {"complete_matched": matched and base["complete"] and candidate["complete"],
+             "both_costs_known": baseline_summary["cost_total_usd"] is not None and candidate_summary["cost_total_usd"] is not None,
+             "candidate_success": candidate_summary["pass_rate"] >= args.min_success,
+             "candidate_cost": candidate_summary["cost_mean_usd"] is not None and candidate_summary["cost_mean_usd"] <= args.max_cost,
+             "quality_improvement": paired is not None and paired["pass_difference"]["mean"] + 0.000000000001 >= args.min_improvement_pp / 100}
+    canonical = read_suite(Path(__file__).with_name("suite-60.txt"))
+    profile = "MATCHED180" if tasks == canonical and args.attempts == 3 else "CUSTOM_%d_TASKS_%d_ATTEMPTS_NOT_MATCHED180" % (len(tasks), expected)
+    return {"schema_version": 1, "profile": profile, "matched": matched, "status": "PASS" if all(gates.values()) else "FAIL",
+            "policy": {"gates_apply_to": "candidate; both arms require complete matched matrices", "min_success": args.min_success, "max_cost_usd_per_attempt": args.max_cost, "min_improvement_pp": args.min_improvement_pp},
+            "gates": gates, "issues": issues, "baseline": baseline_summary, "candidate": candidate_summary,
+            "paired": paired, "prices_per_million_tokens": PRICES_PER_MTOK, "prices_source": PRICES_SOURCE,
+            "interpretation": "Errors count as nonpasses in the full planned denominator. Cost is list-price equivalent, not invoiced spend. Unknown costs are not zero. Candidate source and agent-root pins are the treatment and may differ; measurement config, task, image and cache variants must match."}
+
+
+def readable(report):
+    lines = [report["profile"] + ": " + report["status"]]
+    for name in ("baseline", "candidate"):
+        arm = report[name]
+        cost_label = "$%.6f/attempt" % arm["cost_mean_usd"] if arm["cost_mean_usd"] is not None else "unknown cost (known lower bound $%.6f total)" % arm["cost_lower_bound_usd"]
+        interval = arm["pass_wilson_95"]
+        confidence = " [95%% Wilson %.2f%%, %.2f%%]" % (100 * interval[0], 100 * interval[1]) if interval else ""
+        lines.append("%s: %d/%d passed (%.2f%%)%s; %d failed, %d errors, %d missing; %s; %d unknown-cost rows" % (name, arm["counts"]["passed"], arm["expected_attempts"], 100 * arm["pass_rate"], confidence, arm["counts"]["failed"], arm["counts"]["errored"], len(arm["missing"]), cost_label, len(arm["unknown_cost_rows"])))
+    paired = report["paired"]
+    if paired:
+        difference = paired["pass_difference"]
+        lines.append("Paired delta: %.2f pp [95%% %.2f, %.2f]; %d task clusters, %d repetitions, seed %d" % (100 * difference["mean"], 100 * difference["ci_95"][0], 100 * difference["ci_95"][1], paired["clusters"], paired["repetitions"], paired["seed"]))
+        lines.append("Paired cost delta: " + (json.dumps(paired["cost_difference_usd"]) if paired["cost_difference_usd"] is not None else "unknown"))
+    for name in ("baseline", "candidate"):
+        if report[name]["unknown_external_streams"]:
+            lines.append("%s: %d preserved streams with unknown cost" % (name, len(report[name]["unknown_external_streams"])))
+    for name, passed in report["gates"].items():
+        lines.append(name + ": " + ("PASS" if passed else "FAIL"))
+    for scope in ("baseline", "candidate"):
+        lines.extend(scope + ": " + issue for issue in report[scope]["issues"])
+    lines.extend(report["issues"])
+    return "\n".join(lines)
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description="Strict matched baseline/candidate arm report; no row filtering or inferred provenance.")
+    parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--baseline-accounting", type=Path, help="preserved stream accounting JSON (including aborted streams)")
+    parser.add_argument("--candidate-accounting", type=Path, help="preserved stream accounting JSON (including aborted streams)")
+    parser.add_argument("--suite", type=Path, default=Path(__file__).with_name("suite-60.txt"))
+    parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument("--expected-tasks", type=int, default=60)
+    parser.add_argument("--agent", choices=("hl-agent",), default="hl-agent")
+    parser.add_argument("--min-success", type=float, default=0.92)
+    parser.add_argument("--max-cost", type=float, default=0.010)
+    parser.add_argument("--min-improvement-pp", type=float, default=5.0, help="candidate minus baseline point-estimate percentage points; not relative percent")
+    parser.add_argument("--bootstrap-reps", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--summary", action="store_true", help="print readable summary instead of JSON")
+    args = parser.parse_args()
+    if min(args.attempts, args.expected_tasks, args.bootstrap_reps) < 1:
+        parser.error("attempts, expected-tasks and bootstrap-reps must be positive")
+    if not 0 <= args.min_success <= 1 or not math.isfinite(args.max_cost) or args.max_cost < 0 or not 0 <= args.min_improvement_pp <= 100:
+        parser.error("invalid quality/cost policy")
+    return args
 
 
 def main():
-    rows = []
-    for out in sys.argv[1:]:
-        rows += load(out)
-    agents = sorted({row["agent"] for row in rows}, key=lambda agent: (agent != "nanocode", agent))
-    models = sorted({row["model"] for row in rows})
-    print("Model: " + ", ".join(models) + ". Prices: " + PRICES_SOURCE + ".")
-    print()
-    print("\n".join(summary(rows, agents)))
-    print()
-    print("\n".join(per_task(rows, agents)))
-    print()
-    for index, first in enumerate(agents):
-        for other in agents[index + 1:]:
-            pair = [first, other]
-            print("\n".join(paired(rows, pair)))
-            print()
-            print("\n".join(differences(rows, pair)))
-            print("\n".join(paired_outcomes(rows, pair)))
-            print()
-    for agent in agents:
-        dropped = [row["id"] for row in rows if row["agent"] == agent and (row.get("meter") or {}).get("statuses", {}).get("0")]
-        print("%s rows with a request the upstream connection dropped: %d %s" % (agent, len(dropped), " ".join(dropped)))
-    errors = [row for row in rows if row["outcome"] == "errored"]
-    for row in errors:
-        print("errored: " + row["id"] + ": " + str(row.get("note")))
+    args = arguments()
+    try:
+        report = build_report(args)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("report input error: " + str(error), file=sys.stderr)
+        return 2
+    encoded = json.dumps(report, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    if args.json_out:
+        args.json_out.write_text(encoded)
+    print(readable(report) if args.summary else encoded, end="\n" if args.summary else "")
+    return 0 if report["status"] == "PASS" else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
