@@ -21,6 +21,7 @@ MODEL_ENDPOINTS = ("/messages", "/responses", "/responses/compact", "/chat/compl
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 OUTCOMES = ("passed", "failed", "errored")
 BINDING_FIELDS = ("meter_port", "relay_port", "meter_host")
+POLICY_FIXTURE_PATHS = ("scripts/fixtures/prompts/codex-instructions.md", "scripts/fixtures/prompts/codex-texts.json")
 REQUIRED_CONFIG = ("agents", "attempts", "model", "parallel", "limits", "agent_memory_mb", "max_turns", "openai_route", "hl_agent_arg", "ca_sha256")
 
 
@@ -413,6 +414,8 @@ def compare_optional(base, candidate, label, issues):
 
 
 def measurement_path(path):
+    if path in POLICY_FIXTURE_PATHS:
+        return False
     return path.startswith(("evals/", "scripts/", "rust-toolchain")) or path in ("Cargo.toml", "Cargo.lock")
 
 

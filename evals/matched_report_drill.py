@@ -310,6 +310,46 @@ def change_checkpoint_identity(arm, action):
         write(path, state)
 
 
+def check_policy_treatment(root):
+    args = fixture(root)
+    checkpoint_fixture(args)
+    paths = ["examples/codex_agent.hl", *report.POLICY_FIXTURE_PATHS]
+    for arm in (args.baseline, args.candidate):
+        change_checkpoint_identity(arm, lambda identity: identity["source_files"].update(
+            {path: ("a" if arm == args.baseline else "b") * 64 for path in paths}))
+    args.allow_source_change = ["src/agent.rs", *paths]
+    result = report.build_report(args)
+    assert result["status"] == "PASS", report.readable(result)
+    assert set(result["treatment"]["observed_changes"]["source"]) == set(args.allow_source_change)
+    for path in paths:
+        args.allow_source_change.remove(path)
+        fails(report.build_report(args))
+        args.allow_source_change.append(path)
+    blocked = ("scripts/program-literals.py", "scripts/fixtures/prompts/tools.json",
+               "scripts/fixtures/prompts/codex-texts.json.extra", "scripts/check.sh",
+               "evals/run.py", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml")
+    for path in blocked:
+        assert report.measurement_path(path)
+        original = report.read_json(args.candidate / "campaign.json")["identity"]["source_files"].get(path)
+        change_checkpoint_identity(args.candidate, lambda identity: identity["source_files"].update({path: "e" * 64}))
+        args.allow_source_change.append(path)
+        fails(report.build_report(args))
+        args.allow_source_change.remove(path)
+        if original is None:
+            change_checkpoint_identity(args.candidate, lambda identity: identity["source_files"].pop(path))
+        else:
+            change_checkpoint_identity(args.candidate, lambda identity: identity["source_files"].update({path: original}))
+    assert report.build_report(args)["status"] == "PASS"
+    command = [sys.executable, str(ROOT / "report.py"), "--baseline", str(args.baseline),
+               "--candidate", str(args.candidate), "--suite", str(args.suite), "--expected-tasks", "3"]
+    for path in args.allow_source_change:
+        command.extend(["--allow-source-change", path])
+    completed = subprocess.run(command, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    completed = subprocess.run(command + ["--allow-source-change", "scripts/check.sh"], capture_output=True, text=True)
+    assert completed.returncode == 2 and "cannot be treatment exceptions" in completed.stderr
+
+
 def check_checkpoint(root):
     args = fixture(root)
     checkpoint_fixture(args)
@@ -393,6 +433,9 @@ def main():
         checkpoint = root / "checkpoint"
         checkpoint.mkdir()
         check_checkpoint(checkpoint)
+        policy = root / "policy-treatment"
+        policy.mkdir()
+        check_policy_treatment(policy)
         evidence = valid / "journal-counters.json"
         write(evidence, {"streams": [dict(row="before-1", aborted_cost_unknown=True),
                                      dict(row="before-2", aborted_cost_unknown=True)]})
