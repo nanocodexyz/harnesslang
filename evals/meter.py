@@ -284,6 +284,7 @@ class Meter(http.server.BaseHTTPRequestHandler):
             connection.request(self.command, path, body=body, headers=headers)
             response = connection.getresponse()
             if translated and response.status == 200:
+                assert request_id is None
                 self.relay_translated(response)
                 record["status"] = response.status
                 return

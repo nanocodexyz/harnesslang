@@ -9,7 +9,7 @@ import uuid
 
 import checkpoint
 
-MODEL_ENDPOINTS = ('/messages', '/responses', '/responses/compact')
+MODEL_ENDPOINTS = ('/messages', '/responses', '/responses/compact', '/chat/completions')
 POLL_SECONDS = 0.02
 
 

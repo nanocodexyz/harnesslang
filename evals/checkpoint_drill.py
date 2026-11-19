@@ -628,7 +628,7 @@ def stream_usage_drill(base):
     import meter
     original_upstream = meter.upstream
     results = []
-    for index in range(3):
+    for index in range(6):
         directory = os.path.join(base, 'truncated-sse-' + str(index))
         checkpoint.durable_directory(directory)
         class Response:
@@ -642,6 +642,8 @@ def stream_usage_drill(base):
                 if self.sent:
                     return b''
                 self.sent = True
+                if index >= 3:
+                    return json.dumps({'object': 'chat.completion', 'usage': {'prompt_tokens': 7, 'completion_tokens': 4}}).encode()
                 return b'data: ' + json.dumps({'type': 'message_start', 'message': {'usage': {'input_tokens': 7, 'output_tokens': 0}}}).encode() + b'\n\n'
         class Connection:
             def request(self, *args, **kwargs):
@@ -660,7 +662,8 @@ def stream_usage_drill(base):
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         connection = http.client.HTTPConnection(*server.server_address, timeout=TIMEOUT_SECONDS)
-        connection.request('POST', '/run/truncated-sse-' + str(index) + '/openai/v1/responses', body=b'{}')
+        endpoint = '/chat/completions' if index >= 3 else '/responses'
+        connection.request('POST', '/run/truncated-sse-' + str(index) + '/openai/v1' + endpoint, body=b'{}')
         assert connection.getresponse().read()
         connection.close()
         assert run.meter_totals(directory)['unknown_usage_requests'] == 1
@@ -669,9 +672,25 @@ def stream_usage_drill(base):
         server.shutdown()
         server.server_close()
         worker.join(TIMEOUT_SECONDS)
-        results.append({'nonterminal_mislabeled_sse_unknown': True})
+        results.append({'nonterminal_mislabeled_sse_unknown': index < 3, 'unsupported_chat_usage_unknown': index >= 3})
     meter.upstream = original_upstream
     return results
+
+
+def routing_drill():
+    import meter
+    paths = []
+    for endpoint in ('/messages', '/responses', '/responses/compact', '/chat/completions'):
+        provider, path = meter.route('chatgpt/v1' + endpoint)
+        assert provider == 'chatgpt'
+        forwarded, translated = meter.platform_models(path)
+        assert not translated and forwarded == path
+        assert path.endswith(checkpoint_meter.MODEL_ENDPOINTS)
+        paths.append(path)
+    _, models = meter.route('chatgpt/v1/models')
+    _, translated = meter.platform_models(models)
+    assert translated and not models.endswith(checkpoint_meter.MODEL_ENDPOINTS)
+    return {'billed_routes_not_model_list_translation': paths, 'translated_models_get_unbilled': True}
 
 
 def main():
@@ -714,10 +733,11 @@ def main():
     cache = cache_hook_drill(fixture)
     ledger_mutations = ledger_mutation_drill(base)
     streams = stream_usage_drill(base)
+    routing = routing_drill()
     print(json.dumps({'fixture': base, 'matrix_rows': len(rows), 'process_kills': 3,
         'agent_dispatches': 3, 'verifier_dispatches': 3, 'completed_immutable': 3,
         'identity_mutations_rejected': rejected, 'interruption_guards': interruptions,
-        'truncated_sse_n3': streams, 'ledger_mutations': ledger_mutations, 'cache_hook': cache, 'accounting_n3': accounting, 'intent_owner_sigkill_n3': intents, 'saved_agent_window_n3': saved, 'relay_collision_cleanup_n3': collisions,
+        'api_edge_n3_each': streams, 'routing': routing, 'ledger_mutations': ledger_mutations, 'cache_hook': cache, 'accounting_n3': accounting, 'intent_owner_sigkill_n3': intents, 'saved_agent_window_n3': saved, 'relay_collision_cleanup_n3': collisions,
         'shell_receipts': shell_receipts, 'service_owner_kill_recoveries': service_recoveries, 'stopped_container_drill': stopped, 'model_calls': 0, 'docker_calls': 0}, sort_keys=True))
 
 
