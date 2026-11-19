@@ -2,6 +2,8 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
+import shlex
 import os
 import shutil
 import signal
@@ -13,6 +15,11 @@ import time
 import tomllib
 import urllib.parse
 
+import checkpoint
+import checkpoint_phase
+import checkpoint_meter
+import provenance
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 AGENT_MOUNT = "/opt/nanoeval-agent"
 JOURNAL_MOUNT = "/opt/nanoeval-journal"
@@ -21,7 +28,6 @@ CA_ENV = ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAIN
 METER_PORT = 18777
 RELAY_PORT = 13128
 DOCKER_BRIDGE = "bridge"
-KILL_GRACE_SEC = 10
 SETUP_TIMEOUT_SEC = 1800
 METER_READY_ATTEMPTS = 50
 METER_READY_SLEEP_SEC = 0.1
@@ -40,7 +46,6 @@ CLAUDE_CODE_SELECT = 'if [ -e ' + MUSL_LOADER + ' ]; then exec ' + AGENT_MOUNT +
 CONTAINER_RUN_DIGITS = 12
 PACKAGE_FILES = ("instruction.md", "README.md", "task.toml")
 PACKAGE_DIRECTORIES = ("environment", "solution", "steps", "tests")
-OUTCOMES = ("passed", "failed", "errored")
 PAUSE_FILE = "pause"
 PAUSE_POLL_SEC = 15
 
@@ -112,23 +117,6 @@ def container_env(gateway, upstream, relay_port):
     return env
 
 
-def image_for(task, config, env, lock):
-    if config["image"]:
-        with lock:
-            if sh(["docker", "image", "inspect", config["image"]], check=False).returncode != 0:
-                sh(["docker", "pull", "-q", config["image"]])
-        return config["image"]
-    digest = task_digest(task["dir"])
-    tag = "nanoeval-eval/" + task["source"] + "-" + task["task"] + ":" + digest[:16]
-    with lock:
-        if sh(["docker", "image", "inspect", tag], check=False).returncode != 0:
-            build = ["docker", "build", "-q", "-t", tag]
-            for name, value in env.items():
-                build += ["--build-arg", name + "=" + value]
-            sh(build + [os.path.join(task["dir"], "environment")])
-    return tag
-
-
 def agent_command(agent, model, workdir, run_url, instruction, max_turns, hl_agent_args, openai_route):
     openai_url = run_url + OPENAI_ROUTES[openai_route]
     if agent == "codex":
@@ -154,66 +142,45 @@ def agent_command(agent, model, workdir, run_url, instruction, max_turns, hl_age
     return ({"ANTHROPIC_BASE_URL": run_url, "ANTHROPIC_API_KEY": "metered-by-host"} if claude else {"OPENAI_BASE_URL": openai_url, "OPENAI_API_KEY": METERED_KEY}, command)
 
 
-def run_agent(name, row, env, argv, timeout, journal):
-    exec_env = []
-    for key, value in env.items():
-        exec_env += ["-e", key + "=" + value]
-    wrapped = ["sh", "-c", 'echo $$ > ' + JOURNAL_MOUNT + '/agent.pid; exec "$@"', "sh"] + argv
-    started = time.time()
-    with open(os.path.join(journal, "agent.stdout"), "w") as out, open(os.path.join(journal, "agent.stderr"), "w") as err:
-        process = subprocess.Popen(["docker", "exec", "-w", row["workdir"]] + exec_env + [name] + wrapped, stdout=out, stderr=err)
-        try:
-            code = process.wait(timeout=timeout)
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            pid = open(os.path.join(journal, "agent.pid")).read().strip()
-            sh(["docker", "exec", "-u", "0", name, "kill", "-9", pid], check=False)
-            try:
-                code = process.wait(timeout=KILL_GRACE_SEC)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                code = process.wait()
-    return {"exit": code, "timed_out": timed_out, "wall_ms": int((time.time() - started) * 1000)}
+def run_agent(name, row, env, argv, timeout, journal, state=None):
+    if state is None:
+        raise checkpoint.ResumeError("run_agent requires a durable attempt")
+    return checkpoint_phase.phase(sh, name, row, env, argv, timeout, journal, "agent", state)
 
 
-def verify(name, row, config, out):
-    sh(["docker", "exec", "-u", "0", name, "sh", "-c", "rm -rf /logs/verifier /tests && mkdir -p /logs/verifier && chmod 777 /logs/verifier"])
-    sh(["docker", "cp", os.path.join(row["dir"], "tests") + "/.", name + ":/tests"])
-    env = []
-    for key, value in config["verifier_env"].items():
-        env += ["-e", key + "=" + value]
-    started = time.time()
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "-w", row["workdir"]] + env + [name, "sh", "-c", RUN_SHELL, "sh", "/tests/test.sh"],
-            capture_output=True, text=True, timeout=config["verifier_timeout"],
-        )
-        code, timed_out = result.returncode, False
-        log = result.stdout + result.stderr
-    except subprocess.TimeoutExpired as expired:
-        code, timed_out = None, True
-        log = (expired.stdout or b"").decode(errors="replace") if isinstance(expired.stdout, bytes) else (expired.stdout or "")
+def verify(name, row, config, out, state=None):
+    if state is None:
+        raise checkpoint.ResumeError("verify requires a durable attempt")
+    journal = os.path.join(out, "journal")
+    if state.value["stage"] != "verifier":
+        sh(["docker", "exec", "-u", "0", name, "sh", "-c", "rm -rf /logs/verifier /tests && mkdir -p /logs/verifier && chmod 777 /logs/verifier"])
+        sh(["docker", "cp", os.path.join(row["dir"], "tests") + "/.", name + ":/tests"])
+    result = checkpoint_phase.phase(sh, name, row, config["verifier_env"],
+        ["sh", "-c", RUN_SHELL, "sh", "/tests/test.sh"], config["verifier_timeout"], journal, "verifier", state)
     with open(os.path.join(out, "verifier.log"), "w") as handle:
-        handle.write(log)
-    sh(["docker", "cp", name + ":/logs/verifier", os.path.join(out, "verifier")], check=False)
-    reward = None
-    path = os.path.join(out, "verifier", "reward.txt")
+        for suffix in ("stdout", "stderr"):
+            path = os.path.join(journal, "verifier." + suffix)
+            if os.path.isfile(path):
+                with open(path, errors="replace") as source:
+                    shutil.copyfileobj(source, handle)
+    reward_dir = os.path.join(out, "verifier")
+    if os.path.isdir(reward_dir):
+        shutil.rmtree(reward_dir)
+    sh(["docker", "cp", name + ":/logs/verifier", reward_dir], check=False)
+    result["reward"] = None
+    path = os.path.join(reward_dir, "reward.txt")
     if os.path.isfile(path):
         try:
-            reward = float(open(path).read().strip())
+            result["reward"] = float(open(path).read().strip())
         except ValueError:
-            reward = None
-    return {"exit": code, "timed_out": timed_out, "reward": reward, "wall_ms": int((time.time() - started) * 1000)}
+            pass
+    return result
 
 
 def meter_totals(directory):
-    totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "reasoning_tokens": 0, "tool_calls": 0, "statuses": {}}
-    path = os.path.join(directory, "requests.jsonl")
-    if not os.path.isfile(path):
-        return totals
-    for line in open(path):
-        record = json.loads(line)
+    totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "reasoning_tokens": 0, "tool_calls": 0, "unknown_usage_requests": 0, "statuses": {}}
+    _, records = checkpoint_meter.snapshot(directory, None)
+    for record in records:
         if not record["path"].split("?")[0].endswith(MODEL_ENDPOINTS):
             continue
         totals["requests"] += 1
@@ -221,8 +188,11 @@ def meter_totals(directory):
         totals["statuses"][status] = totals["statuses"].get(status, 0) + 1
         if record.get("status") == 200:
             totals["ok_requests"] += 1
+        usage = record.get("usage") or {}
+        if not record.get("usage_known", False) or "input_tokens" not in usage or "output_tokens" not in usage:
+            totals["unknown_usage_requests"] += 1
         for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cache_write_1h_tokens", "reasoning_tokens"):
-            totals[key] += record["usage"].get(key, 0)
+            totals[key] += usage.get(key, 0)
         totals["tool_calls"] += len(record.get("tool_uses") or [])
     return totals
 
@@ -235,118 +205,289 @@ def outcome(agent_result, verifier, totals):
     return ("passed" if verifier["reward"] == 1 else "failed"), ("agent timed out" if agent_result["timed_out"] else None)
 
 
-def remove_tree(path, image):
-    try:
-        shutil.rmtree(path)
-        return
-    except PermissionError:
-        pass
-    sh(["docker", "run", "--rm", "-u", "0", "-v", os.path.abspath(path) + ":/stale", "--entrypoint", "", image, "find", "/stale", "-mindepth", "1", "-delete"])
-    shutil.rmtree(path)
-
-
-def finished(out):
-    path = os.path.join(out, "result.json")
-    if not os.path.isfile(path):
-        return None
-    try:
-        result = json.load(open(path))
-    except (OSError, ValueError):
-        return None
-    if result.get("outcome") not in OUTCOMES or result.get("crashed"):
-        return None
-    return result
-
-
 def record_crash(row, args, runs, error):
     out = os.path.join(runs, row["id"])
-    os.makedirs(out, exist_ok=True)
-    result = {"id": row["id"], "source": row["source"], "task": row["task"], "agent": row["agent"], "attempt": row["attempt"], "model": args.model, "outcome": "errored", "crashed": True, "note": "exception: " + type(error).__name__ + ": " + str(error)[-1500:]}
-    with open(os.path.join(out, "result.json"), "w") as handle:
-        json.dump(result, handle, indent=1)
+    path = os.path.join(out, "infrastructure.json")
+    result = {key: row[key] for key in ("id", "source", "task", "agent", "attempt")}
+    result.update(model=args.model, outcome="errored", infrastructure_status="unresumable" if isinstance(error, checkpoint.Unresumable) else "blocked", retry_policy="no_fresh_attempt", accounting_status="unknown_after_infrastructure",
+        note="exception: " + type(error).__name__ + ": " + str(error)[-1500:])
+    try:
+        result["meter"] = meter_totals(out)
+    except (OSError, ValueError, KeyError, TypeError):
+        result["meter"] = {}
+    result["meter"].update(accounting_status="unknown_after_infrastructure", unknown_requests=None)
+    if os.path.isdir(out) and not os.path.exists(path):
+        checkpoint.atomic(path, result, True)
     return result
+
+
+def prepare_container(row, args, env, agent_root, journal, name, state):
+    image = state.value["image_id"]
+    if state.value.get("container_prepared"):
+        return
+    inspected = sh(["docker", "inspect", name], check=False)
+    if inspected.returncode == 0:
+        raise checkpoint.ResumeError("container creation interrupted; preserved for inspection")
+    checkpoint.durable_directory(journal)
+    checkpoint.durable_directory(os.path.join(os.path.dirname(journal), "meter-intents"))
+    os.chmod(journal, 0o777)
+    instruction = open(os.path.join(row["dir"], "instruction.md")).read()
+    instruction_path = os.path.join(journal, "instruction.md")
+    if not os.path.exists(instruction_path):
+        with open(instruction_path, "x") as handle:
+            handle.write(instruction)
+            handle.flush()
+            os.fsync(handle.fileno())
+        checkpoint.sync_directory(journal)
+    run = ["docker", "run", "-d", "--init", "--name", name]
+    config = task_config(row["dir"])
+    if args.limits == "task":
+        run += ["--cpus", str(config["cpus"]), "--memory", str(config["memory_mb"] + args.agent_memory_mb) + "m"]
+    for key, value in env.items():
+        run += ["-e", key + "=" + value]
+    if args.ca_bundle:
+        run += ["-v", os.path.abspath(args.ca_bundle) + ":" + CA_MOUNT + ":ro"]
+        for key in CA_ENV:
+            run += ["-e", key + "=" + CA_MOUNT]
+    run += ["-v", agent_root + ":" + AGENT_MOUNT + ":ro", "-v", journal + ":" + JOURNAL_MOUNT, "--entrypoint", "", image, "tail", "-f", "/dev/null"]
+    sh(run)
+    state.value["container_prepared"] = True
+    state.save()
 
 
 def run_row(row, args, gateway, env, lock, agent_root, runs):
     out = os.path.join(runs, row["id"])
-    done = finished(out)
+    state = checkpoint.Attempt(out, dict(campaign=args.campaign_identity, row=row["id"]))
+    done = state.completed()
     if done:
         return done
+    if os.path.exists(os.path.join(out, "infrastructure.json")):
+        return checkpoint.read(os.path.join(out, "infrastructure.json"))
+    if os.path.isfile(os.path.join(runs, CHATGPT_HALT_FILE)):
+        raise checkpoint.ResumeError("meter halt retained; no fallback or new attempt")
     while os.path.exists(os.path.join(os.path.dirname(runs), PAUSE_FILE)):
         time.sleep(PAUSE_POLL_SEC)
     config = task_config(row["dir"])
     journal = os.path.join(out, "journal")
     name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
-    result = {"id": row["id"], "source": row["source"], "task": row["task"], "agent": row["agent"], "attempt": row["attempt"], "model": args.model}
+    result = {key: row[key] for key in ("id", "source", "task", "agent", "attempt")}
+    result["model"] = args.model
+    result["cache"] = getattr(args, "cache_identity", {"enabled": False})
     try:
-        image = image_for(row, config, env, lock)
-        if os.path.isdir(out):
-            remove_tree(out, image)
-        os.makedirs(journal)
-        os.chmod(journal, 0o777)
-        workdir = sh(["docker", "image", "inspect", "-f", "{{.Config.WorkingDir}}", image]).stdout.strip() or "/"
-        row["workdir"] = workdir
-        sh(["docker", "rm", "-f", name], check=False)
-        run = ["docker", "run", "-d", "--init", "--name", name]
-        if args.limits == "task":
-            run += ["--cpus", str(config["cpus"]), "--memory", str(config["memory_mb"] + args.agent_memory_mb) + "m"]
-        for key, value in env.items():
-            run += ["-e", key + "=" + value]
-        if args.ca_bundle:
-            run += ["-v", os.path.abspath(args.ca_bundle) + ":" + CA_MOUNT + ":ro"]
-            for key in CA_ENV:
-                run += ["-e", key + "=" + CA_MOUNT]
-        run += ["-v", agent_root + ":" + AGENT_MOUNT + ":ro", "-v", journal + ":" + JOURNAL_MOUNT, "--entrypoint", "", image, "tail", "-f", "/dev/null"]
-        sh(run)
-        instruction = open(os.path.join(row["dir"], "instruction.md")).read()
-        with open(os.path.join(journal, "instruction.md"), "w") as handle:
-            handle.write(instruction)
-        run_url = "http://" + (args.meter_host or gateway) + ":" + str(args.meter_port) + "/run/" + row["id"]
-        agent_env, argv = agent_command(row["agent"], args.model, workdir, run_url, instruction, args.max_turns, args.hl_agent_arg or [], args.openai_route)
-        agent_result = run_agent(name, row, agent_env, argv, config["agent_timeout"], journal)
-        peak = sh(["docker", "exec", name, "cat", "/sys/fs/cgroup/memory.peak"], check=False).stdout.strip()
-        verifier = verify(name, row, config, out)
+        if "image_id" not in state.value:
+            state.value.update(image_id=args.image_ids[row["id"]], workdir=args.workdirs[row["id"]], accounting_status="observed")
+            state.save()
+        incarnation = getattr(args, "meter_incarnation", "mock-offline")
+        if state.value.get("meter_incarnation", incarnation) != incarnation:
+            state.value["accounting_status"] = "unknown_meter_incarnation_changed"
+        state.value["meter_incarnation"] = incarnation
+        state.save()
+        row["workdir"] = state.value["workdir"]
+        prepare_container(row, args, env, agent_root, journal, name, state)
+        info = checkpoint_phase.validate_container(sh, name, state.value, journal, agent_root)
+        if state.value["stage"] == "prepared" and not info["State"]["Running"]:
+            sh(["docker", "start", name])
+        if state.value["stage"] in ("prepared", "agent") and "agent_result" not in state.value:
+            instruction = open(os.path.join(journal, "instruction.md")).read()
+            run_url = "http://" + (args.meter_host or gateway) + ":" + str(args.meter_port) + "/run/" + row["id"]
+            agent_env, argv = agent_command(row["agent"], args.model, row["workdir"], run_url, instruction, args.max_turns, args.hl_agent_arg or [], args.openai_route)
+            state.value["agent_result"] = run_agent(name, row, agent_env, argv, config["agent_timeout"], journal, state)
+            state.save()
+        if state.value["stage"] == "agent":
+            info = checkpoint_phase.container(sh, name)
+            if not info["State"]["Running"]:
+                sh(["docker", "start", name])
+                state.value["container_restarted_after_agent"] = True
+                state.save()
+        verifier = verify(name, row, config, out, state)
+        ledger = checkpoint_meter.reconcile(out, incarnation)
         totals = meter_totals(out)
-        kind, note = outcome(agent_result, verifier, totals)
-        result.update({"outcome": kind, "note": note, "agent": row["agent"], "agent_result": agent_result, "verifier": verifier, "meter": totals, "memory_peak_bytes": int(peak) if peak.isdigit() else None, "image": image, "workdir": workdir})
+        totals["durable_ledger"] = ledger
+        if ledger["unknown"] or ledger["unmatched_records"]:
+            state.value["accounting_status"] = "unknown_meter_requests"
+        if totals["unknown_usage_requests"]:
+            state.value["accounting_status"] = "unknown_model_usage"
+        totals["accounting_status"] = state.value["accounting_status"]
+        totals["unknown_requests"] = None if state.value["accounting_status"] != "observed" else 0
+        kind, note = outcome(state.value["agent_result"], verifier, totals)
+        result.update(outcome=kind, note=note, agent_result=state.value["agent_result"], verifier=verifier,
+            meter=totals, accounting_status=state.value["accounting_status"], image=state.value["image_id"], workdir=row["workdir"])
         usage = os.path.join(journal, "hl", "usage.json")
         if os.path.isfile(usage):
-            result["self_reported_usage"] = json.load(open(usage))
-    except (RuntimeError, subprocess.TimeoutExpired, OSError) as error:
-        result.update({"outcome": "errored", "note": "infrastructure: " + str(error)[-1500:], "meter": meter_totals(out)})
-    finally:
-        sh(["docker", "exec", "-u", "0", name, "chown", "-R", str(os.getuid()) + ":" + str(os.getgid()), JOURNAL_MOUNT], check=False)
-        sh(["docker", "rm", "-f", name], check=False)
-    os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "result.json"), "w") as handle:
-        json.dump(result, handle, indent=1)
-    return result
+            result["self_reported_usage"] = checkpoint.read(usage)
+        result = state.complete(result)
+        sh(["docker", "stop", "--time", "1", name], check=False)
+        return result
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, ValueError) as error:
+        state.value["accounting_status"] = "unknown_after_infrastructure"
+        state.save()
+        return record_crash(row, args, runs, error)
 
 
 def start_services(gateway, upstream, runs, logs, meter_port, relay_port, meter_host):
     processes = []
-    meter_log = open(os.path.join(logs, "meter.log"), "a")
+    owner = checkpoint.digest([os.path.abspath(runs), checkpoint.read(os.path.join(logs, "campaign.json"))["identity"]])
+    state_root = os.path.join(logs, "services")
+    checkpoint.durable_directory(state_root)
     meter_env = dict(os.environ)
     if meter_host != gateway:
         meter_env["NANOEVAL_METER_CLIENTS"] = bridge_subnet()
-    processes.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "meter.py"), meter_host, str(meter_port), runs], stdout=meter_log, stderr=meter_log, env=meter_env, start_new_session=True))
+    specs = [("meter", [meter_host, str(meter_port), runs], meter_env)]
     if upstream:
-        relay_log = open(os.path.join(logs, "relay.log"), "a")
-        processes.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "relay.py"), gateway, str(relay_port), upstream], stdout=relay_log, stderr=relay_log, start_new_session=True))
-    for _ in range(METER_READY_ATTEMPTS):
-        exited = [process for process in processes if process.poll() is not None]
-        if exited:
-            raise SystemExit("the meter or relay exited (is its port taken?); see " + logs)
-        try:
-            socket.create_connection((meter_host, meter_port), timeout=1).close()
-            time.sleep(METER_READY_SLEEP_SEC)
-            if all(process.poll() is None for process in processes):
-                return processes
-        except OSError:
-            time.sleep(METER_READY_SLEEP_SEC)
-        except OSError:
-            time.sleep(METER_READY_SLEEP_SEC)
-    raise SystemExit("the meter did not start; see " + logs + "/meter.log")
+        specs.append(("relay", [gateway, str(relay_port), upstream], dict(os.environ)))
+    try:
+        for role, arguments, environment in specs:
+            relevant = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN", "HTTPS_PROXY", "https_proxy", "NANOEVAL_METER_CLIENTS", "NANOEVAL_ANTHROPIC_UPSTREAM", "NANOEVAL_OPENAI_UPSTREAM", "NANOEVAL_CHATGPT_UPSTREAM")
+            environment_sha256 = checkpoint.digest({key: environment.get(key) for key in relevant})
+            command = [sys.executable, os.path.join(ROOT, "checkpoint_meter.py"), "--role", role, "--owner", owner,
+                "--environment-sha256", environment_sha256, "--state", os.path.join(state_root, role + ".json")] + arguments
+            with open(os.path.join(logs, role + ".log"), "a") as log:
+                endpoint = (meter_host, meter_port) if role == "meter" else (gateway, relay_port)
+                processes.append(checkpoint_phase.service(command, log, environment, endpoint))
+        for _ in range(METER_READY_ATTEMPTS):
+            if any(process.poll() is not None for process in processes):
+                raise checkpoint.ResumeError("campaign meter or relay exited; see " + logs)
+            try:
+                socket.create_connection((meter_host, meter_port), timeout=1).close()
+                time.sleep(METER_READY_SLEEP_SEC)
+                if all(process.poll() is None for process in processes):
+                    return processes
+            except OSError:
+                time.sleep(METER_READY_SLEEP_SEC)
+        raise checkpoint.ResumeError("campaign meter did not start; see " + logs)
+    except BaseException:
+        checkpoint_phase.stop_services(processes)
+        raise
+
+
+def matrix(args, agents):
+    if args.attempts <= 0 or args.parallel <= 0 or len(set(agents)) != len(agents):
+        raise checkpoint.ResumeError("attempts and parallel must be positive; agents unique")
+    tasks = load_suite(args.suite, args.tasks)
+    if args.only:
+        missing = set(args.only) - {task["task"] for task in tasks}
+        if missing:
+            raise checkpoint.ResumeError("unknown selected task")
+        tasks = [task for task in tasks if task["task"] in args.only]
+    tasks.sort(key=lambda task: -task_config(task["dir"])["agent_timeout"])
+    rows = []
+    for task in tasks:
+        for attempt in range(1, args.attempts + 1):
+            for agent in agents:
+                row = dict(task, agent=agent, attempt=attempt)
+                row["id"] = task["source"] + "." + task["task"] + "." + agent + "." + str(attempt)
+                if any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in row["id"]):
+                    raise checkpoint.ResumeError("unsafe row identifier")
+                rows.append(row)
+    if not rows or len({row["id"] for row in rows}) != len(rows):
+        raise checkpoint.ResumeError("matrix must be nonempty and unique")
+    return rows
+
+
+
+def preflight_rows(args, rows, identity):
+    root = os.path.join(args.out, "rows")
+    expected = {row["id"] for row in rows}
+    campaign_hash = checkpoint.digest(identity)
+    marker = os.path.join(args.out, "matrix-prepared.json")
+    prepared = os.path.exists(marker)
+    if prepared and checkpoint.read(marker) != {"campaign": campaign_hash, "rows": sorted(expected)}:
+        raise checkpoint.ResumeError("matrix preparation identity changed")
+    if not os.path.isdir(root):
+        if prepared:
+            raise checkpoint.ResumeError("prepared matrix lost row directory")
+        return
+    actual = {name for name in os.listdir(root) if os.path.isdir(os.path.join(root, name))}
+    if actual - expected:
+        raise checkpoint.ResumeError("unexpected rows outside campaign matrix")
+    if prepared and actual != expected:
+        raise checkpoint.ResumeError("prepared matrix lost rows; no fresh attempts permitted")
+    for name in sorted(actual):
+        directory = os.path.join(root, name)
+        path = os.path.join(directory, "checkpoint.json")
+        if not os.path.exists(path):
+            raise checkpoint.ResumeError("row lost checkpoint; no fresh attempt permitted")
+        value = checkpoint.read(path)
+        if value["identity"] != {"campaign": campaign_hash, "row": name} or value["stage"] not in checkpoint.STAGES:
+            raise checkpoint.ResumeError("row checkpoint identity mismatch")
+        if not prepared and value["stage"] != "prepared":
+            raise checkpoint.ResumeError("dispatch without prepared matrix")
+        result_path = os.path.join(directory, "result.json")
+        if value["stage"] == "completed":
+            if not os.path.exists(result_path) or checkpoint.digest(checkpoint.read(result_path)) != value["result_sha256"]:
+                raise checkpoint.ResumeError("completed row result changed or missing")
+
+
+def prepare_matrix(args, rows, campaign_hash):
+    root = os.path.join(args.out, "rows")
+    checkpoint.durable_directory(root)
+    for row in rows:
+        checkpoint.Attempt(os.path.join(root, row["id"]), {"campaign": campaign_hash, "row": row["id"]})
+    marker = os.path.join(args.out, "matrix-prepared.json")
+    if not os.path.exists(marker):
+        checkpoint.atomic(marker, {"campaign": campaign_hash, "rows": sorted(row["id"] for row in rows)}, True)
+
+def cache_variants(args, rows, images, workdirs):
+    selected = {}
+    for specification in getattr(args, "cache_variant", None) or []:
+        task, separator, variant = specification.partition("=")
+        if not separator or not task or task in selected:
+            raise checkpoint.ResumeError("cache variant must be unique source/task=sha256")
+        selected[task] = variant
+    args.cache_identity = {"enabled": False}
+    if not selected:
+        return
+    import cache_store
+    store = cache_store.Store()
+    tasks = {row["source"] + "/" + row["task"]: row for row in rows}
+    if selected.keys() - tasks.keys():
+        raise checkpoint.ResumeError("cache variant task outside campaign")
+    variants = {}
+    for key, variant in sorted(selected.items()):
+        row = tasks[key]
+        expected = {"task_digest": task_digest(row["dir"]), "verifier_sha256": provenance.file_digest(os.path.join(row["dir"], "tests", "test.sh")), "base_image_id": images[row["id"]]}
+        manifest = cache_store.load_variant(store, variant, expected=expected)
+        image = cache_store.image_for_variant(manifest)
+        inspected = json.loads(sh(["docker", "image", "inspect", image]).stdout)[0]
+        if inspected["Id"] != image:
+            raise checkpoint.ResumeError("cache warm image identity mismatch")
+        variants[key] = {"variant_id": variant, "manifest": manifest}
+        for item in rows:
+            if item["source"] + "/" + item["task"] == key:
+                images[item["id"]] = image
+                workdirs[item["id"]] = inspected["Config"].get("WorkingDir") or "/"
+    args.cache_identity = {"enabled": True, "variants": variants, "new_infrastructure_campaign": True}
+
+
+def preflight(args, rows):
+    images, workdirs, configs = {}, {}, {}
+    inspected, missing = {}, set()
+    for row in rows:
+        config = task_config(row["dir"])
+        if any(not math.isfinite(config[key]) or config[key] <= 0 for key in ("agent_timeout", "verifier_timeout")):
+            raise checkpoint.ResumeError("invalid timeout")
+        configs[row["id"]] = config
+        image = config["image"] or "nanoeval-eval/" + row["source"] + "-" + row["task"] + ":" + task_digest(row["dir"])[:16]
+        if image in missing:
+            continue
+        if image not in inspected:
+            result = sh(["docker", "image", "inspect", image], check=False)
+            if result.returncode:
+                missing.add(image)
+                continue
+            inspected[image] = json.loads(result.stdout)[0]
+        images[row["id"]] = inspected[image]["Id"]
+        workdirs[row["id"]] = inspected[image]["Config"].get("WorkingDir") or "/"
+    if missing:
+        raise checkpoint.ResumeError("matrix " + str(len(rows)) + " rows; missing " + str(len(missing)) + " images: " + ", ".join(sorted(missing)) + "; no implicit pull/build")
+    cache_variants(args, rows, images, workdirs)
+    identity = provenance.campaign(args, rows, task_digest, configs, images)
+    path = os.path.join(args.out, "campaign.json")
+    if os.path.exists(path) and checkpoint.read(path)["identity"] != identity:
+        raise checkpoint.ResumeError("campaign identity mismatch; no work dispatched")
+    preflight_rows(args, rows, identity)
+    args.image_ids, args.workdirs = images, workdirs
+    return identity
 
 
 def main():
@@ -369,6 +510,9 @@ def main():
     parser.add_argument("--hl-agent-arg", action="append")
     parser.add_argument("--openai-route", choices=tuple(OPENAI_ROUTES), default="openai")
     parser.add_argument("--meter-host")
+    parser.add_argument("--cache-variant", action="append", metavar="SOURCE/TASK=SHA256")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
     agents = args.agents.split(",")
     for agent in agents:
@@ -377,30 +521,28 @@ def main():
         binary = os.path.join(args.agent_root, "bin", AGENT_BINARIES.get(agent, agent))
         if not os.access(binary, os.X_OK):
             raise SystemExit(binary + " is missing; run evals/setup.sh")
+    rows = matrix(args, agents)
+    identity = preflight(args, rows)
+    print("matrix", len(rows), "identity", checkpoint.digest(identity), flush=True)
+    if args.preflight:
+        return
     for agent in agents:
         if not any(os.environ.get(key) for key in AGENT_KEYS[agent]):
-            raise SystemExit(agent + " needs " + " or ".join(AGENT_KEYS[agent]) + " set for the meter")
-    tasks = load_suite(args.suite, args.tasks)
-    if args.only:
-        tasks = [task for task in tasks if task["task"] in args.only]
+            raise SystemExit(agent + " needs a configured meter credential")
+    campaign = checkpoint.Campaign(os.path.abspath(args.out), identity, args.resume)
+    args.campaign_identity = campaign.identity
+    prepare_matrix(args, rows, campaign.identity)
     runs = os.path.abspath(os.path.join(args.out, "rows"))
-    os.makedirs(runs, exist_ok=True)
-    tasks.sort(key=lambda task: -task_config(task["dir"])["agent_timeout"])
-    rows = []
-    for task in tasks:
-        for attempt in range(1, args.attempts + 1):
-            for agent in agents:
-                row = dict(task, agent=agent, attempt=attempt)
-                row["id"] = task["source"] + "." + task["task"] + "." + agent + "." + str(attempt)
-                rows.append(row)
-                os.makedirs(os.path.join(runs, row["id"]), exist_ok=True)
-    with open(os.path.join(args.out, "run-" + "-".join(agents) + ".json"), "w") as handle:
-        json.dump({"argv": sys.argv[1:], "rows": len(rows), "started": time.time()}, handle, indent=1)
-    gateway, upstream = network()
-    env = container_env(gateway, upstream, args.relay_port)
-    services = start_services(gateway, upstream, runs, os.path.abspath(args.out), args.meter_port, args.relay_port, args.meter_host or gateway)
-    lock = threading.Lock()
+    checkpoint.durable_directory(runs)
+    resume_argv = [value for value in sys.argv[1:] if value != "--resume"] + ["--resume"]
+    print("resume:", shlex.join([sys.executable, os.path.abspath(__file__)] + resume_argv), flush=True)
+    services = []
     try:
+        gateway, upstream = network()
+        env = container_env(gateway, upstream, args.relay_port)
+        services = start_services(gateway, upstream, runs, os.path.abspath(args.out), args.meter_port, args.relay_port, args.meter_host or gateway)
+        args.meter_incarnation = checkpoint.read(os.path.join(args.out, "services", "meter.json"))["incarnation"]
+        lock = threading.Lock()
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
             futures = {pool.submit(run_row, row, args, gateway, env, lock, os.path.abspath(args.agent_root), runs): row for row in rows}
             for future in concurrent.futures.as_completed(futures):
@@ -413,8 +555,8 @@ def main():
                     cancelled = sum(1 for pending in futures if pending.cancel())
                     print("the meter halted the ChatGPT route; cancelled " + str(cancelled) + " rows", flush=True)
     finally:
-        for process in services:
-            os.killpg(process.pid, signal.SIGTERM)
+        checkpoint_phase.stop_services(services)
+        campaign.close()
 
 
 if __name__ == "__main__":

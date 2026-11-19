@@ -9,6 +9,10 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
+
+import checkpoint
+import checkpoint_meter
 
 PROVIDERS = {
     "anthropic": {"origin": "https://api.anthropic.com", "key_env": "ANTHROPIC_API_KEY", "origin_env": "NANOEVAL_ANTHROPIC_UPSTREAM"},
@@ -141,6 +145,7 @@ class Assembler:
     def __init__(self):
         self.message = {"content": [], "usage": {}}
         self.buffer = b""
+        self.complete = False
 
     def feed_stream(self, data):
         self.buffer += data
@@ -152,7 +157,9 @@ class Assembler:
 
     def event(self, event):
         kind = event.get("type")
-        if kind == "message_start":
+        if kind == "message_stop":
+            self.complete = True
+        elif kind == "message_start":
             message = event["message"]
             self.message.update({key: value for key, value in message.items() if key != "content"})
             self.message["usage"] = dict(message.get("usage") or {})
@@ -178,6 +185,7 @@ class Assembler:
         elif kind == "response.output_item.done":
             self.message["content"].append(event["item"])
         elif kind in ("response.completed", "response.incomplete", "response.failed"):
+            self.complete = True
             response = event["response"]
             self.message.update({key: value for key, value in response.items() if key != "output"})
             self.message["stop_reason"] = response.get("status")
@@ -251,6 +259,13 @@ class Meter(http.server.BaseHTTPRequestHandler):
         if provider == "chatgpt" and Meter.halted is not None:
             self.send_error(503, "the meter stopped the ChatGPT route after status " + str(Meter.halted))
             return
+        request_id = None
+        if path.split("?")[0].endswith(checkpoint_meter.MODEL_ENDPOINTS):
+            try:
+                request_id = checkpoint_meter.begin(directory, self.incarnation)
+            except checkpoint.ResumeError as error:
+                self.send_error(503, str(error))
+                return
         started = time.time()
         headers = {name: value for name, value in self.headers.items() if name.lower() not in DROPPED_REQUEST_HEADERS}
         if provider == "chatgpt" and not lite_context(body):
@@ -260,8 +275,11 @@ class Meter(http.server.BaseHTTPRequestHandler):
         headers["content-length"] = str(len(body))
         connection = upstream(os.environ.get(PROVIDERS[provider]["origin_env"]) or PROVIDERS[provider]["origin"])
         record = {"run": run, "provider": provider, "path": path, "started": started, "request": summarize_request(body)}
+        if request_id:
+            record.update(request_id=request_id, meter_incarnation=self.incarnation)
         assembler = Assembler()
         raw = b""
+        streaming = False
         try:
             connection.request(self.command, path, body=body, headers=headers)
             response = connection.getresponse()
@@ -286,8 +304,6 @@ class Meter(http.server.BaseHTTPRequestHandler):
                     raw += data
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                 self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
             record["status"] = response.status
             if provider == "chatgpt" and response.status in CHATGPT_HALT_STATUSES:
                 self.halt(response.status, run)
@@ -302,6 +318,7 @@ class Meter(http.server.BaseHTTPRequestHandler):
                         assembler.message["error"] = parsed
                 except ValueError:
                     if raw.lstrip().startswith(SSE_PREFIXES):
+                        streaming = True
                         assembler.feed_stream(raw + b"\n\n")
                     else:
                         assembler.message["error"] = raw[:2000].decode(errors="replace")
@@ -312,11 +329,14 @@ class Meter(http.server.BaseHTTPRequestHandler):
             connection.close()
         message = assembler.message
         record["ended"] = time.time()
+        record["usage_known"] = record.get("status") == 200 and (not streaming or assembler.complete) and all(type((message.get("usage") or {}).get(key)) is int and message["usage"][key] >= 0 for key in ("input_tokens", "output_tokens"))
         record["usage"] = usage_of(message)
         record["stop_reason"] = message.get("stop_reason")
         record["tool_uses"] = [block.get("name") or block.get("type") for block in message.get("content") or [] if block.get("type") in TOOL_USE_TYPES]
         if message.get("error"):
             record["error"] = message["error"]
+        if request_id:
+            checkpoint_meter.finish(directory, request_id, record)
         with self.lock:
             with open(os.path.join(directory, "requests.jsonl"), "a") as handle:
                 handle.write(json.dumps(record) + "\n")
@@ -325,6 +345,8 @@ class Meter(http.server.BaseHTTPRequestHandler):
             if body:
                 with open(os.path.join(directory, "last-request.json"), "wb") as handle:
                     handle.write(body)
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
 
     def relay_translated(self, response):
@@ -355,6 +377,7 @@ def main():
         chatgpt_login(keys["chatgpt"])
     if not keys:
         raise SystemExit("meter.py needs " + " or ".join(spec["key_env"] for spec in PROVIDERS.values()))
+    Meter.incarnation = getattr(Meter, "incarnation", None) or uuid.uuid4().hex
     Meter.runs = os.path.abspath(sys.argv[3])
     Meter.keys = keys
     if os.environ.get(CLIENTS_ENV):
