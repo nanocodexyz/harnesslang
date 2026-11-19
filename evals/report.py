@@ -584,12 +584,13 @@ def build_report(args):
              "both_costs_known": baseline_summary["cost_total_usd"] is not None and candidate_summary["cost_total_usd"] is not None,
              "candidate_success": candidate_summary["pass_rate"] >= args.min_success,
              "candidate_cost": candidate_summary["cost_mean_usd"] is not None and candidate_summary["cost_mean_usd"] <= args.max_cost,
+             "paired_improvement_ci_positive": paired is not None and paired["pass_difference"]["ci_95"][0] > 0,
              "quality_improvement": paired is not None and paired["pass_difference"]["mean"] + 0.000000000001 >= args.min_improvement_pp / 100}
     canonical = read_suite(Path(__file__).with_name("suite-60.txt"))
     profile = "MATCHED180" if tasks == canonical and args.attempts == 3 else "CUSTOM_%d_TASKS_%d_ATTEMPTS_NOT_MATCHED180" % (len(tasks), expected)
     return {"schema_version": 1, "profile": profile, "matched": matched, "status": "PASS" if all(gates.values()) else "FAIL",
             "experiment": "quality-first: model/effort/finish-check/budget configuration stays matched. Intentional model/cost-cascade/finish-check config changes require a separate cost experiment; this report does not exempt them.",
-            "policy": {"gates_apply_to": "candidate; both arms require complete matched matrices", "min_success": args.min_success, "max_cost_usd_per_attempt": args.max_cost, "min_improvement_pp": args.min_improvement_pp},
+            "policy": {"gates_apply_to": "candidate; both arms require complete matched matrices", "min_success": args.min_success, "max_cost_usd_per_attempt": args.max_cost, "min_improvement_pp": args.min_improvement_pp, "paired_improvement_ci_lower_strictly_above": 0.0},
             "gates": gates, "issues": issues, "treatment": treatment, "baseline": baseline_summary, "candidate": candidate_summary,
             "paired": paired, "prices_per_million_tokens": PRICES_PER_MTOK, "prices_source": PRICES_SOURCE,
             "interpretation": "Errors count as nonpasses in the full planned denominator. Cost is list-price equivalent, not invoiced spend. Unknown costs are not zero. Candidate source and agent-root pins may differ only at declared treatment paths with granular pins; measurement config, task, image and cache variants must match."}
@@ -614,6 +615,7 @@ def readable(report):
     for name in ("baseline", "candidate"):
         if report[name]["unknown_external_streams"]:
             lines.append("%s: %d preserved streams with unknown cost" % (name, len(report[name]["unknown_external_streams"])))
+    lines.append("Adoption requires paired mean improvement >= %.2f pp and paired 95%% CI lower bound > 0 pp." % report["policy"]["min_improvement_pp"])
     for name, passed in report["gates"].items():
         lines.append(name + ": " + ("PASS" if passed else "FAIL"))
     for scope in ("baseline", "candidate"):

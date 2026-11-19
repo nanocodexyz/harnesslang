@@ -46,7 +46,7 @@ def fixture(root, tasks=TASKS):
                 row = dict(id=identifier, source=source, task=task, attempt=attempt, agent="hl-agent",
                            model="gpt-6-luna", outcome="passed", campaign_sha256=identity,
                            image="sha256:" + "9" * 64, meter=dict(requests=2, ok_requests=2))
-                if arm == args.baseline and index == 0:
+                if arm == args.baseline and attempt == 1:
                     row["outcome"] = "failed"
                 write(directory / "result.json", row)
                 records = [dict(run=identifier, path="/v1/responses", status=200, request=dict(model=model),
@@ -111,6 +111,8 @@ def check_valid(args):
     assert result["paired"]["seed"] == 42
     assert result["paired"]["repetitions"] == 501
     assert math.isclose(result["paired"]["pass_difference"]["mean"], 1 / 3)
+    assert result["gates"]["paired_improvement_ci_positive"]
+    assert result["paired"]["pass_difference"]["ci_95"][0] > 0
     assert math.isclose(result["candidate"]["cost_mean_usd"], 0.00165)
     for name in ("baseline", "candidate"):
         interval = result[name]["cost_mean_bootstrap_95"]
@@ -131,6 +133,7 @@ def check_valid(args):
     completed = subprocess.run(command + ["--summary"], capture_output=True, text=True)
     assert completed.returncode == 0
     assert "95% Wilson" in completed.stdout and "3 task clusters" in completed.stdout
+    assert "paired 95% CI lower bound > 0 pp" in completed.stdout
 
 
 def check_unknown(result):
@@ -148,6 +151,24 @@ def check_incomplete(result):
     fails(result)
     assert result["candidate"]["cost_mean_usd"] is None
     assert result["candidate"]["cost_mean_bootstrap_95"] is None
+
+
+def uncertain_improvement(args):
+    for directory in (args.baseline / "rows").iterdir():
+        path = directory / "result.json"
+        row = report.read_json(path)
+        row["outcome"] = "failed" if (row["source"], row["task"]) == TASKS[0] else "passed"
+        write(path, row)
+
+
+def check_uncertain_improvement(result):
+    fails(result)
+    assert result["matched"]
+    assert result["gates"]["quality_improvement"]
+    assert result["paired"]["pass_difference"]["mean"] > 0.05
+    assert result["paired"]["pass_difference"]["ci_95"][0] == 0
+    assert not result["gates"]["paired_improvement_ci_positive"]
+    assert all(passed for name, passed in result["gates"].items() if name != "paired_improvement_ci_positive")
 
 
 def check_error(result):
@@ -418,6 +439,7 @@ def main():
             ("negative-usage", lambda args: change_requests(args.candidate, lambda rows: rows[0]["usage"].update(input_tokens=-1)), check_unknown),
             ("missing-log", lambda args: (first_row(args.candidate) / "requests.jsonl").unlink(), check_unknown),
             ("missing-request", lambda args: change_requests(args.candidate, lambda rows: rows.pop()), check_unknown),
+            ("uncertain-improvement", uncertain_improvement, check_uncertain_improvement),
             ("no-improvement", lambda args: setattr(args, "min_improvement_pp", 34), fails),
             ("over-budget", lambda args: setattr(args, "max_cost", 0.001), fails),
         ]
