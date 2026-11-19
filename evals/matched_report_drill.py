@@ -1,6 +1,7 @@
 import copy
 import json
 import math
+import random
 from pathlib import Path
 import shutil
 import subprocess
@@ -111,6 +112,12 @@ def check_valid(args):
     assert result["paired"]["repetitions"] == 501
     assert math.isclose(result["paired"]["pass_difference"]["mean"], 1 / 3)
     assert math.isclose(result["candidate"]["cost_mean_usd"], 0.00165)
+    for name in ("baseline", "candidate"):
+        interval = result[name]["cost_mean_bootstrap_95"]
+        assert interval["clusters"] == 3 and interval["attempts_per_cluster"] == 3
+        assert interval["repetitions"] == 501 and interval["seed"] == 42
+        assert math.isclose(interval["mean"], 0.00165)
+        assert all(math.isclose(value, 0.00165) for value in interval["ci_95"])
     assert result == report.build_report(args)
     assert report.wilson(2, 3)[0] > 0.20
     encoded = json.dumps(result, allow_nan=False)
@@ -130,10 +137,17 @@ def check_unknown(result):
     fails(result)
     assert result["candidate"]["cost_mean_usd"] is None
     assert result["candidate"]["cost_total_usd"] is None
+    assert result["candidate"]["cost_mean_bootstrap_95"] is None
     assert result["candidate"]["unknown_cost_rows"]
     if result["paired"]:
         assert result["paired"]["cost_difference_usd"] is None
     assert not result["gates"]["candidate_cost"]
+
+
+def check_incomplete(result):
+    fails(result)
+    assert result["candidate"]["cost_mean_usd"] is None
+    assert result["candidate"]["cost_mean_bootstrap_95"] is None
 
 
 def check_error(result):
@@ -168,6 +182,92 @@ def response_mismatch(args, field):
     (directory / "responses.jsonl").write_text("".join(json.dumps(message) + "\n" for message in messages))
 
 
+def seal_ledger(directory):
+    path = directory / "requests.jsonl"
+    records = report.read_lines(path)
+    for index, record in enumerate(records):
+        key = "request-%d" % index
+        record.update(request_id=key, meter_incarnation="fixture-incarnation")
+        write(directory / "meter-intents" / (key + ".intent.json"),
+              dict(request_id=key, incarnation="fixture-incarnation"))
+        write(directory / "meter-intents" / (key + ".done.json"),
+              dict(request_id=key, record=record, record_sha256=report.checkpoint_digest(record)))
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    write(directory / "meter-closed.json", dict(incarnation="fixture-incarnation"))
+
+
+def ledger_mutation(args, kind):
+    directory = first_row(args.candidate)
+    seal_ledger(directory)
+    root = directory / "meter-intents"
+    if kind == "unresolved":
+        write(root / "lost.intent.json", dict(request_id="lost", incarnation="previous-incarnation"))
+    elif kind == "unclosed":
+        (directory / "meter-closed.json").unlink()
+    elif kind == "orphan-completion":
+        (root / "request-0.intent.json").unlink()
+    elif kind == "orphan-request":
+        (root / "request-0.intent.json").unlink()
+        (root / "request-0.done.json").unlink()
+    elif kind == "duplicate":
+        change_requests(args.candidate, lambda rows: rows.append(rows[0]))
+        change_row(args.candidate, lambda row: row["meter"].update(requests=3))
+    else:
+        path = root / "request-0.done.json"
+        value = report.read_json(path)
+        if kind == "incarnation":
+            value["record"]["meter_incarnation"] = "invalid"
+            value["record_sha256"] = report.checkpoint_digest(value["record"])
+        else:
+            value[{"digest": "record_sha256", "identifier": "request_id"}[kind]] = "invalid"
+        write(path, value)
+
+
+def check_receipt_recovery(root):
+    args = fixture(root)
+    directory = first_row(args.candidate)
+    seal_ledger(directory)
+    before = report.build_report(args)
+    assert before["status"] == "PASS"
+    (directory / "requests.jsonl").unlink()
+    after = report.build_report(args)
+    assert after["status"] == "PASS", report.readable(after)
+    assert after["candidate"]["cost_mean_bootstrap_95"] == before["candidate"]["cost_mean_bootstrap_95"]
+    assert after["candidate"]["cost_total_usd"] == before["candidate"]["cost_total_usd"]
+    write(directory / "meter-intents" / "lost.intent.json", dict(request_id="lost", incarnation="old"))
+    check_unknown(report.build_report(args))
+
+
+def check_cost_clusters(root):
+    args = fixture(root)
+    factors = (1, 2, 4)
+    for arm in (args.baseline, args.candidate):
+        for directory in (arm / "rows").iterdir():
+            row = report.read_json(directory / "result.json")
+            factor = factors[TASKS.index((row["source"], row["task"]))] * row["attempt"]
+            path = directory / "requests.jsonl"
+            records = report.read_lines(path)
+            for record in records:
+                record["usage"]["input_tokens"] *= factor
+                record["usage"]["output_tokens"] *= factor
+            path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    result = report.build_report(args)
+    assert result["status"] == "PASS", report.readable(result)
+    means = [0.00165 * factors[TASKS.index(task)] * 2 for task in sorted(TASKS)]
+    randomizer = random.Random(args.seed)
+    samples = sorted(sum(means[randomizer.randrange(3)] for _ in range(3)) / 3 for _ in range(args.bootstrap_reps))
+    expected = [report.percentile(samples, probability) for probability in (0.025, 0.975)]
+    for arm in ("baseline", "candidate"):
+        interval = result[arm]["cost_mean_bootstrap_95"]
+        assert math.isclose(interval["mean"], sum(means) / 3)
+        assert all(math.isclose(first, second) for first, second in zip(interval["ci_95"], expected))
+        assert interval["ci_95"][0] < interval["mean"] < interval["ci_95"][1]
+    assert result["paired"]["cost_difference_usd"] == dict(mean=0.0, ci_95=[0.0, 0.0])
+    change_requests(args.candidate, lambda rows: rows[0].update(status=0))
+    check_unknown(report.build_report(args))
+    assert report.build_report(args)["baseline"]["cost_mean_bootstrap_95"] is not None
+
+
 def checkpoint_fixture(args):
     for arm in (args.baseline, args.candidate):
         old = report.read_json(arm / "campaign.json")
@@ -189,6 +289,7 @@ def checkpoint_fixture(args):
         identity["images"] = {directory.name: "sha256:" + "9" * 64 for directory in directories}
         write(arm / "campaign.json", dict(schema=1, identity=identity, created=123))
         for directory in directories:
+            seal_ledger(directory)
             path = directory / "result.json"
             row = report.read_json(path)
             row.pop("campaign_sha256")
@@ -253,7 +354,7 @@ def main():
         valid.mkdir()
         check_valid(fixture(valid))
         mutations = [
-            ("incomplete", lambda args: shutil.rmtree(first_row(args.candidate)), fails),
+            ("incomplete", lambda args: shutil.rmtree(first_row(args.candidate)), check_incomplete),
             ("duplicate", duplicate, fails),
             ("unknown-task", lambda args: change_row(args.candidate, lambda row: row.update(task="foreign")), fails),
             ("unknown-agent", lambda args: change_row(args.candidate, lambda row: row.update(agent="nanocode")), fails),
@@ -280,7 +381,15 @@ def main():
             ("no-improvement", lambda args: setattr(args, "min_improvement_pp", 34), fails),
             ("over-budget", lambda args: setattr(args, "max_cost", 0.001), fails),
         ]
+        mutations.extend(("ledger-" + kind, lambda args, kind=kind: ledger_mutation(args, kind), check_unknown)
+                         for kind in ("unresolved", "unclosed", "orphan-completion", "orphan-request", "duplicate", "digest", "incarnation", "identifier"))
         rejected = [run_mutant(root, *mutation) for mutation in mutations]
+        varied = root / "varied-cost"
+        varied.mkdir()
+        check_cost_clusters(varied)
+        recovery = root / "receipt-recovery"
+        recovery.mkdir()
+        check_receipt_recovery(recovery)
         checkpoint = root / "checkpoint"
         checkpoint.mkdir()
         check_checkpoint(checkpoint)
@@ -292,6 +401,7 @@ def main():
         result = report.build_report(args)
         assert result["baseline"]["cost_total_usd"] is None
         assert result["baseline"]["cost_mean_usd"] is None
+        assert result["baseline"]["cost_mean_bootstrap_95"] is None
         assert len(result["baseline"]["unknown_external_streams"]) == 2
         assert result["paired"]["cost_difference_usd"] is None
         assert result["status"] == "FAIL"
@@ -307,6 +417,7 @@ def main():
         assert len(result["baseline"]["unknown_cost_rows"]) == 2
         assert result["baseline"]["cost_total_usd"] is None
         assert result["baseline"]["cost_mean_usd"] is None
+        assert result["baseline"]["cost_mean_bootstrap_95"] is None
         assert result["paired"]["cost_difference_usd"] is None
         assert result["status"] == "FAIL"
         suite60 = report.read_suite(ROOT / "suite-60.txt")
@@ -318,6 +429,9 @@ def main():
         args = fixture(full, suite60)
         assert report.build_report(args)["profile"] == "MATCHED180"
         assert report.build_report(args)["paired"]["clusters"] == 60
+        for name in ("baseline", "candidate"):
+            assert report.build_report(args)[name]["cost_mean_bootstrap_95"]["clusters"] == 60
+            assert report.build_report(args)[name]["cost_mean_bootstrap_95"]["attempts_per_cluster"] == 3
         historical = root / "historical"
         historical.mkdir()
         args = fixture(historical, suite60[:35])

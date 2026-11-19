@@ -96,6 +96,8 @@ def raw_usage(message):
 def request_cost(record, response, row_id):
     if not isinstance(record, dict):
         raise ValueError("invalid request record")
+    if record.get("usage_known") is False:
+        raise ValueError("request usage not established")
     if record.get("status") != 200 or record.get("error"):
         raise ValueError("request status/error: " + str(record.get("status")))
     if record.get("run", row_id) != row_id:
@@ -114,18 +116,92 @@ def request_cost(record, response, row_id):
     return amount, model
 
 
-def price_row(directory, row):
+def ledger_json(path, issues):
+    try:
+        return read_json(path)
+    except (OSError, ValueError) as error:
+        issues.append("invalid durable meter evidence %s: %s" % (path.name, error))
+        return {}
+
+
+def meter_ledger(directory, records, required):
+    root = directory / "meter-intents"
+    status = {"required": required, "intents": 0, "completed": 0, "issues": [], "duplicate_record_numbers": [], "recovered_records": []}
+    issues = status["issues"]
+    if not root.is_dir() and not required:
+        return status
+    closed = directory / "meter-closed.json"
+    if not closed.is_file() or not ledger_json(closed, issues).get("incarnation"):
+        issues.append("durable meter accounting is not closed")
+    if not root.is_dir():
+        issues.append("missing durable meter intents")
+        return status
+    by_id = {}
+    for number, record in enumerate(records, 1):
+        if not isinstance(record, dict) or not str(record.get("path", "")).split("?")[0].endswith(MODEL_ENDPOINTS):
+            continue
+        key = record.get("request_id")
+        if not isinstance(key, str) or not key:
+            issues.append("model request %d has no durable request identifier" % number)
+        elif key in by_id:
+            issues.append("duplicate durable request identifier: " + key)
+            status["duplicate_record_numbers"].append(number)
+        else:
+            by_id[key] = checkpoint_digest(record)
+    intent_ids, done_ids = set(), set()
+    for path in sorted(root.iterdir()):
+        if path.name.endswith(".done.json"):
+            done_ids.add(path.name.removesuffix(".done.json"))
+            continue
+        if not path.name.endswith(".intent.json"):
+            issues.append("unknown durable meter entry: " + path.name)
+            continue
+        key = path.name.removesuffix(".intent.json")
+        intent_ids.add(key)
+        intent = ledger_json(path, issues)
+        done_path = root / (key + ".done.json")
+        if not done_path.is_file():
+            issues.append("unresolved durable meter intent: " + key)
+            continue
+        done = ledger_json(done_path, issues)
+        if intent.get("request_id") != key or done.get("request_id") != key:
+            issues.append("durable meter intent/completion identifier mismatch: " + key)
+        elif not isinstance(done.get("record"), dict):
+            issues.append("missing durable meter completion record: " + key)
+        elif not intent.get("incarnation") or done["record"].get("meter_incarnation") != intent["incarnation"]:
+            issues.append("durable meter incarnation mismatch: " + key)
+        elif done["record"].get("request_id") != key or checkpoint_digest(done["record"]) != done.get("record_sha256") or (key in by_id and by_id[key] != done["record_sha256"]):
+            issues.append("durable meter completion/request digest mismatch: " + key)
+        else:
+            status["completed"] += 1
+            if key not in by_id:
+                status["recovered_records"].append(done["record"])
+    status["intents"] = len(intent_ids)
+    for key in sorted(done_ids - intent_ids):
+        issues.append("orphan durable meter completion: " + key)
+    for key in sorted(set(by_id) - intent_ids):
+        issues.append("orphan durable model request: " + key)
+    return status
+
+
+def price_row(directory, row, require_ledger=False):
     path = directory / "requests.jsonl"
     result = {"total_usd": None, "lower_bound_usd": 0.0, "unknown": [], "requests": 0, "non_model_records": 0, "by_model_usd": {}}
-    if not path.is_file():
+    records = read_lines(path) if path.is_file() else []
+    result["ledger"] = meter_ledger(directory, records, require_ledger)
+    recovered = result["ledger"].pop("recovered_records")
+    result["unknown"].extend(result["ledger"]["issues"])
+    if not path.is_file() and not recovered:
         result["unknown"].append("missing request log")
-        return result
-    records = read_lines(path)
+    duplicate_records = set(result["ledger"]["duplicate_record_numbers"])
     responses_path = directory / "responses.jsonl"
     responses = read_lines(responses_path) if responses_path.is_file() else None
     if responses is not None and len(responses) != len(records):
         result["unknown"].append("request/response log lengths differ")
         responses = None
+    records.extend(recovered)
+    if responses is not None:
+        responses.extend([None] * len(recovered))
     for index, record in enumerate(records):
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
             result["unknown"].append("record %d: missing request path" % (index + 1))
@@ -137,6 +213,8 @@ def price_row(directory, row):
                 result["unknown"].append("record %d: unrecognized endpoint %s" % (index + 1, endpoint))
             continue
         result["requests"] += 1
+        if index + 1 in duplicate_records:
+            continue
         try:
             response = responses[index] if responses is not None else None
             amount, model = request_cost(record, response, row.get("id"))
@@ -313,7 +391,7 @@ def load_arm(path, tasks, attempts, agent):
         else:
             row = read_json(result_path)
             issues.extend(validate_row(row, directory, manifest, identity, agent))
-        row["pricing"] = price_row(directory, row)
+        row["pricing"] = price_row(directory, row, checkpoint_schema)
         key = row_key(row)
         if key in by_key:
             issues.append("duplicate row: " + str(key))
@@ -419,6 +497,7 @@ def arm_summary(arm, expected):
             "pass_rate": passed / expected, "pass_wilson_95": wilson(passed, expected) if arm["complete"] else None,
             "cost_total_usd": lower_bound if full_cost else None, "cost_lower_bound_usd": lower_bound,
             "cost_mean_usd": lower_bound / expected if full_cost else None,
+            "cost_mean_bootstrap_95": None,
             "cost_mean_lower_bound_usd": lower_bound / expected if arm["complete"] else None,
             "unknown_cost_rows": unknown, "unknown_external_streams": external_unknown,
             "accounting_evidence": evidence, "issues": arm["issues"],
@@ -430,6 +509,20 @@ def percentile(values, probability):
     lower = math.floor(position)
     fraction = position - lower
     return values[lower] * (1 - fraction) + values[math.ceil(position)] * fraction
+
+
+def arm_cost_bootstrap(arm, summary, tasks, attempts, repetitions, seed):
+    if summary["cost_mean_usd"] is None:
+        return None
+    clusters = [sum(arm["by_key"][task + (attempt,)]["pricing"]["total_usd"]
+                    for attempt in range(1, attempts + 1)) / attempts for task in tasks]
+    count = len(clusters)
+    randomizer = random.Random(seed)
+    samples = sorted(sum(clusters[randomizer.randrange(count)] for _ in range(count)) / count
+                     for _ in range(repetitions))
+    return {"method": "task-cluster percentile bootstrap; all attempts retained per sampled task",
+            "clusters": count, "attempts_per_cluster": attempts, "repetitions": repetitions, "seed": seed,
+            "mean": summary["cost_mean_usd"], "ci_95": [percentile(samples, 0.025), percentile(samples, 0.975)]}
 
 
 def clustered_bootstrap(base, candidate, tasks, attempts, repetitions, seed):
@@ -479,6 +572,8 @@ def build_report(args):
     matched = not (issues or base["issues"] or candidate["issues"])
     expected = len(tasks) * args.attempts
     baseline_summary, candidate_summary = [arm_summary(arm, expected) for arm in (base, candidate)]
+    for arm, summary in ((base, baseline_summary), (candidate, candidate_summary)):
+        summary["cost_mean_bootstrap_95"] = arm_cost_bootstrap(arm, summary, tasks, args.attempts, args.bootstrap_reps, args.seed)
     paired = clustered_bootstrap(base, candidate, tasks, args.attempts, args.bootstrap_reps, args.seed) if matched else None
     if paired and (baseline_summary["cost_total_usd"] is None or candidate_summary["cost_total_usd"] is None):
         paired["cost_difference_usd"] = None
@@ -490,6 +585,7 @@ def build_report(args):
     canonical = read_suite(Path(__file__).with_name("suite-60.txt"))
     profile = "MATCHED180" if tasks == canonical and args.attempts == 3 else "CUSTOM_%d_TASKS_%d_ATTEMPTS_NOT_MATCHED180" % (len(tasks), expected)
     return {"schema_version": 1, "profile": profile, "matched": matched, "status": "PASS" if all(gates.values()) else "FAIL",
+            "experiment": "quality-first: model/effort/finish-check/budget configuration stays matched. Intentional model/cost-cascade/finish-check config changes require a separate cost experiment; this report does not exempt them.",
             "policy": {"gates_apply_to": "candidate; both arms require complete matched matrices", "min_success": args.min_success, "max_cost_usd_per_attempt": args.max_cost, "min_improvement_pp": args.min_improvement_pp},
             "gates": gates, "issues": issues, "treatment": treatment, "baseline": baseline_summary, "candidate": candidate_summary,
             "paired": paired, "prices_per_million_tokens": PRICES_PER_MTOK, "prices_source": PRICES_SOURCE,
@@ -501,6 +597,9 @@ def readable(report):
     for name in ("baseline", "candidate"):
         arm = report[name]
         cost_label = "$%.6f/attempt" % arm["cost_mean_usd"] if arm["cost_mean_usd"] is not None else "unknown cost (known lower bound $%.6f total)" % arm["cost_lower_bound_usd"]
+        cost_interval = arm["cost_mean_bootstrap_95"]
+        if cost_interval:
+            cost_label += " [95%% task-cluster $%.6f, $%.6f; %d clusters x %d attempts]" % (*cost_interval["ci_95"], cost_interval["clusters"], cost_interval["attempts_per_cluster"])
         interval = arm["pass_wilson_95"]
         confidence = " [95%% Wilson %.2f%%, %.2f%%]" % (100 * interval[0], 100 * interval[1]) if interval else ""
         lines.append("%s: %d/%d passed (%.2f%%)%s; %d failed, %d errors, %d missing; %s; %d unknown-cost rows" % (name, arm["counts"]["passed"], arm["expected_attempts"], 100 * arm["pass_rate"], confidence, arm["counts"]["failed"], arm["counts"]["errored"], len(arm["missing"]), cost_label, len(arm["unknown_cost_rows"])))
