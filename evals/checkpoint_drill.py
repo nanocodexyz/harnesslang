@@ -363,12 +363,13 @@ def service_drill(base):
     release(os.path.join(base, "service.release"))
     return 1
 
-def accounting_drill(base):
+def accounting_drill(base, sse=False):
     import http.client
     import meter
     results = []
     for index in range(3):
-        directory = os.path.join(base, 'accounting-' + str(index))
+        run_id = ('terminal-sse-' if sse else 'accounting-') + str(index)
+        directory = os.path.join(base, run_id)
         checkpoint.durable_directory(directory)
         entered, release_finish, consumed = threading.Event(), threading.Event(), threading.Event()
         original_finish, original_upstream = checkpoint_meter.finish, meter.upstream
@@ -380,14 +381,17 @@ def accounting_drill(base):
             status = 200
             sent = False
             def getheader(self, key):
-                return 'application/json'
+                return 'text/event-stream' if sse else 'application/json'
             def getheaders(self):
-                return [('content-type', 'application/json')]
+                return [('content-type', self.getheader('content-type'))]
             def read1(self, size):
                 if self.sent:
                     return b''
                 self.sent = True
-                return json.dumps({'object': 'response', 'usage': {'input_tokens': 3, 'output_tokens': 2}}).encode()
+                response = {'object': 'response', 'usage': {'input_tokens': 3, 'output_tokens': 2}}
+                if sse:
+                    return b'data: ' + json.dumps({'type': 'response.completed', 'response': response}).encode() + b'\n\n'
+                return json.dumps(response).encode()
         class Connection:
             def request(self, *args, **kwargs):
                 ledger, _ = checkpoint_meter.snapshot(directory, 'live')
@@ -410,15 +414,24 @@ def accounting_drill(base):
         def client():
             try:
                 connection = http.client.HTTPConnection(*server.server_address, timeout=TIMEOUT_SECONDS)
-                connection.request('POST', '/run/accounting-' + str(index) + '/openai/v1/responses', body=b'{}')
-                assert connection.getresponse().read()
+                connection.request('POST', '/run/' + run_id + '/openai/v1/responses', body=b'{}')
+                response = connection.getresponse()
+                if sse:
+                    assert b'response.completed' in response.readline()
+                    consumed.set()
+                    assert release_finish.wait(TIMEOUT_SECONDS)
+                assert response.read()
                 consumed.set()
                 connection.close()
             except BaseException as error:
                 errors.append(repr(error))
         reader = threading.Thread(target=client)
         reader.start()
-        assert entered.wait(TIMEOUT_SECONDS) and not consumed.wait(POLL_SECONDS)
+        assert entered.wait(TIMEOUT_SECONDS)
+        if sse:
+            assert consumed.wait(TIMEOUT_SECONDS)
+        else:
+            assert not consumed.wait(POLL_SECONDS)
         assert checkpoint_meter.snapshot(directory, 'live')[0]['active'] == 1
         drained = []
         barrier = threading.Thread(target=lambda: drained.append(checkpoint_meter.reconcile(directory, 'live', TIMEOUT_SECONDS)))
@@ -443,7 +456,7 @@ def accounting_drill(base):
         server.shutdown()
         server.server_close()
         worker.join(TIMEOUT_SECONDS)
-        results.append({'intent_before_upstream': True, 'eof_after_receipt': True, 'barrier_waited': True, 'receipt_without_log_counted': True})
+        results.append({'intent_before_upstream': True, 'eof_after_receipt': True, 'barrier_waited': True, 'receipt_without_log_counted': True, 'terminal_sse_consumed_before_receipt': sse})
     return results
 
 
@@ -693,6 +706,43 @@ def routing_drill():
     return {'billed_routes_not_model_list_translation': paths, 'translated_models_get_unbilled': True}
 
 
+def source_pin_drill(base):
+    import provenance
+    root = os.path.join(base, 'source-pin-fixture')
+    paths = ['hosts/runtime' + suffix for suffix in ('.wat', '.mjs', '.js', '.c', '.h', '.inc')]
+    paths += ['rust-toolchain', 'rust-toolchain.toml', '.cargo/config.toml', '.cargo/config']
+    excluded = ['agents/' + name + '/artifact.py' for name in provenance.SOURCE_EXCLUDED]
+    for path in paths + excluded:
+        absolute = os.path.join(root, path)
+        os.makedirs(os.path.dirname(absolute), exist_ok=True)
+        with open(absolute, 'w') as handle:
+            handle.write('fixture input')
+    pins = provenance.source_files(root)
+    assert set(pins) == set(paths)
+    campaign_path = os.path.join(base, 'source-pin-campaign')
+    campaign = checkpoint.Campaign(campaign_path, {'source_files': pins}, False)
+    campaign.close()
+    for path in paths:
+        absolute = os.path.join(root, path)
+        with open(absolute, 'w') as handle:
+            handle.write('mutated input')
+        mutated = provenance.source_files(root)
+        assert mutated[path] != pins[path]
+        try:
+            checkpoint.Campaign(campaign_path, {'source_files': mutated}, True)
+        except checkpoint.ResumeError:
+            pass
+        else:
+            raise AssertionError('runtime/toolchain mutation accepted: ' + path)
+        with open(absolute, 'w') as handle:
+            handle.write('fixture input')
+    for path in excluded:
+        with open(os.path.join(root, path), 'w') as handle:
+            handle.write('changed artifact')
+    assert provenance.source_files(root) == pins
+    return {'runtime_toolchain_mutations_rejected': len(paths), 'artifact_directories_ignored': len(excluded)}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--intent-worker')
@@ -727,6 +777,8 @@ def main():
     service_recoveries = service_drill(base)
     stopped = stopped_drill(base, fixture)
     accounting = accounting_drill(base)
+    terminal_sse = accounting_drill(base, True)
+    source_pins = source_pin_drill(base)
     intents = intent_crash_drill(base)
     saved = saved_agent_drill(base, fixture)
     collisions = collision_drill(base)
@@ -737,7 +789,7 @@ def main():
     print(json.dumps({'fixture': base, 'matrix_rows': len(rows), 'process_kills': 3,
         'agent_dispatches': 3, 'verifier_dispatches': 3, 'completed_immutable': 3,
         'identity_mutations_rejected': rejected, 'interruption_guards': interruptions,
-        'api_edge_n3_each': streams, 'routing': routing, 'ledger_mutations': ledger_mutations, 'cache_hook': cache, 'accounting_n3': accounting, 'intent_owner_sigkill_n3': intents, 'saved_agent_window_n3': saved, 'relay_collision_cleanup_n3': collisions,
+        'terminal_sse_barrier_n3': terminal_sse, 'runtime_source_pins': source_pins, 'api_edge_n3_each': streams, 'routing': routing, 'ledger_mutations': ledger_mutations, 'cache_hook': cache, 'accounting_n3': accounting, 'intent_owner_sigkill_n3': intents, 'saved_agent_window_n3': saved, 'relay_collision_cleanup_n3': collisions,
         'shell_receipts': shell_receipts, 'service_owner_kill_recoveries': service_recoveries, 'stopped_container_drill': stopped, 'model_calls': 0, 'docker_calls': 0}, sort_keys=True))
 
 
