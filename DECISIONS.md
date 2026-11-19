@@ -646,3 +646,23 @@ SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scr
 ```
 
 The first command builds the reference workspaces with fresh caches and networking disabled. The second runs the full local suite: repeated component comparisons, seeded simulations, compiled-host comparisons, checks that deliberately broken programs are rejected, bounded-program proofs and checks against the source-size limits in `gate.txt`. Both commands disable remote builds; the job variables select build and check concurrency.
+
+
+## Durable evaluation attempts and matched reports
+
+The existing Rust compiler builds Harnesslang agent programs for fixed platform hosts. The model evaluator runs an agent on benchmark tasks and tests its solutions. One attempt includes agent execution and a separate verifier, the task-specific test script; the controller is the Python process coordinating those phases.
+
+Local verification passed on November 19, 2026 PST. These commands disable remote builds, build vendored reference implementations and check the compiler locally; they do not run model benchmarks:
+
+```sh
+SHIPPY_REMOTE_BUILD=0 CARGO_BUILD_JOBS=2 scripts/offline-check.sh --build
+SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh
+```
+
+The evaluator now saves each attempt's identity, phase deadlines, receipts and completed result durably. A restarted controller can wait for the original phase and collect its saved result without dispatching it again. A receipt records a phase's completion. Missing receipts remain explicit infrastructure errors with unknown model usage and cost; they are not silently replaced with fresh attempts. This does not guarantee recovery after every worker-machine failure or exactly-once external billing.
+
+Baseline and candidate campaigns are the two comparison arms. Verifier dependency container images and downloaded artifacts have content-addressed manifests. Cache selection is explicit and identical across comparison arms. The benchmark task for recovering a SQLite write-ahead log has a verifier that still downloads installer metadata; warming its dependencies does not change its assertions or solve its task.
+
+A matched report compares baseline and candidate agent campaigns. It requires every planned task and repetition, known request-level usage and identical measurement settings. Intended differences in the Harnesslang agent program and its compiled executable package must be listed separately. The acceptance gate requires a 95% task-paired pass-rate improvement interval above zero as well as at least 92% passing attempts, at most $0.010 per attempt and at least five percentage points of pass-rate improvement over baseline. Cache, checkpoint and reporting drills now run in the default local suite.
+
+These changes add evaluator support code. They do not remove handwritten compiler or host code, show that the compiler can build an identical successor, or demonstrate a higher benchmark pass rate.

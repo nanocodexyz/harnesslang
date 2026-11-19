@@ -427,6 +427,9 @@ queue selfhost-assemble python3 scripts/selfhost-lex-assemble.py --runs 3 --muta
 queue selfhost-functions python3 scripts/selfhost-func.py --allocated --runs 3 --out "$(mktemp -d "$PWD/output/selfhost-func.XXXXXXXX")"
 queue selfhost-components scripts/selfhost-components.sh
 queue offline scripts/offline-check.sh
+queue eval-cache python3 evals/cache_selfcheck.py
+queue eval-checkpoints python3 evals/checkpoint_drill.py --out "$scratch/eval-checkpoints"
+queue eval-report python3 evals/matched_report_drill.py
 for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl docs/snippets/in_flight.hl docs/snippets/fork.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"

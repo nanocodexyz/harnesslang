@@ -769,6 +769,8 @@ def main():
     if args.phase_worker:
         phase_worker(*args.phase_worker)
         return
+    if args.out:
+        checkpoint.durable_directory(os.path.abspath(args.out))
     base = tempfile.mkdtemp(prefix='checkpoint-drill-', dir=args.out)
     fixture, rows, identity = resume_drill(base)
     rejected = mutation_drill(fixture, rows, identity)

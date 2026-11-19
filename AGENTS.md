@@ -36,3 +36,32 @@ SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true scripts/selfhost-components.sh
 ```
 
 These checks compare components; they do not establish a full self-hosted compiler or byte-identical compiler output when a compiler builds its successor. `scripts/ci.sh` runs locally, not in GitHub Actions. Follow any repository protections instead of bypassing them.
+
+## Restartable model experiments
+
+The model evaluator has separate checks from the compiler suite. Before using model credentials, run:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 evals/cache_selfcheck.py
+PYTHONDONTWRITEBYTECODE=1 python3 evals/checkpoint_drill.py --out output/checkpoint-drills
+PYTHONDONTWRITEBYTECODE=1 python3 evals/matched_report_drill.py
+```
+
+A campaign fixes its task suite, attempt count, configuration and agent package: the executable and libraries staged by `evals/agent-root.sh`. For a ChatGPT-backed run, set `NANOEVAL_CHATGPT_LOGIN` to a private login-file path. Set `TASKS` to the fetched task directory, `AGENT_ROOT` to the staged agent package, `MODEL` to the starting model, `CA_BUNDLE` to the trusted PEM certificate file, and `CAMPAIGN` to a new output directory under `$HOME`. Preflight the full command:
+
+```sh
+python3 evals/run.py --suite evals/suite-60.txt --tasks "$TASKS" \
+  --agent-root "$AGENT_ROOT" --out "$CAMPAIGN" --agents hl-agent \
+  --attempts 3 --model "$MODEL" --parallel 1 --limits task \
+  --openai-route chatgpt --ca-bundle "$CA_BUNDLE" --preflight
+```
+
+`--limits task` requests each task's configured CPU and memory limits; if those cannot be enforced, declare a separate experiment with `--limits none` in both arms. Do not change limits while resuming. This checks local inputs and image availability without starting models or downloading images. Then run that command without `--preflight`. Keep its output under the worker computer's persistent home directory. At startup, `evals/run.py` prints the exact command with `--resume` included; use that command with the original inputs and configuration after an interruption.
+
+An attempt is one agent solving one task and the task's verifier testing its result. These are its agent-execution and verifier-execution phases. They run separately from the controlling Python process, so restarting that process can reattach to a still-running phase. Completed attempts are immutable. A stopped phase with an uncertain outcome is retained as an infrastructure error, not repeated as a fresh attempt. Other unstarted attempts can continue. Infrastructure errors remain nonpasses in the planned pass-rate denominator and block a complete matched result. Lost model usage remains unknown, not zero. These rules preserve evidence; they do not guarantee recovery of every interrupted operation.
+
+A verifier cache contains a pinned dependency image and artifacts, without changing task assertions. `evals/cache_wal.py --help` describes preparing the supported cache for the SQLite write-ahead-log (WAL) recovery task. It produces a variant-manifest digest. Select it with `--cache-variant SOURCE/TASK=SHA256`: SOURCE is the dataset collection, TASK its task name, and SHA256 that digest. A prewarmed image can still require network access.
+
+An experiment arm is one campaign being compared, such as baseline or candidate. Both arms must use the same per-task cache variant, image, HTTP proxy and trusted certificates, and CPU/memory settings. These are pinned from the runner's arguments and environment. A newly cached campaign is not a controlled comparison against an older uncached campaign.
+
+For acceptance, select `--suite evals/suite-60.txt --attempts 3` in both campaigns and the report. This is the complete matched-arm acceptance profile. See `evals/report.py --help` for reporting options. Declare intended repository-file differences with repeated `--allow-source-change` paths, and staged executable differences with `--allow-agent-change` paths. Differences in the evaluator scripts or toolchain cannot be exempted. Missing attempts, unknown usage or mismatched measurement settings cannot establish a passing result.
