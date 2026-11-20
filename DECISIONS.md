@@ -694,3 +694,25 @@ The combined terminal-receipt and reference-cache changes passed the complete lo
 ```sh
 SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh
 ```
+
+
+## Pinned R verifier dependency-cache preparation
+
+The evaluator can now plan dependency-cache preparation for the adaptive-rejection-sampler task. The helper pins the task, verifier and assertions, setup script, toolchain, transport and resource profile. Container resource limits remain the default; an explicit `none` profile records that CPU and memory limits are unenforced, rather than silently falling back. Dependency setup checks `Rscript --version` separately from the unchanged `Rscript --vanilla -e` statistics-namespace check. The original task verifier and assertions are not rewritten, and a prepared cache can still require network access.
+
+Focused offline verification passed on November 19, 2026 PST. The first command ran three times, with four checks passing in each run. These checks use synthetic plans and loopback HTTP, reject resource-profile and input-pin mutations, and reject the old version-command ordering. The remaining commands parsed both changed Python files and checked each documented CLI entry point.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -B evals/cache_selfcheck.py
+python3 -B - <<'PY'
+import ast
+from pathlib import Path
+for name in ('evals/cache_r.py', 'evals/cache_selfcheck.py'):
+    ast.parse(Path(name).read_bytes())
+PY
+python3 -B evals/cache_r.py --help
+python3 -B evals/cache_r.py plan --help
+python3 -B evals/cache_r.py warm --help
+```
+
+The new helper adds 231 Python lines; the existing cache self-check grows by 102 lines and is already included in the default local check queue. The evaluator source manifest grows from 366 to 367 files. This is evaluator support code, not a reduction in compiler or fixed-host source. These focused checks did not run Docker, dependency warming, a task verifier, model requests, external downloads, builds or the full local suite; they do not establish runtime cache readiness or a benchmark improvement.

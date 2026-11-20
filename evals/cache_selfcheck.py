@@ -2,14 +2,17 @@ import concurrent.futures
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+from unittest import mock
 
 import cache_store as cache
+import cache_r
 
 
 def rejects(action):
@@ -108,6 +111,104 @@ def manifests(root):
     return {"variant_id": variant, "same_bytes_same_variant": True, "pin_and_comparison_mutations_rejected": True, "real_docker_image_tested": False}
 
 
+def r_limits(path, ca, limits):
+    original = path.read_bytes()
+    record = cache_r.inspect_plan(path, ca)
+    enforced = limits == "container"
+    assert record["warm_limits"] == limits
+    assert record["warm_limits_enforced"] is enforced
+    assert record["warm_cpus"] == (1 if enforced else None)
+    assert record["warm_memory_mb"] == (2048 if enforced else None)
+    assert cache_r.limits_args(record) == (["--cpus", "1", "--memory", "2048m"] if enforced else [])
+    host = {"NanoCpus": 1000000000 if enforced else 0, "Memory": 2147483648 if enforced else 0}
+    cache_r.inspect_limits({"HostConfig": host}, record)
+    for field in host:
+        for value in (None, False, str(host[field]), host[field] + 1):
+            rejects(lambda: cache_r.inspect_limits({"HostConfig": host | {field: value}}, record))
+        rejects(lambda: cache_r.inspect_limits({"HostConfig": {key: value for key, value in host.items() if key != field}}, record))
+    mutations = (("warm_limits", "none" if enforced else "container"), ("warm_limits", "task"),
+        ("schema", "r-cache-plan-v1"), ("warm_limits", None), ("warm_limits_enforced", not enforced), ("warm_limits_enforced", int(enforced)),
+        ("warm_cpus", 2), ("warm_cpus", True), ("warm_memory_mb", 4096), ("warm_memory_mb", "2048"))
+    for field, value in mutations:
+        path.write_bytes(cache.canonical(record | {field: value}))
+        rejects(lambda: cache_r.inspect_plan(path, ca))
+        rejects(lambda: cache_r.warm(path, None, 1, ca))
+    for field in ("warm_limits", "warm_limits_enforced", "warm_cpus", "warm_memory_mb"):
+        path.write_bytes(cache.canonical({key: value for key, value in record.items() if key != field}))
+        rejects(lambda: cache_r.inspect_plan(path, ca))
+        rejects(lambda: cache_r.warm(path, None, 1, ca))
+    assert not path.with_name("warm-started.json").exists()
+    path.write_bytes(original)
+    default = cache_r.record_for(Path(record["task"]), record["download_timeout_sec"], ca)
+    assert cache_r.limits_args(default) == ["--cpus", "1", "--memory", "2048m"]
+    rejects(lambda: cache_r.plan(Path(record["task"]), path.parent / "bad-limits", 900, ca, "task"))
+    assert not (path.parent / "bad-limits").exists()
+
+
+def r_profile(root):
+    task = root / "task"
+    (task / "tests").mkdir(parents=True)
+    (task / "task.toml").write_text('[environment]\ndocker_image="' + cache_r.IMAGE_REF + '"\n')
+    (task / "instruction.md").write_text("mock task, not benchmark instructions\n")
+    verifier = task / "tests" / "test.sh"
+    verifier.write_text("mock verifier; never execute\n")
+    assertions = task / "tests" / "test_outputs.py"
+    assertions.write_text("mock assertions; never execute\n")
+    pins = dict(TASK_DIGEST=cache_r.run.task_digest(task), VERIFIER_SHA256=cache.hash_file(verifier), ASSERTIONS_SHA256=cache.hash_file(assertions))
+    ca = root / "ca.pem"
+    ca.write_bytes(b"mock CA, not a real trust anchor")
+    with mock.patch.multiple(cache_r, **pins), mock.patch.object(cache_r.wal, "docker", side_effect=AssertionError("offline plan invoked Docker")):
+        paths = []
+        for limits in ("container", "none"):
+            profile_paths = []
+            for number in range(3):
+                result = cache_r.plan(task, root / limits / str(number), 900, ca, limits)
+                profile_paths.append(Path(result["plan"]))
+                assert result["network_started"] is False
+                cache_r.inspect_plan(profile_paths[-1], ca)
+            assert len({path.read_bytes() for path in profile_paths}) == 1
+            assert len({path.with_name("setup.sh").read_bytes() for path in profile_paths}) == 1
+            r_limits(profile_paths[0], ca, limits)
+            paths.extend(profile_paths)
+        assert paths[0].read_bytes() != paths[-1].read_bytes()
+        assert paths[0].with_name("setup.sh").read_bytes() == paths[-1].with_name("setup.sh").read_bytes()
+        path = paths[0]
+        original = path.read_bytes()
+        record = json.loads(original)
+        for field, value in (("schema", "wal-cache-plan-v1"), ("task_digest", "0" * 64), ("verifier_sha256", "0" * 64), ("all_arms_required", False), ("assertions_sha256", "0" * 64), ("base_image_id", "sha256:" + "0" * 64), ("dependency_requests", {}), ("setup_transport", {}), ("setup_toolchain", {}), ("download_timeout_sec", 0)):
+            path.write_bytes(cache.canonical(record | {field: value}))
+            rejects(lambda: cache_r.inspect_plan(path, ca))
+        path.write_bytes(original)
+        setup = path.with_name("setup.sh")
+        before = setup.read_bytes()
+        setup.write_bytes(before + b"exit 0\n")
+        rejects(lambda: cache_r.inspect_plan(path, ca))
+        setup.write_bytes(before)
+        for changed in (verifier, assertions, task / "instruction.md", ca):
+            before = changed.read_bytes()
+            changed.write_bytes(before + b"mutation")
+            rejects(lambda: cache_r.inspect_plan(path, ca))
+            changed.write_bytes(before)
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://changed.invalid:1"}):
+            rejects(lambda: cache_r.inspect_plan(path, ca))
+        rejects(lambda: cache_r.plan(task, root / "bad-timeout", 0, ca))
+        script = setup.read_text()
+        assert "--no-install-recommends" in script
+        assert "r-base-core" in script
+        assert 'cd "$capture"' in script
+        assert "stage r-version Rscript --version\n" in script
+        assert "Rscript --vanilla --version" not in script
+        assert "Rscript --vanilla -e" in script
+        assert script.index("stage r-version Rscript --version\n") < script.index("stage r-stats Rscript --vanilla -e") < script.index('task_tree > "$capture/task-after"')
+        for name in ("pytest", "numpy", "scipy", "pytest-json-ctrf"):
+            assert name + "==" + cache_r.DEPENDENCIES[name] in script
+        assert "pytest --version" in script
+        assert "/tests/test.sh" not in script
+        assert "source(\"ars.R\")" not in script
+        assert cache_r.inspect_plan(path, ca) == record
+    return {"deterministic_plans_per_profile": 3, "profiles": ["container", "none"], "fixture_only": True, "task_assertion_profile_transport_setup_mutations_rejected": True, "docker_calls": 0}
+
+
 def main():
     output = Path(__file__).resolve().parents[1] / "output"
     output.mkdir(exist_ok=True)
@@ -116,6 +217,7 @@ def main():
         "restart_mirror": restart_mirror(root / "mirror"),
         "atomic_race": atomic_race(root / "race"),
         "manifest": manifests(root / "manifest"),
+        "r_profile": r_profile(root / "r-profile"),
     }
     result = {"passed": len(checks), "failed": 0, "checks": checks, "evidence_root": str(root), "real_network_downloads": 0, "docker_runs": 0, "model_requests": 0}
     (root / "summary.json").write_bytes(cache.canonical(result))
