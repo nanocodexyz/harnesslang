@@ -393,6 +393,8 @@ def accounting_drill(base, sse=False):
                     return b'data: ' + json.dumps({'type': 'response.completed', 'response': response}).encode() + b'\n\n'
                 return json.dumps(response).encode()
         class Connection:
+            def connect(self):
+                pass
             def request(self, *args, **kwargs):
                 ledger, _ = checkpoint_meter.snapshot(directory, 'live')
                 assert ledger['active'] == 1 and ledger['completed'] == 0
@@ -656,6 +658,8 @@ def stream_usage_drill(base):
                     return json.dumps({'object': 'chat.completion', 'usage': {'prompt_tokens': 7, 'completion_tokens': 4}}).encode()
                 return b'data: ' + json.dumps({'type': 'message_start', 'message': {'usage': {'input_tokens': 7, 'output_tokens': 0}}}).encode() + b'\n\n'
         class Connection:
+            def connect(self):
+                pass
             def request(self, *args, **kwargs):
                 pass
             def getresponse(self):

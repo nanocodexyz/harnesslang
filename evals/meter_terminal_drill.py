@@ -1,10 +1,13 @@
 import argparse
 import hashlib
+import http.client
 import io
 import json
 import os
 from pathlib import Path
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -22,6 +25,8 @@ CASES = ('before-sse', 'after-sse', 'before-json', 'after-json', 'keyed-only',
     'disconnect', 'terminal-disconnect', 'truncated', 'id-mismatch', 'model-mismatch', 'malformed', 'deliver-sse', 'deliver-json',
     'after-anthropic', 'truncated-anthropic', 'incomplete', 'failed', 'missing-model', 'missing-id',
     'incomplete-missing-status', 'failed-missing-status', 'incomplete-completed-status', 'failed-completed-status')
+DISPATCH_CASES = ('connect-oserror', 'connect-dns', 'connect-tls', 'before-connect',
+    'request-same-error', 'partial-send', 'incomplete-read')
 MODEL = 'gpt-6-luna'
 BODY = json.dumps({'model': MODEL, 'stream': True, 'input': 'fixture-only'}).encode()
 
@@ -75,6 +80,8 @@ def payload(case):
 def worker(directory, case):
     root = directory.parent
     wire = payload(case)
+    if case == 'incomplete-read':
+        wire = frame({'type': 'response.created', 'response': {'id': 'resp_fixture', 'model': MODEL}})
     response_type = 'application/json' if case.endswith('json') else 'text/event-stream'
     original_finish, original_atomic = checkpoint_meter.finish, checkpoint.atomic
 
@@ -110,10 +117,26 @@ def worker(directory, case):
             return [('content-type', response_type)]
 
         def read1(self, size):
-            return self.source.read(min(size, len(b'data: ')))
+            data = self.source.read(min(size, len(b'data: ')))
+            if not data and case == 'incomplete-read':
+                raise http.client.IncompleteRead(b'partial')
+            return data
 
     class Connection:
+        def connect(self):
+            intents = list((directory / 'meter-intents').glob('*.intent.json'))
+            assert len(intents) == 1 and not list((directory / 'meter-intents').glob('*.done.json'))
+            with open(directory / 'connects', 'a') as handle:
+                handle.write('connect\n')
+            if case in ('connect-oserror', 'before-connect'):
+                raise OSError('Tunnel connection failed: 502 Bad Gateway')
+            if case == 'connect-dns':
+                raise socket.gaierror('offline DNS failure')
+            if case == 'connect-tls':
+                raise ssl.SSLError('offline TLS failure')
+
         def request(self, method, path, body, headers):
+            assert self.auto_open is False
             intents = list((directory / 'meter-intents').glob('*.intent.json'))
             assert len(intents) == 1
             intent = checkpoint.read(str(intents[0]))
@@ -125,6 +148,17 @@ def worker(directory, case):
             assert 'do-not-persist' not in json.dumps(intent)
             with open(directory / 'dispatches', 'a') as handle:
                 handle.write('dispatch\n')
+            if case == 'partial-send':
+                class PartialSocket:
+                    def sendall(self, data):
+                        (directory / 'partial-bytes').write_bytes(data[:len(data) // 2])
+                        raise OSError('Tunnel connection failed: 502 Bad Gateway')
+                transport = http.client.HTTPConnection('offline.invalid')
+                transport.sock, transport.auto_open = PartialSocket(), False
+                transport.request(method, path, body=body, headers=headers)
+                raise AssertionError('partial send did not fail')
+            if case == 'request-same-error':
+                raise OSError('Tunnel connection failed: 502 Bad Gateway')
 
         def getresponse(self):
             return Response()
@@ -265,13 +299,150 @@ def mutation_check(base):
         cost = report.price_row(directory, {'id': directory.name, 'meter': {'requests': 1, 'unknown_requests': 0}}, True)
         assert cost['total_usd'] is None and cost['ledger']['completed'] == 0
     checkpoint.atomic(str(intent_path), intent)
+    legacy_intent = dict(intent, schema=2)
+    legacy_receipt = json.loads(json.dumps(original))
+    legacy_receipt['record']['intent_sha256'] = checkpoint.digest(legacy_intent)
+    legacy_receipt['record_sha256'] = checkpoint.digest(legacy_receipt['record'])
+    checkpoint.atomic(str(intent_path), legacy_intent)
+    checkpoint.atomic(str(done), legacy_receipt)
+    assert checkpoint_meter.snapshot(str(directory), 'replacement')[0]['completed'] == 1
+    assert report.price_row(directory, {'id': directory.name, 'meter': {'requests': 1}}, True)['total_usd'] is not None
+    checkpoint.atomic(str(intent_path), intent)
+    checkpoint.atomic(str(done), original)
     return list(mutations + intent_mutations)
+
+
+
+def check_dispatch_case(base, case, index):
+    import run
+    directory = base / (case + '-' + str(index))
+    directory.mkdir()
+    checkpoint.atomic(str(directory / 'checkpoint.json'), {'identity': {'fixture': directory.name}})
+    with open(directory / 'worker.log', 'wb') as log:
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+            '--worker', str(directory), '--case', case], stdout=log, stderr=log,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+        try:
+            wait_for(directory / 'ready.json')
+            process.kill()
+            assert process.wait(timeout=WAIT_SECONDS) == -signal.SIGKILL
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=WAIT_SECONDS)
+    status = checkpoint_meter.reconcile(str(directory), 'replacement', 0)
+    _, records = checkpoint_meter.snapshot(str(directory), 'replacement')
+    proven = case.startswith('connect-')
+    unresolved = case == 'before-connect'
+    totals = run.meter_totals(str(directory))
+    assert status['unknown'] == int(unresolved)
+    assert status['completed'] == int(not unresolved)
+    assert totals['not_dispatched_requests'] == int(proven)
+    assert totals['ok_requests'] == 0
+    assert totals['unknown_usage_requests'] == int(not proven and not unresolved)
+    assert run.outcome({}, {'reward': 1}, totals)[0] == 'errored'
+    row = {'id': directory.name, 'meter': dict(totals, unknown_requests=int(unresolved))}
+    priced = report.price_row(directory, row, True)
+    assert priced['total_usd'] is None
+    assert priced['not_dispatched_requests'] == int(proven)
+    if proven:
+        intent = checkpoint.read(str(next((directory / 'meter-intents').glob('*.intent.json'))))
+        assert report.request_cost(records[0], None, directory.name, intent) == (0.0, None)
+        assert not any(key in records[0] for key in ('usage', 'usage_known', 'terminal'))
+    assert (directory / 'connects').read_text() == 'connect\n'
+    dispatches = (directory / 'dispatches').read_text() if (directory / 'dispatches').exists() else ''
+    assert dispatches == ('' if proven or unresolved else 'dispatch\n')
+    assert (directory / 'partial-bytes').exists() is (case == 'partial-send')
+    if case == 'partial-send':
+        assert (directory / 'partial-bytes').read_bytes().startswith(b'POST ')
+    return {'case': case, 'repetition': index, 'request_calls': int(bool(dispatches)),
+        'not_dispatched': proven, 'unresolved_intent': unresolved, 'all_no_model_guard': True}
+
+
+def dispatch_mutations(base, index):
+    import run
+    directory = base / ('connect-oserror-' + str(index))
+    done = next((directory / 'meter-intents').glob('*.done.json'))
+    intent_path = next((directory / 'meter-intents').glob('*.intent.json'))
+    original, intent = checkpoint.read(str(done)), checkpoint.read(str(intent_path))
+    fields = ('intent_sha256', 'request_id', 'meter_incarnation', 'usage', 'usage_known',
+        'terminal', 'status', 'proof-schema', 'reason', 'body_sha256',
+        'attempt_identity_sha256', 'incarnation', 'old-schema', 'legacy-schema')
+    for field in fields:
+        changed, changed_intent = json.loads(json.dumps(original)), dict(intent)
+        record = changed['record']
+        if field in ('body_sha256', 'attempt_identity_sha256', 'incarnation', 'old-schema', 'legacy-schema'):
+            if field == 'legacy-schema':
+                changed_intent.pop('schema')
+            else:
+                changed_intent['schema' if field == 'old-schema' else field] = 2 if field == 'old-schema' else 'f' * 64
+            if field == 'attempt_identity_sha256':
+                record['intent_sha256'] = checkpoint.digest(changed_intent)
+        elif field == 'proof-schema':
+            record['not_dispatched']['schema'] = True
+        elif field == 'reason':
+            record['not_dispatched']['reason'] = 'unknown'
+        else:
+            record[field] = 200 if field == 'status' else True if field == 'usage_known' else {} if field in ('usage', 'terminal') else 'wrong'
+        changed['record_sha256'] = checkpoint.digest(record)
+        checkpoint.atomic(str(done), changed)
+        checkpoint.atomic(str(intent_path), changed_intent)
+        status, records = checkpoint_meter.snapshot(str(directory), 'replacement')
+        assert status['unknown'] == 1 and not records, field
+        assert run.meter_totals(str(directory))['not_dispatched_requests'] == 0
+        priced = report.price_row(directory, {'id': directory.name, 'meter': {'requests': 1}}, True)
+        assert priced['total_usd'] is None and priced['not_dispatched_requests'] == 0
+    checkpoint.atomic(str(done), original)
+    checkpoint.atomic(str(intent_path), intent)
+    return list(fields)
+
+
+def dispatch_mixed(base, index):
+    import run
+    directory = base / ('mixed-' + str(index))
+    directory.mkdir()
+    root = directory / 'meter-intents'
+    root.mkdir()
+    for case in ('after-sse', 'connect-oserror', 'request-same-error'):
+        source = base / (case + '-' + str(index))
+        intent_path = next((source / 'meter-intents').glob('*.intent.json'))
+        intent = checkpoint.read(str(intent_path))
+        done_path = next((source / 'meter-intents').glob('*.done.json'))
+        receipt = checkpoint.read(str(done_path))
+        record = receipt['record']
+        record['run'] = directory.name
+        intent['attempt_identity_sha256'] = checkpoint.digest({'run': directory.name})
+        record['intent_sha256'] = checkpoint.digest(intent)
+        receipt['record_sha256'] = checkpoint.digest(record)
+        checkpoint.atomic(str(root / intent_path.name), intent)
+        checkpoint.atomic(str(root / done_path.name), receipt)
+        checkpoint_meter.reconcile(str(directory), 'replacement', 0)
+        totals = run.meter_totals(str(directory))
+        priced = report.price_row(directory, {'id': directory.name, 'meter': totals}, True)
+        assert totals['requests'] == (1 if case == 'after-sse' else 2 if case == 'connect-oserror' else 3)
+        assert totals['ok_requests'] == 1
+        assert totals['input_tokens'] == 7 and totals['output_tokens'] == 4
+        expected = report.cost(MODEL, {'input_tokens': 7, 'output_tokens': 4,
+            'cache_read_tokens': 0, 'cache_write_tokens': 0})
+        assert priced['lower_bound_usd'] == expected
+        assert (priced['total_usd'] == expected) is (case != 'request-same-error')
+        if case != 'after-sse':
+            assert totals['not_dispatched_requests'] == priced['not_dispatched_requests'] == 1
+        if case == 'request-same-error':
+            assert totals['unknown_usage_requests'] == 1 and priced['total_usd'] is None
+        if case == 'connect-oserror':
+            for taint in ('unknown_at_timeout', 'unknown_after_infrastructure'):
+                tainted = report.price_row(directory, {'id': directory.name, 'meter': totals,
+                    'accounting_status': taint}, True)
+                assert tainted['total_usd'] is None
+    return {'repetition': index, 'known_requests': 1, 'not_dispatched_requests': 1,
+        'unknown_blocks_total': True, 'prior_taints_retained': True}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker', type=Path)
-    parser.add_argument('--case', choices=CASES)
+    parser.add_argument('--case', choices=CASES + DISPATCH_CASES)
     parser.add_argument('--out', type=Path, default=Path('output/meter-terminal'))
     args = parser.parse_args()
     if args.worker:
@@ -280,7 +451,10 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     base = Path(tempfile.mkdtemp(prefix='drill-', dir=args.out)).resolve()
     results = [check_case(base, case, index) for case in CASES for index in range(REPETITIONS)]
-    result = {'result': 'passed', 'fixture': str(base), 'process_kills': len(results),
+    dispatch = [check_dispatch_case(base, case, index) for case in DISPATCH_CASES for index in range(REPETITIONS)]
+    mixed = [dispatch_mixed(base, index) for index in range(REPETITIONS)]
+    result = {'dispatch_n3': dispatch, 'dispatch_mixed_n3': mixed,
+        'dispatch_mutations_rejected_n3': [dispatch_mutations(base, index) for index in range(REPETITIONS)], 'result': 'passed', 'fixture': str(base), 'process_kills': len(results) + len(dispatch),
         'model_calls': 0, 'network_calls': 0, 'docker_calls': 0, 'results': results,
         'binding_mutations_rejected': mutation_check(base)}
     checkpoint.atomic(str(base / 'result.json'), result)

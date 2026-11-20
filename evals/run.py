@@ -178,14 +178,18 @@ def verify(name, row, config, out, state=None):
 
 
 def meter_totals(directory):
-    totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "reasoning_tokens": 0, "tool_calls": 0, "unknown_usage_requests": 0, "statuses": {}}
-    _, records = checkpoint_meter.snapshot(directory, None)
+    totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "reasoning_tokens": 0, "tool_calls": 0, "unknown_usage_requests": 0, "not_dispatched_requests": 0, "statuses": {}}
+    bound_intents = {}
+    _, records = checkpoint_meter.snapshot(directory, None, bound_intents)
     for record in records:
         if not record["path"].split("?")[0].endswith(MODEL_ENDPOINTS):
             continue
         totals["requests"] += 1
         status = str(record.get("status"))
         totals["statuses"][status] = totals["statuses"].get(status, 0) + 1
+        if checkpoint_meter.not_dispatched(bound_intents.get(record.get('request_id')), record):
+            totals["not_dispatched_requests"] += 1
+            continue
         if record.get("status") == 200:
             totals["ok_requests"] += 1
         usage = record.get("usage") or {}

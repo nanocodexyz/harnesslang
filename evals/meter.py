@@ -152,11 +152,9 @@ def identity(value):
 
 
 def intent_metadata(directory, run, provider, path, body, started):
-    state = os.path.join(directory, 'checkpoint.json')
-    attempt = checkpoint.read(state)['identity'] if os.path.isfile(state) else {'run': run}
-    return {'schema': 2, 'provider': provider, 'path': path.split('?')[0],
+    return {'schema': 3, 'provider': provider, 'path': path.split('?')[0],
         'model': identity(summarize_request(body).get('model')), 'started': started,
-        'body_sha256': hashlib.sha256(body).hexdigest(), 'attempt_identity_sha256': checkpoint.digest(attempt)}
+        'body_sha256': hashlib.sha256(body).hexdigest(), 'attempt_identity_sha256': checkpoint_meter.attempt_identity_sha256(directory, run)}
 
 
 class Assembler:
@@ -326,7 +324,11 @@ class Meter(http.server.BaseHTTPRequestHandler):
         self.downstream_failed = False
         received = hashlib.sha256()
         record["status"] = 0
+        request_entered = False
         try:
+            connection.connect()
+            request_entered = True
+            connection.auto_open = False
             connection.request(self.command, path, body=body, headers=headers)
             response = connection.getresponse()
             if translated and response.status == 200:
@@ -386,6 +388,11 @@ class Meter(http.server.BaseHTTPRequestHandler):
                 raise
             record["status"] = 0
             assembler.message["error"] = repr(error)
+            if request_id and not request_entered:
+                record.update(ended=time.time(), error=repr(error),
+                    not_dispatched={'schema': 1, 'reason': 'connect_failed_before_request'})
+                checkpoint_meter.finish(directory, request_id, record)
+                persisted = True
         finally:
             connection.close()
         if not persisted:

@@ -96,9 +96,13 @@ def raw_usage(message):
             "cache_write_1h_tokens": (usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0)}
 
 
-def request_cost(record, response, row_id):
+def request_cost(record, response, row_id, intent=None):
     if not isinstance(record, dict):
         raise ValueError("invalid request record")
+    if "not_dispatched" in record:
+        if record.get("run") != row_id or not checkpoint_meter.not_dispatched(intent, record):
+            raise ValueError("invalid or unbound NotDispatched record")
+        return 0.0, None
     if record.get("usage_known") is False:
         raise ValueError("request usage not established")
     if record.get("status") != 200 or record.get("error"):
@@ -129,7 +133,7 @@ def ledger_json(path, issues):
 
 def meter_ledger(directory, records, required):
     root = directory / "meter-intents"
-    status = {"required": required, "intents": 0, "completed": 0, "issues": [], "duplicate_record_numbers": [], "recovered_records": []}
+    status = {"required": required, "intents": 0, "completed": 0, "issues": [], "duplicate_record_numbers": [], "recovered_records": [], "bound_intents": {}}
     issues = status["issues"]
     if not root.is_dir() and not required:
         return status
@@ -175,10 +179,11 @@ def meter_ledger(directory, records, required):
             issues.append("durable meter incarnation mismatch: " + key)
         elif done["record"].get("request_id") != key or checkpoint_digest(done["record"]) != done.get("record_sha256") or (key in by_id and by_id[key] != done["record_sha256"]):
             issues.append("durable meter completion/request digest mismatch: " + key)
-        elif not checkpoint_meter.bound_record(intent, done["record"]):
+        elif not checkpoint_meter.bound_record(intent, done["record"], directory):
             issues.append("durable meter terminal binding mismatch: " + key)
         else:
             status["completed"] += 1
+            status["bound_intents"][key] = intent
             if key not in by_id:
                 status["recovered_records"].append(done["record"])
     status["intents"] = len(intent_ids)
@@ -191,9 +196,10 @@ def meter_ledger(directory, records, required):
 
 def price_row(directory, row, require_ledger=False):
     path = directory / "requests.jsonl"
-    result = {"total_usd": None, "lower_bound_usd": 0.0, "unknown": [], "requests": 0, "non_model_records": 0, "by_model_usd": {}}
+    result = {"total_usd": None, "lower_bound_usd": 0.0, "unknown": [], "requests": 0, "non_model_records": 0, "not_dispatched_requests": 0, "by_model_usd": {}}
     records = read_lines(path) if path.is_file() else []
     result["ledger"] = meter_ledger(directory, records, require_ledger)
+    bound_intents = result["ledger"].pop("bound_intents")
     recovered = result["ledger"].pop("recovered_records")
     result["unknown"].extend(result["ledger"]["issues"])
     if not path.is_file() and not recovered:
@@ -222,9 +228,12 @@ def price_row(directory, row, require_ledger=False):
             continue
         try:
             response = responses[index] if responses is not None else None
-            amount, model = request_cost(record, response, row.get("id"))
+            amount, model = request_cost(record, response, row.get("id"), bound_intents.get(record.get("request_id")))
         except (ValueError, TypeError, AttributeError) as error:
             result["unknown"].append("request %d: %s" % (index + 1, error))
+            continue
+        if model is None:
+            result["not_dispatched_requests"] += 1
             continue
         result["lower_bound_usd"] += amount
         result["by_model_usd"][model] = result["by_model_usd"].get(model, 0.0) + amount
@@ -234,7 +243,7 @@ def price_row(directory, row, require_ledger=False):
         result["unknown"].append("incomplete request accounting: " + str(accounting))
     if meter.get("requests") != result["requests"]:
         result["unknown"].append("meter/request count mismatch or absent meter")
-    if not result["requests"]:
+    if result["requests"] == result["not_dispatched_requests"]:
         result["unknown"].append("no model requests; zero cost not established")
     if not result["unknown"]:
         result["total_usd"] = result["lower_bound_usd"]

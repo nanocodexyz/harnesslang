@@ -1,6 +1,7 @@
 import argparse
 import fcntl
 import json
+import math
 import os
 import runpy
 import sys
@@ -31,8 +32,49 @@ def begin(directory, incarnation, metadata=None):
     return request_id
 
 
-def bound_record(intent, record):
-    if intent.get('schema') != 2:
+def attempt_identity_sha256(directory, run):
+    state = os.path.join(directory, 'checkpoint.json')
+    attempt = checkpoint.read(state)['identity'] if os.path.isfile(state) else {'run': run}
+    return checkpoint.digest(attempt)
+
+
+def not_dispatched(intent, record):
+    if not isinstance(intent, dict) or not isinstance(record, dict):
+        return False
+    proof = record.get('not_dispatched')
+    fields = {'run', 'provider', 'path', 'started', 'request', 'request_id',
+        'meter_incarnation', 'intent_sha256', 'status', 'ended', 'error', 'not_dispatched'}
+    intent_fields = {'schema', 'provider', 'path', 'model', 'started', 'body_sha256',
+        'attempt_identity_sha256', 'request_id', 'incarnation'}
+    return (type(intent.get('schema')) is int and intent['schema'] == 3
+        and set(intent) == intent_fields and set(record) == fields
+        and proof == {'schema': 1, 'reason': 'connect_failed_before_request'}
+        and type(proof.get('schema')) is int
+        and all(isinstance(intent.get(key), str) and intent[key] for key in
+            ('provider', 'path', 'request_id', 'incarnation'))
+        and all(isinstance(intent.get(key), str) and len(intent[key]) == 64
+            and all(char in '0123456789abcdef' for char in intent[key])
+            for key in ('body_sha256', 'attempt_identity_sha256'))
+        and record.get('intent_sha256') == checkpoint.digest(intent)
+        and isinstance(record.get('run'), str) and bool(record['run'])
+        and record.get('request_id') == intent['request_id']
+        and record.get('meter_incarnation') == intent['incarnation']
+        and all(record.get(key) == intent[key] for key in ('provider', 'path', 'started'))
+        and isinstance(record.get('request'), dict)
+        and record['request'].get('model') == intent.get('model')
+        and type(record.get('status')) is int and record['status'] == 0
+        and isinstance(record.get('error'), str) and bool(record['error'])
+        and type(record.get('ended')) in (int, float)
+        and type(intent.get('started')) in (int, float)
+        and math.isfinite(record['ended']) and math.isfinite(intent['started'])
+        and record['ended'] >= intent['started'])
+
+
+def bound_record(intent, record, directory=None):
+    if 'not_dispatched' in record:
+        return (not_dispatched(intent, record) and directory is not None
+            and intent['attempt_identity_sha256'] == attempt_identity_sha256(directory, record['run']))
+    if intent.get('schema') not in (2, 3):
         return 'schema' not in intent and 'intent_sha256' not in record
     terminal = record.get('terminal') or {}
     return (record.get('intent_sha256') == checkpoint.digest(intent)
@@ -49,10 +91,10 @@ def bound_record(intent, record):
 def finish(directory, request_id, record):
     root = os.path.join(directory, 'meter-intents')
     intent = checkpoint.read(os.path.join(root, request_id + '.intent.json'))
-    if not bound_record(intent, record):
+    if not bound_record(intent, record, directory):
         raise checkpoint.ResumeError('terminal receipt does not match durable intent')
     receipt = {'request_id': request_id, 'record': record, 'record_sha256': checkpoint.digest(record)}
-    if intent.get('schema') == 2:
+    if intent.get('schema') in (2, 3) and 'not_dispatched' not in record:
         receipts = os.path.join(directory, 'meter-receipts')
         checkpoint.durable_directory(receipts)
         checkpoint.atomic(os.path.join(receipts, request_id + '.terminal.json'),
@@ -60,7 +102,7 @@ def finish(directory, request_id, record):
     checkpoint.atomic(os.path.join(root, request_id + '.done.json'), receipt, True)
 
 
-def snapshot(directory, incarnation):
+def snapshot(directory, incarnation, bound_intents=None):
     root = os.path.join(directory, 'meter-intents')
     intents = sorted(name for name in os.listdir(root) if name.endswith('.intent.json')) if os.path.isdir(root) else []
     status = {'intents': len(intents), 'completed': 0, 'active': 0, 'unknown': 0, 'unmatched_records': 0}
@@ -77,11 +119,13 @@ def snapshot(directory, incarnation):
             continue
         receipt = checkpoint.read(done)
         record = receipt.get('record')
-        if not isinstance(record, dict) or receipt.get('request_id') != key or record.get('request_id') != key or record.get('meter_incarnation') != intent['incarnation'] or checkpoint.digest(record) != receipt.get('record_sha256') or not bound_record(intent, record):
+        if not isinstance(record, dict) or receipt.get('request_id') != key or record.get('request_id') != key or record.get('meter_incarnation') != intent['incarnation'] or checkpoint.digest(record) != receipt.get('record_sha256') or not bound_record(intent, record, directory):
             status['unknown'] += 1
             continue
         status['completed'] += 1
         records.append(record)
+        if bound_intents is not None:
+            bound_intents[key] = intent
         completed_hashes[key] = receipt['record_sha256']
     path = os.path.join(directory, 'requests.jsonl')
     if os.path.isfile(path):
