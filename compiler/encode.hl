@@ -189,13 +189,13 @@ fn codes(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
   push body unsigned(count)
   loop index below items_max while index < count {
     let locals = word(flat, at + 4)
-    var kind = groups(flat, at + 8, locals)
+    let kind = groups(flat, at + 8, locals)
     at = at + 8 + locals
     let size = word(flat, at)
-    push kind slice(flat, at + 4, at + 4 + size)
-    at = at + 4 + size
-    push body unsigned(len(kind))
+    push body unsigned(len(kind) + size)
     push body kind
+    push body slice(flat, at + 4, at + 4 + size)
+    at = at + 4 + size
   }
   return section(10, body)
 }

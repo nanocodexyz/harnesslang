@@ -1,0 +1,323 @@
+harness encode
+
+const flat_bytes_max: u64 = 4194304
+const module_bytes_max: u64 = 4194304
+const leb_bytes_max: u64 = 10
+const items_max: u64 = 65536
+const locals_max: u64 = 65536
+
+tool read_file(file_path: text) -> text effect none
+tool write_bytes(file_path: text, hex: text) -> text effect idempotent
+
+fn word(flat: bytes<flat_bytes_max>, at: u64) -> u64 {
+  return flat[at] + flat[at + 1] * 256 + flat[at + 2] * 65536 + flat[at + 3] * 16777216
+}
+
+fn long(flat: bytes<flat_bytes_max>, at: u64) -> u64 {
+  return word(flat, at) + word(flat, at + 4) * 4294967296
+}
+
+fn unsigned(value: u64) -> bytes<leb_bytes_max> {
+  var out: bytes<leb_bytes_max> = []
+  var rest = value
+  var done = false
+  loop step below leb_bytes_max while not done {
+    let low = rest % 128
+    rest = rest / 128
+    if rest == 0 {
+      push out low
+      done = true
+    } else {
+      push out low + 128
+    }
+  }
+  return out
+}
+
+fn signed(value: u64) -> bytes<leb_bytes_max> {
+  var out: bytes<leb_bytes_max> = []
+  var rest = value
+  var done = false
+  loop step below leb_bytes_max while not done {
+    let low = rest % 128
+    let negative = rest >= 0x8000000000000000
+    rest = rest / 128
+    if negative {
+      rest = rest + 0xfe00000000000000
+    }
+    let sign = (low / 64) % 2 == 1
+    if (rest == 0 and not sign) or (rest == 0xffffffffffffffff and sign) {
+      push out low
+      done = true
+    } else {
+      push out low + 128
+    }
+  }
+  return out
+}
+
+fn widened(value: u64) -> u64 {
+  let low = value % 4294967296
+  if low >= 2147483648 {
+    return low + 0xffffffff00000000
+  }
+  return low
+}
+
+fn section(id: u64, body: bytes<module_bytes_max>) -> bytes<module_bytes_max> {
+  var out: bytes<module_bytes_max> = []
+  push out id
+  push out unsigned(len(body))
+  push out body
+  return out
+}
+
+fn name(flat: bytes<flat_bytes_max>, at: u64) -> bytes<module_bytes_max> {
+  var out: bytes<module_bytes_max> = []
+  let size = word(flat, at)
+  push out unsigned(size)
+  push out slice(flat, at + 4, at + 4 + size)
+  return out
+}
+
+fn types(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    push body 0x60
+    push body name(flat, at)
+    at = at + 4 + word(flat, at)
+    push body name(flat, at)
+    at = at + 4 + word(flat, at)
+  }
+  return section(1, body)
+}
+
+fn types_end(flat: bytes<flat_bytes_max>, start: u64) -> u64 {
+  var at = start + 4
+  let count = word(flat, start)
+  loop index below items_max while index < count {
+    at = at + 4 + word(flat, at)
+    at = at + 4 + word(flat, at)
+  }
+  return at
+}
+
+fn imports(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    push body name(flat, at)
+    at = at + 4 + word(flat, at)
+    push body name(flat, at)
+    at = at + 4 + word(flat, at)
+    push body 0
+    push body unsigned(word(flat, at))
+    at = at + 4
+  }
+  return section(2, body)
+}
+
+fn imports_end(flat: bytes<flat_bytes_max>, start: u64) -> u64 {
+  var at = start + 4
+  let count = word(flat, start)
+  loop index below items_max while index < count {
+    at = at + 4 + word(flat, at)
+    at = at + 8 + word(flat, at)
+  }
+  return at
+}
+
+fn functions(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    push body unsigned(word(flat, at))
+    at = at + 8 + word(flat, at + 4)
+    at = at + 4 + word(flat, at)
+  }
+  return section(3, body)
+}
+
+fn functions_end(flat: bytes<flat_bytes_max>, start: u64) -> u64 {
+  var at = start + 4
+  let count = word(flat, start)
+  loop index below items_max while index < count {
+    at = at + 8 + word(flat, at + 4)
+    at = at + 4 + word(flat, at)
+  }
+  return at
+}
+
+fn groups(flat: bytes<flat_bytes_max>, start: u64, count: u64) -> bytes<module_bytes_max> {
+  var runs: bytes<module_bytes_max> = []
+  var total = 0
+  var run = 0
+  var kind = 0
+  loop index below locals_max while index < count {
+    let local = flat[start + index]
+    if run > 0 and local != kind {
+      push runs unsigned(run)
+      push runs kind
+      total = total + 1
+      run = 0
+    }
+    kind = local
+    run = run + 1
+  }
+  if run > 0 {
+    push runs unsigned(run)
+    push runs kind
+    total = total + 1
+  }
+  var out: bytes<module_bytes_max> = []
+  push out unsigned(total)
+  push out runs
+  return out
+}
+
+fn codes(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    let locals = word(flat, at + 4)
+    var kind = groups(flat, at + 8, locals)
+    at = at + 8 + locals
+    let size = word(flat, at)
+    push kind slice(flat, at + 4, at + 4 + size)
+    at = at + 4 + size
+    push body unsigned(len(kind))
+    push body kind
+  }
+  return section(10, body)
+}
+
+fn memory(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  if word(flat, start) == 0 {
+    return body
+  }
+  push body 1
+  push body 0
+  push body unsigned(word(flat, start + 4))
+  return section(5, body)
+}
+
+fn globals(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    let kind = flat[at]
+    push body kind
+    push body flat[at + 1]
+    let init = long(flat, at + 2)
+    if kind == 0x7f {
+      push body 0x41
+      push body signed(widened(init))
+    } else {
+      push body 0x42
+      push body signed(init)
+    }
+    push body 0x0b
+    at = at + 10
+  }
+  return section(6, body)
+}
+
+fn exports(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    push body name(flat, at)
+    at = at + 4 + word(flat, at)
+    push body flat[at]
+    push body unsigned(word(flat, at + 1))
+    at = at + 5
+  }
+  return section(7, body)
+}
+
+fn exports_end(flat: bytes<flat_bytes_max>, start: u64) -> u64 {
+  var at = start + 4
+  let count = word(flat, start)
+  loop index below items_max while index < count {
+    at = at + 9 + word(flat, at)
+  }
+  return at
+}
+
+fn data(flat: bytes<flat_bytes_max>, start: u64) -> bytes<module_bytes_max> {
+  var body: bytes<module_bytes_max> = []
+  var at = start + 4
+  let count = word(flat, start)
+  push body unsigned(count)
+  loop index below items_max while index < count {
+    push body 0
+    push body 0x41
+    push body signed(widened(word(flat, at)))
+    push body 0x0b
+    push body name(flat, at + 4)
+    at = at + 8 + word(flat, at + 4)
+  }
+  return section(11, body)
+}
+
+fn module(flat: bytes<flat_bytes_max>) -> bytes<module_bytes_max> {
+  var out: bytes<module_bytes_max> = []
+  push out 0
+  push out 'a'
+  push out 's'
+  push out 'm'
+  push out 1
+  push out 0
+  push out 0
+  push out 0
+  let at_imports = types_end(flat, 0)
+  let at_functions = imports_end(flat, at_imports)
+  let at_memory = functions_end(flat, at_functions)
+  let at_globals = at_memory + 8
+  let at_exports = at_globals + 4 + word(flat, at_globals) * 10
+  let at_data = exports_end(flat, at_exports)
+  push out types(flat, 0)
+  push out imports(flat, at_imports)
+  push out functions(flat, at_functions)
+  push out memory(flat, at_memory)
+  push out globals(flat, at_globals)
+  push out exports(flat, at_exports)
+  push out codes(flat, at_functions)
+  push out data(flat, at_data)
+  return out
+}
+
+fn encode_hex(input: text) -> text {
+  let flat: bytes<flat_bytes_max> = bytes_of_hex(input)
+  return hex_of(module(flat))
+}
+
+on encode(input: text) -> text {
+  return encode_hex(input)
+}
+
+on compile(input_path: text, output_path: text) -> text {
+  match read_file(input_path) {
+    ok(flat) => {
+      match write_bytes(output_path, encode_hex(flat)) {
+        ok(written) => { return written }
+        failed(error) => { return error }
+      }
+    }
+    failed(error) => { return error }
+  }
+}

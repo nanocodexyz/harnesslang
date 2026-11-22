@@ -16,7 +16,7 @@ echo "selfhost components: retaining inputs, logs and results in $work"
 wat="$work/encoder-original.wat"
 wat_sha=148575c5ff0a8c7132f6642cd3dc1a1be6664ad54e421d2a02928689010e7425
 wasm_sha=68b59d50dc5df6e8d5b861ae64c6250ab3d0fb029565151fda18e7998c2a03fb
-"$hl" emit --target native-jsonl --format wat compiler/encode.hl > "$wat"
+"$hl" emit --target native-jsonl --format wat compiler/reference/encode-original.hl > "$wat"
 printf '%s  %s\n' "$wat_sha" "$wat" | sha256sum --check
 "$hl" assemble < "$wat" > "$work/encoder-original.wasm"
 printf '%s  %s\n' "$wasm_sha" "$work/encoder-original.wasm" | sha256sum --check

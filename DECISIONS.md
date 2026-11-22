@@ -716,3 +716,38 @@ python3 -B evals/cache_r.py warm --help
 ```
 
 The new helper adds 231 Python lines; the existing cache self-check grows by 102 lines and is already included in the default local check queue. The evaluator source manifest grows from 366 to 367 files. This is evaluator support code, not a reduction in compiler or fixed-host source. These focused checks did not run Docker, dependency warming, a task verifier, model requests, external downloads, builds or the full local suite; they do not establish runtime cache readiness or a benchmark improvement.
+
+
+## 2026-11-21 HST: avoid an intermediate encoder buffer
+
+Harnesslang is a language for agent harnesses. Its production compiler and binary encoder are still written in Rust. The Harnesslang component in `compiler/encode.hl` converts the compiler's flat byte layout of a WebAssembly module into binary. Its code-section builder, the `codes` function, previously appended instruction bytes to a temporary locals buffer and then appended that combined buffer to the section. It now writes the locals and instruction bytes directly into the section after writing a prefix containing their combined byte length. The Rust encoder and production compiler are unchanged.
+
+On a Linux x86_64 machine, `hl-host`, the fixed runtime that executes compiled WebAssembly and supplies tools, ran the Harnesslang encoder before and after this change. The first three workloads used 31 confirmation pairs, one original and one changed invocation per pair, after a separate seven-pair exploratory run; confirmation excludes the exploratory samples. Each pair also had one pure-Rust reference measurement. Measurement order rotated between the original encoder, the changed encoder and Rust. Every Harnesslang invocation had a fresh execution instance and journal, its durable execution log, and its completed output had to equal Rust byte for byte. The handler is the encoder's `encode` entry point. The frozen-source workload is `compiler/reference/encode-original.hl`, an unchanged copy of the pre-change encoder. The intervals below are paired Student t 95% intervals, not minima selected from repeated runs.
+
+| Input | Pairs | Original handler mean | Changed handler mean | Mean paired saving, 95% interval |
+| --- | --- | --- | --- | --- |
+| `examples/minimal.hl` | 31 | 4.059485 ms | 3.956751 ms | 2.3641%, 0.9291–3.7991% |
+| `examples/agent.hl` | 31 | 4.305882 ms | 4.076338 ms | 5.2527%, 3.8300–6.6754% |
+| Frozen original encoder source | 31 | 4.550169 ms | 4.431659 ms | 2.4953%, 1.0692–3.9214% |
+| `examples/claude_code.hl`, independent holdout | 600 | 6.983117 ms | 6.854004 ms | 1.6757%, 1.0667–2.2847% |
+
+The original representative input, `examples/claude_code.hl`, first had an inconclusive 31-pair result: paired saving 1.4482%, 95% interval -0.3776–3.2741%. Before collecting more samples, a separate fixed 600-pair holdout was declared with a positive lower bound on paired milliseconds saved as its admission rule. That rule passed: 0.129113 ms saved, 95% interval 0.082326–0.175899 ms. The holdout was run once, after the full local suite, and is not pooled with the earlier data. All measured results matched Rust exactly. Its ratio of whole handler time to pure Rust time is still 157.0526, 95% interval 156.1389–157.9664, so this does not resolve the native execution gap.
+
+These timings include the encoder handler's JSON, hex and journal work, but exclude module loading and disk I/O. Rust measures only its binary encoder, so the mean paired ratio of changed-handler time to pure Rust time is 145.9524 on `examples/agent.hl` (95% interval 143.8143–148.0904); this is not an identical-work kernel comparison. Pure Rust averaged 0.027932 ms on this input. This change does not introduce native code generation, and the handler remains much slower than Rust.
+
+Measurements used Rust 1.100.0 on an AMD EPYC 9255 Linux x86_64 machine. From the repository root, reproduce the agent workload comparison with:
+
+```sh
+export SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
+cargo build --release --locked
+cargo build --release --locked --manifest-path compiler/bench/Cargo.toml
+mkdir -p output/encoder-comparison
+target/release/hl emit --format wasm --target native-jsonl compiler/reference/encode-original.hl > output/encoder-comparison/original.wasm
+target/release/hl emit --format wasm --target native-jsonl compiler/encode.hl > output/encoder-comparison/changed.wasm
+compiler/bench/target/release/selfhost-bench --paired examples/agent.hl output/encoder-comparison/original.wasm output/encoder-comparison/changed.wasm 31
+compiler/bench/target/release/selfhost-bench --paired examples/claude_code.hl output/encoder-comparison/original.wasm output/encoder-comparison/changed.wasm 600
+```
+
+The reference source is copied unchanged from `eb724ed32fa5b328dce5cf91ba07a0487527337a:compiler/encode.hl`. It is a retained test input, not a bootstrap compiler or code removed from the repository's handwritten-line count. The component comparison script, `scripts/selfhost-components.sh`, now emits this reference instead of the changing encoder. Its original checks on the hashes of the resulting WebAssembly text (WAT) and binary (Wasm) remain unchanged. Current encoder correctness is checked separately against Rust. These measurements establish no model-benchmark pass-rate or cost result, nor a compiler that builds itself.
+
+Full local verification passed with `SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh`. This includes repeated interpreter/compiled-host comparisons, fault mutations, all-target proofs and the source-size gate. The gate's Rust compiler and fixed-host counts remain 28094 and 7573 lines respectively. No runtime Rust is removed; the paired benchmark adds 103 net handwritten Rust lines of measurement support, and the frozen reference adds 323 retained Harnesslang lines. Source counts are deterministic, not sampled timing estimates.
