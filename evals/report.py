@@ -7,17 +7,11 @@ import random
 import sys
 
 import checkpoint_meter
+import reporting_rules
 
 WILSON_Z_95 = 1.959964
-PRICES_PER_MTOK = {
-    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write_5m": 3.75, "cache_write_1h": 6.0, "cache_read": 0.30},
-    "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.10},
-    "gpt-5.5": {"input": 5.0, "output": 30.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.50},
-    "gpt-5.6-sol": {"input": 4.0, "output": 20.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.40},
-    "gpt-6-luna": {"input": 0.10, "output": 0.50, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.01},
-    "gpt-6.1-terra": {"input": 1.0, "output": 5.0, "cache_write_5m": 0.0, "cache_write_1h": 0.0, "cache_read": 0.05},
-}
-PRICES_SOURCE = "https://docs.anthropic.com/en/docs/about-claude/pricing, read 2026-11-14; https://developers.openai.com/api/docs/models/gpt-5.5 (prompts under 272K tokens), read 2026-11-15; gpt-5.6-sol at https://openrouter.ai/openai/gpt-5.6-sol, read 2026-11-16 (a notional list price: the ChatGPT plan bills none); gpt-6-luna and gpt-6.1-terra at the standard-context list rates agent/src/openai.rs carries"
+PRICES_PER_MTOK = reporting_rules.PRICES_PER_MTOK
+PRICES_SOURCE = reporting_rules.PRICES_SOURCE
 TOKENS_PER_MTOK = 1_000_000
 MODEL_ENDPOINTS = ("/messages", "/responses", "/responses/compact", "/chat/completions")
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
@@ -131,15 +125,30 @@ def ledger_json(path, issues):
         return {}
 
 
+def proven_terminal(intent, record, directory):
+    if type(intent.get("schema")) is not int or intent["schema"] not in (2, 3):
+        return False
+    if "not_dispatched" in record:
+        return checkpoint_meter.bound_record(intent, record, directory)
+    terminal = record.get("terminal") or {}
+    return (record.get("usage_known") is True and terminal.get("complete") is True
+        and terminal.get("identity_matches") is True and valid_digest(terminal.get("response_sha256"))
+        and isinstance(terminal.get("provider_response_id"), str) and bool(terminal["provider_response_id"])
+        and terminal.get("model") == intent.get("model") and bool(terminal.get("model"))
+        and checkpoint_meter.bound_record(intent, record, directory))
+
+
 def meter_ledger(directory, records, required):
     root = directory / "meter-intents"
-    status = {"required": required, "intents": 0, "completed": 0, "issues": [], "duplicate_record_numbers": [], "recovered_records": [], "bound_intents": {}}
+    status = {"required": required, "intents": 0, "completed": 0, "issues": [], "duplicate_record_numbers": [], "recovered_records": [], "bound_intents": {}, "closed": False, "unproven_intents": 0}
     issues = status["issues"]
     if not root.is_dir() and not required:
         return status
     closed = directory / "meter-closed.json"
     if not closed.is_file() or not ledger_json(closed, issues).get("incarnation"):
         issues.append("durable meter accounting is not closed")
+    else:
+        status["closed"] = True
     if not root.is_dir():
         issues.append("missing durable meter intents")
         return status
@@ -183,6 +192,8 @@ def meter_ledger(directory, records, required):
             issues.append("durable meter terminal binding mismatch: " + key)
         else:
             status["completed"] += 1
+            if not proven_terminal(intent, done["record"], directory):
+                status["unproven_intents"] += 1
             status["bound_intents"][key] = intent
             if key not in by_id:
                 status["recovered_records"].append(done["record"])
@@ -194,11 +205,28 @@ def meter_ledger(directory, records, required):
     return status
 
 
-def price_row(directory, row, require_ledger=False):
+def timeout_accounting_closed(meter, ledger):
+    proof = meter.get("durable_ledger") or {}
+    return (proof.get("closed") is True and type(proof.get("intents")) is int
+        and proof["intents"] >= 0 and type(proof.get("completed")) is int
+        and proof["completed"] == proof["intents"]
+        and all(type(proof.get(key)) is int and proof[key] == 0 for key in ("unknown", "unmatched_records"))
+        and type(proof.get("active", 0)) is int and proof.get("active", 0) == 0 and ledger["closed"] and not ledger["issues"]
+        and proof["intents"] == ledger["intents"] and proof["completed"] == ledger["completed"]
+        and type(meter.get("unproven_intents")) is int and meter["unproven_intents"] == 0
+        and ledger["unproven_intents"] == 0
+        and type(meter.get("unknown_requests")) is int and meter["unknown_requests"] == 0
+        and meter.get("accounting_status") == "observed_after_timeout_reconciliation")
+
+
+def price_row(directory, row, require_ledger=False, campaign_rules=None):
     path = directory / "requests.jsonl"
     result = {"total_usd": None, "lower_bound_usd": 0.0, "unknown": [], "requests": 0, "non_model_records": 0, "not_dispatched_requests": 0, "by_model_usd": {}}
     records = read_lines(path) if path.is_file() else []
-    result["ledger"] = meter_ledger(directory, records, require_ledger)
+    meter = row.get("meter") or {}
+    accounting = row.get("accounting_status", meter.get("accounting_status", "observed"))
+    reconciled = accounting == "observed_after_timeout_reconciliation"
+    result["ledger"] = meter_ledger(directory, records, require_ledger or reconciled)
     bound_intents = result["ledger"].pop("bound_intents")
     recovered = result["ledger"].pop("recovered_records")
     result["unknown"].extend(result["ledger"]["issues"])
@@ -237,9 +265,12 @@ def price_row(directory, row, require_ledger=False):
             continue
         result["lower_bound_usd"] += amount
         result["by_model_usd"][model] = result["by_model_usd"].get(model, 0.0) + amount
-    meter = row.get("meter") or {}
-    accounting = row.get("accounting_status", meter.get("accounting_status", "observed"))
-    if accounting != "observed" or meter.get("unknown_requests", 0) != 0:
+    if reconciled and (row.get("reporting_rules") != reporting_rules.pin()
+            or (campaign_rules is not None and campaign_rules != reporting_rules.pin())):
+        result["unknown"].append("reconciled timeout requires matching explicit row and campaign reporting rules pins")
+    if reconciled and not timeout_accounting_closed(meter, result["ledger"]):
+        result["unknown"].append("timeout accounting reconciliation proof is incomplete or differs from durable evidence")
+    if accounting not in ("observed", "observed_after_timeout_reconciliation") or meter.get("unknown_requests", 0) != 0:
         result["unknown"].append("incomplete request accounting: " + str(accounting))
     if meter.get("requests") != result["requests"]:
         result["unknown"].append("meter/request count mismatch or absent meter")
@@ -270,6 +301,9 @@ def validate_manifest(manifest, tasks, attempts, agent):
     for field in ("agent_root_sha256", "campaign_suite_sha256", "transport_sha256"):
         if not valid_digest(manifest.get(field)):
             issues.append("missing provenance pin: " + field)
+    pinned_rules = manifest.get("reporting_rules")
+    if "reporting_rules" in manifest and pinned_rules != reporting_rules.pin():
+        issues.append("reporting rules pin differs from current version/hash; use the pinned reporter")
     config = manifest.get("config") or {}
     for field in REQUIRED_CONFIG:
         if field not in config:
@@ -352,10 +386,14 @@ def row_key(row):
 
 def validate_row(row, directory, manifest, identity, agent):
     issues = []
+    if "reporting_rules" in manifest and row.get("reporting_rules") != manifest["reporting_rules"]:
+        issues.append("row reporting rules pin missing or differs from campaign: " + directory.name)
     if row.get("agent") != agent:
         issues.append("unknown agent: " + str(row.get("agent")))
     if row.get("outcome") not in OUTCOMES:
         issues.append("unknown outcome: " + str(row.get("outcome")))
+    if row.get("outcome") == "passed" and any((row.get(phase) or {}).get("timed_out") for phase in ("agent_result", "verifier")):
+        issues.append("timed-out attempt cannot pass: " + directory.name)
     if type(row.get("attempt")) is not int:
         issues.append("attempt must be an integer")
     identifier = "%s.%s.%s.%s" % (row.get("source"), row.get("task"), agent, row.get("attempt"))
@@ -405,7 +443,7 @@ def load_arm(path, tasks, attempts, agent):
         else:
             row = read_json(result_path)
             issues.extend(validate_row(row, directory, manifest, identity, agent))
-        row["pricing"] = price_row(directory, row, checkpoint_schema)
+        row["pricing"] = price_row(directory, row, checkpoint_schema, manifest.get("reporting_rules", {}))
         key = row_key(row)
         if key in by_key:
             issues.append("duplicate row: " + str(key))
@@ -506,7 +544,7 @@ def arm_summary(arm, expected):
     full_cost = arm["complete"] and not unknown and not external_unknown
     lower_bound = sum(row["pricing"]["lower_bound_usd"] for row in rows)
     provenance = {field: arm["manifest"].get(field) for field in
-                  ("source", "agent_root_sha256", "config", "tasks", "runtime", "transport_sha256", "cache")}
+                  ("source", "agent_root_sha256", "config", "tasks", "runtime", "transport_sha256", "cache", "reporting_rules")}
     provenance["campaign_sha256"] = arm["identity"]
     return {"path": arm["path"], "provenance": provenance, "complete": arm["complete"], "expected_attempts": expected,
             "observed_rows": len(rows), "counts": counts, "missing": arm["missing"],
@@ -514,10 +552,13 @@ def arm_summary(arm, expected):
             "cost_total_usd": lower_bound if full_cost else None, "cost_lower_bound_usd": lower_bound,
             "cost_mean_usd": lower_bound / expected if full_cost else None,
             "cost_mean_bootstrap_95": None,
+            "cost_per_pass": lower_bound / passed if full_cost and passed else None,
+            "cost_per_pass_bootstrap_95": None,
+            "campaign_rules_status": "pinned" if arm["manifest"].get("reporting_rules") == reporting_rules.pin() else "legacy_unpinned" if "reporting_rules" not in arm["manifest"] else "pin_mismatch",
             "cost_mean_lower_bound_usd": lower_bound / expected if arm["complete"] else None,
             "unknown_cost_rows": unknown, "unknown_external_streams": external_unknown,
             "accounting_evidence": evidence, "issues": arm["issues"],
-            "rows": [{"id": row.get("id"), "outcome": row.get("outcome"), "pricing": row["pricing"]} for row in rows]}
+            "rows": [{"id": row.get("id"), "outcome": row.get("outcome"), "reporting_rules": row.get("reporting_rules"), "pricing": row["pricing"]} for row in rows]}
 
 
 def percentile(values, probability):
@@ -539,6 +580,44 @@ def arm_cost_bootstrap(arm, summary, tasks, attempts, repetitions, seed):
     return {"method": "task-cluster percentile bootstrap; all attempts retained per sampled task",
             "clusters": count, "attempts_per_cluster": attempts, "repetitions": repetitions, "seed": seed,
             "mean": summary["cost_mean_usd"], "ci_95": [percentile(samples, 0.025), percentile(samples, 0.975)]}
+
+
+def cost_per_pass_bootstrap(arm, summary, tasks, attempts):
+    if summary["cost_per_pass"] is None:
+        return None
+    clusters = []
+    for task in tasks:
+        rows = [arm["by_key"][task + (attempt,)] for attempt in range(1, attempts + 1)]
+        clusters.append((sum(row["pricing"]["total_usd"] for row in rows),
+                         sum(row["outcome"] == "passed" for row in rows)))
+    count = len(clusters)
+    randomizer = random.Random(reporting_rules.COST_PER_PASS_SEED)
+    samples, zero_pass = [], 0
+    for _ in range(reporting_rules.COST_PER_PASS_REPETITIONS):
+        selected = [clusters[randomizer.randrange(count)] for _ in range(count)]
+        passed = sum(cluster[1] for cluster in selected)
+        zero_pass += int(passed == 0)
+        samples.append(sum(cluster[0] for cluster in selected) / passed if passed else math.inf)
+    samples.sort()
+    endpoints = []
+    for probability in (0.025, 0.975):
+        position = (len(samples) - 1) * probability
+        lower, upper = samples[math.floor(position)], samples[math.ceil(position)]
+        fraction = position - math.floor(position)
+        value = lower if fraction == 0 else lower * (1 - fraction) + upper * fraction
+        endpoints.append(value if math.isfinite(value) else None)
+    return {"method": "task-cluster percentile bootstrap of total all-attempt cost / passes",
+            "clusters": count, "attempts_per_cluster": attempts,
+            "repetitions": reporting_rules.COST_PER_PASS_REPETITIONS, "seed": reporting_rules.COST_PER_PASS_SEED,
+            "mean": summary["cost_per_pass"], "ci_95": endpoints,
+            "zero_pass_replicates": zero_pass,
+            "zero_pass_policy": "retained as positive infinity; null CI endpoint means unbounded"}
+
+
+def report_rules(args):
+    return {"pin": reporting_rules.pin(), "manifest": reporting_rules.manifest(),
+            "per_attempt_bootstrap": {"repetitions": args.bootstrap_reps, "seed": args.seed},
+            "historical_policy": "current rules applied explicitly; legacy unpinned campaigns are not relabelled or modified"}
 
 
 def clustered_bootstrap(base, candidate, tasks, attempts, repetitions, seed):
@@ -590,6 +669,7 @@ def build_report(args):
     baseline_summary, candidate_summary = [arm_summary(arm, expected) for arm in (base, candidate)]
     for arm, summary in ((base, baseline_summary), (candidate, candidate_summary)):
         summary["cost_mean_bootstrap_95"] = arm_cost_bootstrap(arm, summary, tasks, args.attempts, args.bootstrap_reps, args.seed)
+        summary["cost_per_pass_bootstrap_95"] = cost_per_pass_bootstrap(arm, summary, tasks, args.attempts)
     paired = clustered_bootstrap(base, candidate, tasks, args.attempts, args.bootstrap_reps, args.seed) if matched else None
     if paired and (baseline_summary["cost_total_usd"] is None or candidate_summary["cost_total_usd"] is None):
         paired["cost_difference_usd"] = None
@@ -601,7 +681,7 @@ def build_report(args):
              "quality_improvement": paired is not None and paired["pass_difference"]["mean"] + 0.000000000001 >= args.min_improvement_pp / 100}
     canonical = read_suite(Path(__file__).with_name("suite-60.txt"))
     profile = "MATCHED180" if tasks == canonical and args.attempts == 3 else "CUSTOM_%d_TASKS_%d_ATTEMPTS_NOT_MATCHED180" % (len(tasks), expected)
-    return {"schema_version": 1, "profile": profile, "matched": matched, "status": "PASS" if all(gates.values()) else "FAIL",
+    return {"schema_version": 2, "reporting_rules": report_rules(args), "profile": profile, "matched": matched, "status": "PASS" if all(gates.values()) else "FAIL",
             "experiment": "quality-first: model/effort/finish-check/budget configuration stays matched. Intentional model/cost-cascade/finish-check config changes require a separate cost experiment; this report does not exempt them.",
             "policy": {"gates_apply_to": "candidate; both arms require complete matched matrices", "min_success": args.min_success, "max_cost_usd_per_attempt": args.max_cost, "min_improvement_pp": args.min_improvement_pp, "paired_improvement_ci_lower_strictly_above": 0.0},
             "gates": gates, "issues": issues, "treatment": treatment, "baseline": baseline_summary, "candidate": candidate_summary,
@@ -609,14 +689,39 @@ def build_report(args):
             "interpretation": "Errors count as nonpasses in the full planned denominator. Cost is list-price equivalent, not invoiced spend. Unknown costs are not zero. Candidate source and agent-root pins may differ only at declared treatment paths with granular pins; measurement config, task, image and cache variants must match."}
 
 
+def build_single_arm_report(args):
+    tasks = read_suite(args.suite)
+    if len(tasks) != args.expected_tasks:
+        raise ValueError("suite has %d tasks; expected %d" % (len(tasks), args.expected_tasks))
+    arm = load_arm(args.single_arm, tasks, args.attempts, args.agent)
+    accounting_evidence(arm, getattr(args, "accounting", None))
+    summary = arm_summary(arm, len(tasks) * args.attempts)
+    summary["cost_mean_bootstrap_95"] = arm_cost_bootstrap(arm, summary, tasks, args.attempts, args.bootstrap_reps, args.seed)
+    summary["cost_per_pass_bootstrap_95"] = cost_per_pass_bootstrap(arm, summary, tasks, args.attempts)
+    complete = arm["complete"] and not arm["issues"] and summary["cost_total_usd"] is not None
+    return {"schema_version": 2, "mode": "single_arm", "profile": "SINGLE_ARM_%d_TASKS_%d_ATTEMPTS_NOT_MATCHED" % (len(tasks), len(tasks) * args.attempts),
+            "status": "COMPLETE" if complete else "INCOMPLETE", "reporting_rules": report_rules(args),
+            "arm": summary, "matched": False, "paired": None,
+            "interpretation": "Descriptive single-arm result only; no matched comparison or adoption claim. Missing or unknown evidence blocks a complete result. Legacy unpinned campaigns are not relabelled."}
+
+
 def readable(report):
-    lines = [report["profile"] + ": " + report["status"]]
-    for name in ("baseline", "candidate"):
+    lines = [report["profile"] + ": " + report["status"],
+             "Reporting rules: " + json.dumps(report["reporting_rules"]["pin"], sort_keys=True)]
+    scopes = ("arm",) if report.get("mode") == "single_arm" else ("baseline", "candidate")
+    for name in scopes:
         arm = report[name]
         cost_label = "$%.6f/attempt" % arm["cost_mean_usd"] if arm["cost_mean_usd"] is not None else "unknown cost (known lower bound $%.6f total)" % arm["cost_lower_bound_usd"]
         cost_interval = arm["cost_mean_bootstrap_95"]
         if cost_interval:
             cost_label += " [95%% task-cluster $%.6f, $%.6f; %d clusters x %d attempts]" % (*cost_interval["ci_95"], cost_interval["clusters"], cost_interval["attempts_per_cluster"])
+        ratio = arm["cost_per_pass"]
+        cost_label += "; " + ("$%.6f/pass (all attempts)" % ratio if ratio is not None else "unknown cost/pass")
+        ratio_interval = arm["cost_per_pass_bootstrap_95"]
+        if ratio_interval:
+            endpoints = ["unbounded" if value is None else "$%.6f" % value for value in ratio_interval["ci_95"]]
+            cost_label += " [95%% %s, %s; %d zero-pass replicates]" % (*endpoints, ratio_interval["zero_pass_replicates"])
+        cost_label += "; campaign rules: " + arm["campaign_rules_status"]
         interval = arm["pass_wilson_95"]
         confidence = " [95%% Wilson %.2f%%, %.2f%%]" % (100 * interval[0], 100 * interval[1]) if interval else ""
         lines.append("%s: %d/%d passed (%.2f%%)%s; %d failed, %d errors, %d missing; %s; %d unknown-cost rows" % (name, arm["counts"]["passed"], arm["expected_attempts"], 100 * arm["pass_rate"], confidence, arm["counts"]["failed"], arm["counts"]["errored"], len(arm["missing"]), cost_label, len(arm["unknown_cost_rows"])))
@@ -625,9 +730,13 @@ def readable(report):
         difference = paired["pass_difference"]
         lines.append("Paired delta: %.2f pp [95%% %.2f, %.2f]; %d task clusters, %d repetitions, seed %d" % (100 * difference["mean"], 100 * difference["ci_95"][0], 100 * difference["ci_95"][1], paired["clusters"], paired["repetitions"], paired["seed"]))
         lines.append("Paired cost delta: " + (json.dumps(paired["cost_difference_usd"]) if paired["cost_difference_usd"] is not None else "unknown"))
-    for name in ("baseline", "candidate"):
+    for name in scopes:
         if report[name]["unknown_external_streams"]:
             lines.append("%s: %d preserved streams with unknown cost" % (name, len(report[name]["unknown_external_streams"])))
+    if report.get("mode") == "single_arm":
+        lines.append(report["interpretation"])
+        lines.extend(report["arm"]["issues"])
+        return "\n".join(lines)
     lines.append("Adoption requires paired mean improvement >= %.2f pp and paired 95%% CI lower bound > 0 pp." % report["policy"]["min_improvement_pp"])
     for name, passed in report["gates"].items():
         lines.append(name + ": " + ("PASS" if passed else "FAIL"))
@@ -639,8 +748,10 @@ def readable(report):
 
 def arguments():
     parser = argparse.ArgumentParser(description="Strict matched baseline/candidate arm report; no row filtering or inferred provenance.")
-    parser.add_argument("--baseline", type=Path, required=True)
-    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--baseline", type=Path)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--single-arm", type=Path, help="descriptive report for one campaign, never a matched adoption result")
+    parser.add_argument("--accounting", type=Path, help="single-arm preserved stream accounting JSON")
     parser.add_argument("--baseline-accounting", type=Path, help="preserved stream accounting JSON (including aborted streams)")
     parser.add_argument("--candidate-accounting", type=Path, help="preserved stream accounting JSON (including aborted streams)")
     parser.add_argument("--allow-source-change", action="append", default=[], help="declare one exact intended treatment source path; repeat per changed file")
@@ -657,6 +768,11 @@ def arguments():
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--summary", action="store_true", help="print readable summary instead of JSON")
     args = parser.parse_args()
+    if args.single_arm is not None:
+        if args.baseline is not None or args.candidate is not None or args.baseline_accounting or args.candidate_accounting or args.allow_source_change or args.allow_agent_change:
+            parser.error("--single-arm cannot be combined with matched-arm options")
+    elif args.baseline is None or args.candidate is None or args.accounting:
+        parser.error("supply --baseline and --candidate, or --single-arm [--accounting]")
     for path in args.allow_source_change + args.allow_agent_change:
         if not path or Path(path).is_absolute() or ".." in Path(path).parts or any(char in path for char in "*?["):
             parser.error("treatment declarations must be exact safe relative paths")
@@ -672,7 +788,7 @@ def arguments():
 def main():
     args = arguments()
     try:
-        report = build_report(args)
+        report = build_single_arm_report(args) if args.single_arm is not None else build_report(args)
     except (OSError, ValueError, TypeError, KeyError) as error:
         print("report input error: " + str(error), file=sys.stderr)
         return 2
@@ -680,7 +796,7 @@ def main():
     if args.json_out:
         args.json_out.write_text(encoded)
     print(readable(report) if args.summary else encoded, end="\n" if args.summary else "")
-    return 0 if report["status"] == "PASS" else 1
+    return 0 if report["status"] in ("PASS", "COMPLETE") else 1
 
 
 if __name__ == "__main__":

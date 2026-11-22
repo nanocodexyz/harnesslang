@@ -439,21 +439,45 @@ def dispatch_mixed(base, index):
         'unknown_blocks_total': True, 'prior_taints_retained': True}
 
 
+def timeout_accounting(base):
+    import checkpoint_drill
+    result = checkpoint_drill.timeout_drill(str(base))
+    expected = report.cost(MODEL, {'input_tokens': 7, 'output_tokens': 4,
+        'cache_read_tokens': 0, 'cache_write_tokens': 0})
+    for case in result['cases']:
+        directory = Path(case['directory'])
+        row = checkpoint.read(str(directory / 'result.json'))
+        priced = report.price_row(directory, row, True)
+        assert priced['lower_bound_usd'] == expected, (case, priced)
+        known = case['case'] in ('closed', 'verifier-timeout', 'no-timeout')
+        assert priced['total_usd'] == (expected if known else None), (case, priced)
+        assert priced['requests'] == row['meter']['requests']
+        assert priced['not_dispatched_requests'] == 0
+        case.update(lower_bound_usd=priced['lower_bound_usd'], total_usd=priced['total_usd'])
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker', type=Path)
     parser.add_argument('--case', choices=CASES + DISPATCH_CASES)
     parser.add_argument('--out', type=Path, default=Path('output/meter-terminal'))
+    parser.add_argument('--timeout-only', action='store_true')
     args = parser.parse_args()
     if args.worker:
         worker(args.worker, args.case)
         return
     args.out.mkdir(parents=True, exist_ok=True)
     base = Path(tempfile.mkdtemp(prefix='drill-', dir=args.out)).resolve()
+    if args.timeout_only:
+        result = dict(timeout_accounting(base), fixture=str(base))
+        checkpoint.atomic(str(base / 'result.json'), result)
+        print(json.dumps(result, sort_keys=True))
+        return
     results = [check_case(base, case, index) for case in CASES for index in range(REPETITIONS)]
     dispatch = [check_dispatch_case(base, case, index) for case in DISPATCH_CASES for index in range(REPETITIONS)]
     mixed = [dispatch_mixed(base, index) for index in range(REPETITIONS)]
-    result = {'dispatch_n3': dispatch, 'dispatch_mixed_n3': mixed,
+    result = {'timeout_accounting_n3': timeout_accounting(base), 'dispatch_n3': dispatch, 'dispatch_mixed_n3': mixed,
         'dispatch_mutations_rejected_n3': [dispatch_mutations(base, index) for index in range(REPETITIONS)], 'result': 'passed', 'fixture': str(base), 'process_kills': len(results) + len(dispatch),
         'model_calls': 0, 'network_calls': 0, 'docker_calls': 0, 'results': results,
         'binding_mutations_rejected': mutation_check(base)}

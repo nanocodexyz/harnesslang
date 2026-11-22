@@ -53,6 +53,11 @@ def mock_sh(base, command, **kwargs):
         value['State']['Running'] = True
         checkpoint.atomic(marker, value)
         value = SimpleNamespace(returncode=0, stdout='', stderr='')
+    elif command[:2] == ['docker', 'stop']:
+        marker = os.path.join(base, command[-1] + '.container')
+        info = checkpoint.read(marker)
+        info['State']['Running'] = False
+        checkpoint.atomic(marker, info)
     elif command[:2] == ['docker', 'cp'] and command[2].endswith(':/logs/verifier'):
         os.makedirs(command[3], exist_ok=True)
         with open(os.path.join(command[3], 'reward.txt'), 'w') as handle:
@@ -181,7 +186,7 @@ def resume_drill(base):
 
 
 def mutation_drill(args, rows, identity):
-    mutations = ('source_commit', 'source_files', 'parameters', 'suite_sha256', 'agent_tree', 'tasks', 'configs_sha256', 'images', 'matrix', 'ca_sha256', 'transport_sha256', 'runtime', 'task_trees', 'cache', 'meter_ledger_schema')
+    mutations = ('source_commit', 'source_files', 'parameters', 'suite_sha256', 'agent_tree', 'tasks', 'configs_sha256', 'images', 'matrix', 'ca_sha256', 'transport_sha256', 'runtime', 'task_trees', 'cache', 'meter_ledger_schema', 'reporting_rules')
     for path in ('examples/codex_agent.hl', 'scripts/fixtures/prompts/codex-instructions.md', 'scripts/fixtures/prompts/codex-texts.json'):
         assert path in identity['source_files'], 'missing canonical treatment pin: ' + path
     for key in mutations:
@@ -324,6 +329,7 @@ def stopped_drill(base, original_args):
         result = run.run_row(row, args, "127.0.0.1", {}, threading.Lock(), args.agent_root, os.path.join(args.out, "rows"))
         results.append(result)
     assert [result.get("infrastructure_status") for result in results[:2]] == ["unresumable", "unresumable"]
+    assert all(result['reporting_rules'] == run.reporting_rules.pin() for result in results)
     assert [result["outcome"] for result in results[2:]] == ["passed", "passed"]
     for index, row in enumerate(rows):
         directory = os.path.join(args.out, "rows", row["id"])
@@ -744,12 +750,165 @@ def source_pin_drill(base):
     return {'runtime_toolchain_mutations_rejected': len(paths), 'artifact_directories_ignored': len(excluded)}
 
 
+TIMEOUT_CASES = ('closed', 'inflight', 'unknown-usage', 'infrastructure', 'interruption',
+    'incarnation', 'unmatched', 'unproven-dispatch', 'lost-usage', 'legacy-weak', 'no-timeout', 'verifier-timeout')
+TIMEOUT_REPETITIONS = 3
+TIMEOUT_BUDGET_SEC = 0.05
+
+
+def timeout_request(directory, known=True, pending=False):
+    model, started = 'gpt-6-luna', time.time()
+    metadata = dict(schema=3, provider='openai', path='/responses', model=model, started=started,
+        body_sha256=checkpoint.digest({'model': model}),
+        attempt_identity_sha256=checkpoint_meter.attempt_identity_sha256(directory, os.path.basename(directory)))
+    request_id = checkpoint_meter.begin(directory, 'timeout-drill', metadata)
+    if pending:
+        return request_id
+    intent = checkpoint.read(os.path.join(directory, 'meter-intents', request_id + '.intent.json'))
+    usage = {'input_tokens': 7, 'output_tokens': 4, 'cache_read_tokens': 0, 'cache_write_tokens': 0} if known else None
+    terminal = dict(complete=known, identity_matches=known, model=model,
+        response_sha256=checkpoint.digest({'fixture': request_id}), provider_response_id='response-' + request_id,
+        usage_sha256=checkpoint.digest(usage))
+    record = dict(run=os.path.basename(directory), request_id=request_id, meter_incarnation='timeout-drill',
+        provider='openai', path='/responses', started=started, ended=time.time(), request={'model': model},
+        intent_sha256=checkpoint.digest(intent), status=200 if known else 0,
+        usage_known=known, usage=usage, terminal=terminal)
+    checkpoint_meter.finish(directory, request_id, record)
+    return request_id
+
+
+def timeout_fixture(base, case, index):
+    directory = os.path.join(base, 'timeout-' + case + '-' + str(index))
+    task, root = os.path.join(directory, 'task'), os.path.join(directory, 'agent-root')
+    checkpoint.durable_directory(os.path.join(task, 'tests'))
+    checkpoint.durable_directory(root)
+    with open(os.path.join(task, 'task.toml'), 'w') as handle:
+        agent_budget = 1 if case in ('no-timeout', 'verifier-timeout') else TIMEOUT_BUDGET_SEC
+        verifier_budget = TIMEOUT_BUDGET_SEC if case == 'verifier-timeout' else 1
+        handle.write('[environment]\ndocker_image="mock:1"\n[agent]\ntimeout_sec=' + str(agent_budget)
+            + '\n[verifier]\ntimeout_sec=' + str(verifier_budget) + '\n')
+    for path in ('instruction.md', 'tests/test.sh'):
+        with open(os.path.join(task, path), 'w') as handle:
+            handle.write('offline timeout fixture\n')
+    row = dict(id='row', source='mock', task='timeout', agent='hl-agent', attempt=1, dir=task)
+    args = SimpleNamespace(campaign_identity='timeout-fixture', model='gpt-6-luna', limits='none',
+        agent_memory_mb=0, max_turns=None, ca_bundle=None, meter_host=None, meter_port=1,
+        openai_route='openai', hl_agent_arg=[], meter_incarnation='timeout-drill', agent_root=root,
+        image_ids={'row': 'sha256:mock-image'}, workdirs={'row': '/app'})
+    runs = os.path.join(directory, 'rows')
+    state = checkpoint.Attempt(os.path.join(runs, row['id']), dict(campaign=args.campaign_identity, row=row['id']))
+    status = {'infrastructure': 'unknown_after_infrastructure', 'interruption': 'unknown_after_interruption',
+        'lost-usage': 'unknown_model_usage'}.get(case, 'observed')
+    state.value.update(image_id=args.image_ids['row'], workdir='/app', accounting_status=status,
+        meter_incarnation='prior' if case == 'incarnation' else args.meter_incarnation)
+    state.save()
+    return directory, row, args, runs
+
+
+def timeout_legacy_receipt(directory, request_id):
+    root = os.path.join(directory, 'meter-intents', request_id)
+    intent = checkpoint.read(root + '.intent.json')
+    intent.pop('schema')
+    checkpoint.atomic(root + '.intent.json', intent)
+    done = checkpoint.read(root + '.done.json')
+    done['record'].pop('intent_sha256')
+    done['record'].pop('terminal')
+    done['record_sha256'] = checkpoint.digest(done['record'])
+    checkpoint.atomic(root + '.done.json', done)
+
+
+def timeout_case(base, case, index):
+    directory, row, args, runs = timeout_fixture(base, case, index)
+    out = os.path.join(runs, row['id'])
+    commands, request_ids = [], []
+    original_sh, original_launch, original_reconcile = run.sh, checkpoint_phase.launch, checkpoint_meter.reconcile
+    def shell(command, **kwargs):
+        commands.append(command)
+        return mock_sh(directory, command, **kwargs)
+    def launched(sh, name, row, env, argv, stage, token):
+        if stage == 'agent':
+            request_ids.append(timeout_request(out))
+            if case in ('inflight', 'unknown-usage', 'unproven-dispatch'):
+                request_ids.append(timeout_request(out, known=False, pending=case == 'inflight'))
+            if case == 'legacy-weak':
+                timeout_legacy_receipt(out, request_ids[0])
+            if case == 'unmatched':
+                with open(os.path.join(out, 'requests.jsonl'), 'w') as handle:
+                    handle.write(json.dumps({'path': '/unrecognized', 'request_id': 'orphan'}) + '\n')
+        timed_out = stage == ('verifier' if case == 'verifier-timeout' else 'agent') and case != 'no-timeout'
+        if not timed_out:
+            checkpoint.atomic(os.path.join(out, 'journal', stage + '.receipt.json'), {'exit': 0, 'token': token})
+    run.sh, checkpoint_phase.launch = shell, launched
+    checkpoint_meter.reconcile = lambda directory, incarnation: original_reconcile(directory, incarnation, 0)
+    try:
+        result = run.run_row(row, args, '127.0.0.1', {}, threading.Lock(), args.agent_root, runs)
+        again = run.run_row(row, args, '127.0.0.1', {}, threading.Lock(), args.agent_root, runs)
+        assert again == result
+    finally:
+        run.sh, checkpoint_phase.launch, checkpoint_meter.reconcile = original_sh, original_launch, original_reconcile
+    meter = result['meter']
+    assert result['reporting_rules'] == run.reporting_rules.pin()
+    expected = {'closed': 'observed_after_timeout_reconciliation', 'verifier-timeout': 'observed_after_timeout_reconciliation',
+        'infrastructure': 'unknown_after_infrastructure', 'interruption': 'unknown_after_interruption',
+        'incarnation': 'unknown_meter_incarnation_changed', 'lost-usage': 'unknown_model_usage',
+        'no-timeout': 'observed', 'unknown-usage': 'unknown_model_usage',
+        'unproven-dispatch': 'unknown_model_usage'}.get(case, 'unknown_meter_requests')
+    assert result['accounting_status'] == meter['accounting_status'] == expected, result
+    assert result['outcome'] == ('passed' if case == 'no-timeout' else 'errored' if case == 'verifier-timeout' else 'failed')
+    assert result['agent_result']['timed_out'] is (case not in ('no-timeout', 'verifier-timeout'))
+    assert result['verifier']['timed_out'] is (case == 'verifier-timeout')
+    assert meter['input_tokens'] == 7 and meter['output_tokens'] == 4
+    assert meter['unknown_requests'] == (0 if case in ('closed', 'verifier-timeout', 'no-timeout') else None)
+    assert meter['unproven_intents'] == int(case in ('legacy-weak', 'unknown-usage', 'unproven-dispatch'))
+    assert meter['durable_ledger']['closed'] is True
+    assert meter['durable_ledger']['unknown'] == int(case == 'inflight')
+    assert meter['unknown_usage_requests'] == int(case in ('unknown-usage', 'unproven-dispatch'))
+    assert sorted(path.removesuffix('.intent.json') for path in os.listdir(os.path.join(out, 'meter-intents'))
+        if path.endswith('.intent.json')) == sorted(request_ids)
+    stops = [command for command in commands if command[:2] == ['docker', 'stop']]
+    starts = [command for command in commands if command[:2] == ['docker', 'start']]
+    assert len(stops) == (1 if case == 'no-timeout' else 2)
+    assert len(starts) == int(case not in ('no-timeout', 'verifier-timeout'))
+    return dict(case=case, repetition=index, directory=out, accounting_status=expected,
+        outcome=result['outcome'], request_ids=request_ids, actual_deadline_expired=case != 'no-timeout')
+
+
+def timeout_proof_mutations():
+    original = dict(closed=True, intents=1, completed=1, unknown=0, unmatched_records=0)
+    mutations = dict(open=dict(closed=False), missing_closed=dict(closed=None), active=dict(active=1),
+        unknown=dict(unknown=1), unmatched=dict(unmatched_records=1), incomplete=dict(completed=0),
+        malformed_count=dict(completed=True), missing_unknown=dict(unknown=None), missing_unmatched=dict(unmatched_records=None))
+    for name, mutation in mutations.items():
+        state = SimpleNamespace(value={'accounting_status': 'unknown_at_timeout'})
+        totals = {'unknown_usage_requests': 0, 'unproven_intents': 0}
+        run.reconcile_accounting(state, dict(original, **mutation), totals)
+        assert state.value['accounting_status'] == 'unknown_meter_requests', name
+        assert totals['unknown_requests'] is None, name
+    taints = ('unknown_after_infrastructure', 'unknown_after_interruption', 'unknown_meter_incarnation_changed',
+        'unknown_meter_requests', 'unknown_model_usage')
+    for taint in taints:
+        state = SimpleNamespace(value={'accounting_status': taint})
+        totals = {'unknown_usage_requests': 0, 'unproven_intents': 0}
+        run.reconcile_accounting(state, original, totals)
+        assert state.value['accounting_status'] == taint
+        assert totals['unknown_requests'] is None
+    return dict(incomplete_proofs_rejected=len(mutations), sticky_taints=len(taints))
+
+
+def timeout_drill(base):
+    results = [timeout_case(base, case, index) for case in TIMEOUT_CASES for index in range(TIMEOUT_REPETITIONS)]
+    return dict(result='passed', cases=results, rows=len(results), repetitions=TIMEOUT_REPETITIONS,
+        proof_mutations=[timeout_proof_mutations() for _ in range(TIMEOUT_REPETITIONS)],
+        model_calls=0, docker_calls=0)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--intent-worker')
     parser.add_argument('--child', nargs=2)
     parser.add_argument('--phase-worker', nargs=3)
     parser.add_argument('--out')
+    parser.add_argument('--timeout-only', action='store_true')
     parser.add_argument('--service-owner')
     parser.add_argument('--service-worker')
     args = parser.parse_args()
@@ -773,6 +932,11 @@ def main():
     if args.out:
         checkpoint.durable_directory(os.path.abspath(args.out))
     base = tempfile.mkdtemp(prefix='checkpoint-drill-', dir=args.out)
+    if args.timeout_only:
+        result = timeout_drill(base)
+        checkpoint.atomic(os.path.join(base, 'timeout-result.json'), result)
+        print(json.dumps(dict(result, fixture=base), sort_keys=True))
+        return
     fixture, rows, identity = resume_drill(base)
     rejected = mutation_drill(fixture, rows, identity)
     interruptions = interruption_drill(base)
@@ -789,10 +953,11 @@ def main():
     ledger_mutations = ledger_mutation_drill(base)
     streams = stream_usage_drill(base)
     routing = routing_drill()
+    timeouts = timeout_drill(base)
     print(json.dumps({'fixture': base, 'matrix_rows': len(rows), 'process_kills': 3,
         'agent_dispatches': 3, 'verifier_dispatches': 3, 'completed_immutable': 3,
         'identity_mutations_rejected': rejected, 'interruption_guards': interruptions,
-        'terminal_sse_barrier_n3': terminal_sse, 'runtime_source_pins': source_pins, 'api_edge_n3_each': streams, 'routing': routing, 'ledger_mutations': ledger_mutations, 'cache_hook': cache, 'accounting_n3': accounting, 'intent_owner_sigkill_n3': intents, 'saved_agent_window_n3': saved, 'relay_collision_cleanup_n3': collisions,
+        'timeout_accounting_n3': timeouts, 'terminal_sse_barrier_n3': terminal_sse, 'runtime_source_pins': source_pins, 'api_edge_n3_each': streams, 'routing': routing, 'ledger_mutations': ledger_mutations, 'cache_hook': cache, 'accounting_n3': accounting, 'intent_owner_sigkill_n3': intents, 'saved_agent_window_n3': saved, 'relay_collision_cleanup_n3': collisions,
         'shell_receipts': shell_receipts, 'service_owner_kill_recoveries': service_recoveries, 'stopped_container_drill': stopped, 'model_calls': 0, 'docker_calls': 0}, sort_keys=True))
 
 

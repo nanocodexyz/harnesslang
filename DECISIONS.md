@@ -751,3 +751,36 @@ compiler/bench/target/release/selfhost-bench --paired examples/claude_code.hl ou
 The reference source is copied unchanged from `eb724ed32fa5b328dce5cf91ba07a0487527337a:compiler/encode.hl`. It is a retained test input, not a bootstrap compiler or code removed from the repository's handwritten-line count. The component comparison script, `scripts/selfhost-components.sh`, now emits this reference instead of the changing encoder. Its original checks on the hashes of the resulting WebAssembly text (WAT) and binary (Wasm) remain unchanged. Current encoder correctness is checked separately against Rust. These measurements establish no model-benchmark pass-rate or cost result, nor a compiler that builds itself.
 
 Full local verification passed with `SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh`. This includes repeated interpreter/compiled-host comparisons, fault mutations, all-target proofs and the source-size gate. The gate's Rust compiler and fixed-host counts remain 28094 and 7573 lines respectively. No runtime Rust is removed; the paired benchmark adds 103 net handwritten Rust lines of measurement support, and the frozen reference adds 323 retained Harnesslang lines. Source counts are deterministic, not sampled timing estimates.
+
+
+## 2026-11-22 HST: retain closed-request costs after a timeout
+
+The evaluator previously kept `unknown_at_timeout` even after its durable request ledger closed with every request accounted for. New attempts may instead record `observed_after_timeout_reconciliation` when all intent receipts are bound, unique and complete, request usage is known, and no other interruption or infrastructure uncertainty occurred. The reporter independently checks the closed ledger before accepting that state. An agent timeout remains failed even if the verifier found a passing artifact; a verifier timeout remains errored. Neither becomes a pass through cost reconciliation. Earlier accounting uncertainty remains sticky.
+
+`evals/reporting_rules.py` freezes the reporting semantics and notional price card under a content-addressed version. New campaign identities, exported manifests and completed rows bind that pin. Older campaigns and their reporters remain unchanged; this does not retroactively recover unknown costs or reuse older rows in a fresh measurement. The report identifies unpinned legacy inputs and rejects mismatched rule pins.
+
+Cost per pass is the cost of every attempt, including failed and errored attempts, divided by passed attempts. Its 95% interval is a task-cluster percentile bootstrap: 10000 replicates, seed 0, sampling tasks with replacement and retaining all attempts within each task. Zero-pass replicates remain positive infinity and are counted; an unbounded endpoint is explicitly null, not silently omitted. An incomplete matrix, unknown cost or no passes has no finite cost-per-pass result. Pass-rate intervals remain Wilson intervals over the full planned denominator. List-price-equivalent valuation is not an invoice or a claim about subscription billing.
+
+From the repository root, the descriptive reporting command for a newly completed campaign is:
+
+```sh
+python3 -B evals/report.py --single-arm "$CAMPAIGN" \
+  --suite evals/suite-60.txt --attempts 3 --expected-tasks 60 \
+  --bootstrap-reps 10000 --seed 0 --json-out output/campaign-report.json --summary
+```
+
+This increment changes measurement support, not agent quality, production compiler behavior or self-hosting. No new model campaign or acceptance improvement is established by the accounting tests. The previous campaign stays paused and immutable. A fresh run needs a currently authorized numeric spending cap; the optimization target per attempt does not establish that cap.
+
+Focused deterministic checks on the timeout path exercise twelve accounting cases three times each. The deadline-expiry path runs through `run_row`, the real phase wait and request reconciliation, with Docker and phase launch replaced by local fixtures. Closed agent and verifier timeouts retain the known request cost and remain failed or errored. In-flight dispatch, missing usage, unmatched logs, weak legacy receipts and prior uncertainty keep exact totals unknown. Deliberately incomplete closure proofs and changed campaign identities are rejected. These are correctness fixtures, not sampled model outcomes or confidence intervals on acceptance.
+
+Reproduce the focused checks with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 evals/checkpoint_drill.py --out output/checkpoint-accounting-v2
+PYTHONDONTWRITEBYTECODE=1 python3 evals/meter_terminal_drill.py --out output/meter-terminal-accounting-v2
+PYTHONDONTWRITEBYTECODE=1 python3 evals/matched_report_drill.py
+```
+
+The reporting drill checks a synthetic task-by-attempt matrix and repeated independent fixtures for timeout pricing, unequal task costs, zero-pass resamples, changed version pins, and the single-arm command. It does not call a model, download verifier dependencies or establish a real acceptance score.
+
+Full local verification passed on this working-tree source snapshot with `SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh`, including evaluator drills, all-target simulations, compiled-host comparisons, mutations and the source-size gates. The frozen rule pin is `closed-accounting-v2` / `62c158b0bdd94d38f5bc4e7f01f507e572b2c203a902da81c5c8bf39550b666a`. The compiler and fixed hosts remain unchanged at the deterministic gate counts of 28094 and 7573 handwritten lines. Measurement support adds 603 net Python lines, including regression fixtures; no compiler or host deletion is claimed.

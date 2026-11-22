@@ -5,6 +5,7 @@ import sys
 import subprocess
 
 from checkpoint import ResumeError, digest
+import reporting_rules
 
 INPUT_FLAGS = ('model', 'agents', 'attempts', 'limits', 'agent_memory_mb', 'max_turns', 'hl_agent_arg', 'openai_route', 'meter_host', 'meter_port', 'relay_port', 'parallel', 'only')
 
@@ -71,4 +72,5 @@ def campaign(args, rows, task_digest, configs, image_ids):
             'ca_sha256': file_digest(args.ca_bundle) if args.ca_bundle else None,
             'transport_sha256': transport_sha256, 'runtime': runtime,
             'task_trees': {key: digest(tree(directory)) for key, directory in task_dirs.items()},
-            'cache': getattr(args, 'cache_identity', {'enabled': False}), 'meter_ledger_schema': 1}
+            'cache': getattr(args, 'cache_identity', {'enabled': False}), 'meter_ledger_schema': 1,
+            'reporting_rules': reporting_rules.pin()}

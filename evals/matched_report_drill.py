@@ -80,6 +80,16 @@ def change_manifest(arm, action):
         write(row_path, row)
 
 
+def pin_fixture(args):
+    for arm in (args.baseline, args.candidate):
+        change_manifest(arm, lambda value: value.update(reporting_rules=report.reporting_rules.pin()))
+        for directory in (arm / "rows").iterdir():
+            path = directory / "result.json"
+            row = report.read_json(path)
+            row["reporting_rules"] = report.reporting_rules.pin()
+            write(path, row)
+
+
 def change_requests(arm, action):
     path = first_row(arm) / "requests.jsonl"
     rows = report.read_lines(path)
@@ -119,6 +129,13 @@ def check_valid(args):
         assert interval["clusters"] == 3 and interval["attempts_per_cluster"] == 3
         assert interval["repetitions"] == 501 and interval["seed"] == 42
         assert math.isclose(interval["mean"], 0.00165)
+        ratio = result[name]["cost_per_pass_bootstrap_95"]
+        assert ratio["repetitions"] == 10000 and ratio["seed"] == 0
+        expected_ratio = 0.00165 * 9 / result[name]["counts"]["passed"]
+        assert math.isclose(result[name]["cost_per_pass"], expected_ratio)
+        assert math.isclose(ratio["mean"], expected_ratio)
+        assert ratio["zero_pass_replicates"] == 0
+        assert result[name]["campaign_rules_status"] == "legacy_unpinned"
         assert all(math.isclose(value, 0.00165) for value in interval["ci_95"])
     assert result == report.build_report(args)
     assert report.wilson(2, 3)[0] > 0.20
@@ -141,6 +158,8 @@ def check_unknown(result):
     assert result["candidate"]["cost_mean_usd"] is None
     assert result["candidate"]["cost_total_usd"] is None
     assert result["candidate"]["cost_mean_bootstrap_95"] is None
+    assert result["candidate"]["cost_per_pass"] is None
+    assert result["candidate"]["cost_per_pass_bootstrap_95"] is None
     assert result["candidate"]["unknown_cost_rows"]
     if result["paired"]:
         assert result["paired"]["cost_difference_usd"] is None
@@ -151,6 +170,8 @@ def check_incomplete(result):
     fails(result)
     assert result["candidate"]["cost_mean_usd"] is None
     assert result["candidate"]["cost_mean_bootstrap_95"] is None
+    assert result["candidate"]["cost_per_pass"] is None
+    assert result["candidate"]["cost_per_pass_bootstrap_95"] is None
 
 
 def uncertain_improvement(args):
@@ -305,6 +326,8 @@ def checkpoint_fixture(args):
                         task_trees={task["source"] + "/" + task["task"]: task["tree_sha256"] for task in old["tasks"]},
                         configs_sha256="f" * 64, ca_sha256=ca, runtime=old["runtime"],
                         transport_sha256=old["transport_sha256"], cache=dict(enabled=False))
+        if "reporting_rules" in old:
+            identity["reporting_rules"] = old["reporting_rules"]
         directories = sorted((arm / "rows").iterdir())
         identity["matrix"] = [directory.name for directory in directories]
         identity["images"] = {directory.name: "sha256:" + "9" * 64 for directory in directories}
@@ -408,6 +431,180 @@ def check_checkpoint(root):
     assert not result["candidate"]["complete"]
 
 
+def closed_timeout(args):
+    directory = first_row(args.candidate)
+    seal_ledger(directory)
+    records = report.read_lines(directory / "requests.jsonl")
+    for record in records:
+        key = record["request_id"]
+        intent = dict(schema=3, request_id=key, incarnation="fixture-incarnation", provider="openai",
+            path=record["path"], model=record["request"]["model"], started=1.0, body_sha256="1" * 64,
+            attempt_identity_sha256=report.checkpoint_digest({"run": directory.name}))
+        record.update(provider="openai", started=1.0, usage_known=True, intent_sha256=report.checkpoint_digest(intent),
+            terminal=dict(complete=True, identity_matches=True, model=intent["model"], response_sha256="2" * 64,
+                provider_response_id="fixture-response-" + key, usage_sha256=report.checkpoint_digest(record["usage"])))
+        write(directory / "meter-intents" / (key + ".intent.json"), intent)
+        write(directory / "meter-intents" / (key + ".done.json"),
+              dict(request_id=key, record=record, record_sha256=report.checkpoint_digest(record)))
+    (directory / "requests.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records))
+    status = "observed_after_timeout_reconciliation"
+    change_row(args.candidate, lambda row: row.update(outcome="failed", agent_result={"timed_out": True},
+        reporting_rules=report.reporting_rules.pin(), accounting_status=status, meter=dict(requests=2, ok_requests=2, accounting_status=status,
+            unknown_requests=0, unproven_intents=0, durable_ledger=dict(closed=True, intents=2, completed=2, unknown=0, unmatched_records=0))))
+
+
+def check_timeout_accounting(root):
+    args = fixture(root)
+    pin_fixture(args)
+    closed_timeout(args)
+    result = report.build_report(args)
+    assert math.isclose(result["candidate"]["cost_per_pass"], 0.00165 * 9 / 8)
+    assert result["candidate"]["cost_total_usd"] is not None
+    assert result["candidate"]["counts"]["failed"] == 1
+    for field, bad in (("closed", False), ("intents", 3), ("completed", 1), ("unknown", 1), ("unmatched_records", 1),
+                       ("completed", True), ("unknown", False), ("unmatched_records", False), ("active", False)):
+        change_row(args.candidate, lambda row: row["meter"]["durable_ledger"].update({field: bad}))
+        check_unknown(report.build_report(args))
+        closed_timeout(args)
+    for field, bad in (("unproven_intents", 1), ("unproven_intents", False), ("unknown_requests", False)):
+        change_row(args.candidate, lambda row: row["meter"].update({field: bad}))
+        check_unknown(report.build_report(args))
+        closed_timeout(args)
+    change_requests(args.candidate, lambda rows: [record.pop("intent_sha256") for record in rows])
+    seal_ledger(first_row(args.candidate))
+    result = report.build_report(args)
+    assert result["candidate"]["rows"][0]["pricing"]["ledger"]["unproven_intents"] == 2
+    check_unknown(result)
+    closed_timeout(args)
+    change_row(args.candidate, lambda row: row["meter"].pop("durable_ledger"))
+    check_unknown(report.build_report(args))
+    closed_timeout(args)
+    change_row(args.candidate, lambda row: row.update(accounting_status="unknown_at_timeout"))
+    check_unknown(report.build_report(args))
+    closed_timeout(args)
+    (first_row(args.candidate) / "meter-closed.json").unlink()
+    check_unknown(report.build_report(args))
+    closed_timeout(args)
+    change_manifest(args.candidate, lambda value: value.pop("reporting_rules"))
+    check_unknown(report.build_report(args))
+    pin_fixture(args)
+    change_row(args.candidate, lambda row: row.pop("reporting_rules"))
+    check_unknown(report.build_report(args))
+    closed_timeout(args)
+    change_row(args.candidate, lambda row: row["reporting_rules"].update(sha256="0" * 64))
+    check_unknown(report.build_report(args))
+    closed_timeout(args)
+    change_row(args.candidate, lambda row: row.update(outcome="passed"))
+    result = report.build_report(args)
+    fails(result)
+    assert any("timed-out attempt cannot pass" in issue for issue in result["candidate"]["issues"])
+
+
+def check_ratio_clusters(root):
+    args = fixture(root)
+    tasks = sorted(TASKS)
+    for directory in (args.candidate / "rows").iterdir():
+        path = directory / "result.json"
+        row = report.read_json(path)
+        index = tasks.index((row["source"], row["task"]))
+        row["outcome"] = "passed" if index == 0 or (index == 1 and row["attempt"] == 1) else "failed"
+        write(path, row)
+        records = report.read_lines(directory / "requests.jsonl")
+        for record in records:
+            for field in ("input_tokens", "output_tokens"):
+                record["usage"][field] *= (index + 1) * row["attempt"]
+        (directory / "requests.jsonl").write_text("".join(json.dumps(record) + "\n" for record in records))
+    result = report.build_report(args)
+    summary = result["candidate"]
+    clusters = [(0.00165 * 6 * (index + 1), passed) for index, passed in enumerate((3, 1, 0))]
+    assert math.isclose(summary["cost_per_pass"], sum(cost for cost, passed in clusters) / 4)
+    randomizer = random.Random(0)
+    samples = []
+    for _ in range(10000):
+        selected = [clusters[randomizer.randrange(3)] for _ in range(3)]
+        passes = sum(passed for cost, passed in selected)
+        samples.append(sum(cost for cost, passed in selected) / passes if passes else math.inf)
+    samples.sort()
+    interval = summary["cost_per_pass_bootstrap_95"]
+    assert interval["clusters"] == 3 and interval["attempts_per_cluster"] == 3
+    assert interval["zero_pass_replicates"] == samples.count(math.inf) > 0
+    assert interval["ci_95"][1] is None
+    assert math.isclose(interval["ci_95"][0], report.percentile(samples, 0.025))
+    finite_only = [value for value in samples if math.isfinite(value)]
+    assert math.isfinite(report.percentile(finite_only, 0.975))
+    assert result == report.build_report(args)
+    json.dumps(result, allow_nan=False)
+    for directory in (args.candidate / "rows").iterdir():
+        path = directory / "result.json"
+        row = report.read_json(path)
+        row["outcome"] = "failed"
+        write(path, row)
+    summary = report.build_report(args)["candidate"]
+    assert summary["cost_total_usd"] > 0 and summary["cost_mean_usd"] > 0
+    assert summary["cost_per_pass"] is None and summary["cost_per_pass_bootstrap_95"] is None
+
+
+def check_rules(root):
+    args = fixture(root)
+    original = {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    result = report.build_report(args)
+    assert result["reporting_rules"]["pin"] == report.reporting_rules.pin()
+    assert all(Path(path).read_bytes() == content for path, content in original.items())
+    rules = report.reporting_rules.manifest()
+    assert set(rules["implementation_sha256"]) == {"report.py", "reporting_rules.py", "checkpoint_meter.py", "checkpoint.py", "run.py", "checkpoint_phase.py", "provenance.py"}
+    assert all(report.valid_digest(value) for value in rules["implementation_sha256"].values())
+    assert report.checkpoint_digest(rules) == report.reporting_rules.pin()["sha256"]
+    rules["prices_per_million_tokens"]["gpt-6-luna"]["input"] *= 2
+    assert report.checkpoint_digest(rules) != report.reporting_rules.pin()["sha256"]
+    assert report.reporting_rules.manifest() != rules
+    pin_fixture(args)
+    result = report.build_report(args)
+    assert result["status"] == "PASS", report.readable(result)
+    assert all(result[name]["campaign_rules_status"] == "pinned" for name in ("baseline", "candidate"))
+    for field, bad in (("sha256", "0" * 64), ("version", "foreign-version")):
+        change_manifest(args.candidate, lambda value: value["reporting_rules"].update({field: bad}))
+        result = report.build_report(args)
+        fails(result)
+        assert result["candidate"]["campaign_rules_status"] == "pin_mismatch"
+        assert any("reporting rules pin" in issue for issue in result["candidate"]["issues"])
+        change_manifest(args.candidate, lambda value: value.update(reporting_rules=report.reporting_rules.pin()))
+    checkpoint_fixture(args)
+    for arm in (args.baseline, args.candidate):
+        change_checkpoint_identity(arm, lambda value: value.update(reporting_rules=report.reporting_rules.pin()))
+    args.allow_source_change = ["src/agent.rs"]
+    assert report.build_report(args)["status"] == "PASS"
+    change_checkpoint_identity(args.candidate, lambda value: value["reporting_rules"].update(sha256="0" * 64))
+    fails(report.build_report(args))
+
+
+def check_single_arm(root):
+    args = fixture(root)
+    command = [sys.executable, str(ROOT / "report.py"), "--single-arm", str(args.candidate),
+               "--suite", str(args.suite), "--expected-tasks", "3", "--attempts", "3"]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["status"] == "COMPLETE" and not result["matched"] and result["paired"] is None
+    assert "NOT_MATCHED" in result["profile"] and "gates" not in result
+    assert result["arm"]["pass_wilson_95"] == report.wilson(9, 9)
+    assert math.isclose(result["arm"]["cost_per_pass"], 0.00165)
+    completed = subprocess.run(command + ["--summary"], capture_output=True, text=True)
+    assert completed.returncode == 0 and "no matched comparison" in completed.stdout
+    assert "10000" not in completed.stderr
+    completed = subprocess.run(command + ["--baseline", str(args.baseline)], capture_output=True, text=True)
+    assert completed.returncode == 2
+    completed = subprocess.run(command + ["--allow-source-change", "src/agent.rs"], capture_output=True, text=True)
+    assert completed.returncode == 2
+    shutil.rmtree(first_row(args.candidate))
+    completed = subprocess.run(command, capture_output=True, text=True)
+    assert completed.returncode == 1, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["status"] == "INCOMPLETE"
+    assert result["arm"]["cost_per_pass"] is None
+    assert result["arm"]["cost_per_pass_bootstrap_95"] is None
+    assert result["arm"]["pass_wilson_95"] is None
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="matched-report-") as temporary:
         root = Path(temporary)
@@ -446,6 +643,10 @@ def main():
         mutations.extend(("ledger-" + kind, lambda args, kind=kind: ledger_mutation(args, kind), check_unknown)
                          for kind in ("unresolved", "unclosed", "orphan-completion", "orphan-request", "duplicate", "digest", "incarnation", "identifier"))
         rejected = [run_mutant(root, *mutation) for mutation in mutations]
+        for name, check in (("timeout-accounting", check_timeout_accounting), ("ratio-clusters", check_ratio_clusters), ("rules", check_rules), ("single-arm", check_single_arm)):
+            directory = root / name
+            directory.mkdir()
+            check(directory)
         varied = root / "varied-cost"
         varied.mkdir()
         check_cost_clusters(varied)
@@ -502,7 +703,10 @@ def main():
         args = fixture(historical, suite60[:35])
         assert report.build_report(args)["profile"] == "CUSTOM_35_TASKS_105_ATTEMPTS_NOT_MATCHED180"
         print(json.dumps(dict(result="passed", clusters=3, attempts_per_arm=9, mutants_rejected=rejected,
-                              full_matrix="60 tasks x 3 attempts x 2 arms", model_calls=0, network_calls=0)))
+                              full_matrix="60 tasks x 3 attempts x 2 arms", reporting_rules=report.reporting_rules.pin(),
+                              reporting_checks=["ratio-all-attempts", "task-correlation", "zero-pass-replicates", "zero-passes",
+                                                "version-and-price-hash", "historical-no-write", "closed-timeout-proof-mutations", "single-arm-cli", "incomplete-no-CI"],
+                              model_calls=0, network_calls=0)))
 
 
 if __name__ == "__main__":

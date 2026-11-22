@@ -31,7 +31,8 @@ def phase(sh, name, row, env, argv, timeout, journal, stage, checkpoint):
     if fresh:
         launch(sh, name, row, env, argv, stage, token)
     else:
-        checkpoint.value['accounting_status'] = 'unknown_after_interruption'
+        if checkpoint.value.get('accounting_status') in ('observed', 'unknown_at_timeout'):
+            checkpoint.value['accounting_status'] = 'unknown_after_interruption'
         checkpoint.save()
     return await_receipt(sh, name, journal, stage, token, receipt, checkpoint, not fresh)
 
@@ -66,7 +67,8 @@ def await_receipt(sh, name, journal, stage, token, receipt, checkpoint, interrup
             sh(['docker', 'stop', '--time', '1', name])
             if interrupted and remaining <= 0:
                 raise Unresumable(stage + ' budget expired during interruption; no score or replay')
-            checkpoint.value['accounting_status'] = 'unknown_at_timeout'
+            if checkpoint.value.get('accounting_status') == 'observed':
+                checkpoint.value['accounting_status'] = 'unknown_at_timeout'
             checkpoint.save()
             return {'exit': None, 'timed_out': True, 'wall_ms': int((time.time() - checkpoint.value['started']) * 1000)}
         time.sleep(min(POLL_SECONDS, max(0, checkpoint.value['deadline'] - time.time())))

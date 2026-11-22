@@ -19,6 +19,7 @@ import checkpoint
 import checkpoint_phase
 import checkpoint_meter
 import provenance
+import reporting_rules
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 AGENT_MOUNT = "/opt/nanoeval-agent"
@@ -177,10 +178,27 @@ def verify(name, row, config, out, state=None):
     return result
 
 
+def proven_intent(intent, record):
+    if type(intent.get("schema")) is not int or intent["schema"] not in (2, 3):
+        return False
+    if checkpoint_meter.not_dispatched(intent, record):
+        return True
+    terminal = record.get("terminal") or {}
+    response_hash = terminal.get("response_sha256")
+    response_id = terminal.get("provider_response_id")
+    return (record.get("usage_known") is True and terminal.get("complete") is True
+        and terminal.get("identity_matches") is True and isinstance(response_id, str) and bool(response_id)
+        and isinstance(response_hash, str) and len(response_hash) == 64
+        and all(char in "0123456789abcdef" for char in response_hash))
+
+
 def meter_totals(directory):
     totals = {"requests": 0, "ok_requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cache_write_1h_tokens": 0, "reasoning_tokens": 0, "tool_calls": 0, "unknown_usage_requests": 0, "not_dispatched_requests": 0, "statuses": {}}
     bound_intents = {}
     _, records = checkpoint_meter.snapshot(directory, None, bound_intents)
+    totals["unproven_intents"] = sum(1 for record in records
+        if record.get("request_id") in bound_intents
+        and not proven_intent(bound_intents[record["request_id"]], record))
     for record in records:
         if not record["path"].split("?")[0].endswith(MODEL_ENDPOINTS):
             continue
@@ -204,15 +222,38 @@ def meter_totals(directory):
 def outcome(agent_result, verifier, totals):
     if totals["ok_requests"] == 0:
         return "errored", "no model request succeeded"
+    if agent_result.get("timed_out"):
+        return "failed", "agent timed out"
+    if verifier.get("timed_out"):
+        return "errored", "verifier timed out"
     if verifier["reward"] is None:
-        return "errored", "verifier wrote no reward" + (" (timed out)" if verifier["timed_out"] else "")
-    return ("passed" if verifier["reward"] == 1 else "failed"), ("agent timed out" if agent_result["timed_out"] else None)
+        return "errored", "verifier wrote no reward"
+    return ("passed" if verifier["reward"] == 1 else "failed"), None
+
+
+def reconcile_accounting(state, ledger, totals):
+    status = state.value["accounting_status"]
+    complete = (ledger.get("closed") is True and type(ledger.get("intents")) is int
+        and ledger["intents"] >= 0 and type(ledger.get("completed")) is int
+        and ledger["completed"] == ledger["intents"] and ledger.get("active", 0) == 0
+        and all(type(ledger.get(key)) is int and ledger[key] == 0 for key in ("unknown", "unmatched_records")))
+    if status in ("observed", "unknown_at_timeout"):
+        if not complete:
+            status = "unknown_meter_requests"
+        elif totals["unknown_usage_requests"]:
+            status = "unknown_model_usage"
+        elif status == "unknown_at_timeout":
+            status = "unknown_meter_requests" if totals["unproven_intents"] else "observed_after_timeout_reconciliation"
+    state.value["accounting_status"] = status
+    totals.update(durable_ledger=ledger, accounting_status=status,
+        unknown_requests=0 if status in ("observed", "observed_after_timeout_reconciliation") else None)
 
 
 def record_crash(row, args, runs, error):
     out = os.path.join(runs, row["id"])
     path = os.path.join(out, "infrastructure.json")
     result = {key: row[key] for key in ("id", "source", "task", "agent", "attempt")}
+    result["reporting_rules"] = reporting_rules.pin()
     result.update(model=args.model, outcome="errored", infrastructure_status="unresumable" if isinstance(error, checkpoint.Unresumable) else "blocked", retry_policy="no_fresh_attempt", accounting_status="unknown_after_infrastructure",
         note="exception: " + type(error).__name__ + ": " + str(error)[-1500:])
     try:
@@ -275,6 +316,7 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
     journal = os.path.join(out, "journal")
     name = "nanoeval-" + hashlib.sha256(runs.encode()).hexdigest()[:CONTAINER_RUN_DIGITS] + "-" + row["id"]
     result = {key: row[key] for key in ("id", "source", "task", "agent", "attempt")}
+    result["reporting_rules"] = reporting_rules.pin()
     result["model"] = args.model
     result["cache"] = getattr(args, "cache_identity", {"enabled": False})
     try:
@@ -283,7 +325,8 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
             state.save()
         incarnation = getattr(args, "meter_incarnation", "mock-offline")
         if state.value.get("meter_incarnation", incarnation) != incarnation:
-            state.value["accounting_status"] = "unknown_meter_incarnation_changed"
+            if state.value["accounting_status"] in ("observed", "unknown_at_timeout"):
+                state.value["accounting_status"] = "unknown_meter_incarnation_changed"
         state.value["meter_incarnation"] = incarnation
         state.save()
         row["workdir"] = state.value["workdir"]
@@ -306,13 +349,7 @@ def run_row(row, args, gateway, env, lock, agent_root, runs):
         verifier = verify(name, row, config, out, state)
         ledger = checkpoint_meter.reconcile(out, incarnation)
         totals = meter_totals(out)
-        totals["durable_ledger"] = ledger
-        if ledger["unknown"] or ledger["unmatched_records"]:
-            state.value["accounting_status"] = "unknown_meter_requests"
-        if totals["unknown_usage_requests"]:
-            state.value["accounting_status"] = "unknown_model_usage"
-        totals["accounting_status"] = state.value["accounting_status"]
-        totals["unknown_requests"] = None if state.value["accounting_status"] != "observed" else 0
+        reconcile_accounting(state, ledger, totals)
         kind, note = outcome(state.value["agent_result"], verifier, totals)
         result.update(outcome=kind, note=note, agent_result=state.value["agent_result"], verifier=verifier,
             meter=totals, accounting_status=state.value["accounting_status"], image=state.value["image_id"], workdir=row["workdir"])
@@ -486,6 +523,7 @@ def preflight(args, rows):
         raise checkpoint.ResumeError("matrix " + str(len(rows)) + " rows; missing " + str(len(missing)) + " images: " + ", ".join(sorted(missing)) + "; no implicit pull/build")
     cache_variants(args, rows, images, workdirs)
     identity = provenance.campaign(args, rows, task_digest, configs, images)
+    identity["reporting_rules"] = reporting_rules.pin()
     path = os.path.join(args.out, "campaign.json")
     if os.path.exists(path) and checkpoint.read(path)["identity"] != identity:
         raise checkpoint.ResumeError("campaign identity mismatch; no work dispatched")

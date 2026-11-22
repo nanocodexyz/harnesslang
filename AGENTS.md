@@ -67,3 +67,15 @@ A verifier cache contains a pinned dependency image and artifacts, without chang
 An experiment arm is one campaign being compared, such as baseline or candidate. Both arms must use the same per-task cache variant, image, HTTP proxy and trusted certificates, and CPU/memory settings. These are pinned from the runner's arguments and environment. A newly cached campaign is not a controlled comparison against an older uncached campaign.
 
 For acceptance, select `--suite evals/suite-60.txt --attempts 3` in both campaigns and the report. This is the complete matched-arm acceptance profile. See `evals/report.py --help` for reporting options. Declare intended repository-file differences with repeated `--allow-source-change` paths, and staged executable differences with `--allow-agent-change` paths. Differences in the evaluator scripts or toolchain cannot be exempted. Missing attempts, unknown usage or mismatched measurement settings cannot establish a passing result.
+
+Reporting rules and their rate card are versioned in `evals/reporting_rules.py` and pinned in new campaign identities, manifests and rows. A closed timeout may retain exact observed request costs only when every dispatched request has bound terminal evidence and known usage; it remains a nonpass. Interruption, unresolved requests and unknown usage remain unknown-cost. Keep older campaigns and their pinned reporters unchanged.
+
+For a descriptive report of one complete campaign, including pass-rate and all-attempt cost-per-pass intervals, run:
+
+```sh
+python3 -B evals/report.py --single-arm "$CAMPAIGN" \
+  --suite evals/suite-60.txt --attempts 3 --expected-tasks 60 \
+  --bootstrap-reps 10000 --seed 0 --json-out output/campaign-report.json --summary
+```
+
+This is not a matched adoption result. Cost per pass includes the costs of failed attempts. Its interval resamples task clusters with all attempts retained; zero-pass samples remain unbounded. Report list-price-equivalent valuation separately from actual invoiced spending. An optimization target is not a wallet cap: fix the campaign's authorized spending limit and enforce it before dispatching requests.
