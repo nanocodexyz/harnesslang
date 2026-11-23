@@ -551,7 +551,7 @@ def check_rules(root):
     assert result["reporting_rules"]["pin"] == report.reporting_rules.pin()
     assert all(Path(path).read_bytes() == content for path, content in original.items())
     rules = report.reporting_rules.manifest()
-    assert set(rules["implementation_sha256"]) == {"report.py", "reporting_rules.py", "checkpoint_meter.py", "checkpoint.py", "run.py", "checkpoint_phase.py", "provenance.py"}
+    assert set(rules["implementation_sha256"]) == {"report.py", "reporting_rules.py", "checkpoint_meter.py", "checkpoint.py", "run.py", "checkpoint_phase.py", "provenance.py", "meter.py", "budget.py"}
     assert all(report.valid_digest(value) for value in rules["implementation_sha256"].values())
     assert report.checkpoint_digest(rules) == report.reporting_rules.pin()["sha256"]
     rules["prices_per_million_tokens"]["gpt-6-luna"]["input"] *= 2

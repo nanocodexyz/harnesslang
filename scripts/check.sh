@@ -431,6 +431,8 @@ queue eval-cache python3 evals/cache_selfcheck.py
 queue eval-checkpoints python3 evals/checkpoint_drill.py --out "$scratch/eval-checkpoints"
 queue eval-meter-terminal python3 evals/meter_terminal_drill.py --out "$scratch/eval-meter-terminal"
 queue eval-report python3 evals/matched_report_drill.py
+queue eval-budget python3 evals/budget_drill.py
+queue eval-budget-runner python3 evals/budget_runner_drill.py
 for file in $examples docs/snippets/compaction.hl docs/snippets/recovery.hl docs/snippets/catalog.hl docs/snippets/images.hl docs/snippets/tree.hl docs/snippets/side.hl docs/snippets/keep.hl docs/snippets/in_flight.hl docs/snippets/fork.hl; do
   for target in $targets; do
     queue sim sim_one "$target" "$file"

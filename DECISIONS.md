@@ -784,3 +784,25 @@ PYTHONDONTWRITEBYTECODE=1 python3 evals/matched_report_drill.py
 The reporting drill checks a synthetic task-by-attempt matrix and repeated independent fixtures for timeout pricing, unequal task costs, zero-pass resamples, changed version pins, and the single-arm command. It does not call a model, download verifier dependencies or establish a real acceptance score.
 
 Full local verification passed on this working-tree source snapshot with `SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh`, including evaluator drills, all-target simulations, compiled-host comparisons, mutations and the source-size gates. The frozen rule pin is `closed-accounting-v2` / `62c158b0bdd94d38f5bc4e7f01f507e572b2c203a902da81c5c8bf39550b666a`. The compiler and fixed hosts remain unchanged at the deterministic gate counts of 28094 and 7573 handwritten lines. Measurement support adds 603 net Python lines, including regression fixtures; no compiler or host deletion is claimed.
+
+## 2026-11-23 HST — reserve request value before capped model dispatch
+
+A campaign may declare a list-price-equivalent USD cap with `--budget-config`. The meter reserves the request's worst-case pinned token value in a shared SQLite ledger before making an upstream request. Transactions use exact integer nanoUSD, an immediate write lock and full synchronization. Known terminal usage settles a reservation; ambiguous dispatch, missing usage, conflicting receipts and an older meter incarnation retain reservations and block admission. A capped serial runner also stops before another attempt on budget halt, route halt or its declared disk floor. Existing uncapped campaigns keep their old behavior; nothing resumes or rewrites a previous campaign.
+
+The requested fresh profile uses 10 USD, the existing Luna/medium policy with two finish checks and Terra escalation, three attempts on every task, serial execution, unchanged staged candidate binary and explicit unenforced task resources (`--limits none`). It declares an 11 GiB admission floor, a request payload bound of 16 MiB and a ledger request-count bound of 1000000 (the harness's named turn bound, used as this experiment's coarse ledger-capacity policy). These do not change the compiled harness. The price card remains a list-price valuation, not an invoice or subscription charge. A complete descriptive candidate report is not a matched quality-adoption result.
+
+ChatGPT does not need an injected output-limit parameter. The provider model-list response reports a maximum context window of 872000 for each selected model. The provider's conversation-state documentation defines context as including input, output and reasoning. Reserving that entire maximum separately for input and output, plus conservative encoded-request bytes, therefore over-reserves. Both the model metadata and documentation are content-pinned policy inputs. Inline base64 image inputs are allowed only with the total-context policy and pinned provider image-input pricing documentation, which values counted image input tokens at the input rate. Remote media, audio/video, hosted tools and unpriced modes remain outside this profile. A conservative reservation may stop a campaign before its settled value reaches the cap; never remove the reservation or reset the ledger to continue.
+
+Repository: `nanocodexyz/harnesslang`. Offline deterministic checks, three repetitions per case (statistical intervals not applicable), run without model requests:
+
+```sh
+python3 -B evals/budget_drill.py
+python3 -B evals/budget_runner_drill.py
+python3 -B evals/meter_terminal_drill.py --out output/budget-launch/meter-terminal-final
+python3 -B evals/matched_report_drill.py
+SHIPPY_REMOTE_BUILD=0 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 CHECK_JOBS=2 scripts/ci.sh
+```
+
+The budget drill exercises process/thread concurrency, restart retention, duplicate identity, unknown and timed-out usage, exact rates, Unicode/JSON overhead, platform-evidence changes and refusal before network dispatch. The runner drill checks cap, disk and route boundaries. A read-only compatibility replay accepted every saved request body; this is admission compatibility, not a new solver or acceptance result. Compiler, fixed-host and candidate-agent sources are unchanged. This increment adds evaluator control and test code rather than claiming a reduction in handwritten source or a quality gain.
+
+The complete local suite above passed with its default sweeps and all gate ratchets on 2026-11-23 HST. The final frozen source hashes were checked again after the suite. No model requests ran during qualification.

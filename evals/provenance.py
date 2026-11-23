@@ -62,6 +62,11 @@ def campaign(args, rows, task_digest, configs, image_ids):
     task_dirs = {row['source'] + '/' + row['task']: row['dir'] for row in rows}
     tasks = {key: task_digest(directory) for key, directory in task_dirs.items()}
     parameters = {key: getattr(args, key) for key in INPUT_FLAGS}
+    if getattr(args, 'budget_config', None):
+        import budget
+        parameters['budget'] = budget.configuration(args.budget_config)
+    if getattr(args, 'min_free_gib', None) is not None:
+        parameters['min_free_gib'] = args.min_free_gib
     transport_names = ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy', 'NANOEVAL_CHATGPT_UPSTREAM', 'NANOEVAL_OPENAI_UPSTREAM', 'NANOEVAL_ANTHROPIC_UPSTREAM', 'NANOEVAL_METER_CLIENTS')
     transport_sha256 = digest({key: os.environ.get(key) for key in transport_names})
     runtime = {'system': platform.system(), 'release': platform.release(), 'machine': platform.machine(), 'python': platform.python_version(), 'implementation': sys.implementation.name}

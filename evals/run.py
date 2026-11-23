@@ -20,6 +20,7 @@ import checkpoint_phase
 import checkpoint_meter
 import provenance
 import reporting_rules
+import budget
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 AGENT_MOUNT = "/opt/nanoeval-agent"
@@ -371,6 +372,11 @@ def start_services(gateway, upstream, runs, logs, meter_port, relay_port, meter_
     state_root = os.path.join(logs, "services")
     checkpoint.durable_directory(state_root)
     meter_env = dict(os.environ)
+    policy_path = os.path.join(logs, "budget-policy.json")
+    if os.path.isfile(policy_path):
+        meter_env[budget.POLICY_ENV] = policy_path
+    else:
+        meter_env.pop(budget.POLICY_ENV, None)
     if meter_host != gateway:
         meter_env["NANOEVAL_METER_CLIENTS"] = bridge_subnet()
     specs = [("meter", [meter_host, str(meter_port), runs], meter_env)]
@@ -378,7 +384,7 @@ def start_services(gateway, upstream, runs, logs, meter_port, relay_port, meter_
         specs.append(("relay", [gateway, str(relay_port), upstream], dict(os.environ)))
     try:
         for role, arguments, environment in specs:
-            relevant = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN", "HTTPS_PROXY", "https_proxy", "NANOEVAL_METER_CLIENTS", "NANOEVAL_ANTHROPIC_UPSTREAM", "NANOEVAL_OPENAI_UPSTREAM", "NANOEVAL_CHATGPT_UPSTREAM")
+            relevant = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "NANOEVAL_CHATGPT_LOGIN", "HTTPS_PROXY", "https_proxy", "NANOEVAL_METER_CLIENTS", "NANOEVAL_ANTHROPIC_UPSTREAM", "NANOEVAL_OPENAI_UPSTREAM", "NANOEVAL_CHATGPT_UPSTREAM", budget.POLICY_ENV)
             environment_sha256 = checkpoint.digest({key: environment.get(key) for key in relevant})
             command = [sys.executable, os.path.join(ROOT, "checkpoint_meter.py"), "--role", role, "--owner", owner,
                 "--environment-sha256", environment_sha256, "--state", os.path.join(state_root, role + ".json")] + arguments
@@ -532,6 +538,26 @@ def preflight(args, rows):
     return identity
 
 
+def budgeted_rows(args, rows, gateway, env, lock, runs):
+    gate = budget.Gate(args.budget_policy['ledger_path'],
+                       args.budget_policy, args.meter_incarnation)
+    for row in rows:
+        status = gate.status()
+        if status['halt']:
+            print('budget admission stopped:', status['halt'], flush=True)
+            break
+        if args.min_free_gib is not None:
+            free = shutil.disk_usage(args.out).free
+            if free < args.min_free_gib * 1024 ** 3:
+                print('disk admission stopped: free bytes', free, flush=True)
+                break
+        if os.path.isfile(os.path.join(runs, CHATGPT_HALT_FILE)):
+            print('the meter halted the ChatGPT route; no new attempt', flush=True)
+            break
+        result = run_row(row, args, gateway, env, lock, os.path.abspath(args.agent_root), runs)
+        print(result['id'], result['outcome'], result.get('note') or '', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", required=True)
@@ -553,9 +579,16 @@ def main():
     parser.add_argument("--openai-route", choices=tuple(OPENAI_ROUTES), default="openai")
     parser.add_argument("--meter-host")
     parser.add_argument("--cache-variant", action="append", metavar="SOURCE/TASK=SHA256")
+    parser.add_argument("--budget-config")
+    parser.add_argument("--min-free-gib", type=int)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
+    if args.min_free_gib is not None and args.min_free_gib <= 0:
+        parser.error("--min-free-gib must be positive")
+    if args.budget_config and args.parallel != 1:
+        parser.error("budgeted campaigns currently require --parallel 1")
+    args.budget_policy = budget.configuration(args.budget_config) if args.budget_config else None
     agents = args.agents.split(",")
     for agent in agents:
         if agent not in AGENTS:
@@ -573,6 +606,15 @@ def main():
             raise SystemExit(agent + " needs a configured meter credential")
     campaign = checkpoint.Campaign(os.path.abspath(args.out), identity, args.resume)
     args.campaign_identity = campaign.identity
+    if args.budget_policy is None and os.path.exists(os.path.join(args.out, 'budget-policy.json')):
+        raise checkpoint.ResumeError('unexpected budget policy in unbudgeted campaign')
+    if args.budget_policy is not None:
+        path = os.path.join(args.out, 'budget-policy.json')
+        if os.path.exists(path):
+            if checkpoint.read(path) != args.budget_policy:
+                raise checkpoint.ResumeError('budget policy copy changed')
+        else:
+            checkpoint.atomic(path, args.budget_policy, True)
     prepare_matrix(args, rows, campaign.identity)
     runs = os.path.abspath(os.path.join(args.out, "rows"))
     checkpoint.durable_directory(runs)
@@ -585,6 +627,9 @@ def main():
         services = start_services(gateway, upstream, runs, os.path.abspath(args.out), args.meter_port, args.relay_port, args.meter_host or gateway)
         args.meter_incarnation = checkpoint.read(os.path.join(args.out, "services", "meter.json"))["incarnation"]
         lock = threading.Lock()
+        if args.budget_policy is not None:
+            budgeted_rows(args, rows, gateway, env, lock, runs)
+            return
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
             futures = {pool.submit(run_row, row, args, gateway, env, lock, os.path.abspath(args.agent_root), runs): row for row in rows}
             for future in concurrent.futures.as_completed(futures):

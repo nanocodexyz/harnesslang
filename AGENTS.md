@@ -79,3 +79,10 @@ python3 -B evals/report.py --single-arm "$CAMPAIGN" \
 ```
 
 This is not a matched adoption result. Cost per pass includes the costs of failed attempts. Its interval resamples task clusters with all attempts retained; zero-pass samples remain unbounded. Report list-price-equivalent valuation separately from actual invoiced spending. An optimization target is not a wallet cap: fix the campaign's authorized spending limit and enforce it before dispatching requests.
+
+For a capped model campaign, pass `--budget-config` with a pinned list-price-equivalent USD policy before dispatch. The meter reserves the configured worst-case request value atomically in a shared durable ledger, then settles only known terminal usage. Unresolved requests retain their reservations and block further dispatch. The same policy, price card, model bounds and evidence files must remain available when resuming. Do not reset a ledger to recover admission. `--min-free-gib` stops admission of new attempts at the declared disk floor, without deleting evidence or terminating active work. Run the budget checks before using credentials:
+
+```sh
+python3 -B evals/budget_drill.py
+python3 -B evals/budget_runner_drill.py
+```

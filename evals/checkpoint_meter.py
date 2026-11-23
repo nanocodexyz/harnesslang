@@ -20,13 +20,13 @@ def lock(directory):
     return handle
 
 
-def begin(directory, incarnation, metadata=None):
+def begin(directory, incarnation, metadata=None, request_id=None):
     intents = os.path.join(directory, 'meter-intents')
     with lock(directory):
         if os.path.exists(os.path.join(directory, 'meter-closed.json')):
             raise checkpoint.ResumeError('attempt accounting is closed')
         checkpoint.durable_directory(intents)
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         checkpoint.atomic(os.path.join(intents, request_id + '.intent.json'),
             dict(metadata or {}, request_id=request_id, incarnation=incarnation), True)
     return request_id

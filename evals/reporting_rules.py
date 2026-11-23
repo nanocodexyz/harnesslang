@@ -3,7 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
-VERSION = "closed-accounting-v2"
+VERSION = "closed-accounting-v3-budgeted"
 COST_PER_PASS_REPETITIONS = 10000
 COST_PER_PASS_SEED = 0
 PRICES_PER_MTOK = {
@@ -35,6 +35,7 @@ RULES = {
     "per_attempt_cost": "existing total cost / planned attempts and configurable task-cluster percentile bootstrap retained",
     "timeout": "closed agent deadline is failed and verifier deadline is errored, never passed; retain verified observed usage only with observed_after_timeout_reconciliation, persisted complete closure proof and matching live durable ledger; unresolved dispatch, missing terminal evidence, incarnation change or incomplete closure remains unknown/infrastructure",
     "accounting": "closed durable ledger, bound unique request receipts, observed usage and model price required; unknown is never zero; legacy inputs remain explicitly unpinned",
+    "dispatch_budget": "optional pinned campaign list-price-equivalent cap; reserve conservative platform bounds durably before dispatch, settle known terminal usage, retain unresolved reservations and halt on uncertainty; no task or verifier modification",
     "matched_gates": "complete matched arms; both costs known; candidate pass rate >= min_success; candidate per-attempt cost <= max_cost; paired pass delta >= min_improvement_pp and paired 95% lower bound > 0",
 }
 
@@ -43,7 +44,7 @@ def manifest():
     value = copy.deepcopy(RULES)
     root = Path(__file__).resolve().parent
     value["implementation_sha256"] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-                                      for name in ("report.py", "reporting_rules.py", "checkpoint_meter.py", "checkpoint.py", "run.py", "checkpoint_phase.py", "provenance.py")}
+                                      for name in ("report.py", "reporting_rules.py", "checkpoint_meter.py", "checkpoint.py", "run.py", "checkpoint_phase.py", "provenance.py", "meter.py", "budget.py")}
     return value
 
 

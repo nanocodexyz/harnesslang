@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import uuid
 
+import budget
 import checkpoint
 import checkpoint_meter
 
@@ -257,6 +258,7 @@ class Meter(http.server.BaseHTTPRequestHandler):
     lock = threading.Lock()
     halted = None
     clients = None
+    budget_gate = None
 
     def log_message(self, format, *args):
         return
@@ -271,6 +273,14 @@ class Meter(http.server.BaseHTTPRequestHandler):
         self.forward(read_body(self))
 
     def forward(self, body):
+        self.budget_request_id = None
+        try:
+            self.forward_request(body)
+        finally:
+            if self.budget_request_id is not None:
+                self.budget_gate.abandon(self.budget_request_id)
+
+    def forward_request(self, body):
         if self.clients is not None and not any(ipaddress.ip_address(self.client_address[0]) in network for network in self.clients):
             self.send_error(403, "the meter serves only " + os.environ[CLIENTS_ENV])
             return
@@ -293,14 +303,36 @@ class Meter(http.server.BaseHTTPRequestHandler):
         if provider == "chatgpt" and Meter.halted is not None:
             self.send_error(503, "the meter stopped the ChatGPT route after status " + str(Meter.halted))
             return
+        inference = path.split("?")[0].endswith(checkpoint_meter.MODEL_ENDPOINTS)
+        if self.budget_gate is not None:
+            inference = self.command == "POST" and path.split("?")[0] in budget.MODEL_PATHS.get(provider, ())
+        metadata_path = path.split("?")[0] in (CHATGPT_MODELS_PATH, "/v1/models")
+        if self.budget_gate is not None and not inference and not (self.command == "GET" and metadata_path):
+            self.send_error(403, "unrecognized route: no unmetered dispatch is allowed")
+            return
+        if inference and self.budget_gate is not None:
+            try:
+                if provider == "anthropic" and self.headers.get("anthropic-beta"):
+                    raise budget.BudgetError("unpriced Anthropic beta headers")
+                if urllib.parse.urlsplit(path).query:
+                    raise budget.BudgetError("inference query parameters are not priced")
+                budget.quote(self.budget_gate.policy, provider, path, body)
+            except budget.BudgetError as error:
+                self.send_error(503, str(error))
+                return
         request_id = None
         started = time.time()
         metadata = None
-        if path.split("?")[0].endswith(checkpoint_meter.MODEL_ENDPOINTS):
+        if inference:
             metadata = intent_metadata(directory, run, provider, path, body, started)
             try:
-                request_id = checkpoint_meter.begin(directory, self.incarnation, metadata)
-            except checkpoint.ResumeError as error:
+                admission_id = None
+                if self.budget_gate is not None:
+                    admission_id = uuid.uuid4().hex
+                    self.budget_gate.reserve(admission_id, provider, path, body)
+                    self.budget_request_id = admission_id
+                request_id = checkpoint_meter.begin(directory, self.incarnation, metadata, request_id=admission_id)
+            except (checkpoint.ResumeError, budget.BudgetError, OSError) as error:
                 self.send_error(503, str(error))
                 return
         headers = {name: value for name, value in self.headers.items() if name.lower() not in DROPPED_REQUEST_HEADERS}
@@ -392,6 +424,8 @@ class Meter(http.server.BaseHTTPRequestHandler):
                 record.update(ended=time.time(), error=repr(error),
                     not_dispatched={'schema': 1, 'reason': 'connect_failed_before_request'})
                 checkpoint_meter.finish(directory, request_id, record)
+                if self.budget_gate is not None:
+                    self.budget_gate.finish(request_id, record)
                 persisted = True
         finally:
             connection.close()
@@ -446,6 +480,8 @@ class Meter(http.server.BaseHTTPRequestHandler):
             record['error'] = message['error']
         if request_id:
             checkpoint_meter.finish(directory, request_id, record)
+            if self.budget_gate is not None:
+                self.budget_gate.finish(request_id, record)
 
 
     def relay_translated(self, response):
@@ -479,6 +515,7 @@ def main():
     Meter.incarnation = getattr(Meter, "incarnation", None) or uuid.uuid4().hex
     Meter.runs = os.path.abspath(sys.argv[3])
     Meter.keys = keys
+    Meter.budget_gate = budget.from_environment(Meter.runs, Meter.incarnation)
     if os.environ.get(CLIENTS_ENV):
         Meter.clients = [ipaddress.ip_network(network) for network in os.environ[CLIENTS_ENV].split(",")]
     server = Server((sys.argv[1], int(sys.argv[2])), Meter)
